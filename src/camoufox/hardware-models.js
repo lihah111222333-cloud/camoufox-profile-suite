@@ -460,12 +460,13 @@ export const APPLE_SILICON_SKU_CATALOG = Object.freeze({
         cpuArch: 'arm',
         cpuVendor: 'apple',
         gpuRenderer: 'Apple M5 Pro',
-        allowedCores: Object.freeze([12, 14]),
-        allowedRamGb: Object.freeze([24, 48, 64]),
+        allowedCores: Object.freeze([12, 14, 18]),
+        allowedRamGb: Object.freeze([24, 36, 48, 64]),
         allowedStorageGb: Object.freeze([512, 1024, 2048, 4096]),
         allowedCoreRamPairs: Object.freeze([
             { cores: 12, ramGb: Object.freeze([24, 48]) },
-            { cores: 14, ramGb: Object.freeze([24, 48, 64]) }
+            { cores: 14, ramGb: Object.freeze([24, 48, 64]) },
+            { cores: 18, ramGb: Object.freeze([24, 36, 48, 64]) }
         ]),
         formFactors: Object.freeze(['laptop-pro-notch', 'desktop']),
         allowedPanels: Object.freeze([
@@ -485,12 +486,14 @@ export const APPLE_SILICON_SKU_CATALOG = Object.freeze({
         cpuArch: 'arm',
         cpuVendor: 'apple',
         gpuRenderer: 'Apple M5 Max',
-        allowedCores: Object.freeze([14, 16]),
-        allowedRamGb: Object.freeze([36, 48, 64, 128]),
+        allowedCores: Object.freeze([14, 16, 20, 24]),
+        allowedRamGb: Object.freeze([36, 48, 64, 96, 128]),
         allowedStorageGb: Object.freeze([1024, 2048, 4096, 8192]),
         allowedCoreRamPairs: Object.freeze([
             { cores: 14, ramGb: Object.freeze([36]) },
-            { cores: 16, ramGb: Object.freeze([48, 64, 128]) }
+            { cores: 16, ramGb: Object.freeze([48, 64, 128]) },
+            { cores: 20, ramGb: Object.freeze([48, 64, 96, 128]) },
+            { cores: 24, ramGb: Object.freeze([64, 96, 128]) }
         ]),
         formFactors: Object.freeze(['laptop-pro-notch', 'desktop']),
         allowedPanels: Object.freeze([

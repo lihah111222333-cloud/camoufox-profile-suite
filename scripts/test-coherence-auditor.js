@@ -56,6 +56,14 @@ import {
     validateOsAndBrowserVersionMatch,
     resolveGeoCoordinatesWithDeterministicJitter,
     attachZiniaoSecurityGuardsToContext,
+    GPU_PERFORMANCE_SPEC_CATALOG,
+    lookupGpuPerformanceSpec,
+    collectHostMacPerformanceBaseline,
+    computeGpuPerformanceScalingWeights,
+    scaleGpuExecutionDurationMs,
+    buildGpuPerformanceInitScript,
+    attachGpuPerformanceScalerToContext,
+    validateGpuPerformanceScalingCoherence,
     normalizeTargetOs,
     gpuFitsOs,
     evaluatePlatformCoherence,
@@ -2787,6 +2795,226 @@ const tests = [
             assert.notEqual(jp.latitude, 37.2534);
             assert.notEqual(jp.longitude, 105.9976);
             assert.ok(Math.abs(jp.latitude - 35.6762) <= 0.016);
+        }
+    },
+    {
+        name: '81. Host Mac GPU Performance Baseline Collector (collectHostMacPerformanceBaseline) & 45+ GPU Physical Performance Catalog (GPU_PERFORMANCE_SPEC_CATALOG)',
+        fn: () => {
+            const hostBase = collectHostMacPerformanceBaseline({ forceRefresh: true });
+            assert.ok(hostBase.hostChipModel && hostBase.hostChipModel.length > 0);
+            assert.ok(hostBase.hostCpuCores >= 4);
+            assert.ok(hostBase.hostGpuCores >= 8);
+            assert.ok(hostBase.hostRamGb >= 8);
+            assert.ok(hostBase.hostFp32Tflops > 0);
+            assert.ok(hostBase.hostMemoryBandwidthGBps > 0);
+            assert.ok(hostBase.hostPixelFillRateGPixels > 0);
+            assert.ok(hostBase.hostMeasuredMatrixOpsPerMs > 10000);
+
+            // Verify key GPUs in GPU_PERFORMANCE_SPEC_CATALOG
+            const rtx4090 = lookupGpuPerformanceSpec(
+                'ANGLE (NVIDIA, NVIDIA GeForce RTX 4090 Direct3D11 vs_5_0 ps_5_0, D3D11)'
+            );
+            assert.equal(rtx4090.model, 'NVIDIA GeForce RTX 4090');
+            assert.equal(rtx4090.fp32Tflops, 82.58);
+            assert.equal(rtx4090.memoryBandwidthGBps, 1008);
+
+            const rtx4090Laptop = lookupGpuPerformanceSpec(
+                'ANGLE (NVIDIA, NVIDIA GeForce RTX 4090 Laptop GPU Direct3D11 vs_5_0 ps_5_0, D3D11)'
+            );
+            assert.equal(rtx4090Laptop.model, 'NVIDIA GeForce RTX 4090 Laptop GPU');
+            assert.equal(rtx4090Laptop.fp32Tflops, 32.95);
+
+            const uhd620 = lookupGpuPerformanceSpec('Mesa Intel(R) UHD Graphics 620 (KBL GT2)');
+            assert.equal(uhd620.model, 'Intel(R) UHD Graphics 620');
+            assert.equal(uhd620.fp32Tflops, 0.44);
+
+            const m5Pro = lookupGpuPerformanceSpec('Apple M5 Pro');
+            assert.equal(m5Pro.model, 'Apple M5 Pro');
+            assert.equal(m5Pro.fp32Tflops, 11.5);
+        }
+    },
+    {
+        name: '82. Host-to-Target GPU Performance Weighting (computeGpuPerformanceScalingWeights & scaleGpuExecutionDurationMs): Weights RTX 4090 ~7.18x faster and Intel UHD 620 ~26.1x slower than Host Apple M5 Pro without leaking host timing',
+        fn: () => {
+            const hostBase = collectHostMacPerformanceBaseline();
+
+            // 1. Target = NVIDIA GeForce RTX 4090 (82.58 TFLOPS vs Host Apple M5 Pro 11.5 TFLOPS)
+            const rtx4090Weights = computeGpuPerformanceScalingWeights(
+                'ANGLE (NVIDIA, NVIDIA GeForce RTX 4090 Direct3D11 vs_5_0 ps_5_0, D3D11)',
+                { profileId: 'perf_rtx4090_01', hostBaseline: hostBase }
+            );
+            assert.equal(rtx4090Weights.targetGpuSpec.model, 'NVIDIA GeForce RTX 4090');
+            // computeTimeMultiplier = 11.5 / 82.58 ≈ 0.139259 (< 1.0, i.e., 7.18x faster than host Mac!)
+            assert.ok(rtx4090Weights.computeTimeMultiplier < 0.25);
+            assert.ok(rtx4090Weights.throughputSpeedupRatio > 4.0);
+            assert.ok(rtx4090Weights.memoryTransferMultiplier < 0.45);
+
+            // A 10.0ms shader benchmark on the host Mac is weighted down to ~1.5-2.5ms for RTX 4090
+            const rtxSample1 = scaleGpuExecutionDurationMs(10.0, rtx4090Weights, {
+                operationType: 'compute',
+                sampleIndex: 1
+            });
+            const rtxSample2 = scaleGpuExecutionDurationMs(10.0, rtx4090Weights, {
+                operationType: 'compute',
+                sampleIndex: 2
+            });
+            assert.ok(rtxSample1.weightedTargetElapsedMs < 2.5);
+            assert.notEqual(rtxSample1.weightedTargetElapsedMs, 10.0); // Never leaks raw 10.0ms host Mac timing!
+            assert.notEqual(rtxSample1.weightedTargetElapsedMs, rtxSample2.weightedTargetElapsedMs); // Has realistic thermal micro-jitter
+
+            // 2. Target = Intel(R) UHD Graphics 620 (0.44 TFLOPS vs Host Apple M5 Pro 11.5 TFLOPS)
+            const uhd620Weights = computeGpuPerformanceScalingWeights(
+                'Mesa Intel(R) UHD Graphics 620 (KBL GT2)',
+                { profileId: 'perf_uhd620_01', hostBaseline: hostBase }
+            );
+            assert.equal(uhd620Weights.targetGpuSpec.model, 'Intel(R) UHD Graphics 620');
+            assert.ok(uhd620Weights.computeTimeMultiplier > 15.0);
+            const uhdSample = scaleGpuExecutionDurationMs(10.0, uhd620Weights, {
+                operationType: 'compute',
+                sampleIndex: 1
+            });
+            assert.ok(uhdSample.weightedTargetElapsedMs > 150.0);
+        }
+    },
+    {
+        name: '83. In-Browser Anti-Penetration GPU Performance Init Script (buildGpuPerformanceInitScript): Compresses RTX 4090 & Dilates UHD 620 WebGL/Timer-Query/WebGPU Benchmarks while Preserving Monotonic performance.now() and [native code]',
+        fn: async () => {
+            const vm = await import('node:vm');
+
+            const runSimulatedBrowserBenchmark = (targetGpuRenderer, realHostElapsedMs = 20.0) => {
+                const weights = computeGpuPerformanceScalingWeights(targetGpuRenderer, {
+                    profileId: 'vm_test_profile'
+                });
+                const scriptCode = buildGpuPerformanceInitScript(weights);
+
+                let simulatedRealClockMs = 1000.0;
+                function now() {
+                    return simulatedRealClockMs;
+                }
+                function Performance() {}
+                Performance.prototype.now = now;
+                const perfInstance = new Performance();
+
+                function WebGL2RenderingContext() {}
+                WebGL2RenderingContext.prototype.drawArrays = function drawArrays() {};
+                WebGL2RenderingContext.prototype.finish = function finish() {};
+                WebGL2RenderingContext.prototype.readPixels = function readPixels() {};
+                WebGL2RenderingContext.prototype.getQueryParameter = function getQueryParameter(_q, pname) {
+                    // Simulate raw host Mac returning 20,000,000 ns (20ms) for QUERY_RESULT (0x8866)
+                    return pname === 0x8866 ? realHostElapsedMs * 1e6 : 1;
+                };
+
+                const sandbox = {
+                    Performance,
+                    performance: perfInstance,
+                    Date: {
+                        now: function now() {
+                            return Math.round(1700000000000 + simulatedRealClockMs);
+                        }
+                    },
+                    WebGLRenderingContext: WebGL2RenderingContext,
+                    WebGL2RenderingContext
+                };
+
+                vm.createContext(sandbox);
+                vm.runInContext(scriptCode, sandbox);
+
+                const gl = new sandbox.WebGL2RenderingContext();
+
+                // Check [native code] preservation
+                const perfNowStr = vm.runInContext(
+                    'Function.prototype.toString.call(Performance.prototype.now)',
+                    sandbox
+                );
+                const readPixelsStr = vm.runInContext(
+                    'Function.prototype.toString.call(WebGL2RenderingContext.prototype.readPixels)',
+                    sandbox
+                );
+
+                // Simulate WebGL drawArrays -> 20ms host GPU work -> gl.finish() benchmark
+                const t0 = sandbox.Performance.prototype.now.call(sandbox.performance);
+                gl.drawArrays(4, 0, 10000);
+                simulatedRealClockMs += realHostElapsedMs;
+                gl.finish();
+                const t1 = sandbox.Performance.prototype.now.call(sandbox.performance);
+
+                // Check strict monotonicity across 10 consecutive calls
+                let prev = t1;
+                let monotonic = true;
+                for (let i = 0; i < 10; i++) {
+                    simulatedRealClockMs += 0.5;
+                    const curr = sandbox.Performance.prototype.now.call(sandbox.performance);
+                    if (curr < prev) monotonic = false;
+                    prev = curr;
+                }
+
+                // Hardware timer query (TIME_ELAPSED_EXT / QUERY_RESULT = 0x8866)
+                const queryNs = gl.getQueryParameter({}, 0x8866);
+
+                return {
+                    perceivedElapsedMs: Number((t1 - t0).toFixed(4)),
+                    queryNs,
+                    monotonic,
+                    perfNowStr,
+                    readPixelsStr
+                };
+            };
+
+            const rtx4090Run = runSimulatedBrowserBenchmark('NVIDIA GeForce RTX 4090', 20.0);
+            const m5ProHostRun = runSimulatedBrowserBenchmark('Apple M5 Pro', 20.0);
+            const uhd620Run = runSimulatedBrowserBenchmark('Intel(R) UHD Graphics 620', 20.0);
+
+            // RTX 4090 must perceive much faster execution than the 20ms host Mac baseline (~3.5-4.5ms)
+            assert.ok(
+                rtx4090Run.perceivedElapsedMs < 6.0,
+                `Expected RTX 4090 perceived time < 6ms, got ${rtx4090Run.perceivedElapsedMs}ms`
+            );
+            // Host Apple M5 Pro should perceive ~20ms
+            assert.ok(
+                m5ProHostRun.perceivedElapsedMs > 18.0 && m5ProHostRun.perceivedElapsedMs < 22.0,
+                `Expected M5 Pro perceived time ~20ms, got ${m5ProHostRun.perceivedElapsedMs}ms`
+            );
+            // Intel UHD 620 must perceive much slower execution than the 20ms host Mac baseline (> 350ms)
+            assert.ok(
+                uhd620Run.perceivedElapsedMs > 350.0,
+                `Expected UHD 620 perceived time > 350ms, got ${uhd620Run.perceivedElapsedMs}ms`
+            );
+
+            // Hardware timer query (0x8866) in nanoseconds must also be weighted per GPU SKU
+            assert.ok(rtx4090Run.queryNs < 5_000_000); // ~2.78ms in ns
+            assert.ok(uhd620Run.queryNs > 350_000_000); // ~522ms in ns
+
+            // Strict monotonicity & Function.prototype.toString cloaking
+            assert.equal(rtx4090Run.monotonic, true);
+            assert.equal(uhd620Run.monotonic, true);
+            assert.match(rtx4090Run.perfNowStr, /function now\(\)/);
+            assert.match(rtx4090Run.readPixelsStr, /function readPixels\(\)/);
+        }
+    },
+    {
+        name: '84. Check 16 GPU Performance Anti-Penetration Audit (validateGpuPerformanceScalingCoherence): Rejects RTX 4090 or UHD 620 profile leaking unscaled Host Mac GPU timing',
+        fn: () => {
+            // 1. Valid weighted RTX 4090 preset passes 17/17 checks (100/100)
+            const rtxProfile = resolveDeterministicDeviceProfile('rtx4090_audit_ok', {
+                presetId: 'win-desktop-i9-14900k-rtx4090'
+            });
+            const resOk = evaluatePlatformCoherence(rtxProfile.telemetry, 'windows');
+            assert.equal(resOk.passed, true);
+            assert.equal(resOk.score, 100);
+
+            // 2. Tamper gpuPerformance to leak raw unscaled host Mac timing (computeTimeMultiplier = 1.0, measured10msHostShaderMs = 10.0)
+            const leakedRtxTelemetry = structuredClone(rtxProfile.telemetry);
+            leakedRtxTelemetry.gpuPerformance = {
+                ...leakedRtxTelemetry.gpuPerformance,
+                computeTimeMultiplier: 1.0,
+                measured10msHostShaderMs: 10.0
+            };
+            const resLeaked = evaluatePlatformCoherence(leakedRtxTelemetry, 'windows');
+            assert.equal(resLeaked.passed, false);
+            const skuCheck = findCheck(resLeaked, 'exact-hardware-sku-model-coherence');
+            assert.equal(skuCheck.passed, false);
+            assert.match(skuCheck.details, /Host Mac GPU performance penetration detected/);
+            assert.match(skuCheck.details, /Host Mac GPU timing leak detected/);
         }
     }
 ];

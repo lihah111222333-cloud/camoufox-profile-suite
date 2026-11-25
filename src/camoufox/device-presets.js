@@ -46,6 +46,16 @@ import {
     resolveGeoCoordinatesWithDeterministicJitter,
     attachZiniaoSecurityGuardsToContext
 } from './ziniao-security.js';
+import {
+    GPU_PERFORMANCE_SPEC_CATALOG,
+    lookupGpuPerformanceSpec,
+    collectHostMacPerformanceBaseline,
+    computeGpuPerformanceScalingWeights,
+    scaleGpuExecutionDurationMs,
+    buildGpuPerformanceInitScript,
+    attachGpuPerformanceScalerToContext,
+    validateGpuPerformanceScalingCoherence
+} from './gpu-performance-scaler.js';
 
 export {
     SENSITIVE_LOCAL_PORT_CATALOG,
@@ -63,7 +73,15 @@ export {
     CanvasWebglConsistencyLedger,
     validateOsAndBrowserVersionMatch,
     resolveGeoCoordinatesWithDeterministicJitter,
-    attachZiniaoSecurityGuardsToContext
+    attachZiniaoSecurityGuardsToContext,
+    GPU_PERFORMANCE_SPEC_CATALOG,
+    lookupGpuPerformanceSpec,
+    collectHostMacPerformanceBaseline,
+    computeGpuPerformanceScalingWeights,
+    scaleGpuExecutionDurationMs,
+    buildGpuPerformanceInitScript,
+    attachGpuPerformanceScalerToContext,
+    validateGpuPerformanceScalingCoherence
 };
 
 /**
@@ -774,6 +792,27 @@ export const USABLE_DEVICE_PRESET_CATALOG = Object.freeze([
         webgl: Object.freeze({
             unmaskedVendor: 'Apple',
             unmaskedRenderer: 'Apple M5',
+            GPUAdapterInfo: Object.freeze({ vendor: 'apple', architecture: 'metal-3' })
+        })
+    }),
+    Object.freeze({
+        presetId: 'mac-mbp16-m5-pro-18c-64g',
+        os: 'macos',
+        category: 'apple-silicon-laptop',
+        deviceModel: 'MacBook Pro 16" (M5 Pro, 2025)',
+        deviceNameSuffix: 'MacBook Pro',
+        macOuiPrefixes: Object.freeze(['14:98:77', 'A8:5C:2C']),
+        cpuModel: 'Apple M5 Pro',
+        gpuModel: 'Apple M5 Pro',
+        hardwareConcurrency: 18,
+        ramGb: 64,
+        storageGb: 2048,
+        architecture: 'arm',
+        osVersion: '26.1.0',
+        screen: Object.freeze({ width: 1728, height: 1117, availWidth: 1728, availHeight: 1079, colorDepth: 30, devicePixelRatio: 2 }),
+        webgl: Object.freeze({
+            unmaskedVendor: 'Apple',
+            unmaskedRenderer: 'Apple M5 Pro',
             GPUAdapterInfo: Object.freeze({ vendor: 'apple', architecture: 'metal-3' })
         })
     }),
@@ -1675,6 +1714,10 @@ export function resolveDeterministicDeviceProfile(profileId = 'camoufox-profile-
     const acceptLanguage = buildAcceptLanguageHeader(languages);
     const timeZone = options.timeZone || geo.timeZone;
     const geolocation = resolveGeoCoordinatesWithDeterministicJitter(idStr, geo.country);
+    const gpuPerformance = computeGpuPerformanceScalingWeights(
+        preset.gpuModel || preset.webgl.unmaskedRenderer,
+        { profileId: idStr }
+    );
     const securityPolicy = {
         portScanProtection: {
             enabled: options.portScanProtection !== undefined ? Boolean(options.portScanProtection) : true,
@@ -1957,6 +2000,7 @@ export function resolveDeterministicDeviceProfile(profileId = 'camoufox-profile-
             }
         },
         hardwareProfile,
+        gpuPerformance,
         storageEstimate
     };
 
@@ -1974,6 +2018,7 @@ export function resolveDeterministicDeviceProfile(profileId = 'camoufox-profile-
         timeZone,
         geolocation,
         securityPolicy,
+        gpuPerformance,
         seeds: {
             audioFp: audioFpSeed,
             clientRectFp: clientRectFpSeed,
@@ -2218,6 +2263,10 @@ export function sanitizeAdsPowerProfileToCoherentPreset(rawAdsPowerProfile = {})
             webgpuAdapterInfo: { vendor: 'apple', architecture: healedArch }
         };
         healedProfile.telemetry.hardwareProfile = healedProfile.hardwareProfile;
+        healedProfile.gpuPerformance = computeGpuPerformanceScalingWeights(sku.gpuRenderer, {
+            profileId
+        });
+        healedProfile.telemetry.gpuPerformance = healedProfile.gpuPerformance;
 
         return {
             healedPresetId: healedProfile.presetId,

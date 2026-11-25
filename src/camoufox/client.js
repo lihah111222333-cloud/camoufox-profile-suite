@@ -22,7 +22,15 @@ import {
     computeHashSimilarity,
     shouldSkipCanvasNoiseForHost,
     validateOsAndBrowserVersionMatch,
-    resolveGeoCoordinatesWithDeterministicJitter
+    resolveGeoCoordinatesWithDeterministicJitter,
+    GPU_PERFORMANCE_SPEC_CATALOG,
+    lookupGpuPerformanceSpec,
+    collectHostMacPerformanceBaseline,
+    computeGpuPerformanceScalingWeights,
+    scaleGpuExecutionDurationMs,
+    buildGpuPerformanceInitScript,
+    attachGpuPerformanceScalerToContext,
+    validateGpuPerformanceScalingCoherence
 } from './device-presets.js';
 
 export {
@@ -39,7 +47,15 @@ export {
     computeHashSimilarity,
     shouldSkipCanvasNoiseForHost,
     validateOsAndBrowserVersionMatch,
-    resolveGeoCoordinatesWithDeterministicJitter
+    resolveGeoCoordinatesWithDeterministicJitter,
+    GPU_PERFORMANCE_SPEC_CATALOG,
+    lookupGpuPerformanceSpec,
+    collectHostMacPerformanceBaseline,
+    computeGpuPerformanceScalingWeights,
+    scaleGpuExecutionDurationMs,
+    buildGpuPerformanceInitScript,
+    attachGpuPerformanceScalerToContext,
+    validateGpuPerformanceScalingCoherence
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -857,6 +873,7 @@ export async function createProfile(profileName, proxy = null, options = {}) {
             resolvedTimezoneId: deviceProfile.timeZone,
             resolvedGeolocation: deviceProfile.geolocation,
             securityPolicy: deviceProfile.securityPolicy,
+            gpuPerformance: deviceProfile.gpuPerformance,
             hardwareProfile: deviceProfile.hardwareProfile,
             seeds: deviceProfile.seeds,
             createdAt: new Date().toISOString(),
@@ -1170,6 +1187,21 @@ export async function startProfile(profileId, options = {}) {
                 });
             }
 
+            let gpuPerformanceScaler = null;
+            if (
+                options.enableGpuPerformanceScaling !== false &&
+                mergedOptions.enableGpuPerformanceScaling !== false
+            ) {
+                gpuPerformanceScaler = await attachGpuPerformanceScalerToContext(
+                    context,
+                    mergedOptions.gpuPerformance ||
+                        mergedOptions.hardwareProfile?.gpuModel ||
+                        mergedOptions.deviceModel ||
+                        targetOs,
+                    { profileId }
+                );
+            }
+
             const session = {
                 profileId,
                 browser,
@@ -1182,6 +1214,7 @@ export async function startProfile(profileId, options = {}) {
                 trafficPaths,
                 fingerprintLedger,
                 securityGuards,
+                gpuPerformanceScaler,
                 metadata: {
                     ...metadata,
                     os: targetOs,

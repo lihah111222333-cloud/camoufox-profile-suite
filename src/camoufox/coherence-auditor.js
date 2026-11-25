@@ -57,7 +57,15 @@ import {
     CanvasWebglConsistencyLedger,
     validateOsAndBrowserVersionMatch,
     resolveGeoCoordinatesWithDeterministicJitter,
-    attachZiniaoSecurityGuardsToContext
+    attachZiniaoSecurityGuardsToContext,
+    GPU_PERFORMANCE_SPEC_CATALOG,
+    lookupGpuPerformanceSpec,
+    collectHostMacPerformanceBaseline,
+    computeGpuPerformanceScalingWeights,
+    scaleGpuExecutionDurationMs,
+    buildGpuPerformanceInitScript,
+    attachGpuPerformanceScalerToContext,
+    validateGpuPerformanceScalingCoherence
 } from './device-presets.js';
 
 export {
@@ -107,7 +115,15 @@ export {
     CanvasWebglConsistencyLedger,
     validateOsAndBrowserVersionMatch,
     resolveGeoCoordinatesWithDeterministicJitter,
-    attachZiniaoSecurityGuardsToContext
+    attachZiniaoSecurityGuardsToContext,
+    GPU_PERFORMANCE_SPEC_CATALOG,
+    lookupGpuPerformanceSpec,
+    collectHostMacPerformanceBaseline,
+    computeGpuPerformanceScalingWeights,
+    scaleGpuExecutionDurationMs,
+    buildGpuPerformanceInitScript,
+    attachGpuPerformanceScalerToContext,
+    validateGpuPerformanceScalingCoherence
 };
 
 /**
@@ -115,7 +131,7 @@ export {
  * and `coherence.ts`.
  */
 export const CAMOUFOX_COHERENCE_CONSTANTS = Object.freeze({
-    appleSiliconCores: new Set([8, 10, 11, 12, 14, 16, 20, 24, 28, 32]),
+    appleSiliconCores: new Set([8, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32]),
     intelMacIgpCores: new Set([2, 4, 6, 8, 12, 16]),
     intelMacDgpuCores: new Set([2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 56]),
     intelOnlyCoreCounts: new Set([10, 14, 18, 22, 28]),
@@ -1891,20 +1907,19 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
         });
     }
 
-    // Check 16: Exact Hardware SKU & Device Model Parameter Coherence
-    // Validates exact CPU SKU, GPU SKU, Unified/System RAM capacity, SSD/Disk capacity,
-    // StorageManager quota vs physical disk size, laptop notched/non-notched display panel
-    // vs SoC SKU, Windows ANGLE vendor/shader model lockstep, and WebGL hardware limits.
+    // Check 16: Exact Hardware SKU, Device Model & Host-Weighted GPU Performance Anti-Penetration Coherence
     {
         const skuValidation = validateHardwareModelSpec(telemetry, targetOs);
-        const passed = skuValidation.passed;
+        const gpuPerfValidation = validateGpuPerformanceScalingCoherence(telemetry);
+        const combinedIssues = [...skuValidation.issues, ...gpuPerfValidation.issues];
+        const passed = combinedIssues.length === 0;
         const skuDesc = skuValidation.matchedSku ? ` [${skuValidation.matchedSku}]` : '';
         checks.push({
             name: 'exact-hardware-sku-model-coherence',
             passed,
             details: passed
-                ? `Exact hardware model parameters${skuDesc} (CPU cores/threads, GPU SKU, RAM capacity, SSD storage tier, panel form-factor, and WebGL hardware limits) are 100% coherent`
-                : skuValidation.issues.join('; ')
+                ? `Exact hardware model parameters${skuDesc} (CPU cores/threads, GPU SKU, RAM capacity, SSD storage tier, panel form-factor, WebGL limits, and Host-Weighted GPU performance scaling) are 100% coherent`
+                : combinedIssues.join('; ')
         });
     }
 
