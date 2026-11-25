@@ -425,7 +425,111 @@ export const APPLE_SILICON_SKU_CATALOG = Object.freeze({
             ...APPLE_LAPTOP_PANELS.nonNotch13
         ]),
         webglLimits: DEFAULT_APPLE_METAL_WEBGL_LIMITS
+    }),
+    'Apple M5': Object.freeze({
+        chip: 'Apple M5',
+        generation: 5,
+        tier: 'base',
+        cpuArch: 'arm',
+        cpuVendor: 'apple',
+        gpuRenderer: 'Apple M5',
+        allowedCores: Object.freeze([8, 9, 10]),
+        allowedRamGb: Object.freeze([16, 24, 32]),
+        allowedStorageGb: Object.freeze([256, 512, 1024, 2048]),
+        allowedCoreRamPairs: Object.freeze([
+            { cores: 8, ramGb: Object.freeze([16, 24]) },
+            { cores: 9, ramGb: Object.freeze([16, 24]) },
+            { cores: 10, ramGb: Object.freeze([16, 24, 32]) }
+        ]),
+        formFactors: Object.freeze(['laptop-air-notch', 'laptop-pro-14-notch', 'desktop']),
+        allowedPanels: Object.freeze([
+            ...ALL_NOTCHED_AIR_PANELS,
+            ...APPLE_LAPTOP_PANELS.pro14Notch,
+            ...APPLE_LAPTOP_PANELS.desktopDisplays
+        ]),
+        forbiddenPanels: Object.freeze([
+            ...APPLE_LAPTOP_PANELS.pro16Notch,
+            ...APPLE_LAPTOP_PANELS.nonNotch13
+        ]),
+        webglLimits: DEFAULT_APPLE_METAL_WEBGL_LIMITS
+    }),
+    'Apple M5 Pro': Object.freeze({
+        chip: 'Apple M5 Pro',
+        generation: 5,
+        tier: 'pro',
+        cpuArch: 'arm',
+        cpuVendor: 'apple',
+        gpuRenderer: 'Apple M5 Pro',
+        allowedCores: Object.freeze([12, 14]),
+        allowedRamGb: Object.freeze([24, 48, 64]),
+        allowedStorageGb: Object.freeze([512, 1024, 2048, 4096]),
+        allowedCoreRamPairs: Object.freeze([
+            { cores: 12, ramGb: Object.freeze([24, 48]) },
+            { cores: 14, ramGb: Object.freeze([24, 48, 64]) }
+        ]),
+        formFactors: Object.freeze(['laptop-pro-notch', 'desktop']),
+        allowedPanels: Object.freeze([
+            ...ALL_NOTCHED_PRO_PANELS,
+            ...APPLE_LAPTOP_PANELS.desktopDisplays
+        ]),
+        forbiddenPanels: Object.freeze([
+            ...ALL_NOTCHED_AIR_PANELS,
+            ...APPLE_LAPTOP_PANELS.nonNotch13
+        ]),
+        webglLimits: DEFAULT_APPLE_METAL_WEBGL_LIMITS
+    }),
+    'Apple M5 Max': Object.freeze({
+        chip: 'Apple M5 Max',
+        generation: 5,
+        tier: 'max',
+        cpuArch: 'arm',
+        cpuVendor: 'apple',
+        gpuRenderer: 'Apple M5 Max',
+        allowedCores: Object.freeze([14, 16]),
+        allowedRamGb: Object.freeze([36, 48, 64, 128]),
+        allowedStorageGb: Object.freeze([1024, 2048, 4096, 8192]),
+        allowedCoreRamPairs: Object.freeze([
+            { cores: 14, ramGb: Object.freeze([36]) },
+            { cores: 16, ramGb: Object.freeze([48, 64, 128]) }
+        ]),
+        formFactors: Object.freeze(['laptop-pro-notch', 'desktop']),
+        allowedPanels: Object.freeze([
+            ...ALL_NOTCHED_PRO_PANELS,
+            ...APPLE_LAPTOP_PANELS.desktopDisplays
+        ]),
+        forbiddenPanels: Object.freeze([
+            ...ALL_NOTCHED_AIR_PANELS,
+            ...APPLE_LAPTOP_PANELS.nonNotch13
+        ]),
+        webglLimits: DEFAULT_APPLE_METAL_WEBGL_LIMITS
+    }),
+    'Apple M5 Ultra': Object.freeze({
+        chip: 'Apple M5 Ultra',
+        generation: 5,
+        tier: 'ultra',
+        cpuArch: 'arm',
+        cpuVendor: 'apple',
+        gpuRenderer: 'Apple M5 Ultra',
+        allowedCores: Object.freeze([28, 32]),
+        allowedRamGb: Object.freeze([96, 256, 512]),
+        allowedStorageGb: Object.freeze([1024, 2048, 4096, 8192, 16384]),
+        allowedCoreRamPairs: Object.freeze([
+            { cores: 28, ramGb: Object.freeze([96, 256]) },
+            { cores: 32, ramGb: Object.freeze([96, 256, 512]) }
+        ]),
+        formFactors: Object.freeze(['desktop']),
+        allowedPanels: APPLE_LAPTOP_PANELS.desktopDisplays,
+        forbiddenPanels: ALL_LAPTOP_PANELS,
+        webglLimits: DEFAULT_APPLE_METAL_WEBGL_LIMITS
     })
+});
+
+export const APPLE_SILICON_MIN_MACOS_VERSION = Object.freeze({
+    1: 11.0, // M1 requires macOS 11.0 Big Sur+
+    2: 12.4, // M2 requires macOS 12.4 Monterey+
+    3: 14.0, // M3 requires macOS 14.0 Sonoma+
+    4: 14.5, // M4 requires macOS 14.5 Sonoma / 15.0 Sequoia+
+    5: 15.4  // M5 requires macOS 15.4 Sequoia / 26.0 Tahoe+
 });
 
 /**
@@ -445,7 +549,7 @@ export const INTEL_MAC_SKU_CATALOG = Object.freeze({
     'MacBook Pro 13-inch (Intel 2018-2020)': Object.freeze({
         id: 'MacBook Pro 13-inch (Intel 2018-2020)',
         cpuVendor: 'intel',
-        gpuPattern: /Intel\(R\)\s+Iris\(TM\)\s+Plus\s+Graphics(?:\s+(?:640|645|650|655|G7))?/i,
+        gpuPattern: /Intel\(R\)\s+Iris\(TM\)\s+(?:Plus\s+)?Graphics(?:\s+(?:540|550|6100|640|645|650|655|G7))?|Intel\s+Iris(?:\s+Pro)?\s+OpenGL\s+Engine/i,
         allowedCores: Object.freeze([4, 8]),
         allowedRamGb: Object.freeze([8, 16, 32]),
         allowedStorageGb: Object.freeze([128, 256, 512, 1024, 2048, 4096]),
@@ -2247,7 +2351,7 @@ export const STANDARD_PC_STORAGE_GB_TIERS = Object.freeze([
  */
 export function parseAppleSiliconSkuName(text) {
     if (!text || typeof text !== 'string') return null;
-    const match = text.match(/\bApple\s+(M[1-4](?:\s+(?:Pro|Max|Ultra))?)\b/i);
+    const match = text.match(/\bApple\s+(M[1-5](?:\s+(?:Pro|Max|Ultra))?)\b/i);
     if (!match) return null;
     const rawSuffix = match[1].trim().replace(/\s+/g, ' ');
     const parts = rawSuffix.split(' ');
@@ -2511,6 +2615,148 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
             } else {
                 issues.push(
                     `${sku.chip} cannot be paired with incompatible display panel resolution ${panelKey}`
+                );
+            }
+        }
+
+        // Rule N: Apple Silicon Generation vs Minimum Bootable macOS Version (platformVersion / osVersion)
+        const rawOsVer = hw.osVersion || hw.platformVersion || telemetry.userAgentMetadata?.platformVersion || null;
+        if (rawOsVer && typeof rawOsVer === 'string') {
+            const verMatch = rawOsVer.trim().match(/^(\d+)(?:\.(\d+))?/);
+            if (verMatch) {
+                const maj = Number(verMatch[1]);
+                const min = Number(verMatch[2] || 0);
+                const numericOsVer = maj + min / 10;
+                const minRequired = APPLE_SILICON_MIN_MACOS_VERSION[sku.generation] || 11.0;
+                // Note: macOS 10.15 in static Firefox UA is normal, but explicit platformVersion / osVersion (11.x..26.x) must meet min boot OS
+                if (maj >= 11 && numericOsVer < minRequired) {
+                    issues.push(
+                        `${sku.chip} minimum bootable macOS violation: osVersion="${rawOsVer}" is older than ${sku.chip}'s factory minimum macOS ${minRequired.toFixed(1)}`
+                    );
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // Rule M: Apple Mac Product Line (DeviceName / ProductType / deviceModel:
+    //         MacBook Air, MacBook Pro, Mac mini, iMac, Mac Studio, Mac Pro)
+    //         vs SoC Tier & CPU Architecture Lockstep (Discovered via AdsPower Audit)
+    // =========================================================================
+    const macProductLabel = String(hw.deviceName || hw.productType || deviceModel || '').trim();
+    const cpuArchClaim = String(hw.architecture || telemetry.userAgentMetadata?.architecture || '').trim().toLowerCase();
+    if (macProductLabel) {
+        const isMacStudio = /\bMac\s+Studio\b/i.test(macProductLabel);
+        const isMacBookAir = /\bMacBook\s+Air\b/i.test(macProductLabel);
+        const isMacMini = /\bMac\s+mini\b/i.test(macProductLabel);
+        const isIMac = /\biMac(?:\s+Pro)?\b/i.test(macProductLabel);
+        const isMacPro = /\bMac\s+Pro\b/i.test(macProductLabel);
+
+        if (isMacStudio) {
+            if (cpuArchClaim === 'x86' || (!activeAppleSkuName && /Intel|AMD|Radeon/i.test(renderer))) {
+                issues.push(
+                    `Mac product line violation: "${macProductLabel}" (Mac Studio, introduced 2022) is Apple Silicon Max/Ultra exclusive and never existed with x86 Intel/AMD hardware ("${renderer || cpuArchClaim}")`
+                );
+            } else if (activeAppleSkuName) {
+                const sku = APPLE_SILICON_SKU_CATALOG[activeAppleSkuName];
+                if (sku.tier !== 'max' && sku.tier !== 'ultra') {
+                    issues.push(
+                        `Mac product line violation: "${macProductLabel}" (Mac Studio) only ships with Max or Ultra SoCs (M1/M2/M3/M4 Max or Ultra), never with ${sku.tier}-tier "${sku.chip}"`
+                    );
+                }
+            }
+        } else if (isMacBookAir && activeAppleSkuName) {
+            const sku = APPLE_SILICON_SKU_CATALOG[activeAppleSkuName];
+            if (sku.tier !== 'base') {
+                issues.push(
+                    `Mac product line violation: "${macProductLabel}" (MacBook Air) only ships with base Apple M-series SoCs (M1/M2/M3/M4/M5), never with ${sku.tier}-tier "${sku.chip}"`
+                );
+            }
+        } else if (isMacMini && activeAppleSkuName) {
+            const sku = APPLE_SILICON_SKU_CATALOG[activeAppleSkuName];
+            if (sku.tier === 'max' || sku.tier === 'ultra') {
+                issues.push(
+                    `Mac product line violation: "${macProductLabel}" (Mac mini) only ships with base or Pro Apple Silicon SoCs, never with ${sku.tier}-tier "${sku.chip}"`
+                );
+            }
+        } else if (isIMac && activeAppleSkuName) {
+            const sku = APPLE_SILICON_SKU_CATALOG[activeAppleSkuName];
+            if (sku.tier !== 'base') {
+                issues.push(
+                    `Mac product line violation: Apple Silicon "${macProductLabel}" (24-inch iMac) only ships with base M-series SoCs (M1/M3/M4/M5), never with ${sku.tier}-tier "${sku.chip}"`
+                );
+            }
+        } else if (isMacPro) {
+            if (activeAppleSkuName) {
+                const sku = APPLE_SILICON_SKU_CATALOG[activeAppleSkuName];
+                if (sku.tier !== 'ultra') {
+                    issues.push(
+                        `Mac product line violation: Apple Silicon "${macProductLabel}" (Mac Pro) exclusively ships with Ultra-tier SoCs (M2 Ultra / M3 Ultra), never with ${sku.tier}-tier "${sku.chip}"`
+                    );
+                }
+            } else if (/Intel.*Iris|Intel.*HD\s+Graphics|Intel.*UHD\s+Graphics/i.test(renderer)) {
+                issues.push(
+                    `Mac product line violation: Intel "${macProductLabel}" (Mac Pro Xeon workstation) has no integrated Intel GPU and cannot render via laptop iGPU "${renderer}"`
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // Rule O: WebGPU GPUAdapterInfo (vendor / architecture) vs WebGL Renderer Lockstep
+    // =========================================================================
+    const webgpuAdapter =
+        hw.webgpuAdapterInfo ||
+        webgl.gpuAdapterInfo ||
+        webgl.GPUAdapterInfo ||
+        telemetry.webgpu?.adapterInfo ||
+        null;
+    if (webgpuAdapter && typeof webgpuAdapter === 'object' && renderer) {
+        const wVendor = String(webgpuAdapter.vendor || '').trim().toLowerCase();
+        const wArch = String(webgpuAdapter.architecture || '').trim().toLowerCase();
+
+        if (/AMD|Radeon/i.test(renderer)) {
+            if (wVendor && wVendor !== 'amd') {
+                issues.push(
+                    `WebGPU GPUAdapterInfo.vendor="${wVendor}" contradicts AMD WebGL renderer "${renderer}"`
+                );
+            }
+            if (/^gen-\d|^xe-/i.test(wArch) || /^common-\d|^metal-\d/i.test(wArch)) {
+                issues.push(
+                    `WebGPU GPUAdapterInfo.architecture="${wArch}" (Intel/Apple architecture) contradicts AMD WebGL renderer "${renderer}"`
+                );
+            }
+        } else if (/NVIDIA|GeForce|Quadro|RTX|GTX/i.test(renderer)) {
+            if (wVendor && wVendor !== 'nvidia') {
+                issues.push(
+                    `WebGPU GPUAdapterInfo.vendor="${wVendor}" contradicts NVIDIA WebGL renderer "${renderer}"`
+                );
+            }
+            if (/^gen-\d|^common-\d|^metal-\d/i.test(wArch)) {
+                issues.push(
+                    `WebGPU GPUAdapterInfo.architecture="${wArch}" contradicts NVIDIA WebGL renderer "${renderer}"`
+                );
+            }
+        } else if (activeAppleSkuName) {
+            if (wVendor && wVendor !== 'apple') {
+                issues.push(
+                    `WebGPU GPUAdapterInfo.vendor="${wVendor}" contradicts Apple Silicon WebGL renderer "${renderer}"`
+                );
+            }
+            if (/^gen-\d|^xe-|rdna|gcn/i.test(wArch)) {
+                issues.push(
+                    `WebGPU GPUAdapterInfo.architecture="${wArch}" contradicts Apple Silicon WebGL renderer "${renderer}"`
+                );
+            }
+        } else if (/Intel/i.test(renderer)) {
+            // 6th–9th Gen Intel GPUs (HD 520/530/620/630, Iris 540/550/Pro/6100, Iris Plus 640/645/650/655, UHD 617/620/630) are Gen8/Gen9, NEVER Gen12LP!
+            const isLegacyGen8Or9Intel =
+                /Iris(?:\(TM\))?\s+(?:Pro|Graphics\s+(?:540|550|6100)|Plus\s+Graphics(?:\s+6[45]\d)?)|(?:HD|UHD)\s+Graphics\s+(?:5\d\d|6\d\d)|Iris\s+OpenGL\s+Engine/i.test(
+                    renderer
+                );
+            if (isLegacyGen8Or9Intel && wArch === 'gen-12lp') {
+                issues.push(
+                    `WebGPU GPUAdapterInfo.architecture="gen-12lp" (Intel 11th/12th-Gen Tiger/Alder Lake) contradicts legacy Gen8/Gen9 Intel GPU "${renderer}" (expected "gen-9")`
                 );
             }
         }
