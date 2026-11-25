@@ -20,16 +20,23 @@
  */
 
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
     setCamoufoxModule,
     closeSharedBrowser
 } from '../src/camoufox/client.js';
 import { CamoufoxProfile, createAndStartProfile } from '../src/camoufox/profile.js';
 import { CamoufoxTrafficRecorder, redactProxyUrl } from '../src/camoufox/traffic-recorder.js';
+import { detectGmailPage } from '../src/gmail/page-detector.js';
+import { queryProfileTraffic } from './query-traffic-attribution.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 /**
  * Compute SHA-256 hex digest for assertions.
@@ -243,18 +250,36 @@ function createMockCamoufoxEngine() {
     function createMockPage(context) {
         const pageId = ++pageIdSeq;
         let closed = false;
+        let currentUrl = 'about:blank';
         const hub = createEventHub();
 
         return {
             ...hub,
             pageId,
             context: () => context,
+            url: () => currentUrl,
             isClosed: () => closed,
             async close() {
                 closed = true;
             },
             async goto(url, options = {}) {
-                return { url, options, status: 200 };
+                currentUrl = String(url || 'about:blank');
+                return { url: currentUrl, options, status: 200 };
+            },
+            async click(selector, options = {}) {
+                return { selector, options };
+            },
+            async fill(selector, value, options = {}) {
+                return { selector, value, options };
+            },
+            async type(selector, text, options = {}) {
+                return { selector, text, options };
+            },
+            async press(selector, key, options = {}) {
+                return { selector, key, options };
+            },
+            async waitForTimeout() {
+                return null;
             },
             async evaluate(fn, arg) {
                 if (typeof fn === 'function') {
@@ -1005,6 +1030,497 @@ async function runTests() {
 
                 // Clean up both profiles
                 await Promise.all([profileWin.delete(), profileMac.delete()]);
+                await closeSharedBrowser();
+            }
+        );
+
+        // =========================================================================
+        // Test 6: Pre-TLS Wire Log (pre-tls-wire.log), recordBodies: false, & maxBodyBytes Truncation
+        // =========================================================================
+        await testSection(
+            'Test 6: Pre-TLS Wire Log (pre-tls-wire.log), recordBodies: false, & maxBodyBytes Truncation',
+            async () => {
+                // Part A: pre-tls-wire.log + formatTransactionWireDump + maxBodyBytes: 32 truncation
+                const profileTrunc = await createAndStartProfile(
+                    'Traffic_Test_6_Trunc',
+                    'http://10.20.30.40:8080',
+                    {
+                        profileId: 'traffic-test-6-trunc',
+                        os: 'windows',
+                        profilesDir: tempProfilesDir,
+                        useSharedBrowser: false,
+                        maxBodyBytes: 32
+                    }
+                );
+
+                profileTrunc.setTrafficStep('step-6-wire-and-truncation');
+                const truncContext = await profileTrunc.getContext();
+
+                const longReqPayload = JSON.stringify({
+                    message: 'THIS_REQUEST_BODY_IS_LONGER_THAN_32_BYTES_FOR_TRUNCATION_TEST',
+                    seq: 601
+                });
+                const longResPayload = JSON.stringify({
+                    status: 'OK_LONG_RESPONSE_BODY_EXCEEDING_32_BYTES_LIMIT_ON_DISK',
+                    token: 'tok_abcdef1234567890'
+                });
+
+                assert.ok(Buffer.byteLength(longReqPayload) > 32);
+                assert.ok(Buffer.byteLength(longResPayload) > 32);
+
+                const req6 = createMockRequest({
+                    method: 'POST',
+                    url: 'https://accounts.google.com/v3/signin/wire-test?hl=en',
+                    headersArray: [
+                        { name: 'Host', value: 'accounts.google.com' },
+                        { name: 'Content-Type', value: 'application/json' },
+                        { name: 'X-Custom-Order', value: 'first-before-tls' }
+                    ],
+                    postData: longReqPayload
+                });
+                const res6 = createMockResponse({
+                    request: req6,
+                    status: 200,
+                    statusText: 'OK',
+                    headersArray: [
+                        { name: 'Content-Type', value: 'application/json; charset=utf-8' },
+                        { name: 'X-Frame-Options', value: 'DENY' }
+                    ],
+                    body: longResPayload
+                });
+
+                await emitHttpTransaction(truncContext, req6, res6);
+                await profileTrunc.getTrafficAttribution();
+
+                // Verify pre-tls-wire.log exists and contains canonical egress & ingress frames
+                const wireLogPath = profileTrunc.trafficPaths.preTlsWireLogPath;
+                assert.equal(fs.existsSync(wireLogPath), true, 'Expected pre-tls-wire.log to exist');
+                const wireLogContent = fs.readFileSync(wireLogPath, 'utf8');
+                assert.equal(
+                    wireLogContent.includes('>>> EGRESS [PRE-TLS NECKO CHANNEL]'),
+                    true,
+                    'Expected pre-tls-wire.log to contain >>> EGRESS [PRE-TLS NECKO CHANNEL]'
+                );
+                assert.equal(
+                    wireLogContent.includes('<<< INGRESS [POST-TLS NECKO CHANNEL]'),
+                    true,
+                    'Expected pre-tls-wire.log to contain <<< INGRESS [POST-TLS NECKO CHANNEL]'
+                );
+                assert.equal(wireLogContent.includes('POST /v3/signin/wire-test?hl=en HTTP/1.1'), true);
+                assert.equal(wireLogContent.includes('X-Custom-Order: first-before-tls'), true);
+                assert.equal(wireLogContent.includes('HTTP/1.1 200 OK'), true);
+
+                // Verify recorder.formatTransactionWireDump(corrId)
+                const truncEvents = readNdjsonFile(profileTrunc.trafficPaths.trafficNdjsonPath);
+                const egress6 = truncEvents.find((e) => e.type === 'egress');
+                const ingress6 = truncEvents.find((e) => e.type === 'ingress');
+                assert.ok(egress6 && ingress6);
+
+                const recorder6 = profileTrunc.getTrafficRecorder();
+                const wireDump6 = recorder6.formatTransactionWireDump(egress6.correlationId);
+                assert.equal(wireDump6.includes('>>> EGRESS [PRE-TLS NECKO CHANNEL]'), true);
+                assert.equal(wireDump6.includes('<<< INGRESS [POST-TLS NECKO CHANNEL]'), true);
+                assert.equal(wireDump6.includes(egress6.correlationId), true);
+                assert.equal(wireDump6.includes(longReqPayload), true);
+                assert.equal(wireDump6.includes(longResPayload), true);
+
+                // Verify maxBodyBytes: 32 truncation on disk with payloadTruncated: true
+                assert.equal(egress6.payloadTruncated, true);
+                assert.equal(ingress6.payloadTruncated, true);
+                assert.equal(egress6.postDataSha256, sha256Hex(longReqPayload));
+                assert.equal(ingress6.bodySha256, sha256Hex(longResPayload));
+
+                const req6DiskPath = path.join(profileTrunc.trafficPaths.trafficDir, egress6.payloadFile);
+                const res6DiskPath = path.join(profileTrunc.trafficPaths.trafficDir, ingress6.payloadFile);
+                assert.equal(fs.readFileSync(req6DiskPath).byteLength, 32);
+                assert.equal(fs.readFileSync(res6DiskPath).byteLength, 32);
+                assert.equal(
+                    fs.readFileSync(req6DiskPath, 'utf8'),
+                    Buffer.from(longReqPayload, 'utf8').subarray(0, 32).toString('utf8')
+                );
+                assert.equal(
+                    fs.readFileSync(res6DiskPath, 'utf8'),
+                    Buffer.from(longResPayload, 'utf8').subarray(0, 32).toString('utf8')
+                );
+
+                await profileTrunc.delete();
+
+                // Part B: recordBodies: false suppresses writing files to payloads/
+                const profileNoBodies = await createAndStartProfile(
+                    'Traffic_Test_6_NoBodies',
+                    null,
+                    {
+                        profileId: 'traffic-test-6-nobodies',
+                        os: 'linux',
+                        profilesDir: tempProfilesDir,
+                        useSharedBrowser: false,
+                        recordBodies: false
+                    }
+                );
+
+                const noBodiesContext = await profileNoBodies.getContext();
+                const reqNoBody = createMockRequest({
+                    method: 'POST',
+                    url: 'https://accounts.google.com/v3/signin/no-body-persist',
+                    postData: JSON.stringify({ secret: 'do_not_write_payload_file' })
+                });
+                const resNoBody = createMockResponse({
+                    request: reqNoBody,
+                    status: 200,
+                    body: JSON.stringify({ ok: true })
+                });
+
+                await emitHttpTransaction(noBodiesContext, reqNoBody, resNoBody);
+                await profileNoBodies.getTrafficAttribution();
+
+                const payloadFiles = fs.readdirSync(profileNoBodies.trafficPaths.payloadsDir);
+                assert.equal(
+                    payloadFiles.length,
+                    0,
+                    'Expected payloads/ directory to remain empty when recordBodies: false'
+                );
+
+                const noBodyEvents = readNdjsonFile(profileNoBodies.trafficPaths.trafficNdjsonPath);
+                const noBodyEgress = noBodyEvents.find((e) => e.type === 'egress');
+                const noBodyIngress = noBodyEvents.find((e) => e.type === 'ingress');
+                assert.equal(noBodyEgress.payloadFile, null);
+                assert.equal(noBodyIngress.payloadFile, null);
+
+                await profileNoBodies.delete();
+            }
+        );
+
+        // =========================================================================
+        // Test 7: Automatic Causal UI Action Attribution (triggerAction) & detectGmailPage Auto-Step Tagging
+        // =========================================================================
+        await testSection(
+            'Test 7: Automatic Causal UI Action Attribution (triggerAction) & detectGmailPage Auto-Step Tagging',
+            async () => {
+                const profile = await createAndStartProfile(
+                    'Traffic_Test_7_Causal',
+                    'http://10.77.0.1:8080',
+                    {
+                        profileId: 'traffic-test-7-causal',
+                        os: 'windows',
+                        profilesDir: tempProfilesDir,
+                        useSharedBrowser: false
+                    }
+                );
+
+                const page = await profile.getPage();
+                const context = await profile.getContext();
+
+                // 1) Navigate to /steps/signup/name and run detectGmailPage(page)
+                await page.goto('https://accounts.google.com/lifecycle/steps/signup/name');
+                const detectedSignup = await detectGmailPage(page);
+                assert.equal(detectedSignup.type, 'SIGN_UP_FORM');
+                assert.equal(
+                    profile.getTrafficRecorder().getAttributionSnapshot().actionStep,
+                    'gmail-page:sign_up_form'
+                );
+
+                // Perform UI fill action before emitting request
+                await page.fill('input[name="firstName"]', 'Alice');
+
+                const nameReq = createMockRequest({
+                    method: 'POST',
+                    url: 'https://accounts.google.com/lifecycle/steps/signup/name?hl=en',
+                    postData: JSON.stringify({ firstName: 'Alice', lastName: 'Smith' })
+                });
+                const nameRes = createMockResponse({
+                    request: nameReq,
+                    status: 200,
+                    body: JSON.stringify({ step: 'name_accepted' })
+                });
+                await emitHttpTransaction(context, nameReq, nameRes);
+
+                // 2) Navigate to /challenge/phone and run detectGmailPage(page)
+                await page.goto('https://accounts.google.com/v3/signin/challenge/phone');
+                const detectedChallenge = await detectGmailPage(page);
+                assert.equal(detectedChallenge.type, 'VERIFICATION_CODE');
+                assert.equal(
+                    profile.getTrafficRecorder().getAttributionSnapshot().actionStep,
+                    'gmail-page:verification_code'
+                );
+
+                // Perform UI click action on #next-button before emitting challenge request
+                await page.click('#next-button');
+
+                const phoneReq = createMockRequest({
+                    method: 'POST',
+                    url: 'https://accounts.google.com/v3/signin/challenge/phone?flow=signup',
+                    postData: JSON.stringify({ code: '123456' })
+                });
+                const phoneRes = createMockResponse({
+                    request: phoneReq,
+                    status: 429,
+                    statusText: 'Too Many Requests',
+                    body: JSON.stringify({ error: 'RATE_LIMIT_EXCEEDED' })
+                });
+                await emitHttpTransaction(context, phoneReq, phoneRes);
+
+                const summary = await profile.getTrafficAttribution();
+                const events = readNdjsonFile(profile.trafficPaths.trafficNdjsonPath);
+
+                const egressEvents = events.filter((e) => e.type === 'egress');
+                const ingressEvents = events.filter((e) => e.type === 'ingress');
+                assert.equal(egressEvents.length, 2);
+                assert.equal(ingressEvents.length, 2);
+
+                // Verify first transaction (after detectGmailPage on /steps/signup/name + page.fill)
+                const [egressName, egressPhone] = egressEvents;
+                const [ingressName, ingressPhone] = ingressEvents;
+
+                assert.equal(egressName.attribution.actionStep, 'gmail-page:sign_up_form');
+                assert.equal(ingressName.attribution.actionStep, 'gmail-page:sign_up_form');
+                assert.ok(egressName.triggerAction);
+                assert.equal(egressName.triggerAction.actionType, 'page.fill');
+                assert.equal(egressName.triggerAction.target, 'input[name="firstName"]');
+                assert.equal(typeof egressName.triggerAction.elapsedSinceActionMs, 'number');
+                assert.ok(egressName.triggerAction.elapsedSinceActionMs >= 0);
+
+                // Verify second transaction (after detectGmailPage on /challenge/phone + page.click('#next-button'))
+                assert.equal(egressPhone.attribution.actionStep, 'gmail-page:verification_code');
+                assert.equal(ingressPhone.attribution.actionStep, 'gmail-page:verification_code');
+                assert.ok(egressPhone.triggerAction);
+                assert.equal(egressPhone.triggerAction.actionType, 'page.click');
+                assert.equal(egressPhone.triggerAction.target, '#next-button');
+                assert.ok(egressPhone.triggerAction.elapsedSinceActionMs >= 0);
+                assert.ok(ingressPhone.triggerAction);
+                assert.equal(ingressPhone.triggerAction.actionType, 'page.click');
+                assert.equal(ingressPhone.triggerAction.target, '#next-button');
+                assert.ok(ingressPhone.triggerAction.elapsedSinceActionMs >= 0);
+
+                // Verify anomaliesAndRiskSignals include triggerAction
+                const phoneAnomaly = summary.anomaliesAndRiskSignals.find(
+                    (a) => a.type === 'http-429-rate-limit'
+                );
+                assert.ok(phoneAnomaly, 'Expected http-429-rate-limit anomaly');
+                assert.equal(phoneAnomaly.actionStep, 'gmail-page:verification_code');
+                assert.ok(phoneAnomaly.triggerAction);
+                assert.equal(phoneAnomaly.triggerAction.actionType, 'page.click');
+                assert.equal(phoneAnomaly.triggerAction.target, '#next-button');
+                assert.ok(phoneAnomaly.triggerAction.elapsedSinceActionMs >= 0);
+
+                // Verify byTriggerAction in attribution-index.json
+                const triggerEntries = Object.values(summary.byTriggerAction || {});
+                assert.ok(triggerEntries.length >= 2, 'Expected byTriggerAction entries in summary');
+
+                const clickTriggerStats = triggerEntries.find(
+                    (t) => t.actionType === 'page.click' && t.target === '#next-button'
+                );
+                assert.ok(clickTriggerStats, 'Expected byTriggerAction entry for page.click #next-button');
+                assert.equal(clickTriggerStats.requests, 1);
+                assert.equal(clickTriggerStats.responses, 1);
+                assert.equal(clickTriggerStats.statusCounts['429'], 1);
+                assert.ok(clickTriggerStats.anomalyCount >= 1);
+
+                const fillTriggerStats = triggerEntries.find(
+                    (t) => t.actionType === 'page.fill' && t.target === 'input[name="firstName"]'
+                );
+                assert.ok(fillTriggerStats, 'Expected byTriggerAction entry for page.fill firstName');
+                assert.equal(fillTriggerStats.requests, 1);
+                assert.equal(fillTriggerStats.responses, 1);
+                assert.equal(fillTriggerStats.statusCounts['200'], 1);
+
+                await profile.delete();
+            }
+        );
+
+        // =========================================================================
+        // Test 8: Offline Query & Wire-Dump CLI (scripts/query-traffic-attribution.js) + Shared-Browser SSLKEYLOGFILE & MOZ_LOG
+        // =========================================================================
+        await testSection(
+            'Test 8: Offline Query & Wire-Dump CLI (scripts/query-traffic-attribution.js) + Shared-Browser SSLKEYLOGFILE & MOZ_LOG',
+            async () => {
+                // 1) Verify neckoMozLog: true injects MOZ_LOG and MOZ_LOG_FILE into browser launch env
+                const mozLogProfile = await createAndStartProfile(
+                    'Traffic_Test_8_MozLog',
+                    null,
+                    {
+                        profileId: 'traffic-test-8-mozlog',
+                        os: 'linux',
+                        profilesDir: tempProfilesDir,
+                        useSharedBrowser: false,
+                        neckoMozLog: true
+                    }
+                );
+
+                const mozEnv = mozLogProfile.browser.launchOptions.env;
+                assert.ok(mozEnv && mozEnv.MOZ_LOG, 'Expected MOZ_LOG in launch env');
+                assert.equal(mozEnv.MOZ_LOG.includes('nsHttp:5'), true);
+                assert.equal(mozEnv.MOZ_LOG_FILE, mozLogProfile.trafficPaths.neckoMozLogPath);
+                await mozLogProfile.delete();
+
+                // 2) Verify shared-browser mode syncs _shared_sslkeylog.txt into per-profile sslkeylog.txt
+                await closeSharedBrowser();
+                const sharedProfile = await createAndStartProfile(
+                    'Traffic_Test_8_Shared',
+                    'http://10.88.0.1:8080',
+                    {
+                        profileId: 'traffic-test-8-shared',
+                        os: 'windows',
+                        profilesDir: tempProfilesDir,
+                        useSharedBrowser: true,
+                        accountId: 'acct-cli-888',
+                        accountEmail: 'cli.audit888@gmail.com'
+                    }
+                );
+
+                const sharedKeyLogPath = path.join(tempProfilesDir, '_shared_sslkeylog.txt');
+                assert.equal(sharedProfile.browser._sharedSslKeyLogPath, sharedKeyLogPath);
+                assert.equal(fs.existsSync(sharedKeyLogPath), true);
+
+                // Simulate NSS writing a TLS 1.3 secret line into _shared_sslkeylog.txt
+                const mockTlsSecretLine =
+                    'CLIENT_HANDSHAKE_TRAFFIC_SECRET 0123456789abcdef0123456789abcdef aabbccddeeff00112233445566778899';
+                fs.appendFileSync(sharedKeyLogPath, `${mockTlsSecretLine}\n`, 'utf8');
+
+                const page = await sharedProfile.getPage();
+                const context = await sharedProfile.getContext();
+
+                sharedProfile.setTrafficStep('step-8-cli-audit');
+                await page.click('#submit-audit-btn');
+
+                const reqPayload8 = JSON.stringify({
+                    username: 'cli.audit888',
+                    challengeToken: 'tok_cli_wire_888'
+                });
+                const resPayload8 = JSON.stringify({
+                    error: 'ARKOSE_CHALLENGE_REQUIRED',
+                    code: 429
+                });
+
+                const req8 = createMockRequest({
+                    method: 'POST',
+                    url: 'https://accounts.google.com/v3/signin/challenge/arkose?hl=en',
+                    headersArray: [
+                        { name: 'Host', value: 'accounts.google.com' },
+                        { name: 'Content-Type', value: 'application/json' },
+                        { name: 'X-Audit-Header', value: 'pre-tls-verified' }
+                    ],
+                    postData: reqPayload8
+                });
+                const res8 = createMockResponse({
+                    request: req8,
+                    status: 429,
+                    statusText: 'Too Many Requests',
+                    headersArray: [
+                        { name: 'Content-Type', value: 'application/json' },
+                        { name: 'Retry-After', value: '30' }
+                    ],
+                    body: resPayload8
+                });
+
+                await emitHttpTransaction(context, req8, res8);
+
+                // Stop profile (triggers syncSharedSslKeyLog + flushes attribution-index.json)
+                await sharedProfile.stop();
+
+                const profileSslKeyLogContent = fs.readFileSync(
+                    sharedProfile.trafficPaths.sslKeyLogPath,
+                    'utf8'
+                );
+                assert.equal(
+                    profileSslKeyLogContent.includes(mockTlsSecretLine),
+                    true,
+                    'Expected shared _shared_sslkeylog.txt secrets to sync into per-profile sslkeylog.txt'
+                );
+
+                // 3) Verify programmatic queryProfileTraffic()
+                const listResult = queryProfileTraffic({ profilesDir: tempProfilesDir });
+                assert.equal(listResult.mode, 'list-profiles');
+                assert.ok(listResult.profiles.some((p) => p.profileId === 'traffic-test-8-shared'));
+
+                const anomaliesResult = queryProfileTraffic({
+                    profilesDir: tempProfilesDir,
+                    profile: 'traffic-test-8-shared',
+                    anomaliesOnly: true
+                });
+                assert.equal(anomaliesResult.mode, 'anomalies');
+                assert.ok(anomaliesResult.anomalies.length >= 1);
+                const targetCorrId = anomaliesResult.anomalies[0].correlationId;
+                assert.ok(targetCorrId && targetCorrId.startsWith('corr-'));
+
+                const stepFilterResult = queryProfileTraffic({
+                    profilesDir: tempProfilesDir,
+                    profile: 'traffic-test-8-shared',
+                    step: 'step-8-cli-audit',
+                    trigger: '#submit-audit-btn',
+                    domain: 'accounts.google.com',
+                    status: '4xx'
+                });
+                assert.equal(stepFilterResult.transactions.length, 1);
+                assert.equal(stepFilterResult.transactions[0].correlationId, targetCorrId);
+
+                const wireResult = queryProfileTraffic({
+                    profilesDir: tempProfilesDir,
+                    profile: 'traffic-test-8-shared',
+                    dumpWire: targetCorrId
+                });
+                assert.equal(wireResult.mode, 'wire-dump');
+                assert.equal(wireResult.found, true);
+                assert.equal(wireResult.correlationId, targetCorrId);
+                assert.equal(wireResult.actionStep, 'step-8-cli-audit');
+                assert.equal(wireResult.triggerAction.actionType, 'page.click');
+                assert.equal(wireResult.triggerAction.target, '#submit-audit-btn');
+                assert.equal(wireResult.requestPayload, reqPayload8);
+                assert.equal(wireResult.responsePayload, resPayload8);
+                assert.equal(wireResult.wireDump.includes('>>> EGRESS [PRE-TLS NECKO CHANNEL]'), true);
+                assert.equal(wireResult.wireDump.includes('<<< INGRESS [POST-TLS NECKO CHANNEL]'), true);
+
+                // 4) Spawn scripts/query-traffic-attribution.js CLI with --anomalies-only, --dump-wire, and --json
+                const cliScriptPath = path.join(__dirname, 'query-traffic-attribution.js');
+
+                const cliAnomaliesRaw = execFileSync(
+                    process.execPath,
+                    [
+                        cliScriptPath,
+                        `--profiles-dir=${tempProfilesDir}`,
+                        '--profile=traffic-test-8-shared',
+                        '--anomalies-only',
+                        '--json'
+                    ],
+                    { encoding: 'utf8' }
+                );
+                const cliAnomaliesJson = JSON.parse(cliAnomaliesRaw);
+                assert.equal(cliAnomaliesJson.mode, 'anomalies');
+                assert.equal(cliAnomaliesJson.profileId, 'traffic-test-8-shared');
+                assert.ok(cliAnomaliesJson.anomalies.some((a) => a.correlationId === targetCorrId));
+
+                const cliWireJsonRaw = execFileSync(
+                    process.execPath,
+                    [
+                        cliScriptPath,
+                        `--profiles-dir=${tempProfilesDir}`,
+                        `--dump-wire=${targetCorrId}`,
+                        '--json'
+                    ],
+                    { encoding: 'utf8' }
+                );
+                const cliWireJson = JSON.parse(cliWireJsonRaw);
+                assert.equal(cliWireJson.mode, 'wire-dump');
+                assert.equal(cliWireJson.correlationId, targetCorrId);
+                assert.equal(cliWireJson.requestPayload, reqPayload8);
+                assert.equal(cliWireJson.responsePayload, resPayload8);
+
+                const cliWireTextRaw = execFileSync(
+                    process.execPath,
+                    [
+                        cliScriptPath,
+                        `--profiles-dir=${tempProfilesDir}`,
+                        '--profile=traffic-test-8-shared',
+                        `--dump-wire=${targetCorrId}`
+                    ],
+                    { encoding: 'utf8' }
+                );
+                assert.equal(cliWireTextRaw.includes('>>> EGRESS [PRE-TLS NECKO CHANNEL]'), true);
+                assert.equal(cliWireTextRaw.includes('<<< INGRESS [POST-TLS NECKO CHANNEL]'), true);
+                assert.equal(cliWireTextRaw.includes('X-Audit-Header: pre-tls-verified'), true);
+                assert.equal(cliWireTextRaw.includes(reqPayload8), true);
+                assert.equal(cliWireTextRaw.includes(resPayload8), true);
+
+                await sharedProfile.delete();
                 await closeSharedBrowser();
             }
         );

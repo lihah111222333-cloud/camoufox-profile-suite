@@ -24,6 +24,7 @@ const DEFAULT_PROFILES_DIR = (process.env.CAMOUFOX_STORAGE_DIR || process.env.CA
     : path.resolve(__dirname, '../../profiles');
 
 const DEFAULT_MAX_INLINE_PREVIEW_BYTES = 4096;
+const DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024; // 5MB (5242880 bytes)
 
 /**
  * Risk-control, challenge, and anti-bot signal patterns inspected across request URLs,
@@ -360,6 +361,11 @@ export class CamoufoxTrafficRecorder {
      * @param {number} [options.maxInlinePreviewBytes=4096]
      * @param {number} [options.inlinePayloadThresholdBytes=0]
      * @param {boolean} [options.capturePayloads=true]
+     * @param {boolean} [options.recordBodies=true]
+     * @param {number} [options.maxBodyBytes=5242880]
+     * @param {boolean} [options.recordWireLog=true]
+     * @param {string|null} [options.preTlsWireLogPath=null]
+     * @param {string|null} [options.neckoMozLogPath=null]
      * @param {string|null} [options.harPath=null]
      */
     constructor(options = {}) {
@@ -381,6 +387,13 @@ export class CamoufoxTrafficRecorder {
 
         this.payloadsDir = path.join(this.trafficDir, 'payloads');
         this.trafficNdjsonPath = path.join(this.trafficDir, 'traffic.ndjson');
+        this.preTlsWireLogPath = options.preTlsWireLogPath
+            ? path.resolve(options.preTlsWireLogPath)
+            : path.join(this.trafficDir, 'pre-tls-wire.log');
+        this.recordWireLog = options.recordWireLog !== false;
+        this.neckoMozLogPath = options.neckoMozLogPath
+            ? path.resolve(options.neckoMozLogPath)
+            : path.join(this.trafficDir, 'necko-pre-tls.moz_log');
         this.sslKeyLogPath = options.sslKeyLogPath
             ? path.resolve(options.sslKeyLogPath)
             : path.join(this.trafficDir, 'sslkeylog.txt');
@@ -395,7 +408,15 @@ export class CamoufoxTrafficRecorder {
         this.inlinePayloadThresholdBytes = Number.isFinite(options.inlinePayloadThresholdBytes)
             ? Math.max(0, Number(options.inlinePayloadThresholdBytes))
             : 0;
-        this.capturePayloads = options.capturePayloads !== false;
+        const capturePayloads = options.recordBodies !== undefined
+            ? options.recordBodies !== false
+            : options.capturePayloads !== false;
+        this.capturePayloads = capturePayloads;
+        this.recordBodies = capturePayloads;
+        this.maxBodyBytes =
+            Number.isFinite(options.maxBodyBytes) && Number(options.maxBodyBytes) > 0
+                ? Math.floor(Number(options.maxBodyBytes))
+                : DEFAULT_MAX_BODY_BYTES;
 
         const traceId = options.traceId || crypto.randomUUID();
         this.traceId = traceId;
@@ -422,10 +443,13 @@ export class CamoufoxTrafficRecorder {
 
         this.seq = 0;
         this.wsSeq = 0;
+        this.triggerSeq = 0;
+        this.lastTriggerAction = null;
 
         // Correlation & tracking stores
         this.requestCorrelationMap = new WeakMap();
         this.transactions = new Map();
+        this.wsWireBlocks = new Map();
         this.attachedContexts = new WeakSet();
         this.attachedPagesHttp = new WeakSet();
         this.attachedPagesWs = new WeakSet();
@@ -446,6 +470,7 @@ export class CamoufoxTrafficRecorder {
 
         this.byActionStep = new Map();
         this.byDomain = new Map();
+        this.byTriggerAction = new Map();
         this.anomaliesAndRiskSignals = [];
         this.recordedAnomalyKeys = new Set();
 
@@ -454,7 +479,7 @@ export class CamoufoxTrafficRecorder {
     }
 
     /**
-     * Ensure `profiles/<profileId>/traffic/`, `payloads/`, and `sslkeylog.txt` exist on disk.
+     * Ensure `profiles/<profileId>/traffic/`, `payloads/`, `sslkeylog.txt`, and `pre-tls-wire.log` exist on disk.
      */
     _ensureDirectories() {
         fs.mkdirSync(this.trafficDir, { recursive: true });
@@ -465,6 +490,9 @@ export class CamoufoxTrafficRecorder {
                 '# NSS SSL/TLS Secrets Log (Camoufox Pre-TLS Traffic Recorder)\n',
                 'utf8'
             );
+        }
+        if (this.recordWireLog && !fs.existsSync(this.preTlsWireLogPath)) {
+            fs.writeFileSync(this.preTlsWireLogPath, '', 'utf8');
         }
     }
 
@@ -583,6 +611,73 @@ export class CamoufoxTrafficRecorder {
     }
 
     /**
+     * Record a causal UI driver action (`page.goto`, `page.click`, `page.fill`, `locator.press`, etc.)
+     * so all subsequent pre-TLS network requests and responses are attributed to the exact UI trigger.
+     *
+     * @param {string} actionType - e.g. 'page.click', 'page.goto', 'page.fill'
+     * @param {string|null} [target=null] - CSS selector, URL, or element descriptor
+     * @param {object} [metadata={}] - Additional causal action metadata
+     * @returns {object} Recorded trigger action snapshot
+     */
+    recordTriggerAction(actionType, target = null, metadata = {}) {
+        this.triggerSeq += 1;
+        const timestamp = new Date().toISOString();
+        const epochMs = Date.now();
+        this.lastTriggerAction = {
+            actionId: `act-${this.traceIdShort}-${this.triggerSeq}`,
+            actionType: String(actionType || 'unknown'),
+            target: target ? String(target) : null,
+            timestamp,
+            epochMs,
+            actionStep: this.attribution.actionStep,
+            stepIndex: this.attribution.stepIndex,
+            metadata: metadata && typeof metadata === 'object' ? metadata : {}
+        };
+
+        this._ensureTriggerActionRecord(this.lastTriggerAction);
+
+        const seq = this._nextSeq();
+        this._appendNdjsonEvent({
+            type: 'trigger-action',
+            eventType: 'trigger-action',
+            direction: 'internal',
+            stage: 'ui-driver-action',
+            timestamp,
+            epochMs,
+            seq,
+            actionId: this.lastTriggerAction.actionId,
+            actionType: this.lastTriggerAction.actionType,
+            target: this.lastTriggerAction.target,
+            actionStep: this.lastTriggerAction.actionStep,
+            stepIndex: this.lastTriggerAction.stepIndex,
+            metadata: this.lastTriggerAction.metadata,
+            triggerAction: {
+                ...this.lastTriggerAction,
+                elapsedSinceActionMs: 0
+            },
+            attribution: this.getAttributionSnapshot()
+        });
+
+        return { ...this.lastTriggerAction };
+    }
+
+    /**
+     * Return a snapshot of the currently active causal UI trigger action with `elapsedSinceActionMs`.
+     *
+     * @param {number} [nowEpochMs=Date.now()]
+     * @returns {object|null}
+     */
+    getActiveTriggerSnapshot(nowEpochMs = Date.now()) {
+        if (!this.lastTriggerAction) {
+            return null;
+        }
+        return {
+            ...this.lastTriggerAction,
+            elapsedSinceActionMs: Math.max(0, nowEpochMs - this.lastTriggerAction.epochMs)
+        };
+    }
+
+    /**
      * Allocate the next monotonic event sequence integer.
      *
      * @returns {number}
@@ -638,6 +733,56 @@ export class CamoufoxTrafficRecorder {
     }
 
     /**
+     * Ensure per-trigger-action stats bucket exists.
+     *
+     * @param {object|null} triggerAction
+     * @returns {object|null}
+     */
+    _ensureTriggerActionRecord(triggerAction) {
+        if (!triggerAction || !triggerAction.actionId) {
+            return null;
+        }
+        const key = triggerAction.actionId;
+        if (!this.byTriggerAction.has(key)) {
+            this.byTriggerAction.set(key, {
+                actionId: triggerAction.actionId,
+                actionType: triggerAction.actionType || 'unknown',
+                target: triggerAction.target ?? null,
+                actionStep: triggerAction.actionStep || this.attribution.actionStep,
+                stepIndex: triggerAction.stepIndex ?? this.attribution.stepIndex,
+                timestamp: triggerAction.timestamp || new Date().toISOString(),
+                metadata: triggerAction.metadata || {},
+                requests: 0,
+                responses: 0,
+                failedRequests: 0,
+                wsFramesSent: 0,
+                wsFramesReceived: 0,
+                egressBytes: 0,
+                ingressBytes: 0,
+                statusCounts: {},
+                domainsSet: new Set(),
+                correlationIdsSet: new Set(),
+                anomalyCount: 0
+            });
+        }
+        return this.byTriggerAction.get(key);
+    }
+
+    /**
+     * Format a concise human-readable summary of a triggerAction snapshot for wire log headers.
+     *
+     * @param {object|null} triggerSnapshot
+     * @returns {string}
+     */
+    _formatTriggerSummary(triggerSnapshot) {
+        if (!triggerSnapshot || !triggerSnapshot.actionId) {
+            return 'none';
+        }
+        const targetPart = triggerSnapshot.target ? `(${triggerSnapshot.target})` : '';
+        return `${triggerSnapshot.actionType}${targetPart}#${triggerSnapshot.actionId}`;
+    }
+
+    /**
      * Append a single event line to `traffic.ndjson`.
      *
      * @param {object} record
@@ -658,37 +803,64 @@ export class CamoufoxTrafficRecorder {
     }
 
     /**
+     * Append a canonical pre-TLS / post-TLS raw HTTP or WebSocket wire block to `pre-tls-wire.log`.
+     *
+     * @param {string} wireBlock
+     */
+    _appendWireLogBlock(wireBlock) {
+        if (!this.recordWireLog || !wireBlock) {
+            return;
+        }
+        const entry = wireBlock.endsWith('\n') ? wireBlock : `${wireBlock}\n`;
+        try {
+            fs.appendFileSync(this.preTlsWireLogPath, entry, 'utf8');
+        } catch {
+            try {
+                this._ensureDirectories();
+                fs.appendFileSync(this.preTlsWireLogPath, entry, 'utf8');
+            } catch {
+                // Swallow disk error to avoid crashing active browser automation
+            }
+        }
+    }
+
+    /**
      * Persist a request/response/websocket payload buffer into `payloads/`.
+     * Respects `this.capturePayloads` (`this.recordBodies`) and truncates at `this.maxBodyBytes`.
      *
      * @param {'req'|'res'|'ws'} prefix
      * @param {number} seq
      * @param {Buffer} buffer
      * @param {string} shortSha256
      * @param {string|null} mimeType
-     * @returns {{ payloadFile: string|null, payloadPath: string|null, extension: string|null }}
+     * @returns {{ payloadFile: string|null, payloadPath: string|null, extension: string|null, payloadTruncated: boolean }}
      */
     _writePayloadFile(prefix, seq, buffer, shortSha256, mimeType) {
         if (!this.capturePayloads || !buffer || buffer.byteLength === 0) {
-            return { payloadFile: null, payloadPath: null, extension: null };
+            return { payloadFile: null, payloadPath: null, extension: null, payloadTruncated: false };
         }
         if (buffer.byteLength < this.inlinePayloadThresholdBytes) {
-            return { payloadFile: null, payloadPath: null, extension: null };
+            return { payloadFile: null, payloadPath: null, extension: null, payloadTruncated: false };
         }
 
-        const ext = inferPayloadExtension(mimeType, buffer);
+        const payloadTruncated = this.maxBodyBytes > 0 && buffer.byteLength > this.maxBodyBytes;
+        const toWrite = payloadTruncated ? buffer.subarray(0, this.maxBodyBytes) : buffer;
+
+        const ext = inferPayloadExtension(mimeType, toWrite);
         const fileName = `${prefix}-${seq}-${shortSha256}.${ext}`;
         const relativePath = path.posix.join('payloads', fileName);
         const fullPath = path.join(this.payloadsDir, fileName);
 
         try {
-            fs.writeFileSync(fullPath, buffer);
+            fs.writeFileSync(fullPath, toWrite);
             return {
                 payloadFile: relativePath,
                 payloadPath: fullPath,
-                extension: ext
+                extension: ext,
+                payloadTruncated
             };
         } catch {
-            return { payloadFile: null, payloadPath: null, extension: ext };
+            return { payloadFile: null, payloadPath: null, extension: ext, payloadTruncated };
         }
     }
 
@@ -757,7 +929,7 @@ export class CamoufoxTrafficRecorder {
     }
 
     /**
-     * Record a deduplicated anomaly or risk signal entry and increment step anomaly counters.
+     * Record a deduplicated anomaly or risk signal entry and increment step and trigger anomaly counters.
      *
      * @param {object} anomaly
      */
@@ -779,10 +951,20 @@ export class CamoufoxTrafficRecorder {
         const stepBucket = this._ensureStepRecord(stepName, this.attribution.stepIndex);
         stepBucket.anomalyCount += 1;
 
+        const effectiveTrigger =
+            anomaly.triggerAction !== undefined
+                ? anomaly.triggerAction
+                : this.getActiveTriggerSnapshot();
+        const triggerBucket = this._ensureTriggerActionRecord(effectiveTrigger);
+        if (triggerBucket) {
+            triggerBucket.anomalyCount += 1;
+        }
+
         this.anomaliesAndRiskSignals.push({
             timestamp: anomaly.timestamp || new Date().toISOString(),
             correlationId: anomaly.correlationId || null,
             actionStep: stepName,
+            triggerAction: effectiveTrigger || null,
             type: anomaly.type,
             severity: anomaly.severity || 'medium',
             method: anomaly.method || null,
@@ -934,6 +1116,142 @@ export class CamoufoxTrafficRecorder {
     }
 
     /**
+     * Format a canonical pre-TLS egress raw HTTP wire dump block.
+     *
+     * @param {object} params
+     * @returns {string}
+     */
+    _formatEgressWireBlock({
+        timestamp,
+        correlationId,
+        actionStep,
+        triggerSummary,
+        method,
+        parsedUrl,
+        headersArray,
+        bodyPreview
+    }) {
+        const headersText = Array.isArray(headersArray)
+            ? headersArray.map((h) => `${h.name}: ${h.value}`).join('\r\n')
+            : '';
+        return [
+            '================================================================================',
+            `>>> EGRESS [PRE-TLS NECKO CHANNEL] [${timestamp}] [corr=${correlationId}] [step=${actionStep}] [trigger=${triggerSummary}]`,
+            `${method} ${parsedUrl.pathname}${parsedUrl.search} HTTP/1.1`,
+            `Host: ${parsedUrl.host}`,
+            headersText,
+            '',
+            bodyPreview || '',
+            '================================================================================'
+        ].join('\n');
+    }
+
+    /**
+     * Format a canonical post-TLS decrypted ingress raw HTTP wire dump block.
+     *
+     * @param {object} params
+     * @returns {string}
+     */
+    _formatIngressWireBlock({
+        timestamp,
+        correlationId,
+        effectiveStepName,
+        serverAddr,
+        securityDetails,
+        status,
+        statusText,
+        headersArray,
+        bodyPreview
+    }) {
+        const headersText = Array.isArray(headersArray)
+            ? headersArray.map((h) => `${h.name}: ${h.value}`).join('\r\n')
+            : '';
+        return [
+            '--------------------------------------------------------------------------------',
+            `<<< INGRESS [POST-TLS NECKO CHANNEL] [${timestamp}] [corr=${correlationId}] [step=${effectiveStepName}] [remote=${serverAddr?.ipAddress || 'unknown'}:${serverAddr?.port || ''}] [tls=${securityDetails?.protocol || 'plain'}]`,
+            `HTTP/1.1 ${status} ${statusText}`,
+            headersText,
+            '',
+            bodyPreview || '',
+            '--------------------------------------------------------------------------------'
+        ].join('\n');
+    }
+
+    /**
+     * Reconstruct the full egress + ingress raw HTTP wire dump string for a given `correlationId`
+     * from recorded transactions or persisted `traffic.ndjson` events.
+     *
+     * @param {string} correlationId
+     * @returns {string}
+     */
+    formatTransactionWireDump(correlationId) {
+        if (!correlationId) {
+            return '';
+        }
+
+        const tx = this.transactions.get(correlationId);
+        if (tx && (tx.egressWireBlock || tx.ingressWireBlock)) {
+            const parts = [];
+            if (tx.egressWireBlock) parts.push(tx.egressWireBlock);
+            if (tx.ingressWireBlock) parts.push(tx.ingressWireBlock);
+            return parts.join('\n');
+        }
+
+        const wsBlocks = this.wsWireBlocks.get(correlationId);
+        if (wsBlocks && wsBlocks.length > 0) {
+            return wsBlocks.join('\n');
+        }
+
+        // Fallback: reconstruct from traffic.ndjson if events were flushed to disk
+        if (fs.existsSync(this.trafficNdjsonPath)) {
+            try {
+                const lines = fs.readFileSync(this.trafficNdjsonPath, 'utf8').split('\n');
+                const parts = [];
+                for (const line of lines) {
+                    if (!line.trim()) continue;
+                    const evt = JSON.parse(line);
+                    if (evt.correlationId !== correlationId) continue;
+                    if (evt.type === 'egress') {
+                        const parsedUrl = parseUrlComponents(evt.url || '');
+                        const triggerSummary = this._formatTriggerSummary(evt.triggerAction);
+                        parts.push(
+                            this._formatEgressWireBlock({
+                                timestamp: evt.timestamp,
+                                correlationId: evt.correlationId,
+                                actionStep: evt.attribution?.actionStep || 'init',
+                                triggerSummary,
+                                method: evt.method || 'GET',
+                                parsedUrl,
+                                headersArray: evt.headersArray || [],
+                                bodyPreview: evt.bodyPreview || ''
+                            })
+                        );
+                    } else if (evt.type === 'ingress') {
+                        parts.push(
+                            this._formatIngressWireBlock({
+                                timestamp: evt.timestamp,
+                                correlationId: evt.correlationId,
+                                effectiveStepName: evt.attribution?.actionStep || 'init',
+                                serverAddr: evt.serverAddr || null,
+                                securityDetails: evt.securityDetails || null,
+                                status: evt.status ?? 0,
+                                statusText: evt.statusText || '',
+                                headersArray: evt.headersArray || [],
+                                bodyPreview: evt.bodyPreview || ''
+                            })
+                        );
+                    }
+                }
+                return parts.join('\n');
+            } catch {
+                return '';
+            }
+        }
+
+        return '';
+    }
+
+    /**
      * Handle pre-TLS egress `request` event (`http-on-modify-request` in Firefox Necko).
      *
      * @param {object} request - Playwright Request
@@ -946,6 +1264,7 @@ export class CamoufoxTrafficRecorder {
         const { correlationId, seq, redirectedFromCorrelationId } =
             this._resolveRequestCorrelation(request);
         const attributionSnapshot = this.getAttributionSnapshot();
+        const triggerSnapshot = this.getActiveTriggerSnapshot(epochMs);
 
         let method = 'GET';
         let url = '';
@@ -1003,6 +1322,7 @@ export class CamoufoxTrafficRecorder {
         let bodyPreview = null;
         let bodyPreviewTruncated = false;
         let payloadFile = null;
+        let payloadTruncated = false;
 
         if (postDataBuffer && postDataBuffer.byteLength > 0) {
             const hashed = hashPayload(postDataBuffer);
@@ -1025,6 +1345,7 @@ export class CamoufoxTrafficRecorder {
                 contentType
             );
             payloadFile = saved.payloadFile;
+            payloadTruncated = Boolean(saved.payloadTruncated);
         }
 
         // Estimate header byte size + body bytes for pre-TLS egress accounting
@@ -1050,6 +1371,26 @@ export class CamoufoxTrafficRecorder {
         domainBucket.requests += 1;
         domainBucket.egressBytes += estimatedEgressBytes;
 
+        const triggerBucket = this._ensureTriggerActionRecord(triggerSnapshot);
+        if (triggerBucket) {
+            triggerBucket.requests += 1;
+            triggerBucket.egressBytes += estimatedEgressBytes;
+            triggerBucket.domainsSet.add(parsedUrl.host);
+            triggerBucket.correlationIdsSet.add(correlationId);
+        }
+
+        const triggerSummary = this._formatTriggerSummary(triggerSnapshot);
+        const egressWireBlock = this._formatEgressWireBlock({
+            timestamp,
+            correlationId,
+            actionStep: attributionSnapshot.actionStep,
+            triggerSummary,
+            method,
+            parsedUrl,
+            headersArray,
+            bodyPreview
+        });
+
         // Store transaction metadata for response / finish / failure linking
         this.transactions.set(correlationId, {
             correlationId,
@@ -1061,12 +1402,15 @@ export class CamoufoxTrafficRecorder {
             resourceType,
             actionStep: attributionSnapshot.actionStep,
             stepIndex: attributionSnapshot.stepIndex,
+            triggerAction: triggerSnapshot,
             startedAtEpochMs: epochMs,
             estimatedEgressBytes,
             countedIngressBytes: 0,
             requestPayloadFile: payloadFile,
             responsePayloadFile: null,
-            status: null
+            status: null,
+            egressWireBlock,
+            ingressWireBlock: null
         });
 
         const egressEvent = {
@@ -1097,10 +1441,13 @@ export class CamoufoxTrafficRecorder {
             postDataSha256,
             postDataBytes,
             payloadFile,
+            payloadTruncated,
+            triggerAction: triggerSnapshot,
             attribution: attributionSnapshot
         };
 
         this._appendNdjsonEvent(egressEvent);
+        this._appendWireLogBlock(egressWireBlock);
 
         // Inspect pre-TLS request URL for risk-control / challenge endpoints
         const riskSignals = detectRiskSignals({ url, bodyPreview, headers });
@@ -1114,6 +1461,7 @@ export class CamoufoxTrafficRecorder {
                 timestamp,
                 correlationId,
                 actionStep: attributionSnapshot.actionStep,
+                triggerAction: triggerSnapshot,
                 type: `risk-signal:${riskSignals.map((s) => s.name).join('+')}`,
                 severity: highestSeverity,
                 method,
@@ -1151,6 +1499,7 @@ export class CamoufoxTrafficRecorder {
             : { correlationId: `corr-${this.traceIdShort}-${seq}`, redirectedFromCorrelationId: null };
 
         const tx = this.transactions.get(correlationId);
+        const triggerSnapshot = tx?.triggerAction || this.getActiveTriggerSnapshot(epochMs);
 
         let url = tx?.url || '';
         let method = tx?.method || 'GET';
@@ -1204,13 +1553,13 @@ export class CamoufoxTrafficRecorder {
         const rawContentType = headers['content-type'] || headers['Content-Type'] || '';
         const mimeType = rawContentType ? String(rawContentType).split(';')[0].trim().toLowerCase() : null;
 
-        // Capture decrypted response body from Necko channel
+        // Capture decrypted response body from Necko channel when capturePayloads (recordBodies) is enabled
         let bodyBuffer = null;
         let bodyReadError = null;
         const isRedirectStatus = status >= 300 && status < 400;
         const isEmptyBodyStatus = status === 204 || status === 205 || status === 304;
 
-        if (!isRedirectStatus && !isEmptyBodyStatus) {
+        if (this.capturePayloads && !isRedirectStatus && !isEmptyBodyStatus) {
             try {
                 if (typeof response.body === 'function') {
                     const rawBody = await response.body();
@@ -1235,6 +1584,7 @@ export class CamoufoxTrafficRecorder {
         let bodyPreview = null;
         let bodyPreviewTruncated = false;
         let payloadFile = null;
+        let payloadTruncated = false;
 
         if (bodyBuffer && bodyBuffer.byteLength > 0) {
             const hashed = hashPayload(bodyBuffer);
@@ -1257,6 +1607,7 @@ export class CamoufoxTrafficRecorder {
                 mimeType
             );
             payloadFile = saved.payloadFile;
+            payloadTruncated = Boolean(saved.payloadTruncated);
         }
 
         const headerByteEstimate = headersArray.reduce(
@@ -1265,7 +1616,7 @@ export class CamoufoxTrafficRecorder {
         );
         const estimatedIngressBytes = headerByteEstimate + bodyBytes;
 
-        // Update totals, step counters, and domain counters
+        // Update totals, step counters, domain counters, and triggerAction counters
         const effectiveStepName = tx?.actionStep || attributionSnapshot.actionStep;
         const effectiveStepIndex = tx?.stepIndex ?? attributionSnapshot.stepIndex;
 
@@ -1284,12 +1635,55 @@ export class CamoufoxTrafficRecorder {
         domainBucket.ingressBytes += estimatedIngressBytes;
         domainBucket.statusCounts[statusKey] = (domainBucket.statusCounts[statusKey] || 0) + 1;
 
+        const triggerBucket = this._ensureTriggerActionRecord(triggerSnapshot);
+        if (triggerBucket) {
+            triggerBucket.responses += 1;
+            triggerBucket.ingressBytes += estimatedIngressBytes;
+            triggerBucket.domainsSet.add(parsedUrl.host);
+            triggerBucket.correlationIdsSet.add(correlationId);
+            triggerBucket.statusCounts[statusKey] = (triggerBucket.statusCounts[statusKey] || 0) + 1;
+        }
+
+        const ingressWireBlock = this._formatIngressWireBlock({
+            timestamp,
+            correlationId,
+            effectiveStepName,
+            serverAddr,
+            securityDetails,
+            status,
+            statusText,
+            headersArray,
+            bodyPreview
+        });
+
         if (tx) {
             tx.status = status;
             tx.responsePayloadFile = payloadFile;
             tx.countedIngressBytes = estimatedIngressBytes;
+            tx.ingressWireBlock = ingressWireBlock;
             const elapsed = Math.max(0, epochMs - tx.startedAtEpochMs);
             tx.responseDurationMs = elapsed;
+        } else {
+            this.transactions.set(correlationId, {
+                correlationId,
+                seq,
+                method,
+                url,
+                host: parsedUrl.host,
+                pathname: parsedUrl.pathname,
+                resourceType: 'other',
+                actionStep: effectiveStepName,
+                stepIndex: effectiveStepIndex,
+                triggerAction: triggerSnapshot,
+                startedAtEpochMs: epochMs,
+                estimatedEgressBytes: 0,
+                countedIngressBytes: estimatedIngressBytes,
+                requestPayloadFile: null,
+                responsePayloadFile: payloadFile,
+                status,
+                egressWireBlock: null,
+                ingressWireBlock
+            });
         }
 
         const ingressEvent = {
@@ -1319,11 +1713,14 @@ export class CamoufoxTrafficRecorder {
             bodyPreview,
             bodyPreviewTruncated,
             payloadFile,
+            payloadTruncated,
             ...(bodyReadError ? { bodyReadError } : {}),
+            triggerAction: triggerSnapshot,
             attribution: attributionSnapshot
         };
 
         this._appendNdjsonEvent(ingressEvent);
+        this._appendWireLogBlock(ingressWireBlock);
 
         // Automatic HTTP Status & Risk Signal Anomaly Attribution
         if (status === 401 || status === 403 || status === 429 || status >= 500) {
@@ -1344,6 +1741,7 @@ export class CamoufoxTrafficRecorder {
                 timestamp,
                 correlationId,
                 actionStep: effectiveStepName,
+                triggerAction: triggerSnapshot,
                 type: typeLabel,
                 severity,
                 method,
@@ -1365,6 +1763,7 @@ export class CamoufoxTrafficRecorder {
                 timestamp,
                 correlationId,
                 actionStep: effectiveStepName,
+                triggerAction: triggerSnapshot,
                 type: `risk-signal:${riskSignals.map((s) => s.name).join('+')}`,
                 severity: highestSeverity,
                 method,
@@ -1391,6 +1790,7 @@ export class CamoufoxTrafficRecorder {
         const { correlationId } = this._resolveRequestCorrelation(request);
         const tx = this.transactions.get(correlationId);
         const attributionSnapshot = this.getAttributionSnapshot();
+        const triggerSnapshot = tx?.triggerAction || this.getActiveTriggerSnapshot(epochMs);
 
         let url = tx?.url || '';
         let method = tx?.method || 'GET';
@@ -1447,6 +1847,7 @@ export class CamoufoxTrafficRecorder {
             const effectiveStepName = tx?.actionStep || attributionSnapshot.actionStep;
             const effectiveStepIndex = tx?.stepIndex ?? attributionSnapshot.stepIndex;
             const stepBucket = this._ensureStepRecord(effectiveStepName, effectiveStepIndex);
+            const triggerBucket = this._ensureTriggerActionRecord(triggerSnapshot);
 
             if (tx && actualReqBytes > tx.estimatedEgressBytes) {
                 const deltaEgress = actualReqBytes - tx.estimatedEgressBytes;
@@ -1454,6 +1855,9 @@ export class CamoufoxTrafficRecorder {
                 this.totals.totalEgressBytes += deltaEgress;
                 stepBucket.egressBytes += deltaEgress;
                 domainBucket.egressBytes += deltaEgress;
+                if (triggerBucket) {
+                    triggerBucket.egressBytes += deltaEgress;
+                }
             }
             if (tx && actualResBytes > tx.countedIngressBytes) {
                 const deltaIngress = actualResBytes - tx.countedIngressBytes;
@@ -1461,6 +1865,9 @@ export class CamoufoxTrafficRecorder {
                 this.totals.totalIngressBytes += deltaIngress;
                 stepBucket.ingressBytes += deltaIngress;
                 domainBucket.ingressBytes += deltaIngress;
+                if (triggerBucket) {
+                    triggerBucket.ingressBytes += deltaIngress;
+                }
             }
         }
 
@@ -1480,6 +1887,7 @@ export class CamoufoxTrafficRecorder {
             durationMs,
             timing,
             sizes,
+            triggerAction: triggerSnapshot,
             attribution: attributionSnapshot
         });
     }
@@ -1498,6 +1906,7 @@ export class CamoufoxTrafficRecorder {
         const { correlationId } = this._resolveRequestCorrelation(request);
         const tx = this.transactions.get(correlationId);
         const attributionSnapshot = this.getAttributionSnapshot();
+        const triggerSnapshot = tx?.triggerAction || this.getActiveTriggerSnapshot(epochMs);
 
         let url = tx?.url || '';
         let method = tx?.method || 'GET';
@@ -1545,6 +1954,13 @@ export class CamoufoxTrafficRecorder {
             domainBucket.completedWithDurationCount += 1;
         }
 
+        const triggerBucket = this._ensureTriggerActionRecord(triggerSnapshot);
+        if (triggerBucket) {
+            triggerBucket.failedRequests += 1;
+            triggerBucket.domainsSet.add(parsedUrl.host);
+            triggerBucket.correlationIdsSet.add(correlationId);
+        }
+
         this._appendNdjsonEvent({
             type: 'request-failed',
             eventType: 'request-failed',
@@ -1562,6 +1978,7 @@ export class CamoufoxTrafficRecorder {
             failureText,
             durationMs,
             payloadFile: tx?.requestPayloadFile || null,
+            triggerAction: triggerSnapshot,
             attribution: attributionSnapshot
         });
 
@@ -1574,6 +1991,7 @@ export class CamoufoxTrafficRecorder {
             timestamp,
             correlationId,
             actionStep: effectiveStepName,
+            triggerAction: triggerSnapshot,
             type: isProxyOrTlsFailure ? 'network-proxy-or-tls-failure' : 'network-request-failed',
             severity: isProxyOrTlsFailure ? 'high' : 'medium',
             method,
@@ -1597,6 +2015,7 @@ export class CamoufoxTrafficRecorder {
 
         this.wsSeq += 1;
         const wsCorrelationId = `ws-${this.traceIdShort}-${this.wsSeq}`;
+        this.wsWireBlocks.set(wsCorrelationId, []);
         let wsUrl = '';
         try {
             if (typeof ws.url === 'function') {
@@ -1605,6 +2024,7 @@ export class CamoufoxTrafficRecorder {
         } catch {}
 
         const parsedUrl = parseUrlComponents(wsUrl);
+        const openEpochMs = Date.now();
 
         this._appendNdjsonEvent({
             type: 'ws-open',
@@ -1612,12 +2032,13 @@ export class CamoufoxTrafficRecorder {
             direction: 'ws-open',
             stage: 'pre-tls-websocket-open',
             timestamp: new Date().toISOString(),
-            epochMs: Date.now(),
+            epochMs: openEpochMs,
             seq: this._nextSeq(),
             correlationId: wsCorrelationId,
             url: wsUrl,
             host: parsedUrl.host,
             pathname: parsedUrl.pathname,
+            triggerAction: this.getActiveTriggerSnapshot(openEpochMs),
             attribution: this.getAttributionSnapshot()
         });
 
@@ -1626,6 +2047,7 @@ export class CamoufoxTrafficRecorder {
             const epochMs = Date.now();
             const seq = this._nextSeq();
             const attributionSnapshot = this.getAttributionSnapshot();
+            const triggerSnapshot = this.getActiveTriggerSnapshot(epochMs);
 
             const rawPayload = frameData && typeof frameData === 'object' && 'payload' in frameData
                 ? frameData.payload
@@ -1643,6 +2065,7 @@ export class CamoufoxTrafficRecorder {
             );
 
             let payloadFile = null;
+            let payloadTruncated = false;
             if (hashed.byteLength > this.maxInlinePreviewBytes) {
                 const saved = this._writePayloadFile(
                     'ws',
@@ -1652,6 +2075,7 @@ export class CamoufoxTrafficRecorder {
                     'application/octet-stream'
                 );
                 payloadFile = saved.payloadFile;
+                payloadTruncated = Boolean(saved.payloadTruncated);
             }
 
             const stepBucket = this._ensureStepRecord(
@@ -1659,6 +2083,7 @@ export class CamoufoxTrafficRecorder {
                 attributionSnapshot.stepIndex
             );
             const domainBucket = this._ensureDomainRecord(parsedUrl.host);
+            const triggerBucket = this._ensureTriggerActionRecord(triggerSnapshot);
             stepBucket.domainsSet.add(parsedUrl.host);
 
             if (direction === 'ws-egress') {
@@ -1666,11 +2091,44 @@ export class CamoufoxTrafficRecorder {
                 this.totals.totalEgressBytes += hashed.byteLength;
                 stepBucket.egressBytes += hashed.byteLength;
                 domainBucket.egressBytes += hashed.byteLength;
+                if (triggerBucket) {
+                    triggerBucket.wsFramesSent += 1;
+                    triggerBucket.egressBytes += hashed.byteLength;
+                    triggerBucket.domainsSet.add(parsedUrl.host);
+                    triggerBucket.correlationIdsSet.add(wsCorrelationId);
+                }
             } else {
                 this.totals.wsFramesReceived += 1;
                 this.totals.totalIngressBytes += hashed.byteLength;
                 stepBucket.ingressBytes += hashed.byteLength;
                 domainBucket.ingressBytes += hashed.byteLength;
+                if (triggerBucket) {
+                    triggerBucket.wsFramesReceived += 1;
+                    triggerBucket.ingressBytes += hashed.byteLength;
+                    triggerBucket.domainsSet.add(parsedUrl.host);
+                    triggerBucket.correlationIdsSet.add(wsCorrelationId);
+                }
+            }
+
+            const triggerSummary = this._formatTriggerSummary(triggerSnapshot);
+            const wsWireBlock =
+                direction === 'ws-egress'
+                    ? [
+                          '================================================================================',
+                          `>>> WS-EGRESS [PRE-TLS] [${timestamp}] [corr=${wsCorrelationId}] [step=${attributionSnapshot.actionStep}] [trigger=${triggerSummary}] [url=${wsUrl}] [bytes=${hashed.byteLength}]`,
+                          previewObj.preview || '',
+                          '================================================================================'
+                      ].join('\n')
+                    : [
+                          '--------------------------------------------------------------------------------',
+                          `<<< WS-INGRESS [POST-TLS] [${timestamp}] [corr=${wsCorrelationId}] [step=${attributionSnapshot.actionStep}] [trigger=${triggerSummary}] [url=${wsUrl}] [bytes=${hashed.byteLength}]`,
+                          previewObj.preview || '',
+                          '--------------------------------------------------------------------------------'
+                      ].join('\n');
+
+            const storedWsBlocks = this.wsWireBlocks.get(wsCorrelationId);
+            if (storedWsBlocks) {
+                storedWsBlocks.push(wsWireBlock);
             }
 
             this._appendNdjsonEvent({
@@ -1689,8 +2147,11 @@ export class CamoufoxTrafficRecorder {
                 bodyPreview: previewObj.preview,
                 bodyPreviewTruncated: previewObj.truncated,
                 payloadFile,
+                payloadTruncated,
+                triggerAction: triggerSnapshot,
                 attribution: attributionSnapshot
             });
+            this._appendWireLogBlock(wsWireBlock);
         };
 
         const onFrameSent = (frame) =>
@@ -1700,8 +2161,10 @@ export class CamoufoxTrafficRecorder {
 
         const onSocketError = (errorMsg) => {
             const timestamp = new Date().toISOString();
+            const epochMs = Date.now();
             const seq = this._nextSeq();
             const attributionSnapshot = this.getAttributionSnapshot();
+            const triggerSnapshot = this.getActiveTriggerSnapshot(epochMs);
             const failureText = String(errorMsg || 'WEBSOCKET_ERROR');
 
             this._appendNdjsonEvent({
@@ -1710,12 +2173,13 @@ export class CamoufoxTrafficRecorder {
                 direction: 'ws-error',
                 stage: 'websocket-channel-error',
                 timestamp,
-                epochMs: Date.now(),
+                epochMs,
                 seq,
                 correlationId: wsCorrelationId,
                 url: wsUrl,
                 host: parsedUrl.host,
                 failureText,
+                triggerAction: triggerSnapshot,
                 attribution: attributionSnapshot
             });
 
@@ -1723,6 +2187,7 @@ export class CamoufoxTrafficRecorder {
                 timestamp,
                 correlationId: wsCorrelationId,
                 actionStep: attributionSnapshot.actionStep,
+                triggerAction: triggerSnapshot,
                 type: 'websocket-error',
                 severity: 'medium',
                 method: 'WEBSOCKET',
@@ -1734,17 +2199,19 @@ export class CamoufoxTrafficRecorder {
         };
 
         const onClose = () => {
+            const closeEpochMs = Date.now();
             this._appendNdjsonEvent({
                 type: 'ws-close',
                 eventType: 'ws-close',
                 direction: 'ws-close',
                 stage: 'websocket-channel-closed',
                 timestamp: new Date().toISOString(),
-                epochMs: Date.now(),
+                epochMs: closeEpochMs,
                 seq: this._nextSeq(),
                 correlationId: wsCorrelationId,
                 url: wsUrl,
                 host: parsedUrl.host,
+                triggerAction: this.getActiveTriggerSnapshot(closeEpochMs),
                 attribution: this.getAttributionSnapshot()
             });
         };
@@ -1796,6 +2263,30 @@ export class CamoufoxTrafficRecorder {
             };
         }
 
+        const byTriggerActionObj = {};
+        for (const [actionId, stats] of this.byTriggerAction.entries()) {
+            byTriggerActionObj[actionId] = {
+                actionId: stats.actionId,
+                actionType: stats.actionType,
+                target: stats.target,
+                actionStep: stats.actionStep,
+                stepIndex: stats.stepIndex,
+                timestamp: stats.timestamp,
+                metadata: stats.metadata,
+                requests: stats.requests,
+                responses: stats.responses,
+                failedRequests: stats.failedRequests,
+                wsFramesSent: stats.wsFramesSent,
+                wsFramesReceived: stats.wsFramesReceived,
+                egressBytes: stats.egressBytes,
+                ingressBytes: stats.ingressBytes,
+                statusCounts: { ...stats.statusCounts },
+                domains: Array.from(stats.domainsSet),
+                correlationIds: Array.from(stats.correlationIdsSet),
+                anomalyCount: stats.anomalyCount
+            };
+        }
+
         return {
             session: {
                 traceId: this.attribution.traceId,
@@ -1810,6 +2301,8 @@ export class CamoufoxTrafficRecorder {
             },
             artifacts: {
                 trafficNdjsonPath: this.trafficNdjsonPath,
+                preTlsWireLogPath: this.preTlsWireLogPath,
+                neckoMozLogPath: this.neckoMozLogPath,
                 payloadsDir: this.payloadsDir,
                 sslKeyLogPath: this.sslKeyLogPath,
                 harPath: this.harPath,
@@ -1826,6 +2319,7 @@ export class CamoufoxTrafficRecorder {
             },
             byActionStep: byActionStepObj,
             byDomain: byDomainObj,
+            byTriggerAction: byTriggerActionObj,
             anomaliesAndRiskSignals: [...this.anomaliesAndRiskSignals]
         };
     }

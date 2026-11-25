@@ -489,6 +489,8 @@ export function ensureProfileStorage(profileId, profilesDir = DEFAULT_PROFILES_D
         trafficDir,
         payloadsDir,
         sslKeyLogPath: path.join(trafficDir, 'sslkeylog.txt'),
+        preTlsWireLogPath: path.join(trafficDir, 'pre-tls-wire.log'),
+        neckoMozLogPath: path.join(trafficDir, 'necko-pre-tls.moz_log'),
         trafficNdjsonPath: path.join(trafficDir, 'traffic.ndjson'),
         attributionIndexPath: path.join(trafficDir, 'attribution-index.json'),
         harPath: path.join(trafficDir, 'trace.har')
@@ -570,6 +572,70 @@ export async function checkCamoufoxConnection() {
 }
 
 /**
+ * Synchronize NSS TLS secrets from a shared browser SSLKEYLOGFILE into a profile's sslkeylog.txt.
+ */
+function syncSharedSslKeyLog(sharedKeyLogPath, profileKeyLogPath) {
+    if (!sharedKeyLogPath || !profileKeyLogPath || sharedKeyLogPath === profileKeyLogPath) {
+        return false;
+    }
+    try {
+        if (!fs.existsSync(sharedKeyLogPath) || !fs.statSync(sharedKeyLogPath).isFile()) {
+            return false;
+        }
+        const sharedRaw = fs.readFileSync(sharedKeyLogPath, 'utf8');
+        const sharedLines = sharedRaw
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter((l) => l && !l.startsWith('#'));
+        if (sharedLines.length === 0) {
+            return false;
+        }
+
+        fs.mkdirSync(path.dirname(profileKeyLogPath), { recursive: true });
+        let existingContent = '';
+        if (fs.existsSync(profileKeyLogPath)) {
+            existingContent = fs.readFileSync(profileKeyLogPath, 'utf8');
+        } else {
+            existingContent = '# NSS SSL/TLS Secrets Log (Camoufox Pre-TLS Traffic Recorder)\n';
+        }
+
+        const existingSet = new Set(
+            existingContent
+                .split(/\r?\n/)
+                .map((l) => l.trim())
+                .filter((l) => l && !l.startsWith('#'))
+        );
+
+        const newLines = [];
+        for (const line of sharedLines) {
+            if (!existingSet.has(line)) {
+                existingSet.add(line);
+                newLines.push(line);
+            }
+        }
+
+        if (newLines.length > 0) {
+            const prefix = existingContent && !existingContent.endsWith('\n') ? '\n' : '';
+            fs.writeFileSync(
+                profileKeyLogPath,
+                `${existingContent}${prefix}${newLines.join('\n')}\n`,
+                'utf8'
+            );
+        } else if (!fs.existsSync(profileKeyLogPath)) {
+            fs.writeFileSync(profileKeyLogPath, existingContent, 'utf8');
+        }
+        return true;
+    } catch (error) {
+        logger.debug('Could not sync shared SSLKEYLOGFILE into profile sslkeylog.txt', {
+            sharedKeyLogPath,
+            profileKeyLogPath,
+            error: error.message
+        });
+        return false;
+    }
+}
+
+/**
  * Obtain or launch a shared Camoufox browser instance for multi-context profiles.
  */
 export async function getOrCreateSharedBrowser(options = {}) {
@@ -577,7 +643,11 @@ export async function getOrCreateSharedBrowser(options = {}) {
     const targetOs = normalizeTargetOs(options.os);
     const headless = options.headless ?? (process.env.CAMOUFOX_HEADLESS === 'true' ? true : false);
     const humanize = options.humanize !== undefined ? options.humanize : true;
-    const configKey = JSON.stringify({ headless, humanize: Boolean(humanize) });
+    const profilesDir = options.profilesDir || DEFAULT_PROFILES_DIR;
+    const sslKeyLog = options.sslKeyLog !== undefined
+        ? options.sslKeyLog !== false
+        : process.env.CAMOUFOX_SSLKEYLOG !== 'false';
+    const configKey = JSON.stringify({ headless, humanize: Boolean(humanize), sslKeyLog: Boolean(sslKeyLog) });
 
     if (sharedBrowserInstance && sharedBrowserInstance.isConnected?.() !== false && sharedBrowserConfigKey === configKey) {
         return sharedBrowserInstance;
@@ -593,10 +663,34 @@ export async function getOrCreateSharedBrowser(options = {}) {
             const camoufoxMod = await resolveCamoufoxModule();
             const launchFn = camoufoxMod.AsyncCamoufox || camoufoxMod.Camoufox;
 
+            const sharedSslKeyLogPath = sslKeyLog
+                ? path.join(profilesDir, '_shared_sslkeylog.txt')
+                : null;
+            if (sharedSslKeyLogPath) {
+                fs.mkdirSync(profilesDir, { recursive: true });
+                if (!fs.existsSync(sharedSslKeyLogPath)) {
+                    fs.writeFileSync(
+                        sharedSslKeyLogPath,
+                        '# NSS Shared SSL/TLS Secrets Log (Camoufox Shared Browser)\n',
+                        'utf8'
+                    );
+                }
+            }
+
+            const baseLaunchOptions = { ...(options.launchOptions || {}) };
+            if (sharedSslKeyLogPath) {
+                baseLaunchOptions.env = {
+                    ...process.env,
+                    ...(baseLaunchOptions.env || {}),
+                    SSLKEYLOGFILE: sharedSslKeyLogPath
+                };
+            }
+
             logger.info('Launching shared Camoufox browser instance', {
                 os: targetOs,
                 headless,
-                humanize: Boolean(humanize)
+                humanize: Boolean(humanize),
+                sslKeyLog: Boolean(sslKeyLog)
             });
 
             const browser = await launchFn({
@@ -604,8 +698,12 @@ export async function getOrCreateSharedBrowser(options = {}) {
                 headless,
                 humanize,
                 canvas_noise: options.canvas_noise ?? true,
-                ...(options.launchOptions || {})
+                ...baseLaunchOptions
             });
+
+            if (sharedSslKeyLogPath && browser && typeof browser === 'object') {
+                browser._sharedSslKeyLogPath = sharedSslKeyLogPath;
+            }
 
             sharedBrowserPool.add(browser);
             sharedBrowserInstance = browser;
@@ -834,9 +932,24 @@ export async function startProfile(profileId, options = {}) {
             const recordBodies = mergedOptions.recordBodies !== undefined
                 ? mergedOptions.recordBodies !== false
                 : process.env.CAMOUFOX_RECORD_BODIES !== 'false';
+            const recordWireLog = options.recordWireLog !== undefined
+                ? options.recordWireLog !== false
+                : (mergedOptions.recordWireLog !== undefined
+                    ? mergedOptions.recordWireLog !== false
+                    : process.env.CAMOUFOX_RECORD_WIRE_LOG !== 'false');
             const sslKeyLog = mergedOptions.sslKeyLog !== undefined
                 ? mergedOptions.sslKeyLog !== false
                 : process.env.CAMOUFOX_SSLKEYLOG !== 'false';
+            const neckoMozLog = Boolean(
+                options.neckoMozLog ??
+                mergedOptions.neckoMozLog ??
+                (process.env.CAMOUFOX_NECKO_MOZ_LOG === 'true')
+            );
+            const neckoMozLogModules =
+                options.neckoMozLogModules ||
+                mergedOptions.neckoMozLogModules ||
+                process.env.CAMOUFOX_NECKO_MOZ_LOG_MODULES ||
+                'timestamp,nsHttp:5,nsSocketTransport:5,nsHostResolver:4';
             const recordHar = mergedOptions.recordHar !== undefined
                 ? Boolean(mergedOptions.recordHar)
                 : process.env.CAMOUFOX_RECORD_HAR === 'true';
@@ -850,25 +963,33 @@ export async function startProfile(profileId, options = {}) {
                 trafficDir: storageInfo.trafficDir,
                 payloadsDir: storageInfo.payloadsDir,
                 sslKeyLogPath: storageInfo.sslKeyLogPath,
+                preTlsWireLogPath: storageInfo.preTlsWireLogPath,
+                neckoMozLogPath: storageInfo.neckoMozLogPath,
                 trafficNdjsonPath: storageInfo.trafficNdjsonPath,
                 attributionIndexPath: storageInfo.attributionIndexPath,
                 harPath: storageInfo.harPath
             };
 
-            const launchEnv = sslKeyLog
+            const hasCustomLaunchEnv = Boolean(
+                sslKeyLog ||
+                neckoMozLog ||
+                options.env ||
+                mergedOptions.launchOptions?.env
+            );
+            const launchEnv = hasCustomLaunchEnv
                 ? {
                       ...process.env,
                       ...(mergedOptions.launchOptions?.env || {}),
                       ...(options.env || {}),
-                      SSLKEYLOGFILE: storageInfo.sslKeyLogPath
+                      ...(sslKeyLog ? { SSLKEYLOGFILE: storageInfo.sslKeyLogPath } : {}),
+                      ...(neckoMozLog
+                          ? {
+                                MOZ_LOG: neckoMozLogModules,
+                                MOZ_LOG_FILE: storageInfo.neckoMozLogPath
+                            }
+                          : {})
                   }
-                : (options.env || mergedOptions.launchOptions?.env
-                    ? {
-                          ...process.env,
-                          ...(mergedOptions.launchOptions?.env || {}),
-                          ...(options.env || {})
-                      }
-                    : null);
+                : null;
 
             const camoufoxMod = await resolveCamoufoxModule();
             const launchFn = camoufoxMod.AsyncCamoufox || camoufoxMod.Camoufox;
@@ -883,6 +1004,8 @@ export async function startProfile(profileId, options = {}) {
                     os: targetOs,
                     headless,
                     humanize,
+                    sslKeyLog,
+                    profilesDir,
                     canvas_noise: true,
                     launchOptions: {
                         ...(mergedOptions.launchOptions || {}),
@@ -963,12 +1086,15 @@ export async function startProfile(profileId, options = {}) {
                     profileId,
                     trafficDir: storageInfo.trafficDir,
                     sslKeyLogPath: storageInfo.sslKeyLogPath,
+                    preTlsWireLogPath: storageInfo.preTlsWireLogPath,
+                    neckoMozLogPath: storageInfo.neckoMozLogPath,
                     harPath: recordHar ? storageInfo.harPath : null,
                     os: targetOs,
                     proxyServer: normalizedProxy?.server || null,
                     accountId: options.accountId ?? mergedOptions.accountId ?? null,
                     accountEmail: options.accountEmail ?? mergedOptions.accountEmail ?? null,
                     recordBodies: options.recordBodies !== undefined ? options.recordBodies !== false : recordBodies,
+                    recordWireLog,
                     maxBodyBytes: options.maxBodyBytes ?? maxBodyBytes
                 });
                 await trafficRecorder.attachContext(context);
@@ -1041,6 +1167,13 @@ export async function stopProfile(profileId, options = {}) {
     const profilesDir = options.profilesDir || session.profilesDir || DEFAULT_PROFILES_DIR;
 
     try {
+        if (session.browser?._sharedSslKeyLogPath && session.trafficPaths?.sslKeyLogPath) {
+            syncSharedSslKeyLog(
+                session.browser._sharedSslKeyLogPath,
+                session.trafficPaths.sslKeyLogPath
+            );
+        }
+
         if (session.trafficRecorder) {
             try {
                 await session.trafficRecorder.stop();
@@ -1070,6 +1203,13 @@ export async function stopProfile(profileId, options = {}) {
                     error: closeCtxErr.message
                 });
             }
+        }
+
+        if (session.browser?._sharedSslKeyLogPath && session.trafficPaths?.sslKeyLogPath) {
+            syncSharedSslKeyLog(
+                session.browser._sharedSslKeyLogPath,
+                session.trafficPaths.sslKeyLogPath
+            );
         }
 
         if (session.ownsBrowser && session.browser) {

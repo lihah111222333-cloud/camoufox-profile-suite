@@ -115,8 +115,15 @@ CAMOUFOX_RECORD_TRAFFIC=true
 # Capture plaintext request/response bodies inside profiles/<profileId>/traffic/payloads/
 CAMOUFOX_RECORD_BODIES=true
 
+# Write canonical pre-TLS HTTP/1.1 & HTTP/2 wire stream to profiles/<profileId>/traffic/pre-tls-wire.log
+CAMOUFOX_RECORD_WIRE_LOG=true
+
 # Export Firefox NSS TLS 1.2/1.3 secrets to profiles/<profileId>/traffic/sslkeylog.txt
 CAMOUFOX_SSLKEYLOG=true
+
+# Optional: enable Firefox C++ Necko kernel MOZ_LOG to profiles/<profileId>/traffic/necko-pre-tls.moz_log
+CAMOUFOX_NECKO_MOZ_LOG=false
+CAMOUFOX_NECKO_MOZ_LOG_MODULES=timestamp,nsHttp:5,nsSocketTransport:5,nsHostResolver:4
 
 # Optional: record full Playwright HAR 1.2 archive to profiles/<profileId>/traffic/trace.har
 CAMOUFOX_RECORD_HAR=false

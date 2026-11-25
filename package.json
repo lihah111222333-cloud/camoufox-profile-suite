@@ -27,6 +27,7 @@
     "dev": "node --watch src/index.js",
     "list-folders": "node scripts/list-dolphin-folders.js",
     "verify-camoufox": "node scripts/verify-camoufox-coherence.js",
+    "audit-traffic": "node scripts/query-traffic-attribution.js",
     "test:isolation": "node scripts/test-camoufox-isolation.js",
     "test:coherence": "node scripts/test-coherence-auditor.js",
     "test:compat": "node scripts/test-page-compat.js",

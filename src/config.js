@@ -62,7 +62,10 @@ export const config = {
         storageDir: process.env.CAMOUFOX_STORAGE_DIR || path.resolve(__dirname, '../profiles'),
         recordTraffic: process.env.CAMOUFOX_RECORD_TRAFFIC !== 'false', // Default: true (pre-TLS Necko egress/ingress NDJSON + attribution)
         recordBodies: process.env.CAMOUFOX_RECORD_BODIES !== 'false', // Default: true (capture plaintext request/response payloads)
+        recordWireLog: process.env.CAMOUFOX_RECORD_WIRE_LOG !== 'false', // Default: true (writes canonical pre-TLS HTTP/1.1 & HTTP/2 wire stream to pre-tls-wire.log)
         sslKeyLog: process.env.CAMOUFOX_SSLKEYLOG !== 'false', // Default: true (export NSS pre-TLS secrets to sslkeylog.txt)
+        neckoMozLog: process.env.CAMOUFOX_NECKO_MOZ_LOG === 'true', // Default: false (enables Firefox C++ Necko kernel MOZ_LOG to necko-pre-tls.moz_log)
+        neckoMozLogModules: process.env.CAMOUFOX_NECKO_MOZ_LOG_MODULES || 'timestamp,nsHttp:5,nsSocketTransport:5,nsHostResolver:4',
         recordHar: process.env.CAMOUFOX_RECORD_HAR === 'true', // Default: false (optional Playwright HAR 1.2 archive)
         maxBodyBytes: parseInt(process.env.CAMOUFOX_TRAFFIC_MAX_BODY_BYTES || '5242880', 10) // Default: 5MB
     },

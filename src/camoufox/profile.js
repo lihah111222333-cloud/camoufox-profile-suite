@@ -83,12 +83,105 @@ function wrapMultiArgEvaluate(originalEvaluate, decorateResult = null) {
     };
 }
 
+let lastActiveTrafficRecorder = null;
+
+function resolveFrameRecorder(frame) {
+    if (!frame || typeof frame !== 'object') {
+        return lastActiveTrafficRecorder || null;
+    }
+    if (typeof frame.getTrafficRecorder === 'function') {
+        const rec = frame.getTrafficRecorder();
+        if (rec) return rec;
+    }
+    if (frame._camoufoxProfile?.trafficRecorder) {
+        return frame._camoufoxProfile.trafficRecorder;
+    }
+    if (frame._camoufoxContext?._camoufoxTrafficRecorder) {
+        return frame._camoufoxContext._camoufoxTrafficRecorder;
+    }
+    if (typeof frame.page === 'function') {
+        try {
+            const page = frame.page();
+            if (page) {
+                const rec =
+                    page.getTrafficRecorder?.() ||
+                    page._camoufoxProfile?.trafficRecorder ||
+                    page.context?.()?._camoufoxTrafficRecorder;
+                if (rec) return rec;
+            }
+        } catch {
+            // Ignore frame.page() resolution error
+        }
+    }
+    if (typeof frame.context === 'function') {
+        try {
+            const ctx = frame.context();
+            if (ctx?._camoufoxTrafficRecorder) {
+                return ctx._camoufoxTrafficRecorder;
+            }
+        } catch {
+            // Ignore frame.context() resolution error
+        }
+    }
+    return lastActiveTrafficRecorder || null;
+}
+
+function resolveHandleRecorder(handle) {
+    if (!handle || typeof handle !== 'object') {
+        return lastActiveTrafficRecorder || null;
+    }
+    const owner = handle._camoufoxOwner;
+    if (owner) {
+        if (typeof owner.recordTriggerAction === 'function') {
+            return owner;
+        }
+        const rec = resolveFrameRecorder(owner);
+        if (rec) return rec;
+    }
+    if (typeof handle.getTrafficRecorder === 'function') {
+        const rec = handle.getTrafficRecorder();
+        if (rec) return rec;
+    }
+    const internalPage = handle._page || (typeof handle._frame?.page === 'function' ? handle._frame.page() : null);
+    if (internalPage) {
+        const rec = resolveFrameRecorder(internalPage);
+        if (rec) return rec;
+    }
+    if (handle._context?._camoufoxTrafficRecorder) {
+        return handle._context._camoufoxTrafficRecorder;
+    }
+    return lastActiveTrafficRecorder || null;
+}
+
 /**
  * Decorate a Playwright ElementHandle / JSHandle with Puppeteer compatibility helpers
- * (`$x`, `waitForXPath`, `asElement`, and multi-arg `evaluate` / `evaluateHandle`).
+ * (`$x`, `waitForXPath`, `asElement`, and multi-arg `evaluate` / `evaluateHandle`)
+ * as well as automatic pre-TLS causal action trigger hooks (`click`, `fill`, `type`, `press`).
  */
-export function attachElementHandleCompatibility(handle) {
-    if (!handle || typeof handle !== 'object' || handle._camoufoxCompatAttached) {
+export function attachElementHandleCompatibility(handle, owner = null, targetHint = null) {
+    if (!handle || typeof handle !== 'object') {
+        return handle;
+    }
+
+    if (owner && !handle._camoufoxOwner) {
+        Object.defineProperty(handle, '_camoufoxOwner', {
+            value: owner,
+            enumerable: false,
+            configurable: true,
+            writable: true
+        });
+    }
+
+    if (targetHint && !handle._camoufoxTargetHint) {
+        Object.defineProperty(handle, '_camoufoxTargetHint', {
+            value: String(targetHint),
+            enumerable: false,
+            configurable: true,
+            writable: true
+        });
+    }
+
+    if (handle._camoufoxCompatAttached) {
         return handle;
     }
 
@@ -100,7 +193,12 @@ export function attachElementHandleCompatibility(handle) {
 
     if (typeof handle.$ === 'function') {
         const originalQuery = handle.$.bind(handle);
-        handle.$ = async (selector) => attachElementHandleCompatibility(await originalQuery(selector));
+        handle.$ = async (selector) =>
+            attachElementHandleCompatibility(
+                await originalQuery(selector),
+                handle._camoufoxOwner || handle,
+                selector
+            );
     }
 
     if (typeof handle.$$ === 'function') {
@@ -108,7 +206,9 @@ export function attachElementHandleCompatibility(handle) {
         handle.$$ = async (selector) => {
             const elements = await originalQueryAll(selector);
             return Array.isArray(elements)
-                ? elements.map((el) => attachElementHandleCompatibility(el))
+                ? elements.map((el) =>
+                      attachElementHandleCompatibility(el, handle._camoufoxOwner || handle, selector)
+                  )
                 : elements;
         };
     }
@@ -121,7 +221,9 @@ export function attachElementHandleCompatibility(handle) {
         const originalWaitForSelector = handle.waitForSelector.bind(handle);
         handle.waitForSelector = async (selector, options) =>
             attachElementHandleCompatibility(
-                await originalWaitForSelector(selector, normalizeWaitForOptions(options))
+                await originalWaitForSelector(selector, normalizeWaitForOptions(options)),
+                handle._camoufoxOwner || handle,
+                selector
             );
     }
 
@@ -165,13 +267,43 @@ export function attachElementHandleCompatibility(handle) {
                     [fnSource, args]
                 );
             }
-            return attachElementHandleCompatibility(res);
+            return attachElementHandleCompatibility(res, handle._camoufoxOwner || handle);
         };
+    }
+
+    for (const methodName of ['click', 'fill', 'type', 'press']) {
+        if (typeof handle[methodName] === 'function') {
+            const originalMethod = handle[methodName].bind(handle);
+            handle[methodName] = async (...args) => {
+                try {
+                    const recorder = resolveHandleRecorder(handle);
+                    const target = handle._camoufoxTargetHint || 'ElementHandle';
+                    const meta = {};
+                    if (methodName === 'press' && typeof args[0] === 'string') {
+                        meta.key = args[0];
+                    } else if (
+                        (methodName === 'fill' || methodName === 'type') &&
+                        typeof args[0] === 'string'
+                    ) {
+                        meta.valueLength = args[0].length;
+                    }
+                    recorder?.recordTriggerAction?.(`elementHandle.${methodName}`, target, meta);
+                } catch {
+                    // Never allow instrumentation to interfere with ElementHandle actions
+                }
+                return originalMethod(...args);
+            };
+        }
     }
 
     if (typeof handle.asElement === 'function') {
         const originalAsElement = handle.asElement.bind(handle);
-        handle.asElement = () => attachElementHandleCompatibility(originalAsElement());
+        handle.asElement = () =>
+            attachElementHandleCompatibility(
+                originalAsElement(),
+                handle._camoufoxOwner || handle,
+                handle._camoufoxTargetHint || null
+            );
     } else {
         handle.asElement = () => handle;
     }
@@ -196,7 +328,8 @@ export function attachFrameCompatibility(frame) {
 
     if (typeof frame.$ === 'function') {
         const originalQuery = frame.$.bind(frame);
-        frame.$ = async (selector) => attachElementHandleCompatibility(await originalQuery(selector));
+        frame.$ = async (selector) =>
+            attachElementHandleCompatibility(await originalQuery(selector), frame, selector);
     }
 
     if (typeof frame.$$ === 'function') {
@@ -204,7 +337,7 @@ export function attachFrameCompatibility(frame) {
         frame.$$ = async (selector) => {
             const elements = await originalQueryAll(selector);
             return Array.isArray(elements)
-                ? elements.map((el) => attachElementHandleCompatibility(el))
+                ? elements.map((el) => attachElementHandleCompatibility(el, frame, selector))
                 : elements;
         };
     }
@@ -217,7 +350,9 @@ export function attachFrameCompatibility(frame) {
         const originalWaitForSelector = frame.waitForSelector.bind(frame);
         frame.waitForSelector = async (selector, options) =>
             attachElementHandleCompatibility(
-                await originalWaitForSelector(selector, normalizeWaitForOptions(options))
+                await originalWaitForSelector(selector, normalizeWaitForOptions(options)),
+                frame,
+                selector
             );
     }
 
@@ -250,7 +385,7 @@ export function attachFrameCompatibility(frame) {
     if (typeof frame.evaluateHandle === 'function') {
         const originalEvaluateHandle = frame.evaluateHandle.bind(frame);
         frame.evaluateHandle = wrapMultiArgEvaluate(originalEvaluateHandle, (res) =>
-            attachElementHandleCompatibility(res)
+            attachElementHandleCompatibility(res, frame)
         );
     }
 
@@ -261,24 +396,121 @@ export function attachFrameCompatibility(frame) {
  * Decorate a Playwright Page with non-intrusive compatibility shims for callers
  * that use Puppeteer helpers (`$x`, `waitForXPath`, `evaluateOnNewDocument`,
  * `setViewport`/`viewport`, `cookies`/`setCookie`/`deleteCookie`, `setUserAgent`,
- * `frames`/`mainFrame`, `browser()`, multi-arg `evaluate`, `networkidle2`).
+ * `frames`/`mainFrame`, `browser()`, multi-arg `evaluate`, `networkidle2`)
+ * and automatic pre-TLS causal action attribution hooks.
  */
-export function attachPageCompatibility(page, context = null, browser = null) {
-    if (!page || page._camoufoxCompatAttached) {
+export function attachPageCompatibility(page, context = null, profile = null) {
+    if (!page || typeof page !== 'object') {
         return page;
     }
 
-    const resolveContext = () => context || (typeof page.context === 'function' ? page.context() : null);
+    if (context && !page._camoufoxContext) {
+        Object.defineProperty(page, '_camoufoxContext', {
+            value: context,
+            enumerable: false,
+            configurable: true,
+            writable: true
+        });
+    }
+
+    if (profile && !page._camoufoxProfile) {
+        Object.defineProperty(page, '_camoufoxProfile', {
+            value: profile,
+            enumerable: false,
+            configurable: true,
+            writable: true
+        });
+    }
+
+    const resolveContext = () =>
+        page._camoufoxContext ||
+        context ||
+        page._camoufoxProfile?.context ||
+        (typeof page.context === 'function' ? page.context() : null);
+
     const resolveBrowser = () => {
-        if (browser) {
-            return browser;
+        const p = page._camoufoxProfile || profile;
+        if (p) {
+            if (p.browser) {
+                return p.browser;
+            }
+            if (
+                typeof p.contexts === 'function' ||
+                typeof p.newContext === 'function' ||
+                typeof p.isConnected === 'function'
+            ) {
+                return p;
+            }
         }
         const ctx = resolveContext();
         return ctx && typeof ctx.browser === 'function' ? ctx.browser() : null;
     };
 
+    // Traffic attribution helpers directly on page
+    page.getTrafficRecorder = () =>
+        (page._camoufoxProfile || profile)?.trafficRecorder ||
+        resolveContext()?._camoufoxTrafficRecorder ||
+        null;
+
+    page.setTrafficStep = (stepName, meta = {}) =>
+        page.getTrafficRecorder()?.setStep(stepName, meta) || null;
+
+    page.recordTrafficTrigger = (actionType, target = null, meta = {}) =>
+        page.getTrafficRecorder()?.recordTriggerAction?.(actionType, target, meta) || null;
+
+    if (page._camoufoxCompatAttached) {
+        return page;
+    }
+
     // Apply all Frame-level shims ($x, waitForXPath, waitForSelector, goto, waitForNavigation, evaluate, evaluateHandle, waitForTimeout)
     attachFrameCompatibility(page);
+
+    // Instrument page.goto with causal trigger attribution
+    if (typeof page.goto === 'function') {
+        const normalizedGoto = page.goto.bind(page);
+        page.goto = async (url, options) => {
+            try {
+                const recorder = page.getTrafficRecorder?.();
+                const targetUrl = typeof url === 'string' ? url : String(url ?? '');
+                recorder?.recordTriggerAction?.('page.goto', targetUrl, {
+                    url: targetUrl,
+                    pageUrl: typeof page.url === 'function' ? page.url() : null
+                });
+            } catch {
+                // Never allow instrumentation to interfere with navigation
+            }
+            return normalizedGoto(url, options);
+        };
+    }
+
+    // Instrument UI action drivers on page: click, fill, type, press, tap
+    for (const methodName of ['click', 'fill', 'type', 'press', 'tap']) {
+        if (typeof page[methodName] === 'function') {
+            const originalMethod = page[methodName].bind(page);
+            page[methodName] = async (selector, ...rest) => {
+                try {
+                    const recorder = page.getTrafficRecorder?.();
+                    const targetSelector =
+                        typeof selector === 'string' ? selector : String(selector ?? '');
+                    const meta = {
+                        pageUrl: typeof page.url === 'function' ? page.url() : null
+                    };
+                    if (methodName === 'press' && typeof rest[0] === 'string') {
+                        meta.key = rest[0];
+                    } else if (
+                        (methodName === 'fill' || methodName === 'type') &&
+                        typeof rest[0] === 'string'
+                    ) {
+                        meta.valueLength = rest[0].length;
+                    }
+                    recorder?.recordTriggerAction?.(`page.${methodName}`, targetSelector, meta);
+                } catch {
+                    // Never allow instrumentation to interfere with page execution
+                }
+                return originalMethod(selector, ...rest);
+            };
+        }
+    }
 
     // Puppeteer page.evaluateOnNewDocument(fn, ...args) -> Playwright context.addInitScript
     if (typeof page.evaluateOnNewDocument !== 'function') {
@@ -503,7 +735,7 @@ export function attachPageCompatibility(page, context = null, browser = null) {
             const targetBrowser = resolveBrowser();
             const targetContext = resolveContext();
             return targetBrowser
-                ? attachBrowserCompatibility(targetBrowser, { context: targetContext })
+                ? attachBrowserCompatibility(targetBrowser, page._camoufoxProfile || { context: targetContext })
                 : null;
         };
     }
@@ -541,11 +773,11 @@ export function attachBrowserCompatibility(browser, profile = null) {
             if (primaryContext && typeof primaryContext.pages === 'function') {
                 return primaryContext
                     .pages()
-                    .map((p) => attachPageCompatibility(p, primaryContext, browser));
+                    .map((p) => attachPageCompatibility(p, primaryContext, profile || browser));
             }
             const contexts = typeof browser.contexts === 'function' ? browser.contexts() : [];
             return contexts.flatMap((ctx) =>
-                ctx.pages().map((p) => attachPageCompatibility(p, ctx, browser))
+                ctx.pages().map((p) => attachPageCompatibility(p, ctx, profile || browser))
             );
         };
         Object.defineProperty(browser, '_camoufoxPagesWrapped', {
@@ -563,11 +795,11 @@ export function attachBrowserCompatibility(browser, profile = null) {
             const primaryContext = resolvePrimaryContext();
             if (primaryContext && typeof primaryContext.newPage === 'function') {
                 const page = await primaryContext.newPage(...args);
-                return attachPageCompatibility(page, primaryContext, browser);
+                return attachPageCompatibility(page, primaryContext, profile || browser);
             }
             if (originalBrowserNewPage) {
                 const page = await originalBrowserNewPage(...args);
-                return attachPageCompatibility(page, page?.context?.() || null, browser);
+                return attachPageCompatibility(page, page?.context?.() || null, profile || browser);
             }
             throw new Error('No active Playwright context available to create a new page');
         };
@@ -663,12 +895,20 @@ export class CamoufoxProfile {
 
             const session = await camoufoxClient.startProfile(this.profileId, this.options);
             this.context = session.context;
-            this.browser = attachBrowserCompatibility(session.browser, this);
-            this.page = attachPageCompatibility(session.page, this.context, this.browser);
             this.storageStatePath = session.storageStatePath;
             this.metadata = session.metadata;
             this.trafficRecorder = session.trafficRecorder || null;
             this.trafficPaths = session.trafficPaths || null;
+
+            if (this.context) {
+                this.context._camoufoxTrafficRecorder = this.trafficRecorder;
+            }
+            if (this.trafficRecorder) {
+                lastActiveTrafficRecorder = this.trafficRecorder;
+            }
+
+            this.browser = attachBrowserCompatibility(session.browser, this);
+            this.page = attachPageCompatibility(session.page, this.context, this);
 
             // Wrap context.newPage so any additional pages also receive compatibility helpers
             if (this.context && !this.context._camoufoxNewPageWrapped) {
@@ -678,7 +918,7 @@ export class CamoufoxProfile {
                     if (this.trafficRecorder && typeof this.trafficRecorder.attachPage === 'function') {
                         await this.trafficRecorder.attachPage(newPage);
                     }
-                    return attachPageCompatibility(newPage, this.context, this.browser);
+                    return attachPageCompatibility(newPage, this.context, this);
                 };
                 Object.defineProperty(this.context, '_camoufoxNewPageWrapped', {
                     value: true,
@@ -737,7 +977,7 @@ export class CamoufoxProfile {
             this.page = attachPageCompatibility(
                 pages[0] || (await context.newPage()),
                 context,
-                this.browser
+                this
             );
         }
         return this.page;

@@ -6,6 +6,30 @@
 import logger from '../utils/logger.js';
 
 /**
+ * Automatically advance pre-TLS traffic attribution step when a new Gmail page type is detected.
+ */
+function finalizeDetectedPage(page, detected) {
+    if (detected && detected.type && detected.type !== 'UNKNOWN') {
+        try {
+            if (
+                typeof page?.setTrafficStep === 'function' &&
+                page._lastDetectedGmailStep !== detected.type
+            ) {
+                page._lastDetectedGmailStep = detected.type;
+                page.setTrafficStep(`gmail-page:${String(detected.type).toLowerCase()}`, {
+                    pageType: detected.type,
+                    action: detected.action || null,
+                    url: detected.url || (typeof page.url === 'function' ? page.url() : null)
+                });
+            }
+        } catch {
+            // Never allow traffic step tagging to interrupt page detection
+        }
+    }
+    return detected;
+}
+
+/**
  * Detect current Gmail page type
  * اكتشاف نوع صفحة Gmail الحالية
  */
@@ -18,96 +42,96 @@ export async function detectGmailPage(page) {
         // Check for phone verification page
         if (url.includes('/collectemailphone') || url.includes('/signup/phone')) {
             logger.info('Detected: Phone verification page (by URL)');
-            return {
+            return finalizeDetectedPage(page, {
                 type: 'PHONE_VERIFICATION',
                 elements: ['phone'],
                 action: 'enter_phone',
                 url: url
-            };
+            });
         }
 
         // Check for verification code page
         if (url.includes('/challenge/phone') || url.includes('/verification/phone') || 
             url.includes('/challenge/sms') || url.includes('/verification/sms')) {
             logger.info('Detected: Verification code page (by URL)');
-            return {
+            return finalizeDetectedPage(page, {
                 type: 'VERIFICATION_CODE',
                 elements: ['code'],
                 action: 'enter_code',
                 url: url
-            };
+            });
         }
 
         // Check for name input page
         if (url.includes('/steps/signup/name') || url.includes('/signup/name')) {
             logger.info('Detected: Name input page (by URL)');
-            return {
+            return finalizeDetectedPage(page, {
                 type: 'SIGN_UP_FORM',
                 elements: ['firstName', 'lastName'],
                 action: 'fill_name',
                 url: url
-            };
+            });
         }
 
         // Check for username/email input page
         if (url.includes('/steps/signup/username') || url.includes('/signup/username') ||
             url.includes('/steps/signup/email') || url.includes('/signup/email')) {
             logger.info('Detected: Username/Email input page (by URL)');
-            return {
+            return finalizeDetectedPage(page, {
                 type: 'USERNAME_INPUT',
                 elements: ['username'],
                 action: 'enter_username',
                 url: url
-            };
+            });
         }
 
         // Check for password input page
         if (url.includes('/steps/signup/password') || url.includes('/signup/password')) {
             logger.info('Detected: Password input page (by URL)');
-            return {
+            return finalizeDetectedPage(page, {
                 type: 'PASSWORD_INPUT',
                 elements: ['password'],
                 action: 'enter_password',
                 url: url
-            };
+            });
         }
 
         // Check for birthday/gender input page
         if (url.includes('/steps/signup/birthdaygender') || url.includes('/signup/birthdaygender') ||
             url.includes('/birthdaygender')) {
             logger.info('Detected: Birthday/Gender input page (by URL)');
-            return {
+            return finalizeDetectedPage(page, {
                 type: 'BIRTHDAY_GENDER',
                 elements: ['day', 'month', 'year', 'gender'],
                 action: 'fill_birthday_gender',
                 url: url
-            };
+            });
         }
 
         if (url.includes('/signin/identifier') || url.includes('/ServiceLogin')) {
-            return await detectSignInPage(page);
+            return finalizeDetectedPage(page, await detectSignInPage(page));
         }
         
         if (url.includes('/signup') || url.includes('/webcreateaccount')) {
-            return await detectSignUpPage(page);
+            return finalizeDetectedPage(page, await detectSignUpPage(page));
         }
         
         if (url.includes('/challenge') || url.includes('/verification')) {
-            return await detectVerificationPage(page);
+            return finalizeDetectedPage(page, await detectVerificationPage(page));
         }
 
         // Detect by class names (more reliable for Google pages)
         const pageTypeByClass = await detectByClassNames(page);
         if (pageTypeByClass && pageTypeByClass.type !== 'UNKNOWN') {
-            return pageTypeByClass;
+            return finalizeDetectedPage(page, pageTypeByClass);
         }
 
         // Detect by page elements as fallback
         const pageType = await detectByElements(page);
-        return pageType;
+        return finalizeDetectedPage(page, pageType);
     } catch (error) {
         logger.error('Error detecting Gmail page', { error: error.message });
-        return { type: 'UNKNOWN', elements: [] };
+        return finalizeDetectedPage(page, { type: 'UNKNOWN', elements: [] });
     }
 }
 
