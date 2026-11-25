@@ -239,7 +239,13 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
                 dprResolutionMatches: true,
                 orientationLandscape: true,
                 orientationPortrait: false,
-                colorBitsAtLeast8: true
+                colorBitsAtLeast8: true,
+                colorGamutSrgb: true,
+                colorGamutP3: targetOs === 'macos',
+                dynamicRangeHigh: targetOs === 'macos',
+                pointerFine: true,
+                pointerCoarse: false,
+                hoverSupported: true
             }
         },
         intl: {

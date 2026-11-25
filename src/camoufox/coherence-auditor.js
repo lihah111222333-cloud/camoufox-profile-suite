@@ -10,17 +10,37 @@ import fs from 'fs';
 import logger from '../utils/logger.js';
 import {
     APPLE_SILICON_SKU_CATALOG,
+    INTEL_MAC_SKU_CATALOG,
+    QUALCOMM_SNAPDRAGON_SKU_CATALOG,
+    OEM_DEVICE_MODEL_CATALOG,
     PC_CPU_SKU_CATALOG,
     PC_GPU_SKU_CATALOG,
+    PCI_DEVICE_ID_CATALOG,
+    PCI_VENDOR_ID_BY_GPU_VENDOR,
     parseAppleSiliconSkuName,
+    lookupIntelMacSku,
+    lookupSnapdragonSku,
+    lookupOemDeviceSku,
+    lookupPcCpuSku,
+    lookupPcGpuSku,
     validateHardwareModelSpec
 } from './hardware-models.js';
 
 export {
     APPLE_SILICON_SKU_CATALOG,
+    INTEL_MAC_SKU_CATALOG,
+    QUALCOMM_SNAPDRAGON_SKU_CATALOG,
+    OEM_DEVICE_MODEL_CATALOG,
     PC_CPU_SKU_CATALOG,
     PC_GPU_SKU_CATALOG,
+    PCI_DEVICE_ID_CATALOG,
+    PCI_VENDOR_ID_BY_GPU_VENDOR,
     parseAppleSiliconSkuName,
+    lookupIntelMacSku,
+    lookupSnapdragonSku,
+    lookupOemDeviceSku,
+    lookupPcCpuSku,
+    lookupPcGpuSku,
     validateHardwareModelSpec
 };
 
@@ -562,7 +582,13 @@ export async function collectBrowserFingerprint(page) {
                     mm(`(min-resolution: ${Math.max(0.5, dpr - 0.01)}dppx) and (max-resolution: ${dpr + 0.01}dppx)`),
                 orientationLandscape: mm('(orientation: landscape)'),
                 orientationPortrait: mm('(orientation: portrait)'),
-                colorBitsAtLeast8: mm('(min-color: 8)')
+                colorBitsAtLeast8: mm('(min-color: 8)'),
+                colorGamutSrgb: mm('(color-gamut: srgb)'),
+                colorGamutP3: mm('(color-gamut: p3)'),
+                dynamicRangeHigh: mm('(dynamic-range: high)'),
+                pointerFine: mm('(pointer: fine)'),
+                pointerCoarse: mm('(pointer: coarse)'),
+                hoverSupported: mm('(hover: hover)')
             }
         };
 
@@ -1816,6 +1842,84 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
         });
     }
 
+    // Check 17: Display Gamut/HDR, Touchscreen/Pointer & Audio Hardware Limits Coherence
+    {
+        const issues = [];
+        const renderer = String(webgl.unmaskedRenderer || '').trim();
+
+        // 1. Display Color Gamut (sRGB / Display-P3) vs ColorDepth & Hardware Panel Coherence
+        if (mq.colorGamutSrgb === false) {
+            issues.push('CSS (color-gamut: srgb) matchMedia returned false on a desktop/laptop display');
+        }
+        if (targetOs === 'mac' && /^Apple M\d/i.test(renderer) && scr.colorDepth === 30) {
+            if (mq.colorGamutP3 === false) {
+                issues.push(
+                    'macOS 30-bit Apple Silicon Liquid/Retina display reports CSS (color-gamut: p3) === false'
+                );
+            }
+        }
+        if (mq.colorGamutP3 === true && Number.isFinite(scr.colorDepth) && scr.colorDepth < 24) {
+            issues.push(`Display reports CSS (color-gamut: p3) === true with low colorDepth=${scr.colorDepth}`);
+        }
+
+        // 2. Touchscreen (navigator.maxTouchPoints) vs CSS Pointer/Hover & OS Coherence
+        if (targetOs === 'mac' && Number(nav.maxTouchPoints) > 0) {
+            issues.push(
+                `macOS desktop/MacBook identity reports navigator.maxTouchPoints=${nav.maxTouchPoints} (macOS hardware has 0 touch points)`
+            );
+        }
+        if (Number(nav.maxTouchPoints) === 0 && mq.pointerCoarse === true && mq.pointerFine === false) {
+            issues.push(
+                'navigator.maxTouchPoints is 0 but CSS matchMedia reports (pointer: coarse) without (pointer: fine)'
+            );
+        }
+        if (Number(nav.maxTouchPoints) === 0 && mq.hoverSupported === false) {
+            issues.push(
+                'Desktop mouse/trackpad profile (maxTouchPoints=0) reports CSS (hover: hover) === false'
+            );
+        }
+
+        // 3. AudioContext Hardware SampleRate & Channel Limits Coherence
+        if (audio && audio.available) {
+            const validDesktopSampleRates = [44100, 48000, 88200, 96000, 192000];
+            if (
+                audio.sampleRate !== null &&
+                audio.sampleRate !== undefined &&
+                !validDesktopSampleRates.includes(Number(audio.sampleRate))
+            ) {
+                issues.push(
+                    `AudioContext sampleRate=${audio.sampleRate}Hz is non-standard for desktop OS audio hardware (expected 44100Hz or 48000Hz)`
+                );
+            }
+            if (audio.maxChannelCount !== null && audio.maxChannelCount !== undefined) {
+                const maxCh = Number(audio.maxChannelCount);
+                if (!Number.isFinite(maxCh) || maxCh < 2 || maxCh > 64) {
+                    issues.push(
+                        `AudioContext destination.maxChannelCount=${audio.maxChannelCount} is invalid for desktop audio output (expected 2..64 channels)`
+                    );
+                }
+            }
+            if (
+                Number.isFinite(audio.channelCount) &&
+                Number.isFinite(audio.maxChannelCount) &&
+                audio.channelCount > audio.maxChannelCount
+            ) {
+                issues.push(
+                    `AudioContext destination.channelCount (${audio.channelCount}) exceeds maxChannelCount (${audio.maxChannelCount})`
+                );
+            }
+        }
+
+        const passed = issues.length === 0;
+        checks.push({
+            name: 'display-gamut-touch-and-audio-coherence',
+            passed,
+            details: passed
+                ? 'Display color gamut (sRGB/P3), pointer/hover/maxTouchPoints, and AudioContext hardware sampleRate/channels are 100% coherent'
+                : issues.join('; ')
+        });
+    }
+
     const passedCount = checks.filter((c) => c.passed).length;
     const score = checks.length > 0 ? Math.round((passedCount / checks.length) * 100) : 0;
     const passed = passedCount === checks.length;
@@ -2181,9 +2285,19 @@ export async function auditProfileCoherence(page, expectedOs) {
 export default {
     CAMOUFOX_COHERENCE_CONSTANTS,
     APPLE_SILICON_SKU_CATALOG,
+    INTEL_MAC_SKU_CATALOG,
+    QUALCOMM_SNAPDRAGON_SKU_CATALOG,
+    OEM_DEVICE_MODEL_CATALOG,
     PC_CPU_SKU_CATALOG,
     PC_GPU_SKU_CATALOG,
+    PCI_DEVICE_ID_CATALOG,
+    PCI_VENDOR_ID_BY_GPU_VENDOR,
     parseAppleSiliconSkuName,
+    lookupIntelMacSku,
+    lookupSnapdragonSku,
+    lookupOemDeviceSku,
+    lookupPcCpuSku,
+    lookupPcGpuSku,
     validateHardwareModelSpec,
     normalizeTargetOs,
     gpuFitsOs,
