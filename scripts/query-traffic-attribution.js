@@ -15,12 +15,14 @@
  *   --anomalies-only           Show only anomalies & risk signals from attribution-index.json / traffic.ndjson
  *   --correlation=<corrId>     Reconstruct complete Pre-TLS Egress + Post-TLS Ingress wire dump & payloads
  *   --dump-wire=<corrId>       Alias for --correlation=<corrId>
+ *   --verify-integrity         Verify cryptographic SHA-256 event hash chain & payload manifest integrity
  *   --json                     Emit structured JSON output to stdout
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { verifyTrafficIntegrity } from '../src/camoufox/traffic-recorder.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -58,6 +60,7 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
         anomaliesOnly: false,
         correlation: null,
         dumpWire: null,
+        verifyIntegrity: false,
         json: false,
         help: false
     };
@@ -122,6 +125,10 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
             case 'dumpWire':
                 opts.dumpWire = readNextValue();
                 opts.correlation = opts.correlation || opts.dumpWire;
+                break;
+            case 'verify-integrity':
+            case 'verifyIntegrity':
+                opts.verifyIntegrity = value === null ? true : value !== 'false' && value !== '0';
                 break;
             case 'json':
                 opts.json = value === null ? true : value !== 'false' && value !== '0';
@@ -889,8 +896,9 @@ export function queryProfileTraffic(options = {}) {
     };
 
     // If no profile is specified and no direct trafficDir or correlationId is given,
-    // list and summarize all profiles in profilesDir that have a traffic/ directory.
-    if (!targetProfileId && !options.trafficDir && !correlationId) {
+    // list and summarize all profiles in profilesDir that have a traffic/ directory
+    // (unless --verify-integrity is requested, in which case we resolve single or all profiles).
+    if (!targetProfileId && !options.trafficDir && !correlationId && !options.verifyIntegrity) {
         const profiles = listTrafficProfiles(profilesDir);
         return {
             mode: 'list-profiles',
@@ -925,6 +933,41 @@ export function queryProfileTraffic(options = {}) {
                 break;
             }
         }
+    } else if (options.verifyIntegrity) {
+        const candidates = listTrafficProfiles(profilesDir);
+        if (candidates.length === 1) {
+            resolvedPaths = {
+                profileId: candidates[0].profileId,
+                profileDir: candidates[0].profileDir,
+                trafficDir: candidates[0].trafficDir
+            };
+        } else if (candidates.length > 1) {
+            const perProfile = candidates.map((cand) => {
+                const check = verifyTrafficIntegrity(cand.trafficDir);
+                return {
+                    profileId: cand.profileId,
+                    trafficDir: cand.trafficDir,
+                    ...check
+                };
+            });
+            const allValid = perProfile.every((p) => p.valid);
+            const totalEvents = perProfile.reduce((acc, p) => acc + p.eventCount, 0);
+            const totalPayloads = perProfile.reduce((acc, p) => acc + p.verifiedPayloads, 0);
+            const allErrors = perProfile.flatMap((p) =>
+                p.errors.map((err) => `[${p.profileId}] ${err}`)
+            );
+            return {
+                mode: 'verify-integrity',
+                profileId: 'all-profiles',
+                profilesDir,
+                valid: allValid,
+                eventCount: totalEvents,
+                verifiedPayloads: totalPayloads,
+                chainHeadHash: perProfile[perProfile.length - 1]?.chainHeadHash || '0'.repeat(64),
+                errors: allErrors,
+                profiles: perProfile
+            };
+        }
     }
 
     if (!resolvedPaths || !fs.existsSync(resolvedPaths.trafficDir)) {
@@ -934,6 +977,18 @@ export function queryProfileTraffic(options = {}) {
     }
 
     const { profileId, profileDir, trafficDir } = resolvedPaths;
+
+    if (options.verifyIntegrity) {
+        const integrityResult = verifyTrafficIntegrity(trafficDir);
+        return {
+            mode: 'verify-integrity',
+            profileId,
+            profileDir,
+            trafficDir,
+            ...integrityResult,
+            integrity: integrityResult
+        };
+    }
     const trafficNdjsonPath = path.join(trafficDir, 'traffic.ndjson');
     const attributionIndexPath = path.join(trafficDir, 'attribution-index.json');
     const sslKeyLogPath = path.join(trafficDir, 'sslkeylog.txt');
@@ -1083,6 +1138,24 @@ export function formatCliReport(result) {
 
     const lines = [];
 
+    if (result.mode === 'verify-integrity') {
+        const statusText = result.valid
+            ? 'VALID (SHA-256 HASH CHAIN & PAYLOAD MANIFEST VERIFIED)'
+            : 'INVALID (TAMPERING OR CORRUPTION DETECTED)';
+        lines.push(`🔐 Traffic Cryptographic Integrity Verification — Profile: ${result.profileId}`);
+        lines.push(`   Status           : ${statusText}`);
+        lines.push(`   Chained Events   : ${result.eventCount}`);
+        lines.push(`   Verified Payloads: ${result.verifiedPayloads}`);
+        lines.push(`   Chain Head Hash  : ${result.chainHeadHash}`);
+        if (Array.isArray(result.errors) && result.errors.length > 0) {
+            lines.push(`   Errors (${result.errors.length}):`);
+            for (const err of result.errors) {
+                lines.push(`     - ${err}`);
+            }
+        }
+        return lines.join('\n');
+    }
+
     if (result.mode === 'list-profiles') {
         lines.push(`📂 Profiles Directory: ${result.profilesDir}`);
         lines.push(`Found ${result.count} profile(s) with recorded pre-TLS traffic:`);
@@ -1162,6 +1235,7 @@ export function runCli(argv = process.argv.slice(2)) {
                 '  --anomalies-only            Show only anomalies & risk signals',
                 '  --correlation=<corrId>      Reconstruct Pre-TLS Egress + Post-TLS Ingress wire dump',
                 '  --dump-wire=<corrId>        Alias for --correlation=<corrId>',
+                '  --verify-integrity          Verify SHA-256 tamper-evident hash chain & payload manifest',
                 '  --json                      Output structured JSON'
             ].join('\n')
         );
@@ -1177,13 +1251,18 @@ export function runCli(argv = process.argv.slice(2)) {
         status: args.status,
         anomaliesOnly: args.anomaliesOnly,
         correlation: args.correlation,
-        dumpWire: args.dumpWire
+        dumpWire: args.dumpWire,
+        verifyIntegrity: args.verifyIntegrity
     });
 
     if (args.json) {
         process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     } else {
         process.stdout.write(`${formatCliReport(result)}\n`);
+    }
+
+    if (args.verifyIntegrity && result && result.valid === false) {
+        return 1;
     }
     return 0;
 }
@@ -1194,17 +1273,23 @@ const isMainModule =
 
 if (isMainModule) {
     try {
-        runCli(process.argv.slice(2));
+        const exitCode = runCli(process.argv.slice(2));
+        if (typeof exitCode === 'number' && exitCode !== 0) {
+            process.exit(exitCode);
+        }
     } catch (err) {
         console.error(`Error: ${err.message}`);
         process.exit(1);
     }
 }
 
+export { verifyTrafficIntegrity };
+
 export default {
     queryProfileTraffic,
     listTrafficProfiles,
     reconstructTransactionWireDump,
+    verifyTrafficIntegrity,
     parseCliArgs,
     formatCliReport,
     runCli

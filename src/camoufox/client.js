@@ -31,6 +31,9 @@ const sharedBrowserPool = new Set();
 const activeProfiles = new Map();
 const pendingProfileStarts = new Map();
 let profileSeqCounter = 0;
+let cleanupHooksRegistered = false;
+let sigintCleanupHandler = null;
+let sigtermCleanupHandler = null;
 
 /**
  * Inject or reset a custom/mock Camoufox module implementation (used by isolation tests).
@@ -1122,6 +1125,7 @@ export async function startProfile(profileId, options = {}) {
             };
 
             activeProfiles.set(profileId, session);
+            registerProcessCleanupHooks();
 
             logger.info('Camoufox profile started', {
                 profileId,
@@ -1301,6 +1305,104 @@ export async function updateProfileProxy(profileIds, proxy, options = {}) {
     };
 }
 
+/**
+ * Return an array of all currently active Camoufox profile IDs.
+ */
+export function getActiveProfileIds() {
+    return Array.from(activeProfiles.keys());
+}
+
+/**
+ * Gracefully stop all active Camoufox profiles concurrently, flushing each profile's
+ * traffic recorder (`attribution-index.json`), syncing `_shared_sslkeylog.txt`,
+ * persisting `storage-state.json`, and closing any shared Camoufox browser instance.
+ */
+export async function stopAllActiveProfiles(reason = 'shutdown') {
+    if (pendingProfileStarts.size > 0) {
+        await Promise.allSettled(Array.from(pendingProfileStarts.values()));
+    }
+
+    const profileIds = Array.from(activeProfiles.keys());
+    if (profileIds.length > 0) {
+        logger.info('Stopping all active Camoufox profiles', {
+            reason,
+            count: profileIds.length,
+            profileIds
+        });
+    }
+
+    const results = await Promise.allSettled(
+        profileIds.map((profileId) => stopProfile(profileId))
+    );
+    const stoppedCount = results.filter(
+        (res) => res.status === 'fulfilled' && res.value !== false
+    ).length;
+
+    await closeSharedBrowser();
+
+    return {
+        stoppedCount,
+        profileIds,
+        reason
+    };
+}
+
+/**
+ * Idempotently register process SIGINT and SIGTERM cleanup listeners to flush
+ * active Camoufox profiles and shared browsers before termination.
+ */
+export function registerProcessCleanupHooks() {
+    if (cleanupHooksRegistered) {
+        return false;
+    }
+
+    sigintCleanupHandler = () => {
+        if (activeProfiles.size > 0 || sharedBrowserPool.size > 0) {
+            stopAllActiveProfiles('SIGINT').catch((error) => {
+                logger.warn('Error flushing active Camoufox profiles on SIGINT', {
+                    error: error.message
+                });
+            });
+        }
+    };
+
+    sigtermCleanupHandler = () => {
+        if (activeProfiles.size > 0 || sharedBrowserPool.size > 0) {
+            stopAllActiveProfiles('SIGTERM').catch((error) => {
+                logger.warn('Error flushing active Camoufox profiles on SIGTERM', {
+                    error: error.message
+                });
+            });
+        }
+    };
+
+    process.on('SIGINT', sigintCleanupHandler);
+    process.on('SIGTERM', sigtermCleanupHandler);
+    cleanupHooksRegistered = true;
+    return true;
+}
+
+/**
+ * Unregister process SIGINT and SIGTERM cleanup listeners (useful for test suites).
+ */
+export function unregisterProcessCleanupHooks() {
+    if (!cleanupHooksRegistered) {
+        return false;
+    }
+
+    if (sigintCleanupHandler) {
+        process.off('SIGINT', sigintCleanupHandler);
+        sigintCleanupHandler = null;
+    }
+    if (sigtermCleanupHandler) {
+        process.off('SIGTERM', sigtermCleanupHandler);
+        sigtermCleanupHandler = null;
+    }
+
+    cleanupHooksRegistered = false;
+    return true;
+}
+
 export default {
     setCamoufoxModule,
     resolveCamoufoxModule,
@@ -1324,5 +1426,9 @@ export default {
     deleteProfile,
     getProfile,
     listProfiles,
-    updateProfileProxy
+    updateProfileProxy,
+    getActiveProfileIds,
+    stopAllActiveProfiles,
+    registerProcessCleanupHooks,
+    unregisterProcessCleanupHooks
 };

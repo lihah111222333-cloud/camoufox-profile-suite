@@ -31,7 +31,11 @@ import {
     closeSharedBrowser
 } from '../src/camoufox/client.js';
 import { CamoufoxProfile, createAndStartProfile } from '../src/camoufox/profile.js';
-import { CamoufoxTrafficRecorder, redactProxyUrl } from '../src/camoufox/traffic-recorder.js';
+import {
+    CamoufoxTrafficRecorder,
+    redactProxyUrl,
+    verifyTrafficIntegrity
+} from '../src/camoufox/traffic-recorder.js';
 import { detectGmailPage } from '../src/gmail/page-detector.js';
 import { queryProfileTraffic } from './query-traffic-attribution.js';
 
@@ -1522,6 +1526,251 @@ async function runTests() {
 
                 await sharedProfile.delete();
                 await closeSharedBrowser();
+            }
+        );
+
+        // =========================================================================
+        // Test 9: Tamper-Evident SHA-256 Hash Chain, Payload Integrity Verification & Proxy-Authorization Redaction
+        // =========================================================================
+        await testSection(
+            'Test 9: Tamper-Evident SHA-256 Hash Chain, Payload Integrity Verification & Proxy-Authorization Redaction',
+            async () => {
+                const profile = await createAndStartProfile(
+                    'Traffic_Test_9_Integrity',
+                    'http://10.99.0.1:8080:proxyUser9:proxySecret9',
+                    {
+                        profileId: 'traffic-test-9-integrity',
+                        os: 'windows',
+                        profilesDir: tempProfilesDir,
+                        useSharedBrowser: false,
+                        accountId: 'acct-integrity-9',
+                        accountEmail: 'integrity9@gmail.com'
+                    }
+                );
+
+                const page = await profile.getPage();
+                const context = await profile.getContext();
+
+                profile.setTrafficStep('step-9-authenticated-submit');
+                await page.click('#secure-submit');
+
+                const proxySecretBase64 = 'dXNlcjpzZWNyZXQ=';
+                const thirdPartyApiKey = 'omo_live_secret_api_key_99999';
+                const reqBody9 = JSON.stringify({
+                    email: 'integrity9@gmail.com',
+                    action: 'verify_chain'
+                });
+                const resBody9 = JSON.stringify({
+                    status: 'VERIFIED_OK',
+                    step: 'step-9-authenticated-submit'
+                });
+
+                const req9 = createMockRequest({
+                    method: 'POST',
+                    url: 'https://accounts.google.com/v3/signin/challenge/verify?hl=en',
+                    headersArray: [
+                        { name: 'Host', value: 'accounts.google.com' },
+                        { name: 'Proxy-Authorization', value: `Basic ${proxySecretBase64}` },
+                        { name: 'X-Proxy-Authorization', value: `Bearer ${proxySecretBase64}` },
+                        { name: 'X-Api-Key', value: thirdPartyApiKey },
+                        { name: 'Omocaptcha-Key', value: thirdPartyApiKey },
+                        { name: 'Content-Type', value: 'application/json' }
+                    ],
+                    postData: reqBody9
+                });
+
+                const res9 = createMockResponse({
+                    request: req9,
+                    status: 200,
+                    statusText: 'OK',
+                    headersArray: [
+                        { name: 'Content-Type', value: 'application/json; charset=utf-8' },
+                        { name: 'X-Frame-Options', value: 'SAMEORIGIN' }
+                    ],
+                    body: resBody9
+                });
+
+                await emitHttpTransaction(context, req9, res9);
+                await profile.stop();
+                const summary = JSON.parse(
+                    fs.readFileSync(profile.trafficPaths.attributionIndexPath, 'utf8')
+                );
+
+                const trafficDir = profile.trafficPaths.trafficDir;
+                const ndjsonPath = profile.trafficPaths.trafficNdjsonPath;
+                const wireLogPath = profile.trafficPaths.preTlsWireLogPath;
+
+                const ndjsonRaw = fs.readFileSync(ndjsonPath, 'utf8');
+                const wireLogRaw = fs.readFileSync(wireLogPath, 'utf8');
+
+                // 1) Verify Proxy-Authorization and third-party API keys are redacted in both traffic.ndjson and pre-tls-wire.log
+                assert.equal(
+                    ndjsonRaw.includes(proxySecretBase64),
+                    false,
+                    'Proxy-Authorization credentials must never leak into traffic.ndjson'
+                );
+                assert.equal(
+                    wireLogRaw.includes(proxySecretBase64),
+                    false,
+                    'Proxy-Authorization credentials must never leak into pre-tls-wire.log'
+                );
+                assert.equal(
+                    ndjsonRaw.includes(thirdPartyApiKey),
+                    false,
+                    'Third-party API keys must never leak into traffic.ndjson'
+                );
+                assert.equal(
+                    wireLogRaw.includes(thirdPartyApiKey),
+                    false,
+                    'Third-party API keys must never leak into pre-tls-wire.log'
+                );
+                assert.equal(
+                    wireLogRaw.includes('Proxy-Authorization: Basic [REDACTED]'),
+                    true,
+                    'Expected pre-tls-wire.log to show Proxy-Authorization: Basic [REDACTED]'
+                );
+
+                const events = readNdjsonFile(ndjsonPath);
+                const egress9 = events.find((e) => e.type === 'egress');
+                assert.ok(egress9, 'Expected egress event in traffic.ndjson');
+                assert.equal(egress9.headers['proxy-authorization'], 'Basic [REDACTED]');
+                assert.equal(egress9.headers['x-proxy-authorization'], 'Bearer [REDACTED]');
+                assert.equal(egress9.headers['x-api-key'], '[REDACTED]');
+                assert.equal(egress9.headers['omocaptcha-key'], '[REDACTED]');
+                const proxyAuthArrEntry = egress9.headersArray.find(
+                    (h) => h.name === 'Proxy-Authorization'
+                );
+                assert.ok(proxyAuthArrEntry);
+                assert.equal(proxyAuthArrEntry.value, 'Basic [REDACTED]');
+
+                // 2) Verify SHA-256 hash chain structure in traffic.ndjson and summary.integrity
+                assert.ok(summary.integrity, 'Expected integrity section in attribution-index.json');
+                assert.equal(summary.integrity.algorithm, 'sha256-chain');
+                assert.equal(summary.integrity.genesisHash, '0'.repeat(64));
+                assert.equal(summary.integrity.eventCount, events.length);
+                assert.equal(summary.integrity.payloadCount, 2);
+
+                let expectedPrevHash = '0'.repeat(64);
+                for (const ev of events) {
+                    assert.equal(ev.prevEventHash, expectedPrevHash);
+                    assert.equal(typeof ev.eventHash, 'string');
+                    assert.equal(ev.eventHash.length, 64);
+                    expectedPrevHash = ev.eventHash;
+                }
+                assert.equal(summary.integrity.chainHeadHash, expectedPrevHash);
+
+                // 3) Verify verifyTrafficIntegrity(trafficDir) and CLI --verify-integrity pass on untampered data
+                const validCheck = verifyTrafficIntegrity(trafficDir);
+                assert.equal(validCheck.valid, true, `Expected valid integrity, got errors: ${validCheck.errors.join('; ')}`);
+                assert.equal(validCheck.eventCount, events.length);
+                assert.equal(validCheck.verifiedPayloads, 2);
+                assert.equal(validCheck.chainHeadHash, summary.integrity.chainHeadHash);
+                assert.equal(validCheck.errors.length, 0);
+
+                const queryCheck = queryProfileTraffic({
+                    profilesDir: tempProfilesDir,
+                    profile: 'traffic-test-9-integrity',
+                    verifyIntegrity: true
+                });
+                assert.equal(queryCheck.mode, 'verify-integrity');
+                assert.equal(queryCheck.valid, true);
+                assert.equal(queryCheck.verifiedPayloads, 2);
+
+                const cliScriptPath = path.join(__dirname, 'query-traffic-attribution.js');
+                const cliValidOut = execFileSync(
+                    process.execPath,
+                    [
+                        cliScriptPath,
+                        `--profiles-dir=${tempProfilesDir}`,
+                        '--profile=traffic-test-9-integrity',
+                        '--verify-integrity',
+                        '--json'
+                    ],
+                    { encoding: 'utf8' }
+                );
+                const cliValidJson = JSON.parse(cliValidOut);
+                assert.equal(cliValidJson.valid, true);
+                assert.equal(cliValidJson.verifiedPayloads, 2);
+
+                // 4) Tamper with 1 byte in a payload file and verify detection
+                const payloadRelPath = egress9.payloadFile;
+                const payloadFullPath = path.join(trafficDir, payloadRelPath);
+                const originalPayloadBuf = fs.readFileSync(payloadFullPath);
+                const tamperedPayloadBuf = Buffer.from(originalPayloadBuf);
+                tamperedPayloadBuf[0] = tamperedPayloadBuf[0] ^ 0xff;
+                fs.writeFileSync(payloadFullPath, tamperedPayloadBuf);
+
+                const payloadTamperCheck = verifyTrafficIntegrity(trafficDir);
+                assert.equal(payloadTamperCheck.valid, false);
+                assert.ok(payloadTamperCheck.errors.length >= 1);
+                assert.equal(
+                    payloadTamperCheck.errors.some((e) => e.includes('Payload SHA-256 mismatch')),
+                    true
+                );
+
+                // Verify CLI --verify-integrity exits with non-zero code (1) on payload tampering
+                let cliPayloadExitCode = 0;
+                try {
+                    execFileSync(
+                        process.execPath,
+                        [
+                            cliScriptPath,
+                            `--profiles-dir=${tempProfilesDir}`,
+                            '--profile=traffic-test-9-integrity',
+                            '--verify-integrity',
+                            '--json'
+                        ],
+                        { encoding: 'utf8', stdio: 'pipe' }
+                    );
+                } catch (err) {
+                    cliPayloadExitCode = err.status;
+                    const errJson = JSON.parse(err.stdout);
+                    assert.equal(errJson.valid, false);
+                    assert.ok(errJson.errors.length >= 1);
+                }
+                assert.equal(cliPayloadExitCode, 1, 'Expected CLI --verify-integrity to exit with code 1 on payload tampering');
+
+                // Restore payload file and verify integrity is valid again
+                fs.writeFileSync(payloadFullPath, originalPayloadBuf);
+                assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+
+                // 5) Tamper with 1 field in traffic.ndjson and verify hash-chain detection
+                const tamperedEvents = events.map((ev, idx) =>
+                    idx === 0 ? { ...ev, actionStep: 'tampered-step-name' } : ev
+                );
+                fs.writeFileSync(
+                    ndjsonPath,
+                    `${tamperedEvents.map((e) => JSON.stringify(e)).join('\n')}\n`,
+                    'utf8'
+                );
+
+                const chainTamperCheck = verifyTrafficIntegrity(trafficDir);
+                assert.equal(chainTamperCheck.valid, false);
+                assert.ok(chainTamperCheck.errors.length >= 1);
+                assert.equal(
+                    chainTamperCheck.errors.some((e) => e.includes('eventHash mismatch')),
+                    true
+                );
+
+                let cliChainExitCode = 0;
+                try {
+                    execFileSync(
+                        process.execPath,
+                        [
+                            cliScriptPath,
+                            `--profiles-dir=${tempProfilesDir}`,
+                            '--profile=traffic-test-9-integrity',
+                            '--verify-integrity'
+                        ],
+                        { encoding: 'utf8', stdio: 'pipe' }
+                    );
+                } catch (err) {
+                    cliChainExitCode = err.status;
+                    assert.equal(err.stdout.includes('INVALID'), true);
+                }
+                assert.equal(cliChainExitCode, 1, 'Expected CLI --verify-integrity to exit with code 1 on NDJSON tampering');
+
+                await profile.delete();
             }
         );
 

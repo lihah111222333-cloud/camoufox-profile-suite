@@ -47,7 +47,20 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
             availWidth: 1920,
             availHeight: 1040,
             webglVendor: 'Google Inc. (NVIDIA)',
-            webglRenderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)'
+            webglRenderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)',
+            candidatePorts: [54321, 61042],
+            speechVoices: [
+                {
+                    name: 'Microsoft David Desktop - English (United States)',
+                    lang: 'en-US',
+                    voiceURI: 'urn:moz-tts:sapi:Microsoft David Desktop - English (United States)?en-US'
+                },
+                {
+                    name: 'Microsoft Zira Desktop - English (United States)',
+                    lang: 'en-US',
+                    voiceURI: 'urn:moz-tts:sapi:Microsoft Zira Desktop - English (United States)?en-US'
+                }
+            ]
         },
         macos: {
             userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0',
@@ -61,7 +74,20 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
             availWidth: 1512,
             availHeight: 944,
             webglVendor: 'Apple',
-            webglRenderer: 'Apple M2 Pro'
+            webglRenderer: 'Apple M2 Pro',
+            candidatePorts: [51234, 59876],
+            speechVoices: [
+                {
+                    name: 'Samantha',
+                    lang: 'en-US',
+                    voiceURI: 'com.apple.speech.synthesis.voice.samantha'
+                },
+                {
+                    name: 'Alex',
+                    lang: 'en-US',
+                    voiceURI: 'com.apple.speech.synthesis.voice.Alex'
+                }
+            ]
         },
         linux: {
             userAgent: 'Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0',
@@ -75,7 +101,15 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
             availWidth: 1920,
             availHeight: 1052,
             webglVendor: 'Intel',
-            webglRenderer: 'Mesa Intel(R) UHD Graphics 620 (KBL GT2)'
+            webglRenderer: 'Mesa Intel(R) UHD Graphics 620 (KBL GT2)',
+            candidatePorts: [42100, 55120],
+            speechVoices: [
+                {
+                    name: 'English (America)',
+                    lang: 'en-US',
+                    voiceURI: 'urn:moz-tts:speechd:English%20(America)?en'
+                }
+            ]
         }
     };
 
@@ -185,7 +219,15 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
             calendar: 'gregory',
             numberingSystem: 'latn',
             timezoneOffsetMinutes: 300
-        }
+        },
+        automationGlobals: [],
+        webrtc: {
+            available: true,
+            candidatePorts: p.candidatePorts,
+            candidateIps: ['203.0.113.45'],
+            privateIpLeaked: false
+        },
+        speechVoices: p.speechVoices
     };
 }
 

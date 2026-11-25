@@ -31,7 +31,11 @@ import camoufoxClient, {
     updateProfileProxy,
     closeSharedBrowser,
     getStorageStatePath,
-    getProfileMetadataPath
+    getProfileMetadataPath,
+    getActiveProfileIds,
+    stopAllActiveProfiles,
+    registerProcessCleanupHooks,
+    unregisterProcessCleanupHooks
 } from '../src/camoufox/client.js';
 import { CamoufoxProfile, createAndStartProfile } from '../src/camoufox/profile.js';
 
@@ -90,6 +94,7 @@ function createMockCamoufoxEngine() {
         const contextId = ++contextIdSeq;
         let closed = false;
         const pages = [];
+        const listeners = new Map();
         // Deep-isolated per-context cookie jar and origin localStorage map
         let cookieJar = [];
         const originStorage = new Map();
@@ -120,6 +125,23 @@ function createMockCamoufoxEngine() {
             options: { ...contextOptions },
             isClosed: () => closed,
             pages: () => pages.filter((p) => !p.isClosed()),
+            on(event, handler) {
+                if (!listeners.has(event)) {
+                    listeners.set(event, []);
+                }
+                listeners.get(event).push(handler);
+            },
+            off(event, handler) {
+                const arr = listeners.get(event);
+                if (!arr) return;
+                const idx = arr.indexOf(handler);
+                if (idx >= 0) arr.splice(idx, 1);
+            },
+            emit(event, ...args) {
+                for (const fn of [...(listeners.get(event) || [])]) {
+                    fn(...args);
+                }
+            },
             async newPage() {
                 if (closed) {
                     throw new Error(`Cannot create page in closed BrowserContext #${contextId}`);
@@ -739,8 +761,171 @@ async function runTests() {
             }
         );
 
+        // =========================================================================
+        // 6. Emergency Shutdown & Batch Flush (`stopAllActiveProfiles` & `getActiveProfileIds`)
+        // =========================================================================
+        await testSection(
+            'Emergency shutdown & batch flush (stopAllActiveProfiles, getActiveProfileIds & cleanup hooks)',
+            async () => {
+                assert.deepEqual(getActiveProfileIds(), []);
+
+                // Verify idempotent registration and unregistration of process cleanup hooks
+                unregisterProcessCleanupHooks();
+                assert.equal(registerProcessCleanupHooks(), true);
+                assert.equal(registerProcessCleanupHooks(), false);
+                assert.equal(unregisterProcessCleanupHooks(), true);
+                assert.equal(unregisterProcessCleanupHooks(), false);
+
+                // Launch 3 concurrent profiles (Shutdown_Win, Shutdown_Mac, Shutdown_Lin)
+                const [shutdownWin, shutdownMac, shutdownLin] = await Promise.all([
+                    createAndStartProfile('Shutdown_Win', 'http://10.30.1.1:8080', {
+                        profileId: 'Shutdown_Win',
+                        os: 'windows',
+                        profilesDir: tempProfilesDir,
+                        useSharedBrowser: false
+                    }),
+                    createAndStartProfile('Shutdown_Mac', 'socks5://u:p@10.30.2.2:1080', {
+                        profileId: 'Shutdown_Mac',
+                        os: 'macos',
+                        profilesDir: tempProfilesDir,
+                        useSharedBrowser: false
+                    }),
+                    createAndStartProfile('Shutdown_Lin', 'http://[::1]:8085', {
+                        profileId: 'Shutdown_Lin',
+                        os: 'linux',
+                        profilesDir: tempProfilesDir,
+                        useSharedBrowser: true
+                    })
+                ]);
+
+                // Starting a profile automatically ensures process cleanup hooks are registered
+                assert.equal(registerProcessCleanupHooks(), false);
+
+                const activeIds = getActiveProfileIds();
+                assert.equal(activeIds.length, 3);
+                assert.deepEqual(
+                    [...activeIds].sort(),
+                    ['Shutdown_Lin', 'Shutdown_Mac', 'Shutdown_Win']
+                );
+
+                // Write cookies, localStorage, and emit pre-TLS traffic events in each active profile
+                const activeProfilesList = [
+                    { profile: shutdownWin, id: 'Shutdown_Win', tag: 'WIN' },
+                    { profile: shutdownMac, id: 'Shutdown_Mac', tag: 'MAC' },
+                    { profile: shutdownLin, id: 'Shutdown_Lin', tag: 'LIN' }
+                ];
+
+                for (const { profile, id, tag } of activeProfilesList) {
+                    await profile.context.addCookies([
+                        {
+                            name: 'SID',
+                            value: `sid_emergency_${tag}`,
+                            domain: '.google.com',
+                            path: '/'
+                        }
+                    ]);
+                    const page = await profile.getPage();
+                    await page.setLocalStorageItem(
+                        'https://accounts.google.com',
+                        'emergency_state',
+                        `flushed_${tag}`
+                    );
+
+                    // Emit a synthetic pre-TLS request/response cycle on the context
+                    profile.trafficRecorder.setStep(`signup_${tag.toLowerCase()}`);
+                    profile.trafficRecorder.recordTriggerAction(
+                        'page.goto',
+                        `https://accounts.google.com/signup?profile=${id}`
+                    );
+
+                    const mockReq = {
+                        method: () => 'POST',
+                        url: () => `https://accounts.google.com/_/signup/validate?profile=${id}`,
+                        resourceType: () => 'fetch',
+                        isNavigationRequest: () => false,
+                        headers: () => ({ 'content-type': 'application/json' }),
+                        headersArray: async () => [
+                            { name: 'content-type', value: 'application/json' }
+                        ],
+                        postDataBuffer: () =>
+                            Buffer.from(JSON.stringify({ profileId: id, tag }), 'utf8')
+                    };
+                    const mockRes = {
+                        request: () => mockReq,
+                        url: () => `https://accounts.google.com/_/signup/validate?profile=${id}`,
+                        status: () => 200,
+                        statusText: () => 'OK',
+                        headers: () => ({ 'content-type': 'application/json' }),
+                        headersArray: async () => [
+                            { name: 'content-type', value: 'application/json' }
+                        ],
+                        body: async () =>
+                            Buffer.from(JSON.stringify({ ok: true, profileId: id }), 'utf8'),
+                        serverAddr: async () => ({ ipAddress: '142.250.80.109', port: 443 }),
+                        securityDetails: async () => ({ protocol: 'TLS 1.3' })
+                    };
+
+                    profile.context.emit('request', mockReq);
+                    profile.context.emit('response', mockRes);
+                    profile.context.emit('requestfinished', mockReq);
+                }
+
+                // Trigger emergency batch shutdown across all 3 active profiles
+                const shutdownSummary = await stopAllActiveProfiles('test-emergency-shutdown');
+                assert.equal(shutdownSummary.reason, 'test-emergency-shutdown');
+                assert.equal(shutdownSummary.stoppedCount, 3);
+                assert.deepEqual(
+                    [...shutdownSummary.profileIds].sort(),
+                    ['Shutdown_Lin', 'Shutdown_Mac', 'Shutdown_Win']
+                );
+
+                // Verify getActiveProfileIds() is now empty
+                assert.deepEqual(getActiveProfileIds(), []);
+
+                // Verify all underlying mock contexts and browsers were closed
+                for (const { profile } of activeProfilesList) {
+                    assert.equal(profile.context.isClosed(), true);
+                    assert.equal(profile.browser.isConnected(), false);
+                }
+
+                // Verify all 3 profiles flushed storage-state.json and traffic/attribution-index.json to disk
+                for (const { id, tag } of activeProfilesList) {
+                    const storagePath = getStorageStatePath(id, tempProfilesDir);
+                    assert.equal(fs.existsSync(storagePath), true);
+                    const savedState = JSON.parse(fs.readFileSync(storagePath, 'utf8'));
+                    assert.equal(
+                        savedState.cookies.find((c) => c.name === 'SID')?.value,
+                        `sid_emergency_${tag}`
+                    );
+                    const googleOrigin = savedState.origins.find(
+                        (o) => o.origin === 'https://accounts.google.com'
+                    );
+                    assert.equal(
+                        googleOrigin?.localStorage?.find((kv) => kv.name === 'emergency_state')
+                            ?.value,
+                        `flushed_${tag}`
+                    );
+
+                    const attributionPath = path.join(
+                        tempProfilesDir,
+                        id,
+                        'traffic',
+                        'attribution-index.json'
+                    );
+                    assert.equal(fs.existsSync(attributionPath), true);
+                    const attributionReport = JSON.parse(fs.readFileSync(attributionPath, 'utf8'));
+                    assert.equal(attributionReport.session.profileId, id);
+                    assert.equal(attributionReport.totals.totalRequests, 1);
+                    assert.equal(attributionReport.totals.totalResponses, 1);
+                }
+
+                unregisterProcessCleanupHooks();
+            }
+        );
+
         console.log(`\n🎉 All ${passedTests} Camoufox multi-context isolation & storage test suites passed!`);
     } finally {
+        unregisterProcessCleanupHooks();
         setCamoufoxModule(null);
         fs.rmSync(tempProfilesDir, { recursive: true, force: true });
     }

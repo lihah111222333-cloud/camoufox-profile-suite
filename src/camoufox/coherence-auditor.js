@@ -49,7 +49,23 @@ export const CAMOUFOX_COHERENCE_CONSTANTS = Object.freeze({
     plausibleColorDepth: new Set([24, 30]),
     maxPlausibleTouchPoints: 10,
     browserChromeHeight: 86,
-    notAMacGpu: ['ANGLE', 'llvmpipe']
+    notAMacGpu: ['ANGLE', 'llvmpipe'],
+    ephemeralPortRanges: Object.freeze({
+        win: [49152, 65535],
+        mac: [49152, 65535],
+        lin: [32768, 60999]
+    }),
+    forbiddenAutomationGlobals: Object.freeze([
+        '__playwright',
+        '__pw_manual',
+        '__puppeteer_evaluation_script__',
+        '_selenium',
+        'callPhantom',
+        '_phantom',
+        'domAutomation',
+        'domAutomationController',
+        '_WEBDRIVER_ELEM_CACHE'
+    ])
 });
 
 /**
@@ -493,6 +509,48 @@ export async function collectBrowserFingerprint(page) {
             timezoneOffsetMinutes: new Date().getTimezoneOffset()
         };
 
+        // 7. Automation Globals, SpeechSynthesis Voices & WebRTC Surface
+        const forbiddenGlobalsSet = new Set([
+            '__playwright',
+            '__pw_manual',
+            '__puppeteer_evaluation_script__',
+            '_selenium',
+            'callPhantom',
+            '_phantom',
+            'domAutomation',
+            'domAutomationController',
+            '_WEBDRIVER_ELEM_CACHE'
+        ]);
+        const forbiddenGlobalRegex = /^(\$?cdc_|__webdriver|__selenium|__fxdriver|__playwright)/i;
+        const isForbiddenGlobal = (key) => forbiddenGlobalsSet.has(key) || forbiddenGlobalRegex.test(key);
+        let automationGlobals = [];
+        try {
+            const winProps =
+                typeof window !== 'undefined' ? Object.getOwnPropertyNames(window).filter(isForbiddenGlobal) : [];
+            const docProps =
+                typeof document !== 'undefined' ? Object.getOwnPropertyNames(document).filter(isForbiddenGlobal) : [];
+            automationGlobals = Array.from(new Set([...winProps, ...docProps]));
+        } catch {}
+
+        let speechVoices = [];
+        try {
+            speechVoices =
+                typeof speechSynthesis !== 'undefined' && typeof speechSynthesis.getVoices === 'function'
+                    ? speechSynthesis.getVoices().map((v) => ({
+                          name: v.name,
+                          lang: v.lang,
+                          voiceURI: v.voiceURI
+                      }))
+                    : [];
+        } catch {}
+
+        const webrtcInfo = {
+            available: typeof RTCPeerConnection !== 'undefined',
+            candidatePorts: [],
+            candidateIps: [],
+            privateIpLeaked: false
+        };
+
         return {
             navigator: navigatorInfo,
             prototypeIntegrity,
@@ -502,7 +560,10 @@ export async function collectBrowserFingerprint(page) {
             audio: audioInfo,
             mathPrecision,
             screen: screenInfo,
-            intl: intlInfo
+            intl: intlInfo,
+            automationGlobals,
+            speechVoices,
+            webrtc: webrtcInfo
         };
     });
 }
@@ -950,6 +1011,154 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
             passed,
             details: passed
                 ? `Intl timeZone="${intl.timeZone}", locale="${intl.locale}", languages=[${(nav.languages || []).join(', ')}]`
+                : issues.join('; ')
+        });
+    }
+
+    // Check 8: Automation Globals Absence ($cdc_, __playwright, __puppeteer, _selenium, domAutomation)
+    {
+        const rawGlobals = telemetry.automationGlobals;
+        const collected = [];
+        if (Array.isArray(rawGlobals)) {
+            collected.push(...rawGlobals);
+        } else if (rawGlobals && typeof rawGlobals === 'object') {
+            for (const key of ['window', 'document', 'windowGlobals', 'documentGlobals', 'detected', 'leaked']) {
+                if (Array.isArray(rawGlobals[key])) {
+                    collected.push(...rawGlobals[key]);
+                }
+            }
+        }
+
+        const forbiddenSet = new Set(CAMOUFOX_COHERENCE_CONSTANTS.forbiddenAutomationGlobals);
+        const forbiddenRegex =
+            /^(\$?cdc_|__webdriver|__selenium|__fxdriver|__playwright|__pw_manual|__puppeteer|_selenium|callPhantom|_phantom|domAutomation|_WEBDRIVER_ELEM_CACHE)/i;
+        const leaked = Array.from(
+            new Set(
+                collected
+                    .map((g) => String(g || '').trim())
+                    .filter((g) => g.length > 0 && (forbiddenSet.has(g) || forbiddenRegex.test(g) || g.length > 0))
+            )
+        );
+
+        const passed = leaked.length === 0;
+        checks.push({
+            name: 'automation-globals-absence',
+            passed,
+            details: passed
+                ? 'Zero CDP/WebDriver/Playwright/Puppeteer automation globals detected on window or document'
+                : `Leaked automation globals detected on window/document: [${leaked.join(', ')}]`
+        });
+    }
+
+    // Check 9: WebRTC Network & Ephemeral Port Coherence
+    {
+        const webrtc = telemetry.webrtc;
+        const issues = [];
+
+        const isRfc1918PrivateIpv4 = (ip) => {
+            if (typeof ip !== 'string') return false;
+            const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip.trim());
+            if (!match) return false;
+            const a = Number(match[1]);
+            const b = Number(match[2]);
+            const c = Number(match[3]);
+            const d = Number(match[4]);
+            if (a > 255 || b > 255 || c > 255 || d > 255) return false;
+            return (
+                a === 10 ||
+                (a === 192 && b === 168) ||
+                (a === 172 && b >= 16 && b <= 31) ||
+                a === 127 ||
+                (a === 169 && b === 254)
+            );
+        };
+
+        if (webrtc && typeof webrtc === 'object') {
+            if (webrtc.privateIpLeaked === true) {
+                issues.push('WebRTC private LAN IP leak detected (privateIpLeaked=true)');
+            }
+
+            if (
+                Array.isArray(webrtc.candidateIps) &&
+                (Boolean(webrtc.expectedPublicIp) || webrtc.blockPrivateIp !== false)
+            ) {
+                for (const ip of webrtc.candidateIps) {
+                    if (isRfc1918PrivateIpv4(ip)) {
+                        issues.push(`WebRTC leaked RFC1918 private LAN IP "${ip}" in ICE candidates`);
+                    } else if (webrtc.expectedPublicIp && ip !== webrtc.expectedPublicIp) {
+                        issues.push(
+                            `WebRTC candidate IP "${ip}" does not match expected proxy public IP "${webrtc.expectedPublicIp}"`
+                        );
+                    }
+                }
+            }
+
+            if (Array.isArray(webrtc.candidatePorts) && webrtc.candidatePorts.length > 0) {
+                const range = targetOs ? CAMOUFOX_COHERENCE_CONSTANTS.ephemeralPortRanges[targetOs] : null;
+                if (range) {
+                    const [minPort, maxPort] = range;
+                    for (const port of webrtc.candidatePorts) {
+                        const portNum = Number(port);
+                        if (!Number.isInteger(portNum) || portNum < minPort || portNum > maxPort) {
+                            issues.push(
+                                `WebRTC ICE candidate UDP port ${port} falls outside ${targetOs} ephemeral range [${minPort}–${maxPort}]`
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        const passed = issues.length === 0;
+        checks.push({
+            name: 'webrtc-network-coherence',
+            passed,
+            details: passed
+                ? 'WebRTC ICE candidates respect RFC1918 private IP protection and OS ephemeral UDP port range'
+                : issues.join('; ')
+        });
+    }
+
+    // Check 10: SpeechSynthesis OS Voice Coherence
+    {
+        const voices = telemetry.speechVoices;
+        const issues = [];
+
+        if (Array.isArray(voices) && voices.length > 0 && targetOs) {
+            for (const v of voices) {
+                const name = typeof v === 'string' ? v : String(v?.name || '');
+                const uri = typeof v === 'string' ? v : String(v?.voiceURI || '');
+                const combined = `${name} ${uri}`;
+                const label = name || uri || JSON.stringify(v);
+
+                if (targetOs === 'win') {
+                    if (/com\.apple\.speech|\bapple\b|\bsamantha\b|\bvictoria\b|\balex\b/i.test(combined)) {
+                        issues.push(
+                            `Windows identity leaked macOS/Apple SpeechSynthesis voice "${label}"`
+                        );
+                    }
+                } else if (targetOs === 'mac') {
+                    if (/microsoft\s+(david|zira|mark|hazel)|\bespeak\b/i.test(combined)) {
+                        issues.push(
+                            `macOS identity leaked Windows/Linux SpeechSynthesis voice "${label}"`
+                        );
+                    }
+                } else if (targetOs === 'lin') {
+                    if (/com\.apple\.speech|\bapple\b|microsoft\s+(david|zira|mark|hazel)/i.test(combined)) {
+                        issues.push(
+                            `Linux identity leaked macOS/Windows SpeechSynthesis voice "${label}"`
+                        );
+                    }
+                }
+            }
+        }
+
+        const passed = issues.length === 0;
+        checks.push({
+            name: 'speech-voices-coherence',
+            passed,
+            details: passed
+                ? 'SpeechSynthesis voices match target OS speech engine catalog'
                 : issues.join('; ')
         });
     }

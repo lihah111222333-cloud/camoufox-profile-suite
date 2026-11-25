@@ -47,7 +47,20 @@ function buildCoherentTelemetry(os = 'windows') {
             availWidth: 1920,
             availHeight: 1040,
             unmaskedVendor: 'Google Inc. (NVIDIA)',
-            unmaskedRenderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)'
+            unmaskedRenderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)',
+            candidatePorts: [54321, 61042],
+            speechVoices: [
+                {
+                    name: 'Microsoft David Desktop - English (United States)',
+                    lang: 'en-US',
+                    voiceURI: 'urn:moz-tts:sapi:Microsoft David Desktop - English (United States)?en-US'
+                },
+                {
+                    name: 'Microsoft Zira Desktop - English (United States)',
+                    lang: 'en-US',
+                    voiceURI: 'urn:moz-tts:sapi:Microsoft Zira Desktop - English (United States)?en-US'
+                }
+            ]
         },
         macos: {
             userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0',
@@ -61,7 +74,20 @@ function buildCoherentTelemetry(os = 'windows') {
             availWidth: 1512,
             availHeight: 944,
             unmaskedVendor: 'Apple',
-            unmaskedRenderer: 'Apple M2 Pro'
+            unmaskedRenderer: 'Apple M2 Pro',
+            candidatePorts: [51234, 59876],
+            speechVoices: [
+                {
+                    name: 'Samantha',
+                    lang: 'en-US',
+                    voiceURI: 'com.apple.speech.synthesis.voice.samantha'
+                },
+                {
+                    name: 'Alex',
+                    lang: 'en-US',
+                    voiceURI: 'com.apple.speech.synthesis.voice.Alex'
+                }
+            ]
         },
         linux: {
             userAgent: 'Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0',
@@ -75,7 +101,15 @@ function buildCoherentTelemetry(os = 'windows') {
             availWidth: 1920,
             availHeight: 1052,
             unmaskedVendor: 'Intel',
-            unmaskedRenderer: 'Mesa Intel(R) UHD Graphics 620 (KBL GT2)'
+            unmaskedRenderer: 'Mesa Intel(R) UHD Graphics 620 (KBL GT2)',
+            candidatePorts: [42100, 55120],
+            speechVoices: [
+                {
+                    name: 'English (America)',
+                    lang: 'en-US',
+                    voiceURI: 'urn:moz-tts:speechd:English%20(America)?en'
+                }
+            ]
         }
     };
 
@@ -216,7 +250,15 @@ function buildCoherentTelemetry(os = 'windows') {
             calendar: 'gregory',
             numberingSystem: 'latn',
             timezoneOffsetMinutes: 300
-        }
+        },
+        automationGlobals: [],
+        webrtc: {
+            available: true,
+            candidatePorts: p.candidatePorts,
+            candidateIps: ['203.0.113.45'],
+            privateIpLeaked: false
+        },
+        speechVoices: p.speechVoices
     };
 }
 
@@ -234,7 +276,7 @@ const tests = [
             const res = evaluatePlatformCoherence(telemetry, 'windows');
             assert.equal(res.passed, true);
             assert.equal(res.score, 100);
-            assert.equal(res.checks.length, 7);
+            assert.equal(res.checks.length, 10);
             assert.ok(res.checks.every((c) => c.passed));
         }
     },
@@ -528,7 +570,115 @@ const tests = [
             assert.equal(report.passed, true);
             assert.equal(report.score, 100);
             assert.equal(report.expectedOs, 'mac');
-            assert.equal(report.checks.length, 7);
+            assert.equal(report.checks.length, 10);
+        }
+    },
+    {
+        name: '23. Detects leaked $cdc_asdjflasutopfhvcZLmcfl_ / __playwright automation globals on window/document',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('windows');
+            telemetry.automationGlobals = ['$cdc_asdjflasutopfhvcZLmcfl_', '__playwright'];
+            const res = evaluatePlatformCoherence(telemetry, 'windows');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'automation-globals-absence');
+            assert.equal(check.passed, false);
+            assert.match(check.details, /\$cdc_asdjflasutopfhvcZLmcfl_/);
+            assert.match(check.details, /__playwright/);
+        }
+    },
+    {
+        name: '24. Detects WebRTC RFC1918 private LAN IP (192.168.1.45) leak when proxy/WebRTC protection is active',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('windows');
+            telemetry.webrtc = {
+                available: true,
+                candidatePorts: [54321],
+                candidateIps: ['192.168.1.45'],
+                privateIpLeaked: false,
+                blockPrivateIp: true
+            };
+            const res = evaluatePlatformCoherence(telemetry, 'windows');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'webrtc-network-coherence');
+            assert.equal(check.passed, false);
+            assert.match(check.details, /192\.168\.1\.45/);
+        }
+    },
+    {
+        name: '25. Detects WebRTC Linux ephemeral UDP port (38120) leaked on a Windows (49152–65535) identity',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('windows');
+            telemetry.webrtc = {
+                available: true,
+                candidatePorts: [52100, 38120],
+                candidateIps: ['203.0.113.45'],
+                privateIpLeaked: false
+            };
+            const res = evaluatePlatformCoherence(telemetry, 'windows');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'webrtc-network-coherence');
+            assert.equal(check.passed, false);
+            assert.match(check.details, /38120/);
+            assert.match(check.details, /49152–65535/);
+        }
+    },
+    {
+        name: '26. Detects Windows identity leaking macOS Apple com.apple.speech.synthesis.voice.samantha speech voice',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('windows');
+            telemetry.speechVoices = [
+                {
+                    name: 'Samantha',
+                    lang: 'en-US',
+                    voiceURI: 'com.apple.speech.synthesis.voice.samantha'
+                }
+            ];
+            const res = evaluatePlatformCoherence(telemetry, 'windows');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'speech-voices-coherence');
+            assert.equal(check.passed, false);
+            assert.match(check.details, /Windows identity leaked macOS\/Apple SpeechSynthesis voice/);
+        }
+    },
+    {
+        name: '27. Detects macOS identity leaking Windows Microsoft Zira Desktop speech voice',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('macos');
+            telemetry.speechVoices = [
+                {
+                    name: 'Microsoft Zira Desktop - English (United States)',
+                    lang: 'en-US',
+                    voiceURI: 'urn:moz-tts:sapi:Microsoft Zira Desktop - English (United States)?en-US'
+                }
+            ];
+            const res = evaluatePlatformCoherence(telemetry, 'macos');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'speech-voices-coherence');
+            assert.equal(check.passed, false);
+            assert.match(check.details, /macOS identity leaked Windows\/Linux SpeechSynthesis voice/);
+        }
+    },
+    {
+        name: '28. Valid Windows, macOS, and Linux profiles with coherent webrtc ephemeral ports, OS-matched speechVoices, and empty automationGlobals pass 10/10 checks (100/100)',
+        fn: () => {
+            for (const os of ['windows', 'macos', 'linux']) {
+                const telemetry = buildCoherentTelemetry(os);
+                const res = evaluatePlatformCoherence(telemetry, os);
+                assert.equal(res.passed, true, `Expected ${os} profile to pass`);
+                assert.equal(res.score, 100, `Expected ${os} score to be 100`);
+                assert.equal(res.checks.length, 10, `Expected 10 checks for ${os}`);
+                assert.ok(res.checks.every((c) => c.passed));
+
+                // Also verify backward compatibility when older synthetic fixtures omit the 3 new fields
+                const legacyTelemetry = buildCoherentTelemetry(os);
+                delete legacyTelemetry.automationGlobals;
+                delete legacyTelemetry.webrtc;
+                delete legacyTelemetry.speechVoices;
+                const legacyRes = evaluatePlatformCoherence(legacyTelemetry, os);
+                assert.equal(legacyRes.passed, true);
+                assert.equal(legacyRes.score, 100);
+                assert.equal(legacyRes.checks.length, 10);
+            }
         }
     }
 ];

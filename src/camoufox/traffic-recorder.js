@@ -44,6 +44,72 @@ const RISK_SIGNAL_PATTERNS = [
 const TEXTUAL_MIME_PATTERNS =
     /\b(json|text|html|xml|javascript|ecmascript|x-www-form-urlencoded|graphql|csv|plain|svg|css)\b/i;
 
+const SENSITIVE_HEADER_NAME_REGEX =
+    /^(proxy-authorization|x-proxy-authorization|x-api-key|omocaptcha-key)$/i;
+
+/**
+ * Redact a sensitive header value while preserving an authentication scheme prefix
+ * (e.g. `Basic dXNlcjpzZWNyZXQ=` -> `Basic [REDACTED]`, raw API key -> `[REDACTED]`).
+ *
+ * @param {string} rawValue
+ * @returns {string}
+ */
+function redactSensitiveHeaderValue(rawValue) {
+    const str = String(rawValue ?? '').trim();
+    const schemeMatch = str.match(/^([A-Za-z0-9._-]+)\s+\S+$/);
+    if (schemeMatch) {
+        return `${schemeMatch[1]} [REDACTED]`;
+    }
+    return '[REDACTED]';
+}
+
+/**
+ * Automatically redact sensitive proxy and API-key headers (`Proxy-Authorization`,
+ * `X-Proxy-Authorization`, `X-Api-Key`, `Omocaptcha-Key`) in both `headers` object
+ * and ordered `headersArray`.
+ *
+ * @param {{ headers?: Record<string, string>, headersArray?: Array<{ name: string, value: string }> }} input
+ * @returns {{ headers: Record<string, string>, headersArray: Array<{ name: string, value: string }> }}
+ */
+export function redactSensitiveHeaders({ headers = {}, headersArray = [] } = {}) {
+    const redactedHeaders = {};
+    if (headers && typeof headers === 'object') {
+        for (const [key, value] of Object.entries(headers)) {
+            redactedHeaders[key] = SENSITIVE_HEADER_NAME_REGEX.test(key)
+                ? redactSensitiveHeaderValue(value)
+                : String(value ?? '');
+        }
+    }
+
+    const redactedHeadersArray = Array.isArray(headersArray)
+        ? headersArray.map((entry) => {
+              const name = String(entry?.name ?? '');
+              const value = String(entry?.value ?? '');
+              const redactedValue = SENSITIVE_HEADER_NAME_REGEX.test(name)
+                  ? redactSensitiveHeaderValue(value)
+                  : value;
+              if (SENSITIVE_HEADER_NAME_REGEX.test(name)) {
+                  const lowerName = name.toLowerCase();
+                  if (Object.prototype.hasOwnProperty.call(redactedHeaders, name)) {
+                      redactedHeaders[name] = redactedValue;
+                  }
+                  if (Object.prototype.hasOwnProperty.call(redactedHeaders, lowerName)) {
+                      redactedHeaders[lowerName] = redactedValue;
+                  }
+              }
+              return {
+                  name,
+                  value: redactedValue
+              };
+          })
+        : [];
+
+    return {
+        headers: redactedHeaders,
+        headersArray: redactedHeadersArray
+    };
+}
+
 /**
  * Determine default desktop OS name in Camoufox format ('windows' | 'macos' | 'linux').
  */
@@ -338,7 +404,7 @@ async function extractHeadersWithOrder(target) {
         }));
     }
 
-    return { headers, headersArray };
+    return redactSensitiveHeaders({ headers, headersArray });
 }
 
 /**
@@ -445,6 +511,12 @@ export class CamoufoxTrafficRecorder {
         this.wsSeq = 0;
         this.triggerSeq = 0;
         this.lastTriggerAction = null;
+
+        // Cryptographic SHA-256 tamper-evident hash chain & payload integrity manifest
+        this.genesisHash = '0'.repeat(64);
+        this.chainHeadHash = this.genesisHash;
+        this.chainedEventCount = 0;
+        this.payloadManifest = {};
 
         // Correlation & tracking stores
         this.requestCorrelationMap = new WeakMap();
@@ -783,19 +855,32 @@ export class CamoufoxTrafficRecorder {
     }
 
     /**
-     * Append a single event line to `traffic.ndjson`.
+     * Append a single event line to `traffic.ndjson` with a deterministic
+     * cryptographic SHA-256 tamper-evident chain link (`prevEventHash` -> `eventHash`).
      *
      * @param {object} record
      */
     _appendNdjsonEvent(record) {
+        if (!record || typeof record !== 'object') {
+            return;
+        }
+
+        record.prevEventHash = this.chainHeadHash;
+        const canonicalPayload = JSON.stringify({ ...record, eventHash: undefined });
+        const preimage = `${record.prevEventHash}|${record.seq ?? 0}|${canonicalPayload}`;
+        const eventHash = crypto.createHash('sha256').update(preimage, 'utf8').digest('hex');
+        record.eventHash = eventHash;
+        this.chainHeadHash = eventHash;
+        this.chainedEventCount += 1;
+
+        const line = `${JSON.stringify(record)}\n`;
         try {
-            const line = `${JSON.stringify(record)}\n`;
             fs.appendFileSync(this.trafficNdjsonPath, line, 'utf8');
         } catch {
             // Ensure directory exists and retry once if needed
             try {
                 this._ensureDirectories();
-                fs.appendFileSync(this.trafficNdjsonPath, `${JSON.stringify(record)}\n`, 'utf8');
+                fs.appendFileSync(this.trafficNdjsonPath, line, 'utf8');
             } catch {
                 // Swallow disk error to avoid crashing active browser automation
             }
@@ -844,15 +929,23 @@ export class CamoufoxTrafficRecorder {
         }
 
         const payloadTruncated = this.maxBodyBytes > 0 && buffer.byteLength > this.maxBodyBytes;
-        const toWrite = payloadTruncated ? buffer.subarray(0, this.maxBodyBytes) : buffer;
+        const toWriteBuffer = payloadTruncated ? buffer.subarray(0, this.maxBodyBytes) : buffer;
 
-        const ext = inferPayloadExtension(mimeType, toWrite);
+        const ext = inferPayloadExtension(mimeType, toWriteBuffer);
         const fileName = `${prefix}-${seq}-${shortSha256}.${ext}`;
         const relativePath = path.posix.join('payloads', fileName);
         const fullPath = path.join(this.payloadsDir, fileName);
 
         try {
-            fs.writeFileSync(fullPath, toWrite);
+            fs.writeFileSync(fullPath, toWriteBuffer);
+            const writtenSha256 = crypto.createHash('sha256').update(toWriteBuffer).digest('hex');
+            this.payloadManifest[relativePath] = {
+                sha256: writtenSha256,
+                bytes: toWriteBuffer.byteLength,
+                truncated: Boolean(payloadTruncated),
+                seq,
+                prefix
+            };
             return {
                 payloadFile: relativePath,
                 payloadPath: fullPath,
@@ -2320,7 +2413,15 @@ export class CamoufoxTrafficRecorder {
             byActionStep: byActionStepObj,
             byDomain: byDomainObj,
             byTriggerAction: byTriggerActionObj,
-            anomaliesAndRiskSignals: [...this.anomaliesAndRiskSignals]
+            anomaliesAndRiskSignals: [...this.anomaliesAndRiskSignals],
+            integrity: {
+                algorithm: 'sha256-chain',
+                genesisHash: this.genesisHash,
+                eventCount: this.chainedEventCount,
+                chainHeadHash: this.chainHeadHash,
+                payloadCount: Object.keys(this.payloadManifest).length,
+                payloadManifest: { ...this.payloadManifest }
+            }
         };
     }
 
@@ -2366,6 +2467,181 @@ export class CamoufoxTrafficRecorder {
 
         return this.flushSummary();
     }
+}
+
+/**
+ * Verify the cryptographic SHA-256 tamper-evident hash chain across `traffic.ndjson`
+ * and verify every payload file listed in `attribution-index.json` (`integrity.payloadManifest`).
+ *
+ * @param {string} trafficDir
+ * @returns {{
+ *   valid: boolean,
+ *   eventCount: number,
+ *   verifiedPayloads: number,
+ *   chainHeadHash: string,
+ *   errors: string[]
+ * }}
+ */
+export function verifyTrafficIntegrity(trafficDir) {
+    const errors = [];
+    const defaultGenesisHash = '0'.repeat(64);
+    let chainHeadHash = defaultGenesisHash;
+    let eventCount = 0;
+    let verifiedPayloads = 0;
+
+    if (!trafficDir) {
+        errors.push('trafficDir path is required');
+        return {
+            valid: false,
+            eventCount,
+            verifiedPayloads,
+            chainHeadHash,
+            errors
+        };
+    }
+
+    const resolvedTrafficDir = path.resolve(String(trafficDir));
+    if (!fs.existsSync(resolvedTrafficDir)) {
+        errors.push(`Traffic directory does not exist: ${resolvedTrafficDir}`);
+        return {
+            valid: false,
+            eventCount,
+            verifiedPayloads,
+            chainHeadHash,
+            errors
+        };
+    }
+
+    const attributionIndexPath = path.join(resolvedTrafficDir, 'attribution-index.json');
+    const trafficNdjsonPath = path.join(resolvedTrafficDir, 'traffic.ndjson');
+
+    let summary = null;
+    if (!fs.existsSync(attributionIndexPath)) {
+        errors.push(`Missing attribution-index.json at ${attributionIndexPath}`);
+    } else {
+        try {
+            summary = JSON.parse(fs.readFileSync(attributionIndexPath, 'utf8'));
+        } catch (err) {
+            errors.push(`Failed to parse attribution-index.json: ${err.message}`);
+        }
+    }
+
+    const integrity = summary?.integrity || null;
+    if (summary && (!integrity || typeof integrity !== 'object')) {
+        errors.push('Missing integrity block in attribution-index.json');
+    }
+
+    const genesisHash =
+        typeof integrity?.genesisHash === 'string' && integrity.genesisHash.length === 64
+            ? integrity.genesisHash
+            : defaultGenesisHash;
+    chainHeadHash = genesisHash;
+
+    if (fs.existsSync(trafficNdjsonPath)) {
+        const rawNdjson = fs.readFileSync(trafficNdjsonPath, 'utf8');
+        const lines = rawNdjson.split(/\r?\n/);
+
+        for (let i = 0; i < lines.length; i += 1) {
+            const trimmed = lines[i].trim();
+            if (!trimmed) continue;
+
+            const lineNumber = i + 1;
+            let record = null;
+            try {
+                record = JSON.parse(trimmed);
+            } catch (err) {
+                errors.push(`Line ${lineNumber}: Invalid JSON in traffic.ndjson (${err.message})`);
+                continue;
+            }
+
+            eventCount += 1;
+
+            if (record.prevEventHash !== chainHeadHash) {
+                errors.push(
+                    `Line ${lineNumber} (seq=${record.seq ?? 'n/a'}): prevEventHash mismatch (expected ${chainHeadHash}, got ${record.prevEventHash ?? 'missing'})`
+                );
+            }
+
+            const canonicalPayload = JSON.stringify({ ...record, eventHash: undefined });
+            const preimage = `${record.prevEventHash}|${record.seq ?? 0}|${canonicalPayload}`;
+            const expectedEventHash = crypto
+                .createHash('sha256')
+                .update(preimage, 'utf8')
+                .digest('hex');
+
+            if (record.eventHash !== expectedEventHash) {
+                errors.push(
+                    `Line ${lineNumber} (seq=${record.seq ?? 'n/a'}): eventHash mismatch (expected ${expectedEventHash}, got ${record.eventHash ?? 'missing'})`
+                );
+            }
+
+            chainHeadHash =
+                typeof record.eventHash === 'string' && record.eventHash.length === 64
+                    ? record.eventHash
+                    : expectedEventHash;
+        }
+    } else if ((integrity?.eventCount ?? 0) > 0) {
+        errors.push(`Missing traffic.ndjson at ${trafficNdjsonPath}`);
+    }
+
+    if (integrity && typeof integrity === 'object') {
+        if (typeof integrity.eventCount === 'number' && eventCount !== integrity.eventCount) {
+            errors.push(
+                `Event count mismatch: traffic.ndjson has ${eventCount} event(s), attribution-index.json expects ${integrity.eventCount}`
+            );
+        }
+        if (
+            typeof integrity.chainHeadHash === 'string' &&
+            chainHeadHash !== integrity.chainHeadHash
+        ) {
+            errors.push(
+                `Chain head hash mismatch: computed ${chainHeadHash}, attribution-index.json expects ${integrity.chainHeadHash}`
+            );
+        }
+
+        const manifest =
+            integrity.payloadManifest && typeof integrity.payloadManifest === 'object'
+                ? integrity.payloadManifest
+                : {};
+
+        for (const [relativePath, manifestEntry] of Object.entries(manifest)) {
+            const fullPayloadPath = path.join(resolvedTrafficDir, relativePath);
+            if (!fs.existsSync(fullPayloadPath)) {
+                errors.push(`Missing payload file on disk: ${relativePath}`);
+                continue;
+            }
+
+            const diskBuffer = fs.readFileSync(fullPayloadPath);
+            const actualSha256 = crypto.createHash('sha256').update(diskBuffer).digest('hex');
+            const actualBytes = diskBuffer.byteLength;
+
+            let payloadOk = true;
+            if (manifestEntry?.sha256 && actualSha256 !== manifestEntry.sha256) {
+                errors.push(
+                    `Payload SHA-256 mismatch for ${relativePath}: expected ${manifestEntry.sha256}, got ${actualSha256}`
+                );
+                payloadOk = false;
+            }
+            if (typeof manifestEntry?.bytes === 'number' && actualBytes !== manifestEntry.bytes) {
+                errors.push(
+                    `Payload byte length mismatch for ${relativePath}: expected ${manifestEntry.bytes}, got ${actualBytes}`
+                );
+                payloadOk = false;
+            }
+
+            if (payloadOk) {
+                verifiedPayloads += 1;
+            }
+        }
+    }
+
+    return {
+        valid: errors.length === 0,
+        eventCount,
+        verifiedPayloads,
+        chainHeadHash,
+        errors
+    };
 }
 
 /**
