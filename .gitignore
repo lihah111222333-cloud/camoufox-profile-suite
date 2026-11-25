@@ -59,4 +59,8 @@ coverage/
 .gpm/
 gpm-data/
 
+# Camoufox persistent profile storage & audit output
+profiles/
+camoufox-audit-report.json
+
 

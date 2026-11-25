@@ -78,3 +78,35 @@ FIVESIM_MAX_PRICE=50
 - يمكن استخدام `SMS_VERIFY_API_KEY` مع 5SIM Legacy إذا لم يتم تحديد `FIVESIM_API_KEY`
 - جميع الإعدادات الاختيارية لها قيم افتراضية معقولة
 
+---
+
+## Camoufox Antidetect Browser Configuration (Open-Source Firefox Engine)
+
+يمكنك استبدال Dolphin Anty أو GPM Login بمحرك **Camoufox** المفتوح المصدر (`PROFILE_SERVICE=camoufox`):
+
+```env
+# Select Camoufox as profile engine ('gpm', 'dolphin', or 'camoufox')
+PROFILE_SERVICE=camoufox
+
+# Target Desktop OS fingerprint ('windows', 'macos', or 'linux')
+CAMOUFOX_OS=windows
+
+# Headless mode ('false', 'true', or 'virtual')
+CAMOUFOX_HEADLESS=false
+
+# Enable myuri humanized cursor/scroll/typing dynamics (default: true)
+CAMOUFOX_HUMANIZE=true
+
+# Automatically align timezone, locale, geolocation & WebRTC IP with proxy GeoIP (default: true)
+CAMOUFOX_GEOIP=true
+
+# Controlled canvas readback protection for cross-OS isolation (default: true)
+CAMOUFOX_CANVAS_NOISE=true
+
+# Persistent storage directory for profile cookies (datr, ig_did, ttwid) & localStorage
+CAMOUFOX_STORAGE_DIR=./profiles
+
+# Optional: run in-browser C++ fingerprint coherence audit automatically on profile startup
+CAMOUFOX_AUDIT_ON_START=false
+```
+

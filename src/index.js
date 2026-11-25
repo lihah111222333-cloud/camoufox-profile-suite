@@ -6,12 +6,12 @@
  * نقطة البداية الرئيسية للتطبيق
  */
 
-import dotenv from 'dotenv';
 import logger from './utils/logger.js';
 import proxyManager from './utils/proxy-manager.js';
 import nameGenerator from './utils/name-generator.js';
 import { createAndStartProfile as createAndStartGPMProfile } from './gpmlogin/profile.js';
 import { createAndStartProfile as createAndStartDolphinProfile } from './dolphin/profile.js';
+import { createAndStartProfile as createAndStartCamoufoxProfile } from './camoufox/profile.js';
 import { createGmailAccount } from './gmail/creator.js';
 import config from './config.js';
 import fs from 'fs';
@@ -20,15 +20,6 @@ import { fileURLToPath, pathToFileURL } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-// Load .env file first, then try .emv if .env doesn't exist
-// تحميل ملف .env أولاً، ثم تجربة .emv إذا لم يوجد .env
-dotenv.config({ path: path.resolve(__dirname, '../.env') });
-// Also try loading .emv if .env doesn't have required variables
-// أيضاً جرب تحميل .emv إذا لم يكن .env يحتوي على المتغيرات المطلوبة
-if (!process.env.PROFILE_SERVICE && !process.env.DOLPHIN_API_KEY) {
-    dotenv.config({ path: path.resolve(__dirname, '../.emv') });
-}
 
 const RESULTS_FILE = path.join(__dirname, '../results.json');
 
@@ -90,7 +81,23 @@ async function createAccount(accountNumber = null) {
         logger.info(`${accountLabel} Creating ${profileService.toUpperCase()} profile`, { name: profileName });
         
         // Format proxy according to service
-        if (profileService === 'dolphin') {
+        if (profileService === 'camoufox') {
+            const camoufoxProxy = proxy ? {
+                ip: proxy.ip,
+                port: proxy.port,
+                username: proxy.username || '',
+                password: proxy.password || '',
+                type: proxy.type || 'http'
+            } : null;
+            profile = await createAndStartCamoufoxProfile(profileName, camoufoxProxy, {
+                os: config.camoufox?.os,
+                headless: config.camoufox?.headless,
+                humanize: config.camoufox?.humanize,
+                geoip: config.camoufox?.geoip,
+                canvas_noise: config.camoufox?.canvasNoise,
+                profilesDir: config.camoufox?.storageDir
+            });
+        } else if (profileService === 'dolphin') {
             // Dolphin Anty proxy format
             const dolphinProxy = proxy ? {
                 ip: proxy.ip,
@@ -118,8 +125,11 @@ async function createAccount(accountNumber = null) {
         const browser = await profile.getBrowser();
         const page = await profile.getPage();
 
+        const serviceName = profileService === 'camoufox'
+            ? 'Camoufox'
+            : (profileService === 'dolphin' ? 'Dolphin Anty' : 'GPM Login');
+
         if (!browser || !page) {
-            const serviceName = profileService === 'dolphin' ? 'Dolphin Anty' : 'GPM Login';
             throw new Error(`Failed to get browser instance from ${serviceName} profile`);
         }
 
@@ -150,7 +160,7 @@ async function createAccount(accountNumber = null) {
             success: true,
             ...result,
             profileId: profile.profileId,
-            profileType: profileService === 'dolphin' ? 'Dolphin Anty' : 'GPM Login',
+            profileType: serviceName,
             proxy: proxyManager.getStringFormat(proxy),
             proxyIP: proxy ? proxy.ip : null,
             profileIP: profileIP,
