@@ -12,14 +12,16 @@ import {
     USABLE_DEVICE_PRESET_CATALOG,
     listUsableDevicePresets,
     resolveDeterministicDeviceProfile,
-    sanitizeAdsPowerProfileToCoherentPreset
+    sanitizeAdsPowerProfileToCoherentPreset,
+    sanitizeZiniaoProfileToCoherentPreset
 } from './device-presets.js';
 
 export {
     USABLE_DEVICE_PRESET_CATALOG,
     listUsableDevicePresets,
     resolveDeterministicDeviceProfile,
-    sanitizeAdsPowerProfileToCoherentPreset
+    sanitizeAdsPowerProfileToCoherentPreset,
+    sanitizeZiniaoProfileToCoherentPreset
 };
 
 const __filename = fileURLToPath(import.meta.url);

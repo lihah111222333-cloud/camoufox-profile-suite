@@ -40,7 +40,8 @@ import {
     selectCoherentSpeechVoices,
     createCoherentMediaDevices,
     resolveDeterministicDeviceProfile,
-    sanitizeAdsPowerProfileToCoherentPreset
+    sanitizeAdsPowerProfileToCoherentPreset,
+    sanitizeZiniaoProfileToCoherentPreset
 } from './device-presets.js';
 
 export {
@@ -73,7 +74,8 @@ export {
     selectCoherentSpeechVoices,
     createCoherentMediaDevices,
     resolveDeterministicDeviceProfile,
-    sanitizeAdsPowerProfileToCoherentPreset
+    sanitizeAdsPowerProfileToCoherentPreset,
+    sanitizeZiniaoProfileToCoherentPreset
 };
 
 /**

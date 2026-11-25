@@ -2769,6 +2769,73 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
     }
 
     // =========================================================================
+    // Rule P: Cross-OS Hostname, IEEE 802.3 OUI MAC Address & W3C DeviceMemory
+    //         Coherence (Discovered via Ziniao SuperBrowser V6 Reverse-Engineering)
+    // =========================================================================
+    const rawHostName = String(hw.deviceName || hw.device_info_str || '').trim();
+    if (rawHostName && targetOs) {
+        if (targetOs === 'mac' && /^(?:DESKTOP|LAPTOP|WIN)-[A-Z0-9]+$/i.test(rawHostName)) {
+            issues.push(
+                `Cross-OS DeviceName violation: Windows hostname pattern "${rawHostName}" (DESKTOP-/LAPTOP-/WIN-) cannot appear on macOS targetOs="mac"`
+            );
+        } else if (
+            (targetOs === 'win' || targetOs === 'lin') &&
+            /\b(?:MacBook|iMac|Mac[\s_-]+mini|Mac[\s_-]+Studio|Mac[\s_-]+Pro)\b/i.test(rawHostName)
+        ) {
+            issues.push(
+                `Cross-OS DeviceName violation: Apple Mac hostname "${rawHostName}" cannot appear on targetOs="${targetOs}"`
+            );
+        }
+    }
+
+    const rawMacAddr = String(hw.macAddress || hw.mac_address_str || '').trim();
+    if (rawMacAddr) {
+        const macMatch = rawMacAddr.match(/^([0-9A-Fa-f]{2})(?:[:-][0-9A-Fa-f]{2}){5}$/);
+        if (!macMatch) {
+            issues.push(`Invalid IEEE 802.3 MAC address format: "${rawMacAddr}"`);
+        } else {
+            const firstOctet = parseInt(macMatch[1], 16);
+            if ((firstOctet & 0x01) !== 0) {
+                issues.push(
+                    `MAC address "${rawMacAddr}" has multicast bit set (first octet 0x${macMatch[1].toUpperCase()} bit 0 === 1); physical NIC MAC must be unicast`
+                );
+            }
+            if ((firstOctet & 0x02) !== 0) {
+                issues.push(
+                    `MAC address "${rawMacAddr}" has Locally Administered bit set (first octet 0x${macMatch[1].toUpperCase()} bit 1 === 1, typical of Ziniao random MAC / VM spoof); physical OEM/Apple NICs use globally unique IEEE OUI (bit 1 === 0)`
+                );
+            }
+        }
+    }
+
+    const rawDeviceMemory =
+        hw.deviceMemory !== undefined && hw.deviceMemory !== null
+            ? Number(hw.deviceMemory)
+            : nav.deviceMemory !== undefined && nav.deviceMemory !== null
+              ? Number(nav.deviceMemory)
+              : null;
+    if (rawDeviceMemory !== null) {
+        const validW3cDeviceMemory = [0.25, 0.5, 1, 2, 4, 8];
+        if (!validW3cDeviceMemory.includes(rawDeviceMemory)) {
+            issues.push(
+                `W3C Device Memory specification violation: deviceMemory=${rawDeviceMemory}GB is not a power-of-two W3C value (allowed: [0.25, 0.5, 1, 2, 4, 8]GB; Ziniao 6GB spoofing signature)`
+            );
+        }
+    }
+
+    if (
+        Number.isFinite(scr.width) &&
+        Number.isFinite(scr.height) &&
+        scr.width === 1024 &&
+        scr.height === 1366 &&
+        targetOs
+    ) {
+        issues.push(
+            'Desktop screen resolution violation: portrait 1024x1366 (Ziniao headless window fallback) is an iPad Pro tablet portrait resolution and impossible on a desktop monitor/laptop'
+        );
+    }
+
+    // =========================================================================
     // Rule I: Intel-based Apple Mac Device & GPU SKU Coherence (2017–2020 Intel Macs)
     // =========================================================================
     const intelMacSku =

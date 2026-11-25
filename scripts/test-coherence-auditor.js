@@ -40,6 +40,7 @@ import {
     createCoherentMediaDevices,
     resolveDeterministicDeviceProfile,
     sanitizeAdsPowerProfileToCoherentPreset,
+    sanitizeZiniaoProfileToCoherentPreset,
     normalizeTargetOs,
     gpuFitsOs,
     evaluatePlatformCoherence,
@@ -2479,6 +2480,61 @@ const tests = [
                 assert.equal(fullAudit.passed, true);
                 assert.equal(fullAudit.score, 100);
             }
+        }
+    },
+    {
+        name: '76. Rule P & Ziniao SuperBrowser V6 Reverse-Engineered Flaw Detection & Auto-Healer: Rejects 3-core concurrency, 6GB W3C deviceMemory violation, DESKTOP-XXXXXX on macOS, Locally-Administered MAC (bit 1=1), and 1024x1366 portrait headless screen, and auto-heals via sanitizeZiniaoProfileToCoherentPreset',
+        fn: () => {
+            const brokenZiniaoMac = buildCoherentTelemetry('macos');
+            brokenZiniaoMac.navigator.hardwareConcurrency = 3; // Ziniao kwn dropdown offers "3" cores!
+            brokenZiniaoMac.worker.hardwareConcurrency = 3;
+            brokenZiniaoMac.iframeParity.hardwareConcurrency = 3;
+            brokenZiniaoMac.screen.width = 1024; // Ziniao headless fallback 1024x1366 portrait!
+            brokenZiniaoMac.screen.height = 1366;
+            brokenZiniaoMac.hardwareProfile = {
+                deviceName: 'DESKTOP-8F3A1B', // Ziniao h1a() always generates DESKTOP-XXXXXX even on macOS
+                macAddress: '52-A4-1C-99-01-FE', // Ziniao m1a() sets bit 1 = 1 (0x52 & 0x02 === 2, Locally Administered)
+                deviceMemory: 6, // Ziniao zwn dropdown offers "6GB" (violates W3C power-of-2 spec)
+                ramGb: 6
+            };
+
+            const skuCheck = validateHardwareModelSpec(brokenZiniaoMac, 'macos');
+            assert.equal(skuCheck.passed, false);
+            assert.ok(skuCheck.issues.some((i) => i.includes('Cross-OS DeviceName violation: Windows hostname pattern "DESKTOP-8F3A1B"')));
+            assert.ok(skuCheck.issues.some((i) => i.includes('has Locally Administered bit set')));
+            assert.ok(skuCheck.issues.some((i) => i.includes('W3C Device Memory specification violation: deviceMemory=6GB')));
+            assert.ok(skuCheck.issues.some((i) => i.includes('portrait 1024x1366 (Ziniao headless window fallback)')));
+
+            // Auto-heal raw Ziniao V6 config while absorbing its port_scan_protection and canvas_fingerprint_skip_hosts
+            const healedZiniao = sanitizeZiniaoProfileToCoherentPreset({
+                ContainerId: 'SB9901234',
+                system_value: 2, // MacOS
+                concurrent_hardware_num: 3,
+                device_memory: 6,
+                device_info_str: 'DESKTOP-8F3A1B',
+                mac_address_str: '52-A4-1C-99-01-FE',
+                webgl_metadata: 1, // --disable-gpu
+                webgl_renderer: 'ANGLE (Apple, ANGLE Metal Renderer: Apple M3 Pro, Unspecified Version)',
+                port_protection: 1,
+                port_protection_msg: '9222, 5900',
+                canvas_fingerprint_skip_hosts: 'sellercentral.amazon.com|www.ebay.com'
+            });
+
+            assert.equal(healedZiniao.validation.passed, true);
+            assert.ok(healedZiniao.repairsApplied.length >= 5);
+            assert.equal(healedZiniao.absorbedSecurityPolicy.portScanProtection.enabled, true);
+            assert.deepEqual(healedZiniao.absorbedSecurityPolicy.portScanProtection.allowedPorts, [9222, 5900]);
+            assert.deepEqual(healedZiniao.absorbedSecurityPolicy.canvasSkipHosts, [
+                'sellercentral.amazon.com',
+                'www.ebay.com'
+            ]);
+
+            const platformAudit = evaluatePlatformCoherence(
+                healedZiniao.healedTelemetry,
+                healedZiniao.healedProfile.os
+            );
+            assert.equal(platformAudit.passed, true);
+            assert.equal(platformAudit.score, 100);
         }
     }
 ];

@@ -2200,6 +2200,157 @@ export function sanitizeAdsPowerProfileToCoherentPreset(rawAdsPowerProfile = {})
     };
 }
 
+/**
+ * 8. Ziniao SuperBrowser V5/V6 Broken-Profile Auto-Healer & Feature Absorber
+ *    (`sanitizeZiniaoProfileToCoherentPreset`)
+ *
+ * Absorbs Ziniao's positive security features:
+ *   - Local Port-Scan Protection (`port_scan_protection`: blocks websites from scanning 127.0.0.1/localhost ports)
+ *   - Per-Domain Canvas/WebGL Consistency & Skip-Hosts (`canvas_fingerprint_skip_hosts`)
+ * while repairing Ziniao's reverse-engineered fingerprint defects:
+ *   - `concurrent_hardware_num = 3` (impossible odd logical thread count) or 12-core cap on 14/16/24/32-core hardware
+ *   - `device_memory = 6` (violates W3C power-of-2 Device Memory spec `[0.25, 0.5, 1, 2, 4, 8]`)
+ *   - `h1a()` generating Windows `DESKTOP-XXXXXX` hostnames on macOS/Linux
+ *   - `m1a()` setting Locally Administered MAC bit (`a |= 2`, `x2:xx:xx`) instead of a real hardware IEEE OUI
+ *   - Headless fallback `1024x1366` portrait window and `webgl_metadata = 1` (`--disable-gpu` SwiftShader fallback)
+ *
+ * @param {object} rawZiniaoConfig
+ * @returns {{
+ *   healedPresetId: string,
+ *   healedProfile: object,
+ *   healedTelemetry: object,
+ *   absorbedSecurityPolicy: {
+ *     portScanProtection: { enabled: boolean, allowedPorts: number[] },
+ *     canvasSkipHosts: string[]
+ *   },
+ *   validation: { passed: boolean, matchedSku: string | null, issues: string[] },
+ *   repairsApplied: string[]
+ * }}
+ */
+export function sanitizeZiniaoProfileToCoherentPreset(rawZiniaoConfig = {}) {
+    const repairsApplied = [];
+    const adv =
+        rawZiniaoConfig.Detail?.advanced ||
+        rawZiniaoConfig.browser_custome_v1 ||
+        rawZiniaoConfig.advanced_config_v1 ||
+        rawZiniaoConfig;
+
+    const profileId = String(
+        rawZiniaoConfig.ContainerId ||
+            rawZiniaoConfig.BrowserName ||
+            adv.mixture_key ||
+            rawZiniaoConfig.id ||
+            'ziniao-healed-profile'
+    );
+
+    const sysVal = Number(adv.os ?? adv.system_value ?? rawZiniaoConfig.system_value ?? 1);
+    const uaStr = String(
+        rawZiniaoConfig.Detail?.browser?.user_agent ||
+            adv.ua ||
+            rawZiniaoConfig.UserAgent ||
+            ''
+    );
+    const normOs =
+        sysVal === 2 || /Macintosh|Mac OS X/i.test(uaStr)
+            ? 'macos'
+            : sysVal === 3 || /X11;\s*Linux/i.test(uaStr)
+              ? 'linux'
+              : 'windows';
+
+    const rawCores = Number(adv.hardware_concurrency ?? adv.concurrent_hardware_num ?? 8);
+    if (rawCores === 3 || rawCores % 2 !== 0) {
+        repairsApplied.push(
+            `Repaired Ziniao odd hardware_concurrency=${rawCores} (from kwn=[2,3,4,6,8,10,12]) to physical SKU core count`
+        );
+    }
+
+    const rawMem = Number(adv.memery_device ?? adv.device_memory ?? 8);
+    if (rawMem === 6 || ![0, 0.25, 0.5, 1, 2, 4, 8].includes(rawMem)) {
+        repairsApplied.push(
+            `Repaired Ziniao non-power-of-two device_memory=${rawMem}GB (W3C spec violation) to authentic factory RAM tier`
+        );
+    }
+
+    const rawHost = String(adv.device_info_str || rawZiniaoConfig.device_info_str || '').trim();
+    if (rawHost && normOs !== 'windows' && /^DESKTOP-/i.test(rawHost)) {
+        repairsApplied.push(
+            `Repaired Ziniao h1a() Windows hostname "${rawHost}" on ${normOs} to OS-authentic hostname`
+        );
+    }
+
+    const rawMac = String(adv.mac_address_str || rawZiniaoConfig.mac_address_str || '').trim();
+    if (rawMac) {
+        const firstByte = parseInt(rawMac.slice(0, 2), 16);
+        if (!Number.isNaN(firstByte) && (firstByte & 0x02) !== 0) {
+            repairsApplied.push(
+                `Repaired Ziniao m1a() Locally Administered random MAC "${rawMac}" (bit 1 === 1) to globally unique IEEE OUI MAC`
+            );
+        }
+    }
+
+    if (Number(adv.webgl_metadata) === 1 || Number(adv.webgl_metadata?.switcher) === 1) {
+        repairsApplied.push(
+            'Removed Ziniao webgl_metadata=1 (--disable-gpu SwiftShader fallback) and restored hardware-accelerated GPU SKU'
+        );
+    }
+
+    const renderer = String(
+        adv.webgl_metadata?.render ||
+            adv.webgl_renderer ||
+            rawZiniaoConfig.webgl_renderer ||
+            ''
+    ).trim();
+
+    const delegated = sanitizeAdsPowerProfileToCoherentPreset({
+        fbccId: profileId,
+        Platform: normOs === 'macos' ? 'MacIntel' : normOs === 'linux' ? 'Linux x86_64' : 'Win32',
+        DeviceName: normOs === 'macos' && /^DESKTOP-/i.test(rawHost) ? "Alex's MacBook Pro" : rawHost || undefined,
+        HardwareConcurrency: rawCores,
+        DeviceMemory: rawMem,
+        UNMASKED_RENDERER_WEBGL: renderer || undefined
+    });
+
+    const portProt = adv.port_scan_protection || {};
+    const portProtEnabled =
+        Number(portProt.switcher ?? adv.port_protection ?? 1) === 1;
+    const rawPortsStr = String(portProt.value ?? adv.port_protection_msg ?? '').trim();
+    const allowedPorts = rawPortsStr
+        ? rawPortsStr
+              .split(',')
+              .map((s) => Number(s.trim()))
+              .filter((n) => Number.isInteger(n) && n > 0 && n <= 65535)
+        : [];
+
+    const skipHostsRaw =
+        rawZiniaoConfig.canvas_fingerprint_skip_hosts ||
+        rawZiniaoConfig.Raw?.canvas_fingerprint_skip_hosts ||
+        [];
+    const canvasSkipHosts = Array.isArray(skipHostsRaw)
+        ? skipHostsRaw
+        : typeof skipHostsRaw === 'string' && skipHostsRaw.trim()
+          ? skipHostsRaw.split('|').map((s) => s.trim()).filter(Boolean)
+          : [];
+
+    const absorbedSecurityPolicy = {
+        portScanProtection: {
+            enabled: portProtEnabled,
+            allowedPorts
+        },
+        canvasSkipHosts
+    };
+
+    delegated.healedProfile.securityPolicy = absorbedSecurityPolicy;
+
+    return {
+        healedPresetId: delegated.healedPresetId,
+        healedProfile: delegated.healedProfile,
+        healedTelemetry: delegated.healedTelemetry,
+        absorbedSecurityPolicy,
+        validation: delegated.validation,
+        repairsApplied: [...repairsApplied, ...delegated.repairsApplied]
+    };
+}
+
 export default {
     OS_FONT_CATALOG,
     LOCALE_FALLBACK_CHAINS,
@@ -2215,5 +2366,6 @@ export default {
     selectCoherentSpeechVoices,
     createCoherentMediaDevices,
     resolveDeterministicDeviceProfile,
-    sanitizeAdsPowerProfileToCoherentPreset
+    sanitizeAdsPowerProfileToCoherentPreset,
+    sanitizeZiniaoProfileToCoherentPreset
 };
