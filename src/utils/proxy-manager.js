@@ -21,6 +21,94 @@ class ProxyManager {
     }
 
     /**
+     * Parse a single proxy line supporting:
+     * - `ip:port` or `ip:port:username:password` (including passwords containing `:`)
+     * - `[ipv6]:port` or `[ipv6]:port:username:password`
+     * - `http://user:pass@host:port`, `https://...`, `socks5://...`
+     */
+    parseProxyLine(rawLine) {
+        if (!rawLine || typeof rawLine !== 'string') return null;
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#')) return null;
+
+        let type = 'http';
+        let ip = '';
+        let port = '';
+        let username = '';
+        let password = '';
+
+        // 1. URL scheme format: protocol://[user:pass@]host:port or protocol://host:port:user:pass
+        const schemeMatch = line.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(.+)$/);
+        if (schemeMatch) {
+            type = schemeMatch[1].toLowerCase();
+            const rest = schemeMatch[2];
+            if (rest.includes('@')) {
+                const lastAt = rest.lastIndexOf('@');
+                const authPart = rest.slice(0, lastAt);
+                const hostPart = rest.slice(lastAt + 1);
+                const colonIdx = authPart.indexOf(':');
+                if (colonIdx >= 0) {
+                    username = decodeURIComponent(authPart.slice(0, colonIdx));
+                    password = decodeURIComponent(authPart.slice(colonIdx + 1));
+                } else {
+                    username = decodeURIComponent(authPart);
+                }
+                const parsedHost = this._splitHostAndRemainder(hostPart);
+                if (!parsedHost || parsedHost.extra.length > 0) return null;
+                ip = parsedHost.ip;
+                port = parsedHost.port;
+            } else {
+                const parsedHost = this._splitHostAndRemainder(rest);
+                if (!parsedHost) return null;
+                ip = parsedHost.ip;
+                port = parsedHost.port;
+                username = parsedHost.extra[0] || '';
+                password = parsedHost.extra.slice(1).join(':');
+            }
+        } else {
+            // 2. Unschemed host:port[:user[:pass]] or [ipv6]:port[:user[:pass]]
+            const parsedHost = this._splitHostAndRemainder(line);
+            if (!parsedHost) return null;
+            ip = parsedHost.ip;
+            port = parsedHost.port;
+            username = parsedHost.extra[0] || '';
+            password = parsedHost.extra.slice(1).join(':');
+        }
+
+        const portNum = Number.parseInt(port, 10);
+        if (!ip || !/^\d+$/.test(port) || Number.isNaN(portNum) || portNum < 1 || portNum > 65535) {
+            return null;
+        }
+
+        return {
+            ip: ip.trim(),
+            port: String(portNum),
+            username: username.trim(),
+            password: password.trim(),
+            type,
+            raw: line
+        };
+    }
+
+    _splitHostAndRemainder(input) {
+        if (input.startsWith('[')) {
+            const closeIdx = input.indexOf(']');
+            if (closeIdx <= 1 || input[closeIdx + 1] !== ':') return null;
+            const ip = input.slice(0, closeIdx + 1);
+            const afterBracket = input.slice(closeIdx + 2).split(':');
+            const port = (afterBracket[0] || '').trim();
+            return { ip, port, extra: afterBracket.slice(1) };
+        }
+        const parts = input.split(':');
+        if (parts.length < 2) return null;
+        return {
+            ip: parts[0].trim(),
+            port: parts[1].trim(),
+            extra: parts.slice(2)
+        };
+    }
+
+    /**
      * Load proxies from file
      * تحميل البروكسيات من الملف
      */
@@ -33,35 +121,25 @@ class ProxyManager {
             }
 
             const content = fs.readFileSync(PROXIES_FILE, 'utf8');
-            const lines = content.split('\n').map(line => line.trim()).filter(line => {
+            const lines = content.split(/\r?\n/).map(line => line.trim()).filter(line => {
                 // Skip empty lines and comments
                 return line && !line.startsWith('#');
             });
 
             this.proxies = lines.map((line, index) => {
-                const parts = line.split(':');
-                if (parts.length >= 2) {
-                    const proxy = {
-                        ip: parts[0].trim(),
-                        port: parts[1].trim(),
-                        username: (parts[2] || '').trim(),
-                        password: (parts[3] || '').trim(),
-                        raw: line
-                    };
-                    
-                    // Log proxy details (without password for security)
-                    // تسجيل تفاصيل البروكسي (بدون كلمة المرور للأمان)
-                    if (index === 0) { // Log first proxy as example
+                const proxy = this.parseProxyLine(line);
+                if (proxy) {
+                    if (index === 0) {
                         logger.info('Example proxy loaded', {
                             ip: proxy.ip,
                             port: proxy.port,
+                            type: proxy.type,
                             hasUsername: !!proxy.username,
                             hasPassword: !!proxy.password,
                             usernameLength: proxy.username.length,
                             passwordLength: proxy.password.length
                         });
                     }
-                    
                     return proxy;
                 }
                 logger.warn('Invalid proxy format', { line, lineNumber: index + 1 });
@@ -125,8 +203,23 @@ class ProxyManager {
             port: proxy.port,
             username: proxy.username || '',
             password: proxy.password || '',
-            type: 'http' // Default to HTTP
+            type: proxy.type || 'http'
         };
+    }
+
+    /**
+     * Get proxy in Camoufox / Playwright format
+     */
+    getCamoufoxFormat(proxy) {
+        if (!proxy) return null;
+        const protocol = (proxy.type || 'http').toLowerCase();
+        const host = proxy.ip.includes(':') && !proxy.ip.startsWith('[') ? `[${proxy.ip}]` : proxy.ip;
+        const formatted = {
+            server: `${protocol}://${host}:${proxy.port}`
+        };
+        if (proxy.username) formatted.username = proxy.username;
+        if (proxy.password) formatted.password = proxy.password;
+        return formatted;
     }
 
     /**

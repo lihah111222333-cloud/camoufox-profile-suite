@@ -30,7 +30,8 @@
     "test:isolation": "node scripts/test-camoufox-isolation.js",
     "test:coherence": "node scripts/test-coherence-auditor.js",
     "test:compat": "node scripts/test-page-compat.js",
-    "test": "node scripts/test-camoufox-isolation.js && node scripts/test-coherence-auditor.js && node scripts/test-page-compat.js && node scripts/verify-camoufox-coherence.js --dry-run",
+    "test:traffic": "node scripts/test-traffic-attribution.js",
+    "test": "node scripts/test-camoufox-isolation.js && node scripts/test-coherence-auditor.js && node scripts/test-page-compat.js && node scripts/test-traffic-attribution.js && node scripts/verify-camoufox-coherence.js --dry-run",
     "prepack": "node --check src/index.js && node --check bin/gmail-account-creator.js"
   },
   "keywords": [

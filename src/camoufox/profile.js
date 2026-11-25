@@ -603,6 +603,45 @@ export class CamoufoxProfile {
         this.storageStatePath = null;
         this.metadata = null;
         this.coherenceReport = null;
+        this.trafficRecorder = null;
+        this.trafficPaths = null;
+        this.lastTrafficAttribution = null;
+    }
+
+    /**
+     * Set active workflow step for pre-TLS traffic attribution
+     */
+    setTrafficStep(stepName, metadata = {}) {
+        return this.trafficRecorder?.setStep(stepName, metadata);
+    }
+
+    /**
+     * Update account/profile attribution metadata on the active traffic recorder
+     */
+    updateTrafficAttribution(partial = {}) {
+        return this.trafficRecorder?.updateAttribution(partial);
+    }
+
+    /**
+     * Get the underlying CamoufoxTrafficRecorder instance
+     */
+    getTrafficRecorder() {
+        return this.trafficRecorder;
+    }
+
+    /**
+     * Flush and return the latest pre-TLS traffic attribution summary report
+     */
+    async getTrafficAttribution() {
+        if (this.trafficRecorder) {
+            if (typeof this.trafficRecorder.flushSummary === 'function') {
+                return await this.trafficRecorder.flushSummary();
+            }
+            if (typeof this.trafficRecorder.getSummary === 'function') {
+                return this.trafficRecorder.getSummary();
+            }
+        }
+        return this.lastTrafficAttribution || null;
     }
 
     /**
@@ -628,12 +667,17 @@ export class CamoufoxProfile {
             this.page = attachPageCompatibility(session.page, this.context, this.browser);
             this.storageStatePath = session.storageStatePath;
             this.metadata = session.metadata;
+            this.trafficRecorder = session.trafficRecorder || null;
+            this.trafficPaths = session.trafficPaths || null;
 
             // Wrap context.newPage so any additional pages also receive compatibility helpers
             if (this.context && !this.context._camoufoxNewPageWrapped) {
                 const originalNewPage = this.context.newPage.bind(this.context);
                 this.context.newPage = async (...args) => {
                     const newPage = await originalNewPage(...args);
+                    if (this.trafficRecorder && typeof this.trafficRecorder.attachPage === 'function') {
+                        await this.trafficRecorder.attachPage(newPage);
+                    }
                     return attachPageCompatibility(newPage, this.context, this.browser);
                 };
                 Object.defineProperty(this.context, '_camoufoxNewPageWrapped', {
@@ -719,7 +763,7 @@ export class CamoufoxProfile {
     }
 
     /**
-     * Stop profile (automatically saves storageState before closing)
+     * Stop profile (automatically saves storageState and flushes traffic attribution before closing)
      */
     async stop() {
         try {
@@ -729,6 +773,17 @@ export class CamoufoxProfile {
                 profileId: this.profileId,
                 error: error.message
             });
+        }
+
+        if (this.trafficRecorder && typeof this.trafficRecorder.stop === 'function') {
+            try {
+                this.lastTrafficAttribution = await this.trafficRecorder.stop();
+            } catch (error) {
+                logger.warn('Failed to stop Camoufox trafficRecorder during stop()', {
+                    profileId: this.profileId,
+                    error: error.message
+                });
+            }
         }
 
         try {

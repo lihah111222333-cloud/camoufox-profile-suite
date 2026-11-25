@@ -27,9 +27,32 @@ if (!fs.existsSync(LOG_DIR)) {
 
 const logFile = path.join(LOG_DIR, `app-${new Date().toISOString().split('T')[0]}.log`);
 
+function safeStringify(data) {
+    const seen = new WeakSet();
+    try {
+        return JSON.stringify(data, (_key, value) => {
+            if (typeof value === 'bigint') {
+                return value.toString();
+            }
+            if (value instanceof Error) {
+                return { name: value.name, message: value.message, stack: value.stack };
+            }
+            if (typeof value === 'object' && value !== null) {
+                if (seen.has(value)) {
+                    return '[Circular]';
+                }
+                seen.add(value);
+            }
+            return value;
+        });
+    } catch {
+        return String(data);
+    }
+}
+
 function formatMessage(level, message, data = null) {
     const timestamp = new Date().toISOString();
-    const dataStr = data ? ` | Data: ${JSON.stringify(data)}` : '';
+    const dataStr = data ? ` | Data: ${safeStringify(data)}` : '';
     return `[${timestamp}] [${level}] ${message}${dataStr}\n`;
 }
 

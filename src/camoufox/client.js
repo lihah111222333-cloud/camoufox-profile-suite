@@ -7,6 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import logger from '../utils/logger.js';
+import { CamoufoxTrafficRecorder } from './traffic-recorder.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -466,7 +467,11 @@ export function getProfileMetadataPath(profileId, profilesDir = DEFAULT_PROFILES
  */
 export function ensureProfileStorage(profileId, profilesDir = DEFAULT_PROFILES_DIR) {
     const profileDir = getProfileDir(profileId, profilesDir);
+    const trafficDir = path.join(profileDir, 'traffic');
+    const payloadsDir = path.join(trafficDir, 'payloads');
     fs.mkdirSync(profileDir, { recursive: true });
+    fs.mkdirSync(trafficDir, { recursive: true });
+    fs.mkdirSync(payloadsDir, { recursive: true });
 
     const storageStatePath = getStorageStatePath(profileId, profilesDir);
     if (!fs.existsSync(storageStatePath)) {
@@ -480,7 +485,13 @@ export function ensureProfileStorage(profileId, profilesDir = DEFAULT_PROFILES_D
     return {
         profileDir,
         storageStatePath,
-        metadataPath: getProfileMetadataPath(profileId, profilesDir)
+        metadataPath: getProfileMetadataPath(profileId, profilesDir),
+        trafficDir,
+        payloadsDir,
+        sslKeyLogPath: path.join(trafficDir, 'sslkeylog.txt'),
+        trafficNdjsonPath: path.join(trafficDir, 'traffic.ndjson'),
+        attributionIndexPath: path.join(trafficDir, 'attribution-index.json'),
+        harPath: path.join(trafficDir, 'trace.har')
     };
 }
 
@@ -815,7 +826,50 @@ export async function startProfile(profileId, options = {}) {
             const headless = mergedOptions.headless ?? false;
             const useSharedBrowser = Boolean(mergedOptions.useSharedBrowser);
 
+            const storageInfo = ensureProfileStorage(profileId, profilesDir);
             const storageStatePath = loadStorageState(profileId, profilesDir);
+            const recordTraffic = mergedOptions.recordTraffic !== undefined
+                ? mergedOptions.recordTraffic !== false
+                : process.env.CAMOUFOX_RECORD_TRAFFIC !== 'false';
+            const recordBodies = mergedOptions.recordBodies !== undefined
+                ? mergedOptions.recordBodies !== false
+                : process.env.CAMOUFOX_RECORD_BODIES !== 'false';
+            const sslKeyLog = mergedOptions.sslKeyLog !== undefined
+                ? mergedOptions.sslKeyLog !== false
+                : process.env.CAMOUFOX_SSLKEYLOG !== 'false';
+            const recordHar = mergedOptions.recordHar !== undefined
+                ? Boolean(mergedOptions.recordHar)
+                : process.env.CAMOUFOX_RECORD_HAR === 'true';
+            const maxBodyBytes = mergedOptions.maxBodyBytes !== undefined
+                ? mergedOptions.maxBodyBytes
+                : (process.env.CAMOUFOX_TRAFFIC_MAX_BODY_BYTES
+                    ? parseInt(process.env.CAMOUFOX_TRAFFIC_MAX_BODY_BYTES, 10)
+                    : 5242880);
+
+            const trafficPaths = {
+                trafficDir: storageInfo.trafficDir,
+                payloadsDir: storageInfo.payloadsDir,
+                sslKeyLogPath: storageInfo.sslKeyLogPath,
+                trafficNdjsonPath: storageInfo.trafficNdjsonPath,
+                attributionIndexPath: storageInfo.attributionIndexPath,
+                harPath: storageInfo.harPath
+            };
+
+            const launchEnv = sslKeyLog
+                ? {
+                      ...process.env,
+                      ...(mergedOptions.launchOptions?.env || {}),
+                      ...(options.env || {}),
+                      SSLKEYLOGFILE: storageInfo.sslKeyLogPath
+                  }
+                : (options.env || mergedOptions.launchOptions?.env
+                    ? {
+                          ...process.env,
+                          ...(mergedOptions.launchOptions?.env || {}),
+                          ...(options.env || {})
+                      }
+                    : null);
+
             const camoufoxMod = await resolveCamoufoxModule();
             const launchFn = camoufoxMod.AsyncCamoufox || camoufoxMod.Camoufox;
             const newContextFn = camoufoxMod.AsyncNewContext || camoufoxMod.NewContext;
@@ -830,7 +884,10 @@ export async function startProfile(profileId, options = {}) {
                     headless,
                     humanize,
                     canvas_noise: true,
-                    launchOptions: mergedOptions.launchOptions
+                    launchOptions: {
+                        ...(mergedOptions.launchOptions || {}),
+                        ...(launchEnv ? { env: launchEnv } : {})
+                    }
                 });
                 ownsBrowser = false;
 
@@ -844,6 +901,7 @@ export async function startProfile(profileId, options = {}) {
                     ...(mergedOptions.timezoneId ? { timezoneId: mergedOptions.timezoneId } : {}),
                     ...(mergedOptions.ff_version ? { ff_version: mergedOptions.ff_version } : {}),
                     ...(mergedOptions.preset ? { preset: mergedOptions.preset } : {}),
+                    ...(recordHar ? { recordHar: { path: storageInfo.harPath, content: 'attach' } } : {}),
                     ...(mergedOptions.contextOptions || {})
                 };
 
@@ -868,7 +926,8 @@ export async function startProfile(profileId, options = {}) {
                     ...(mergedOptions.firefox_user_prefs
                         ? { firefox_user_prefs: mergedOptions.firefox_user_prefs }
                         : {}),
-                    ...(mergedOptions.launchOptions || {})
+                    ...(mergedOptions.launchOptions || {}),
+                    ...(launchEnv ? { env: launchEnv } : {})
                 };
 
                 logger.info('Launching isolated Camoufox browser for profile', {
@@ -877,7 +936,8 @@ export async function startProfile(profileId, options = {}) {
                     hasProxy: Boolean(normalizedProxy),
                     geoip,
                     humanize: Boolean(humanize),
-                    headless
+                    headless,
+                    sslKeyLog
                 });
 
                 browser = await launchFn(launchOpts);
@@ -887,6 +947,7 @@ export async function startProfile(profileId, options = {}) {
                     storageState: storageStatePath,
                     ...(mergedOptions.timezoneId ? { timezoneId: mergedOptions.timezoneId } : {}),
                     ...(mergedOptions.geolocation ? { geolocation: mergedOptions.geolocation } : {}),
+                    ...(recordHar ? { recordHar: { path: storageInfo.harPath, content: 'attach' } } : {}),
                     ...(mergedOptions.contextOptions || {})
                 };
 
@@ -896,6 +957,24 @@ export async function startProfile(profileId, options = {}) {
             const existingPages = context.pages();
             const page = existingPages.length > 0 ? existingPages[0] : await context.newPage();
 
+            let trafficRecorder = null;
+            if (recordTraffic) {
+                trafficRecorder = new CamoufoxTrafficRecorder({
+                    profileId,
+                    trafficDir: storageInfo.trafficDir,
+                    sslKeyLogPath: storageInfo.sslKeyLogPath,
+                    harPath: recordHar ? storageInfo.harPath : null,
+                    os: targetOs,
+                    proxyServer: normalizedProxy?.server || null,
+                    accountId: options.accountId ?? mergedOptions.accountId ?? null,
+                    accountEmail: options.accountEmail ?? mergedOptions.accountEmail ?? null,
+                    recordBodies: options.recordBodies !== undefined ? options.recordBodies !== false : recordBodies,
+                    maxBodyBytes: options.maxBodyBytes ?? maxBodyBytes
+                });
+                await trafficRecorder.attachContext(context);
+                await trafficRecorder.attachPage(page);
+            }
+
             const session = {
                 profileId,
                 browser,
@@ -904,12 +983,15 @@ export async function startProfile(profileId, options = {}) {
                 ownsBrowser,
                 profilesDir,
                 storageStatePath,
+                trafficRecorder,
+                trafficPaths,
                 metadata: {
                     ...metadata,
                     os: targetOs,
                     proxy: normalizedProxy,
                     geoip,
-                    humanize
+                    humanize,
+                    trafficPaths
                 }
             };
 
@@ -959,6 +1041,17 @@ export async function stopProfile(profileId, options = {}) {
     const profilesDir = options.profilesDir || session.profilesDir || DEFAULT_PROFILES_DIR;
 
     try {
+        if (session.trafficRecorder) {
+            try {
+                await session.trafficRecorder.stop();
+            } catch (trafficErr) {
+                logger.warn('Could not flush traffic recorder before stopping profile', {
+                    profileId,
+                    error: trafficErr.message
+                });
+            }
+        }
+
         if (session.context) {
             try {
                 await saveProfileStorageState(profileId, session.context, profilesDir);

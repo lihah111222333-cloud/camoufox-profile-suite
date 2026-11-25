@@ -108,5 +108,20 @@ CAMOUFOX_STORAGE_DIR=./profiles
 
 # Optional: run in-browser C++ fingerprint coherence audit automatically on profile startup
 CAMOUFOX_AUDIT_ON_START=false
+
+# Pre-TLS traffic recording (Necko egress/ingress NDJSON + per-profile/account attribution index)
+CAMOUFOX_RECORD_TRAFFIC=true
+
+# Capture plaintext request/response bodies inside profiles/<profileId>/traffic/payloads/
+CAMOUFOX_RECORD_BODIES=true
+
+# Export Firefox NSS TLS 1.2/1.3 secrets to profiles/<profileId>/traffic/sslkeylog.txt
+CAMOUFOX_SSLKEYLOG=true
+
+# Optional: record full Playwright HAR 1.2 archive to profiles/<profileId>/traffic/trace.har
+CAMOUFOX_RECORD_HAR=false
+
+# Maximum plaintext body size (in bytes) captured per request/response (default: 5MB)
+CAMOUFOX_TRAFFIC_MAX_BODY_BYTES=5242880
 ```
 

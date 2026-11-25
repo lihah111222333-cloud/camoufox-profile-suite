@@ -7,15 +7,7 @@
  * - 'fivesim-legacy' - 5SIM Legacy API (api1.5sim.net)
  */
 
-import dotenv from 'dotenv';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// Project root .env (this file lives in src/providers/)
-dotenv.config({ path: path.resolve(__dirname, '..', '..', '.env') });
+import '../config.js';
 
 // Get provider from .env (default: 'sms-verification')
 const SMS_PROVIDER = (process.env.SMS_PROVIDER || 'sms-verification').toLowerCase().trim();

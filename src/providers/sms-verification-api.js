@@ -4,8 +4,6 @@
  * Compatible API with sms-verification-number.com
  */
 
-import axios from 'axios';
-
 const SMS_VERIFY_API_URL = 'https://sms-verification-number.com/stubs/handler_api';
 
 // Order status constants
@@ -30,7 +28,7 @@ function getLang() {
 }
 
 /**
- * Make API request to SMS Verification service
+ * Make API request to SMS Verification service using built-in fetch (zero external dependency required)
  * @param {string} action - API action name
  * @param {Object} params - Additional parameters
  * @returns {Promise<any>} Response data
@@ -49,22 +47,41 @@ async function makeRequest(action, params = {}) {
     };
 
     try {
-        const response = await axios.get(SMS_VERIFY_API_URL, {
-            params: queryParams,
-            timeout: 30000
-        });
-
-        // Handle string responses (common API format)
-        if (typeof response.data === 'string') {
-            // Check for common error responses
-            if (response.data === 'BAD_KEY') {
-                throw new Error('BAD_KEY');
+        const url = new URL(SMS_VERIFY_API_URL);
+        for (const [k, v] of Object.entries(queryParams)) {
+            if (v !== undefined && v !== null) {
+                url.searchParams.append(k, String(v));
             }
         }
 
-        return response.data;
+        const response = await fetch(url.toString(), {
+            method: 'GET',
+            signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(30000) : undefined
+        });
+
+        const rawText = await response.text();
+        let data = rawText;
+        try {
+            data = JSON.parse(rawText);
+        } catch {
+            // Keep string response format (e.g. ACCESS_NUMBER:..., BAD_KEY)
+        }
+
+        if (!response.ok) {
+            if (typeof data === 'string' && data === 'BAD_KEY') {
+                throw new Error('BAD_KEY');
+            }
+            const err = new Error(`HTTP ${response.status}: ${rawText}`);
+            err.response = { status: response.status, data };
+            throw err;
+        }
+
+        if (typeof data === 'string' && data === 'BAD_KEY') {
+            throw new Error('BAD_KEY');
+        }
+
+        return data;
     } catch (error) {
-        // Handle axios errors
         if (error.response?.data) {
             const errorData = error.response.data;
             if (typeof errorData === 'string' && errorData === 'BAD_KEY') {
@@ -72,7 +89,6 @@ async function makeRequest(action, params = {}) {
             }
             console.error(`SMS Verify API Error [${action}]:`, errorData);
         } else if (error.message === 'BAD_KEY') {
-            // Already handled, re-throw
             throw error;
         } else {
             console.error(`SMS Verify API Error [${action}]:`, error.message);

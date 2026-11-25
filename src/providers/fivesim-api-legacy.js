@@ -4,15 +4,7 @@
  * This API uses the old format for compatibility with existing software
  */
 
-import dotenv from 'dotenv';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// Load environment variables from project root
-dotenv.config({ path: path.resolve(__dirname, '..', '..', '.env') });
+import '../config.js';
 
 // Legacy API Configuration
 const LEGACY_API_URL = 'http://api1.5sim.net/stubs/handler_api.php';

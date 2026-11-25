@@ -9,8 +9,6 @@
 import logger from './utils/logger.js';
 import proxyManager from './utils/proxy-manager.js';
 import nameGenerator from './utils/name-generator.js';
-import { createAndStartProfile as createAndStartGPMProfile } from './gpmlogin/profile.js';
-import { createAndStartProfile as createAndStartDolphinProfile } from './dolphin/profile.js';
 import { createAndStartProfile as createAndStartCamoufoxProfile } from './camoufox/profile.js';
 import { createGmailAccount } from './gmail/creator.js';
 import config from './config.js';
@@ -61,11 +59,17 @@ async function createAccount(accountNumber = null) {
         logger.info(`${accountLabel} === Starting Gmail Account Creation ===`);
 
         // Step 1: Get proxy
+        const profileService = config.profileService || 'gpm';
         proxy = proxyManager.getNextProxy();
         if (!proxy) {
-            throw new Error('No proxies available');
+            if (profileService === 'camoufox' && config.app?.testProxy === false) {
+                logger.warn(`${accountLabel} No proxies configured; proceeding with direct connection (TEST_PROXY=false)`);
+            } else {
+                throw new Error('No proxies available');
+            }
+        } else {
+            logger.info(`${accountLabel} Proxy selected`, { proxy: proxy.ip });
         }
-        logger.info(`${accountLabel} Proxy selected`, { proxy: proxy.ip });
 
         // Step 2: Generate account data
         const accountData = nameGenerator.generateAccountData();
@@ -76,29 +80,30 @@ async function createAccount(accountNumber = null) {
 
         // Step 3: Create profile based on selected service
         const profileName = `Gmail_${accountData.username}_${Date.now()}`;
-        const profileService = config.profileService || 'gpm';
         
         logger.info(`${accountLabel} Creating ${profileService.toUpperCase()} profile`, { name: profileName });
         
         // Format proxy according to service
         if (profileService === 'camoufox') {
-            const camoufoxProxy = proxy ? {
-                ip: proxy.ip,
-                port: proxy.port,
-                username: proxy.username || '',
-                password: proxy.password || '',
-                type: proxy.type || 'http'
-            } : null;
+            const camoufoxProxy = proxy ? proxyManager.getCamoufoxFormat(proxy) : null;
             profile = await createAndStartCamoufoxProfile(profileName, camoufoxProxy, {
                 os: config.camoufox?.os,
                 headless: config.camoufox?.headless,
                 humanize: config.camoufox?.humanize,
                 geoip: config.camoufox?.geoip,
                 canvas_noise: config.camoufox?.canvasNoise,
-                profilesDir: config.camoufox?.storageDir
+                profilesDir: config.camoufox?.storageDir,
+                accountId: accountNumber,
+                accountEmail: accountData.email,
+                recordTraffic: config.camoufox?.recordTraffic,
+                recordBodies: config.camoufox?.recordBodies,
+                sslKeyLog: config.camoufox?.sslKeyLog,
+                recordHar: config.camoufox?.recordHar,
+                maxBodyBytes: config.camoufox?.maxBodyBytes
             });
         } else if (profileService === 'dolphin') {
-            // Dolphin Anty proxy format
+            // Lazy-load Dolphin Anty profile module only when selected
+            const { createAndStartProfile: createAndStartDolphinProfile } = await import('./dolphin/profile.js');
             const dolphinProxy = proxy ? {
                 ip: proxy.ip,
                 port: proxy.port,
@@ -108,13 +113,14 @@ async function createAccount(accountNumber = null) {
             } : null;
             profile = await createAndStartDolphinProfile(profileName, dolphinProxy);
         } else {
-            // GPM Login proxy format (default)
+            // Lazy-load GPM Login profile module only when selected
+            const { createAndStartProfile: createAndStartGPMProfile } = await import('./gpmlogin/profile.js');
             const gpmProxy = proxy ? {
                 ip: proxy.ip,
                 port: proxy.port,
                 username: proxy.username || '',
                 password: proxy.password || '',
-                type: 'http' // Default to HTTP
+                type: proxy.type || 'http'
             } : null;
             profile = await createAndStartGPMProfile(profileName, gpmProxy);
         }
@@ -135,11 +141,17 @@ async function createAccount(accountNumber = null) {
 
         // Step 5: Create Gmail account
         logger.info(`${accountLabel} Starting Gmail account creation process`);
+        if (typeof profile.setTrafficStep === 'function') {
+            profile.setTrafficStep('signup-flow', { email: accountData.email });
+        }
         const result = await createGmailAccount(page, accountData);
 
         // Step 6: Get profile IP (if available)
         let profileIP = null;
         try {
+            if (typeof profile.setTrafficStep === 'function') {
+                profile.setTrafficStep('ip-check');
+            }
             const page = await profile.getPage();
             if (page) {
                 profileIP = await page.evaluate(() => {
@@ -164,6 +176,7 @@ async function createAccount(accountNumber = null) {
             proxy: proxyManager.getStringFormat(proxy),
             proxyIP: proxy ? proxy.ip : null,
             profileIP: profileIP,
+            trafficAttribution: profile.trafficPaths || null,
             timestamp: new Date().toISOString()
         });
 
@@ -171,7 +184,10 @@ async function createAccount(accountNumber = null) {
             email: result.email
         });
 
-        return result;
+        return {
+            ...result,
+            trafficAttribution: profile.trafficPaths || null
+        };
     } catch (error) {
         logger.error(`${accountLabel} === Account Creation Failed ===`, {
             error: error.message,
@@ -182,6 +198,8 @@ async function createAccount(accountNumber = null) {
         saveResult({
             success: false,
             error: error.message,
+            profileId: profile?.profileId || null,
+            trafficAttribution: profile?.trafficPaths || null,
             timestamp: new Date().toISOString()
         });
 

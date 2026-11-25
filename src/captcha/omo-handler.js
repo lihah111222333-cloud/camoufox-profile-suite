@@ -6,12 +6,33 @@
 import logger from '../utils/logger.js';
 import config from '../config.js';
 
-const OMOCAPTCHA_EXTENSION_ID = 'dfjghhjachoacpgpkmbpdlpppeagojhe';
-const OMOCAPTCHA_KEY = process.env.OMOCAPTCHA_KEY || 'OMO_ENXZJL877JRCK52ZB2L6FNQFRIOIMEXAUKBZ0V2HOQGCMYQ5N1AV9KRY2ZTOSP1765618401';
-const OMO_CAPTCHA_ENABLED = config.omocaptcha.enabled !== false; // Default: true
+const OMOCAPTCHA_EXTENSION_ID = config.omocaptcha?.extensionId || 'dfjghhjachoacpgpkmbpdlpppeagojhe';
+const OMOCAPTCHA_KEY = config.omocaptcha?.apiKey || process.env.OMOCAPTCHA_KEY || '';
+const OMO_CAPTCHA_ENABLED = config.omocaptcha?.enabled !== false; // Default: true
 
 // Flag to prevent multiple simultaneous setup attempts
 let omoSetupInProgress = false;
+
+/**
+ * Detect whether the active profile/page runs on Camoufox (Firefox / Gecko),
+ * where `chrome-extension://` CRX URLs are unsupported.
+ */
+async function isFirefoxOrCamoufoxEngine(page = null) {
+    if (config.profileService === 'camoufox') {
+        return true;
+    }
+    if (page && typeof page.evaluate === 'function') {
+        try {
+            return await page.evaluate(() => {
+                const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+                return /\bFirefox\/\d+/i.test(ua) && typeof chrome === 'undefined';
+            });
+        } catch {
+            return false;
+        }
+    }
+    return false;
+}
 
 /**
  * Check if reCAPTCHA extension is installed
@@ -405,6 +426,16 @@ export async function setupOMOCaptchaExtension(page) {
     // Check if OMO Captcha setup is disabled via environment variable
     if (!OMO_CAPTCHA_ENABLED) {
         logger.info('OMO Captcha extension setup is disabled (SETUP_OMO_CAPTCHA=false) - skipping');
+        return true;
+    }
+
+    if (await isFirefoxOrCamoufoxEngine(page)) {
+        logger.info('Camoufox (Firefox/Gecko) engine detected - skipping Chromium chrome-extension:// OMO probe');
+        return true;
+    }
+
+    if (!OMOCAPTCHA_KEY) {
+        logger.info('OMOCAPTCHA_KEY is not configured - skipping OMO Captcha extension setup');
         return true;
     }
     

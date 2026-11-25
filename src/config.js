@@ -59,7 +59,12 @@ export const config = {
         humanize: process.env.CAMOUFOX_HUMANIZE !== 'false', // Default: true
         geoip: process.env.CAMOUFOX_GEOIP !== 'false', // Default: true when proxy is used
         canvasNoise: process.env.CAMOUFOX_CANVAS_NOISE !== 'false', // Default: true for cross-OS isolation
-        storageDir: process.env.CAMOUFOX_STORAGE_DIR || path.resolve(__dirname, '../profiles')
+        storageDir: process.env.CAMOUFOX_STORAGE_DIR || path.resolve(__dirname, '../profiles'),
+        recordTraffic: process.env.CAMOUFOX_RECORD_TRAFFIC !== 'false', // Default: true (pre-TLS Necko egress/ingress NDJSON + attribution)
+        recordBodies: process.env.CAMOUFOX_RECORD_BODIES !== 'false', // Default: true (capture plaintext request/response payloads)
+        sslKeyLog: process.env.CAMOUFOX_SSLKEYLOG !== 'false', // Default: true (export NSS pre-TLS secrets to sslkeylog.txt)
+        recordHar: process.env.CAMOUFOX_RECORD_HAR === 'true', // Default: false (optional Playwright HAR 1.2 archive)
+        maxBodyBytes: parseInt(process.env.CAMOUFOX_TRAFFIC_MAX_BODY_BYTES || '5242880', 10) // Default: 5MB
     },
     gologin: {
         apiKey: process.env.GOLOGIN_API_KEY || '',
