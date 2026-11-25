@@ -60,7 +60,8 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
                     lang: 'en-US',
                     voiceURI: 'urn:moz-tts:sapi:Microsoft Zira Desktop - English (United States)?en-US'
                 }
-            ]
+            ],
+            fonts: ['Segoe UI', 'Consolas', 'Calibri', 'Arial', 'Times New Roman']
         },
         macos: {
             userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0',
@@ -87,7 +88,8 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
                     lang: 'en-US',
                     voiceURI: 'com.apple.speech.synthesis.voice.Alex'
                 }
-            ]
+            ],
+            fonts: ['SF Pro', 'Helvetica Neue', 'Menlo', 'Monaco', 'Arial', 'Times New Roman']
         },
         linux: {
             userAgent: 'Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0',
@@ -109,7 +111,8 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
                     lang: 'en-US',
                     voiceURI: 'urn:moz-tts:speechd:English%20(America)?en'
                 }
-            ]
+            ],
+            fonts: ['Ubuntu', 'Liberation Sans', 'DejaVu Sans', 'Arial', 'Times New Roman']
         }
     };
 
@@ -129,6 +132,8 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
             language: 'en-US',
             webdriver: false,
             maxTouchPoints: 0,
+            pdfViewerEnabled: true,
+            cookieEnabled: true,
             hasUserAgentData: false,
             vendor: '',
             buildID: '20181001000000'
@@ -227,7 +232,8 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
             candidateIps: ['203.0.113.45'],
             privateIpLeaked: false
         },
-        speechVoices: p.speechVoices
+        speechVoices: p.speechVoices,
+        fonts: p.fonts
     };
 }
 

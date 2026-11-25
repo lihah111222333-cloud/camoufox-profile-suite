@@ -22,7 +22,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { verifyTrafficIntegrity } from '../src/camoufox/traffic-recorder.js';
+import {
+    verifyTrafficIntegrity,
+    exportTrafficToHar,
+    parseSslKeyLog,
+    detectWireHeaderAnomalies
+} from '../src/camoufox/traffic-recorder.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -61,6 +66,7 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
         correlation: null,
         dumpWire: null,
         verifyIntegrity: false,
+        exportHar: null,
         json: false,
         help: false
     };
@@ -129,6 +135,22 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
             case 'verify-integrity':
             case 'verifyIntegrity':
                 opts.verifyIntegrity = value === null ? true : value !== 'false' && value !== '0';
+                break;
+            case 'export-har':
+            case 'exportHar':
+                if (value !== null) {
+                    opts.exportHar =
+                        value === '' || value === 'true'
+                            ? true
+                            : value === 'false' || value === '0'
+                              ? false
+                              : value;
+                } else if (i + 1 < argv.length && !String(argv[i + 1]).startsWith('--')) {
+                    i += 1;
+                    opts.exportHar = String(argv[i]);
+                } else {
+                    opts.exportHar = true;
+                }
                 break;
             case 'json':
                 opts.json = value === null ? true : value !== 'false' && value !== '0';
@@ -897,8 +919,14 @@ export function queryProfileTraffic(options = {}) {
 
     // If no profile is specified and no direct trafficDir or correlationId is given,
     // list and summarize all profiles in profilesDir that have a traffic/ directory
-    // (unless --verify-integrity is requested, in which case we resolve single or all profiles).
-    if (!targetProfileId && !options.trafficDir && !correlationId && !options.verifyIntegrity) {
+    // (unless --verify-integrity or --export-har is requested, in which case we resolve single or all profiles).
+    if (
+        !targetProfileId &&
+        !options.trafficDir &&
+        !correlationId &&
+        !options.verifyIntegrity &&
+        !options.exportHar
+    ) {
         const profiles = listTrafficProfiles(profilesDir);
         return {
             mode: 'list-profiles',
@@ -968,6 +996,15 @@ export function queryProfileTraffic(options = {}) {
                 profiles: perProfile
             };
         }
+    } else if (options.exportHar) {
+        const candidates = listTrafficProfiles(profilesDir);
+        if (candidates.length >= 1) {
+            resolvedPaths = {
+                profileId: candidates[0].profileId,
+                profileDir: candidates[0].profileDir,
+                trafficDir: candidates[0].trafficDir
+            };
+        }
     }
 
     if (!resolvedPaths || !fs.existsSync(resolvedPaths.trafficDir)) {
@@ -987,6 +1024,30 @@ export function queryProfileTraffic(options = {}) {
             trafficDir,
             ...integrityResult,
             integrity: integrityResult
+        };
+    }
+
+    if (options.exportHar) {
+        const customHarPath =
+            typeof options.exportHar === 'string' &&
+            options.exportHar.trim().length > 0 &&
+            options.exportHar !== 'true'
+                ? path.resolve(options.exportHar)
+                : path.join(trafficDir, 'traffic.har');
+        const harResult = exportTrafficToHar(trafficDir, customHarPath, { profileId });
+        return {
+            mode: 'export-har',
+            profileId,
+            profileDir,
+            trafficDir,
+            harPath: harResult.harPath,
+            outputPath: harResult.outputPath,
+            entryCount: harResult.entryCount,
+            entriesCount: harResult.entriesCount,
+            pageCount: harResult.pageCount,
+            bytes: harResult.bytes,
+            log: harResult.log,
+            har: harResult.har
         };
     }
     const trafficNdjsonPath = path.join(trafficDir, 'traffic.ndjson');
@@ -1156,6 +1217,15 @@ export function formatCliReport(result) {
         return lines.join('\n');
     }
 
+    if (result.mode === 'export-har') {
+        lines.push(`📦 W3C HAR 1.2 Archive Exported — Profile: ${result.profileId}`);
+        lines.push(`   Output Path : ${result.harPath}`);
+        lines.push(`   Entry Count : ${result.entryCount}`);
+        lines.push(`   Page Count  : ${result.pageCount ?? 0}`);
+        lines.push(`   File Size   : ${result.bytes ?? 0} bytes`);
+        return lines.join('\n');
+    }
+
     if (result.mode === 'list-profiles') {
         lines.push(`📂 Profiles Directory: ${result.profilesDir}`);
         lines.push(`Found ${result.count} profile(s) with recorded pre-TLS traffic:`);
@@ -1236,6 +1306,7 @@ export function runCli(argv = process.argv.slice(2)) {
                 '  --correlation=<corrId>      Reconstruct Pre-TLS Egress + Post-TLS Ingress wire dump',
                 '  --dump-wire=<corrId>        Alias for --correlation=<corrId>',
                 '  --verify-integrity          Verify SHA-256 tamper-evident hash chain & payload manifest',
+                '  --export-har[=<path>]       Export recorded profile traffic to W3C HAR 1.2 archive',
                 '  --json                      Output structured JSON'
             ].join('\n')
         );
@@ -1252,7 +1323,8 @@ export function runCli(argv = process.argv.slice(2)) {
         anomaliesOnly: args.anomaliesOnly,
         correlation: args.correlation,
         dumpWire: args.dumpWire,
-        verifyIntegrity: args.verifyIntegrity
+        verifyIntegrity: args.verifyIntegrity,
+        exportHar: args.exportHar
     });
 
     if (args.json) {
@@ -1283,13 +1355,21 @@ if (isMainModule) {
     }
 }
 
-export { verifyTrafficIntegrity };
+export {
+    verifyTrafficIntegrity,
+    exportTrafficToHar,
+    parseSslKeyLog,
+    detectWireHeaderAnomalies
+};
 
 export default {
     queryProfileTraffic,
     listTrafficProfiles,
     reconstructTransactionWireDump,
     verifyTrafficIntegrity,
+    exportTrafficToHar,
+    parseSslKeyLog,
+    detectWireHeaderAnomalies,
     parseCliArgs,
     formatCliReport,
     runCli

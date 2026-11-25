@@ -15,6 +15,7 @@ import {
     normalizeTargetOs,
     gpuFitsOs,
     evaluatePlatformCoherence,
+    evaluateWireToDomCoherence,
     auditProfileCoherence
 } from '../src/camoufox/coherence-auditor.js';
 
@@ -60,7 +61,8 @@ function buildCoherentTelemetry(os = 'windows') {
                     lang: 'en-US',
                     voiceURI: 'urn:moz-tts:sapi:Microsoft Zira Desktop - English (United States)?en-US'
                 }
-            ]
+            ],
+            fonts: ['Segoe UI', 'Consolas', 'Calibri', 'Arial', 'Times New Roman']
         },
         macos: {
             userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0',
@@ -87,7 +89,8 @@ function buildCoherentTelemetry(os = 'windows') {
                     lang: 'en-US',
                     voiceURI: 'com.apple.speech.synthesis.voice.Alex'
                 }
-            ]
+            ],
+            fonts: ['SF Pro', 'Helvetica Neue', 'Menlo', 'Monaco', 'Arial', 'Times New Roman']
         },
         linux: {
             userAgent: 'Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0',
@@ -109,7 +112,8 @@ function buildCoherentTelemetry(os = 'windows') {
                     lang: 'en-US',
                     voiceURI: 'urn:moz-tts:speechd:English%20(America)?en'
                 }
-            ]
+            ],
+            fonts: ['Ubuntu', 'Liberation Sans', 'DejaVu Sans', 'Arial', 'Times New Roman']
         }
     };
 
@@ -129,6 +133,8 @@ function buildCoherentTelemetry(os = 'windows') {
             language: 'en-US',
             webdriver: false,
             maxTouchPoints: 0,
+            pdfViewerEnabled: true,
+            cookieEnabled: true,
             hasUserAgentData: false,
             hasWindowChrome: false,
             vendor: '',
@@ -258,7 +264,8 @@ function buildCoherentTelemetry(os = 'windows') {
             candidateIps: ['203.0.113.45'],
             privateIpLeaked: false
         },
-        speechVoices: p.speechVoices
+        speechVoices: p.speechVoices,
+        fonts: p.fonts
     };
 }
 
@@ -276,7 +283,7 @@ const tests = [
             const res = evaluatePlatformCoherence(telemetry, 'windows');
             assert.equal(res.passed, true);
             assert.equal(res.score, 100);
-            assert.equal(res.checks.length, 10);
+            assert.equal(res.checks.length, 11);
             assert.ok(res.checks.every((c) => c.passed));
         }
     },
@@ -570,7 +577,7 @@ const tests = [
             assert.equal(report.passed, true);
             assert.equal(report.score, 100);
             assert.equal(report.expectedOs, 'mac');
-            assert.equal(report.checks.length, 10);
+            assert.equal(report.checks.length, 11);
         }
     },
     {
@@ -659,26 +666,163 @@ const tests = [
         }
     },
     {
-        name: '28. Valid Windows, macOS, and Linux profiles with coherent webrtc ephemeral ports, OS-matched speechVoices, and empty automationGlobals pass 10/10 checks (100/100)',
+        name: '28. Valid Windows, macOS, and Linux profiles with coherent webrtc ephemeral ports, OS-matched speechVoices, and empty automationGlobals pass 11/11 checks (100/100)',
         fn: () => {
             for (const os of ['windows', 'macos', 'linux']) {
                 const telemetry = buildCoherentTelemetry(os);
                 const res = evaluatePlatformCoherence(telemetry, os);
                 assert.equal(res.passed, true, `Expected ${os} profile to pass`);
                 assert.equal(res.score, 100, `Expected ${os} score to be 100`);
-                assert.equal(res.checks.length, 10, `Expected 10 checks for ${os}`);
+                assert.equal(res.checks.length, 11, `Expected 11 checks for ${os}`);
                 assert.ok(res.checks.every((c) => c.passed));
 
-                // Also verify backward compatibility when older synthetic fixtures omit the 3 new fields
+                // Also verify backward compatibility when older synthetic fixtures omit the optional fields
                 const legacyTelemetry = buildCoherentTelemetry(os);
                 delete legacyTelemetry.automationGlobals;
                 delete legacyTelemetry.webrtc;
                 delete legacyTelemetry.speechVoices;
+                delete legacyTelemetry.fonts;
                 const legacyRes = evaluatePlatformCoherence(legacyTelemetry, os);
                 assert.equal(legacyRes.passed, true);
                 assert.equal(legacyRes.score, 100);
-                assert.equal(legacyRes.checks.length, 10);
+                assert.equal(legacyRes.checks.length, 11);
             }
+        }
+    },
+    {
+        name: '29. Detects navigator.pdfViewerEnabled === false and navigator.cookieEnabled === false anomalies',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('windows');
+            telemetry.navigator.pdfViewerEnabled = false;
+            telemetry.navigator.cookieEnabled = false;
+            const res = evaluatePlatformCoherence(telemetry, 'windows');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'storage-pdf-fonts-coherence');
+            assert.equal(check.passed, false);
+            assert.match(check.details, /navigator\.pdfViewerEnabled=false/);
+            assert.match(check.details, /navigator\.cookieEnabled=false/);
+        }
+    },
+    {
+        name: '30. Detects Windows identity leaking macOS Helvetica Neue and Menlo system fonts',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('windows');
+            telemetry.fonts = ['Segoe UI', 'Helvetica Neue', 'Menlo', 'Arial'];
+            const res = evaluatePlatformCoherence(telemetry, 'windows');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'storage-pdf-fonts-coherence');
+            assert.equal(check.passed, false);
+            assert.match(check.details, /Windows identity leaked macOS-exclusive font "Helvetica Neue"/);
+            assert.match(check.details, /Windows identity leaked macOS-exclusive font "Menlo"/);
+        }
+    },
+    {
+        name: '31. Detects macOS identity leaking Windows Segoe UI and Consolas system fonts',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('macos');
+            telemetry.fonts = ['SF Pro', 'Segoe UI', 'Consolas', 'Arial'];
+            const res = evaluatePlatformCoherence(telemetry, 'macos');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'storage-pdf-fonts-coherence');
+            assert.equal(check.passed, false);
+            assert.match(check.details, /macOS identity leaked Windows-exclusive font "Segoe UI"/);
+            assert.match(check.details, /macOS identity leaked Windows-exclusive font "Consolas"/);
+        }
+    },
+    {
+        name: '32. evaluateWireToDomCoherence passes 100/100 when pre-TLS egress wire User-Agent and Accept-Language match DOM navigator',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('windows');
+            const egressEvents = [
+                {
+                    type: 'egress',
+                    url: 'https://accounts.google.com/signup/v2/webcreateaccount',
+                    headers: {
+                        'User-Agent': telemetry.navigator.userAgent,
+                        'Accept-Language': 'en-US,en;q=0.5',
+                        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                    }
+                },
+                {
+                    type: 'egress',
+                    url: 'https://accounts.google.com/_/signup/validatepersonaldetails',
+                    headersArray: [
+                        { name: 'User-Agent', value: telemetry.navigator.userAgent },
+                        { name: 'Accept-Language', value: 'en-US,en;q=0.5' }
+                    ]
+                }
+            ];
+            const res = evaluateWireToDomCoherence(telemetry, egressEvents, 'windows');
+            assert.equal(res.passed, true);
+            assert.equal(res.score, 100);
+            assert.equal(res.inspectedRequests, 2);
+            assert.equal(res.checks.length, 4);
+            assert.ok(res.checks.every((c) => c.passed));
+        }
+    },
+    {
+        name: '33. evaluateWireToDomCoherence detects wire User-Agent vs DOM navigator.userAgent mismatch and Accept-Language vs navigator.language mismatch',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('windows');
+            const egressEvents = [
+                {
+                    type: 'egress',
+                    url: 'https://accounts.google.com/signup',
+                    headers: {
+                        'User-Agent':
+                            'Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0',
+                        'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.5'
+                    }
+                }
+            ];
+            const res = evaluateWireToDomCoherence(telemetry, { egressEvents }, 'windows');
+            assert.equal(res.passed, false);
+            assert.equal(res.inspectedRequests, 1);
+
+            const uaCheck = findCheck(res, 'wire-ua-matches-dom-ua');
+            assert.equal(uaCheck.passed, false);
+            assert.match(uaCheck.details, /does not match DOM navigator\.userAgent/);
+
+            const langCheck = findCheck(res, 'wire-accept-language-matches-dom');
+            assert.equal(langCheck.passed, false);
+            assert.match(langCheck.details, /does not start with DOM primary language "en-US"/);
+        }
+    },
+    {
+        name: '34. evaluateWireToDomCoherence detects Sec-CH-UA Client Hints and X-Forwarded-For proxy leak headers on pre-TLS egress traffic',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('windows');
+            const mockRecorder = {
+                transactions: new Map([
+                    [
+                        'corr-1',
+                        {
+                            correlationId: 'corr-1',
+                            url: 'https://accounts.google.com/v3/signin',
+                            headers: {
+                                'User-Agent': telemetry.navigator.userAgent,
+                                'Accept-Language': 'en-US,en;q=0.5',
+                                'Sec-CH-UA': '"Chromium";v="135", "Not-A.Brand";v="8"',
+                                'Sec-CH-UA-Platform': '"Windows"',
+                                'X-Forwarded-For': '198.51.100.24',
+                                Via: '1.1 squid-proxy'
+                            }
+                        }
+                    ]
+                ])
+            };
+            const res = evaluateWireToDomCoherence(telemetry, mockRecorder, 'windows');
+            assert.equal(res.passed, false);
+            assert.equal(res.inspectedRequests, 1);
+
+            const chCheck = findCheck(res, 'wire-no-chromium-client-hints');
+            assert.equal(chCheck.passed, false);
+            assert.match(chCheck.details, /Sec-CH-UA/);
+
+            const proxyCheck = findCheck(res, 'wire-no-proxy-leak-headers');
+            assert.equal(proxyCheck.passed, false);
+            assert.match(proxyCheck.details, /X-Forwarded-For/);
+            assert.match(proxyCheck.details, /Via/);
         }
     }
 ];

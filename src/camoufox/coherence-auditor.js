@@ -6,6 +6,7 @@
  * inspected by Google BotGuard, Arkose BDA, Meta Device Graph, and ByteDance JSVMP.
  */
 
+import fs from 'fs';
 import logger from '../utils/logger.js';
 
 /**
@@ -65,6 +66,33 @@ export const CAMOUFOX_COHERENCE_CONSTANTS = Object.freeze({
         'domAutomation',
         'domAutomationController',
         '_WEBDRIVER_ELEM_CACHE'
+    ]),
+    windowsExclusiveFonts: Object.freeze([
+        'Segoe UI',
+        'Consolas',
+        'Calibri',
+        'Cambria',
+        'Candara',
+        'Gabriola',
+        'Ebrima'
+    ]),
+    macosExclusiveFonts: Object.freeze([
+        'SF Pro',
+        'SF Pro Text',
+        'SF Pro Display',
+        'Helvetica Neue',
+        'Menlo',
+        'Apple Color Emoji',
+        'Geneva',
+        'Monaco',
+        'PingFang SC'
+    ]),
+    linuxExclusiveFonts: Object.freeze([
+        'Ubuntu',
+        'Ubuntu Mono',
+        'Cantarell',
+        'Liberation Sans',
+        'Noto Color Emoji'
     ])
 });
 
@@ -203,6 +231,8 @@ export async function collectBrowserFingerprint(page) {
             language: navigator.language,
             webdriver: navigator.webdriver,
             maxTouchPoints: typeof navigator.maxTouchPoints === 'number' ? navigator.maxTouchPoints : 0,
+            pdfViewerEnabled: 'pdfViewerEnabled' in navigator ? navigator.pdfViewerEnabled : true,
+            cookieEnabled: 'cookieEnabled' in navigator ? navigator.cookieEnabled : true,
             hasUserAgentData: 'userAgentData' in navigator && Boolean(navigator.userAgentData),
             hasWindowChrome: typeof window.chrome !== 'undefined' && Boolean(window.chrome),
             vendor: navigator.vendor || '',
@@ -551,6 +581,65 @@ export async function collectBrowserFingerprint(page) {
             privateIpLeaked: false
         };
 
+        let fonts = [];
+        try {
+            const probeFonts = [
+                'Segoe UI',
+                'Consolas',
+                'Calibri',
+                'SF Pro',
+                'Helvetica Neue',
+                'Menlo',
+                'Monaco',
+                'Ubuntu',
+                'Liberation Sans',
+                'DejaVu Sans',
+                'Arial',
+                'Times New Roman'
+            ];
+            const probeText = 'mmmmmmmmmmlliWW1234567890';
+            const baseFamilies = ['monospace', 'sans-serif', 'serif'];
+            const fontCanvas =
+                typeof document !== 'undefined' && typeof document.createElement === 'function'
+                    ? document.createElement('canvas')
+                    : null;
+            const fontCtx =
+                fontCanvas && typeof fontCanvas.getContext === 'function'
+                    ? fontCanvas.getContext('2d')
+                    : null;
+
+            if (fontCtx) {
+                const baseWidths = {};
+                for (const base of baseFamilies) {
+                    fontCtx.font = `72px ${base}`;
+                    baseWidths[base] = fontCtx.measureText(probeText).width;
+                }
+                for (const fontName of probeFonts) {
+                    let detected = false;
+                    for (const base of baseFamilies) {
+                        fontCtx.font = `72px "${fontName}", ${base}`;
+                        const width = fontCtx.measureText(probeText).width;
+                        if (width !== baseWidths[base]) {
+                            detected = true;
+                            break;
+                        }
+                    }
+                    if (detected) {
+                        fonts.push(fontName);
+                    }
+                }
+            } else if (
+                typeof document !== 'undefined' &&
+                document.fonts &&
+                typeof document.fonts.check === 'function'
+            ) {
+                const bogusAvailable = document.fonts.check('16px "__camoufox_nonexistent_font__"');
+                if (!bogusAvailable) {
+                    fonts = probeFonts.filter((fontName) => document.fonts.check(`16px "${fontName}"`));
+                }
+            }
+        } catch {}
+
         return {
             navigator: navigatorInfo,
             prototypeIntegrity,
@@ -563,7 +652,8 @@ export async function collectBrowserFingerprint(page) {
             intl: intlInfo,
             automationGlobals,
             speechVoices,
-            webrtc: webrtcInfo
+            webrtc: webrtcInfo,
+            fonts
         };
     });
 }
@@ -1163,6 +1253,72 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
         });
     }
 
+    // Check 11: Storage, PDF Viewer & OS Font Exclusive Signature Coherence
+    {
+        const issues = [];
+        if (nav.pdfViewerEnabled === false) {
+            issues.push(
+                'navigator.pdfViewerEnabled=false (stock Desktop Firefox always reports pdfViewerEnabled=true)'
+            );
+        }
+        if (nav.cookieEnabled === false) {
+            issues.push('navigator.cookieEnabled=false (cookies must be enabled in Desktop Firefox)');
+        }
+
+        const rawFonts = Array.isArray(telemetry.fonts)
+            ? telemetry.fonts
+            : Array.isArray(telemetry.fonts?.available)
+              ? telemetry.fonts.available
+              : [];
+
+        if (rawFonts.length > 0 && targetOs) {
+            const winFontSet = new Set(
+                CAMOUFOX_COHERENCE_CONSTANTS.windowsExclusiveFonts.map((f) => f.toLowerCase())
+            );
+            const macFontSet = new Set(
+                CAMOUFOX_COHERENCE_CONSTANTS.macosExclusiveFonts.map((f) => f.toLowerCase())
+            );
+            const linFontSet = new Set(
+                CAMOUFOX_COHERENCE_CONSTANTS.linuxExclusiveFonts.map((f) => f.toLowerCase())
+            );
+
+            for (const rawFont of rawFonts) {
+                const fontName = String(rawFont || '').trim();
+                const lowerFont = fontName.toLowerCase();
+                if (!lowerFont) continue;
+
+                if (targetOs === 'win') {
+                    if (macFontSet.has(lowerFont)) {
+                        issues.push(`Windows identity leaked macOS-exclusive font "${fontName}"`);
+                    } else if (linFontSet.has(lowerFont)) {
+                        issues.push(`Windows identity leaked Linux-exclusive font "${fontName}"`);
+                    }
+                } else if (targetOs === 'mac') {
+                    if (winFontSet.has(lowerFont)) {
+                        issues.push(`macOS identity leaked Windows-exclusive font "${fontName}"`);
+                    } else if (linFontSet.has(lowerFont)) {
+                        issues.push(`macOS identity leaked Linux-exclusive font "${fontName}"`);
+                    }
+                } else if (targetOs === 'lin') {
+                    if (winFontSet.has(lowerFont)) {
+                        issues.push(`Linux identity leaked Windows-exclusive font "${fontName}"`);
+                    } else if (macFontSet.has(lowerFont)) {
+                        issues.push(`Linux identity leaked macOS-exclusive font "${fontName}"`);
+                    }
+                }
+            }
+        }
+
+        const passed = issues.length === 0;
+        checks.push({
+            name: 'storage-pdf-fonts-coherence',
+            passed,
+            details: passed
+                ? 'navigator.pdfViewerEnabled, navigator.cookieEnabled, and OS system font catalog are coherent'
+                : issues.join('; ')
+        });
+    }
+
     const passedCount = checks.filter((c) => c.passed).length;
     const score = checks.length > 0 ? Math.round((passedCount / checks.length) * 100) : 0;
     const passed = passedCount === checks.length;
@@ -1170,6 +1326,307 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
     return {
         passed,
         score,
+        checks
+    };
+}
+
+/**
+ * Extract pre-TLS egress HTTP request events from an array of events, a summary object
+ * (`{ egressEvents }`), or a live/stopped `CamoufoxTrafficRecorder` instance.
+ *
+ * @param {Array<object> | object | null | undefined} trafficEventsOrSummary
+ * @returns {Array<object>}
+ */
+function extractEgressRequestEvents(trafficEventsOrSummary) {
+    if (!trafficEventsOrSummary) {
+        return [];
+    }
+
+    const isEgressEvent = (ev) => {
+        if (!ev || typeof ev !== 'object') return false;
+        const type = ev.type || ev.eventType || ev.direction || null;
+        if (!type) {
+            return Boolean(ev.headers || ev.headersArray || ev.requestHeaders || ev.egressWireBlock);
+        }
+        return type === 'egress' || type === 'request' || ev.direction === 'egress';
+    };
+
+    if (Array.isArray(trafficEventsOrSummary)) {
+        return trafficEventsOrSummary.filter(isEgressEvent);
+    }
+
+    if (typeof trafficEventsOrSummary === 'object') {
+        if (Array.isArray(trafficEventsOrSummary.egressEvents)) {
+            return trafficEventsOrSummary.egressEvents.filter((ev) => ev && typeof ev === 'object');
+        }
+        if (Array.isArray(trafficEventsOrSummary.events)) {
+            return trafficEventsOrSummary.events.filter(isEgressEvent);
+        }
+        if (Array.isArray(trafficEventsOrSummary.requests)) {
+            return trafficEventsOrSummary.requests.filter((ev) => ev && typeof ev === 'object');
+        }
+
+        const ndjsonPath =
+            trafficEventsOrSummary.paths?.trafficNdjsonPath ||
+            trafficEventsOrSummary.trafficNdjsonPath ||
+            null;
+
+        if (typeof ndjsonPath === 'string' && ndjsonPath.length > 0) {
+            try {
+                if (fs.existsSync(ndjsonPath)) {
+                    const content = fs.readFileSync(ndjsonPath, 'utf8');
+                    const parsedEvents = [];
+                    for (const line of content.split(/\r?\n/)) {
+                        const trimmed = line.trim();
+                        if (!trimmed) continue;
+                        try {
+                            const ev = JSON.parse(trimmed);
+                            if (isEgressEvent(ev)) {
+                                parsedEvents.push(ev);
+                            }
+                        } catch {
+                            // Ignore malformed NDJSON line
+                        }
+                    }
+                    if (parsedEvents.length > 0) {
+                        return parsedEvents;
+                    }
+                }
+            } catch {
+                // Fall back to in-memory transactions if reading traffic.ndjson fails
+            }
+        }
+
+        if (trafficEventsOrSummary.transactions) {
+            const txIterable =
+                trafficEventsOrSummary.transactions instanceof Map
+                    ? Array.from(trafficEventsOrSummary.transactions.values())
+                    : Array.isArray(trafficEventsOrSummary.transactions)
+                      ? trafficEventsOrSummary.transactions
+                      : typeof trafficEventsOrSummary.transactions === 'object'
+                        ? Object.values(trafficEventsOrSummary.transactions)
+                        : [];
+            return txIterable.filter(
+                (tx) =>
+                    tx &&
+                    typeof tx === 'object' &&
+                    Boolean(tx.headers || tx.headersArray || tx.requestHeaders || tx.egressWireBlock)
+            );
+        }
+    }
+
+    return [];
+}
+
+/**
+ * Normalize headers from an egress event (`headers`, `headersArray`, `requestHeaders`, or `egressWireBlock`)
+ * into a uniform list of `{ name, lowerName, value }`.
+ *
+ * @param {object} event
+ * @returns {Array<{ name: string, lowerName: string, value: string }>}
+ */
+function normalizeEgressHeaders(event) {
+    if (!event || typeof event !== 'object') {
+        return [];
+    }
+
+    const result = [];
+    const seen = new Set();
+
+    const pushHeader = (rawName, rawValue) => {
+        const name = String(rawName ?? '').trim();
+        if (!name) return;
+        const lowerName = name.toLowerCase();
+        const value = String(rawValue ?? '').trim();
+        const dedupKey = `${lowerName}\u0000${value}`;
+        if (seen.has(dedupKey)) return;
+        seen.add(dedupKey);
+        result.push({ name, lowerName, value });
+    };
+
+    if (Array.isArray(event.headersArray)) {
+        for (const entry of event.headersArray) {
+            if (entry && typeof entry === 'object') {
+                pushHeader(entry.name, entry.value);
+            }
+        }
+    }
+
+    const headerObjs = [event.headers, event.requestHeaders];
+    for (const hdrObj of headerObjs) {
+        if (hdrObj && typeof hdrObj === 'object' && !Array.isArray(hdrObj)) {
+            for (const [k, v] of Object.entries(hdrObj)) {
+                pushHeader(k, v);
+            }
+        } else if (Array.isArray(hdrObj)) {
+            for (const entry of hdrObj) {
+                if (entry && typeof entry === 'object') {
+                    pushHeader(entry.name, entry.value);
+                }
+            }
+        }
+    }
+
+    if (result.length === 0 && typeof event.egressWireBlock === 'string') {
+        const lines = event.egressWireBlock.split(/\r?\n/);
+        let inHeaders = false;
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!inHeaders) {
+                if (/^[A-Z]+\s+\S+\s+HTTP\/\d(?:\.\d)?$/i.test(trimmed)) {
+                    inHeaders = true;
+                }
+                continue;
+            }
+            if (!trimmed || trimmed.startsWith('====')) {
+                break;
+            }
+            const colonIdx = line.indexOf(':');
+            if (colonIdx > 0) {
+                const hName = line.slice(0, colonIdx).trim();
+                const hVal = line.slice(colonIdx + 1).trim();
+                pushHeader(hName, hVal);
+            }
+        }
+    }
+
+    return result;
+}
+
+/**
+ * Cross-check in-browser DOM telemetry (`domTelemetry.navigator`) against recorded pre-TLS
+ * egress HTTP request events (`traffic.ndjson` / `CamoufoxTrafficRecorder` / array of egress events).
+ *
+ * @param {object} domTelemetry Output of `collectBrowserFingerprint(page)` (or object containing `.navigator`)
+ * @param {Array<object> | object} trafficEventsOrSummary Array of egress events, `{ egressEvents }`, or `CamoufoxTrafficRecorder`
+ * @param {string | null} [expectedOs=null] Optional expected OS ('win' | 'mac' | 'lin')
+ * @returns {{
+ *   passed: boolean,
+ *   score: number,
+ *   inspectedRequests: number,
+ *   checks: Array<{ name: string, passed: boolean, details: string }>
+ * }}
+ */
+export function evaluateWireToDomCoherence(domTelemetry, trafficEventsOrSummary, expectedOs = null) {
+    if (!domTelemetry || typeof domTelemetry !== 'object') {
+        throw new TypeError('evaluateWireToDomCoherence requires a domTelemetry object');
+    }
+
+    const nav = domTelemetry.navigator || domTelemetry.telemetry?.navigator || domTelemetry || {};
+    const domUa = String(nav.userAgent || '').trim();
+    const domPrimaryLang = String(
+        nav.language || (Array.isArray(nav.languages) && nav.languages[0]) || ''
+    ).trim();
+    const targetOs = normalizeTargetOs(expectedOs);
+
+    const egressEvents = extractEgressRequestEvents(trafficEventsOrSummary);
+    const inspectedRequests = egressEvents.length;
+
+    const uaMismatches = [];
+    const langMismatches = [];
+    const clientHintsLeaks = [];
+    const proxyHeaderLeaks = [];
+
+    if (!domUa) {
+        uaMismatches.push('DOM navigator.userAgent is missing or empty');
+    }
+    if (!domPrimaryLang) {
+        langMismatches.push('DOM navigator.language / navigator.languages[0] is missing or empty');
+    }
+
+    const proxyLeakRegex = /^(x-forwarded-for|via|x-real-ip|forwarded)$/i;
+
+    for (let idx = 0; idx < egressEvents.length; idx += 1) {
+        const ev = egressEvents[idx];
+        const reqLabel = ev.url || ev.correlationId || `req#${idx + 1}`;
+        const headers = normalizeEgressHeaders(ev);
+
+        for (const h of headers) {
+            if (h.lowerName === 'user-agent') {
+                if (domUa && h.value !== domUa) {
+                    uaMismatches.push(
+                        `Wire User-Agent "${h.value}" on ${reqLabel} does not match DOM navigator.userAgent "${domUa}"`
+                    );
+                }
+                if (targetOs === 'win' && !h.value.includes('Windows NT')) {
+                    uaMismatches.push(
+                        `Wire User-Agent "${h.value}" on ${reqLabel} contradicts expected Windows OS`
+                    );
+                } else if (targetOs === 'mac' && !h.value.includes('Macintosh')) {
+                    uaMismatches.push(
+                        `Wire User-Agent "${h.value}" on ${reqLabel} contradicts expected macOS`
+                    );
+                } else if (targetOs === 'lin' && !h.value.includes('Linux')) {
+                    uaMismatches.push(
+                        `Wire User-Agent "${h.value}" on ${reqLabel} contradicts expected Linux OS`
+                    );
+                }
+            } else if (h.lowerName === 'accept-language') {
+                if (domPrimaryLang) {
+                    const wireValueLower = h.value.toLowerCase();
+                    const domLangLower = domPrimaryLang.toLowerCase();
+                    const wirePrimaryTag = wireValueLower.split(',')[0].split(';')[0].trim();
+                    if (!wireValueLower.startsWith(domLangLower) || wirePrimaryTag !== domLangLower) {
+                        langMismatches.push(
+                            `Wire Accept-Language "${h.value}" on ${reqLabel} does not start with DOM primary language "${domPrimaryLang}"`
+                        );
+                    }
+                }
+            } else if (h.lowerName.startsWith('sec-ch-ua')) {
+                clientHintsLeaks.push(
+                    `Chromium Client Hint header "${h.name}: ${h.value}" leaked on Gecko egress request (${reqLabel})`
+                );
+            } else if (proxyLeakRegex.test(h.lowerName)) {
+                proxyHeaderLeaks.push(
+                    `Proxy leak header "${h.name}: ${h.value}" detected on egress request (${reqLabel})`
+                );
+            }
+        }
+    }
+
+    const checks = [
+        {
+            name: 'wire-ua-matches-dom-ua',
+            passed: uaMismatches.length === 0,
+            details:
+                uaMismatches.length === 0
+                    ? `All ${inspectedRequests} pre-TLS egress requests match DOM navigator.userAgent`
+                    : uaMismatches.join('; ')
+        },
+        {
+            name: 'wire-accept-language-matches-dom',
+            passed: langMismatches.length === 0,
+            details:
+                langMismatches.length === 0
+                    ? `All ${inspectedRequests} pre-TLS egress requests start with DOM primary language "${domPrimaryLang}"`
+                    : langMismatches.join('; ')
+        },
+        {
+            name: 'wire-no-chromium-client-hints',
+            passed: clientHintsLeaks.length === 0,
+            details:
+                clientHintsLeaks.length === 0
+                    ? 'Zero Sec-CH-UA* Chromium Client Hints headers present on pre-TLS Gecko egress traffic'
+                    : clientHintsLeaks.join('; ')
+        },
+        {
+            name: 'wire-no-proxy-leak-headers',
+            passed: proxyHeaderLeaks.length === 0,
+            details:
+                proxyHeaderLeaks.length === 0
+                    ? 'Zero proxy attribution headers (X-Forwarded-For, Via, X-Real-IP, Forwarded) present on egress traffic'
+                    : proxyHeaderLeaks.join('; ')
+        }
+    ];
+
+    const passedCount = checks.filter((c) => c.passed).length;
+    const score = checks.length > 0 ? Math.round((passedCount / checks.length) * 100) : 0;
+    const passed = passedCount === checks.length;
+
+    return {
+        passed,
+        score,
+        inspectedRequests,
         checks
     };
 }
@@ -1230,5 +1687,6 @@ export default {
     gpuFitsOs,
     collectBrowserFingerprint,
     evaluatePlatformCoherence,
+    evaluateWireToDomCoherence,
     auditProfileCoherence
 };

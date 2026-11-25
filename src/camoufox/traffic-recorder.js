@@ -365,6 +365,251 @@ export function detectRiskSignals({ url = '', bodyPreview = null, headers = {} }
     return matched;
 }
 
+const CHROMIUM_CLIENT_HINT_HEADER_REGEX =
+    /^sec-ch-ua(-mobile|-platform|-platform-version|-arch|-bitness|-full-version|-full-version-list|-model|-wow64|-form-factors)?$/i;
+
+const PROXY_ANONYMITY_LEAK_HEADER_REGEX =
+    /^(x-forwarded-for|x-real-ip|forwarded|via|x-proxy-id|proxy-connection)$/i;
+
+/**
+ * Detect Pre-TLS egress wire header coherence anomalies (Chromium Client-Hints leaked on Gecko,
+ * non-Firefox User-Agent, User-Agent vs configured OS mismatch) and proxy anonymity leaks.
+ *
+ * @param {object} [params={}]
+ * @param {Record<string, string>} [params.headers={}]
+ * @param {Array<{ name: string, value: string }>} [params.headersArray=[]]
+ * @param {string|null} [params.expectedOs=null]
+ * @param {'egress'|'ingress'|string} [params.direction='egress']
+ * @returns {Array<{
+ *   type: string,
+ *   name: string,
+ *   severity: 'critical'|'high',
+ *   direction: string,
+ *   headerName: string,
+ *   headerValue: string,
+ *   matchedHeaders: Array<{ name: string, value: string }>,
+ *   reason: string
+ * }>}
+ */
+export function detectWireHeaderAnomalies({
+    headers = {},
+    headersArray = [],
+    expectedOs = null,
+    direction = 'egress'
+} = {}) {
+    const normDirection = String(direction || 'egress').trim().toLowerCase();
+    const isEgress = normDirection === 'egress' || normDirection === 'request';
+    const entries = [];
+
+    if (Array.isArray(headersArray) && headersArray.length > 0) {
+        for (const h of headersArray) {
+            if (h && h.name !== undefined && h.name !== null) {
+                entries.push({
+                    name: String(h.name),
+                    value: String(h.value ?? '')
+                });
+            }
+        }
+    }
+
+    if (headers && typeof headers === 'object') {
+        const seenLower = new Set(entries.map((e) => e.name.toLowerCase()));
+        for (const [k, v] of Object.entries(headers)) {
+            const lower = String(k).toLowerCase();
+            if (!seenLower.has(lower)) {
+                seenLower.add(lower);
+                entries.push({
+                    name: String(k),
+                    value: String(v ?? '')
+                });
+            }
+        }
+    }
+
+    const anomalies = [];
+
+    if (isEgress) {
+        // 1. Chromium Sec-CH-UA client-hint headers must never appear on a Firefox/Gecko Necko wire channel
+        const clientHintMatches = entries.filter((e) => CHROMIUM_CLIENT_HINT_HEADER_REGEX.test(e.name));
+        if (clientHintMatches.length > 0) {
+            const type = 'wire-header-anomaly:chromium-client-hints-on-gecko';
+            anomalies.push({
+                type,
+                name: type,
+                severity: 'critical',
+                direction: normDirection,
+                headerName: clientHintMatches[0].name,
+                headerValue: clientHintMatches[0].value,
+                matchedHeaders: clientHintMatches,
+                reason: `Chromium Client-Hints header(s) detected on Gecko egress wire: ${clientHintMatches.map((m) => m.name).join(', ')}`
+            });
+        }
+
+        // 2. User-Agent engine & OS coherence inspection
+        const uaEntry = entries.find((e) => e.name.toLowerCase() === 'user-agent');
+        if (uaEntry && uaEntry.value.trim().length > 0) {
+            const uaValue = uaEntry.value.trim();
+            const hasNonFirefoxToken = /(Chrome\/|Safari\/|AppleWebKit\/|Edg\/)/i.test(uaValue);
+            const hasFirefoxAndGecko = /Firefox\//i.test(uaValue) && /Gecko/i.test(uaValue);
+
+            if (hasNonFirefoxToken || !hasFirefoxAndGecko) {
+                const type = 'wire-header-anomaly:non-firefox-wire-ua';
+                anomalies.push({
+                    type,
+                    name: type,
+                    severity: 'critical',
+                    direction: normDirection,
+                    headerName: uaEntry.name,
+                    headerValue: uaValue,
+                    matchedHeaders: [uaEntry],
+                    reason: `Non-Firefox User-Agent detected on Gecko egress wire: ${uaValue}`
+                });
+            }
+
+            const normOs = expectedOs ? String(expectedOs).trim().toLowerCase() : '';
+            if (normOs) {
+                let osMismatch = false;
+                if ((normOs === 'windows' || normOs === 'win32' || normOs === 'win') && !/Windows NT/i.test(uaValue)) {
+                    osMismatch = true;
+                } else if (
+                    (normOs === 'macos' || normOs === 'mac' || normOs === 'darwin' || normOs === 'osx') &&
+                    !/Macintosh/i.test(uaValue)
+                ) {
+                    osMismatch = true;
+                } else if (
+                    (normOs === 'linux' || normOs === 'ubuntu') &&
+                    (!/Linux/i.test(uaValue) || /Android/i.test(uaValue))
+                ) {
+                    osMismatch = true;
+                }
+
+                if (osMismatch) {
+                    const type = 'wire-header-anomaly:ua-os-mismatch';
+                    anomalies.push({
+                        type,
+                        name: type,
+                        severity: 'critical',
+                        direction: normDirection,
+                        headerName: uaEntry.name,
+                        headerValue: uaValue,
+                        matchedHeaders: [uaEntry],
+                        reason: `User-Agent OS token mismatch for configured OS "${normOs}": ${uaValue}`
+                    });
+                }
+            }
+        }
+    }
+
+    // 3. Proxy anonymity leak headers (on both egress and ingress)
+    const proxyLeakMatches = entries.filter((e) => PROXY_ANONYMITY_LEAK_HEADER_REGEX.test(e.name));
+    if (proxyLeakMatches.length > 0) {
+        const type = 'proxy-anonymity-leak';
+        anomalies.push({
+            type,
+            name: type,
+            severity: 'high',
+            direction: normDirection,
+            headerName: proxyLeakMatches[0].name,
+            headerValue: proxyLeakMatches[0].value,
+            matchedHeaders: proxyLeakMatches,
+            reason: `Proxy anonymity leak header(s) detected on ${normDirection}: ${proxyLeakMatches.map((m) => m.name).join(', ')}`
+        });
+    }
+
+    return anomalies;
+}
+
+/**
+ * Parse and validate an NSS `sslkeylog.txt` file (`<LABEL> <CLIENT_RANDOM_HEX> <SECRET_HEX>`),
+ * computing SHA-256 integrity and TLS 1.2 / TLS 1.3 session statistics.
+ *
+ * @param {string} sslKeyLogPath
+ * @returns {{
+ *   exists: boolean,
+ *   sha256: string|null,
+ *   bytes: number,
+ *   entryCount: number,
+ *   uniqueClientRandoms: number,
+ *   tls13SessionCount: number,
+ *   tls12SessionCount: number,
+ *   labelCounts: Record<string, number>,
+ *   malformedLineCount: number
+ * }}
+ */
+export function parseSslKeyLog(sslKeyLogPath) {
+    if (!sslKeyLogPath || !fs.existsSync(sslKeyLogPath)) {
+        return {
+            exists: false,
+            sha256: null,
+            bytes: 0,
+            entryCount: 0,
+            uniqueClientRandoms: 0,
+            tls13SessionCount: 0,
+            tls12SessionCount: 0,
+            labelCounts: {},
+            malformedLineCount: 0
+        };
+    }
+
+    const rawBuffer = fs.readFileSync(sslKeyLogPath);
+    const sha256 = crypto.createHash('sha256').update(rawBuffer).digest('hex');
+    const bytes = rawBuffer.byteLength;
+    const lines = rawBuffer.toString('utf8').split(/\r?\n/);
+
+    let entryCount = 0;
+    let malformedLineCount = 0;
+    const labelCounts = {};
+    const allClientRandoms = new Set();
+    const tls13ClientRandoms = new Set();
+    const tls12ClientRandoms = new Set();
+
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) {
+            continue;
+        }
+
+        const parts = trimmed.split(/\s+/);
+        if (
+            parts.length === 3 &&
+            /^[A-Za-z0-9_]+$/.test(parts[0]) &&
+            /^[0-9a-fA-F]{64}$/.test(parts[1]) &&
+            /^[0-9a-fA-F]{16,256}$/.test(parts[2]) &&
+            parts[2].length % 2 === 0
+        ) {
+            const label = parts[0].toUpperCase();
+            const clientRandom = parts[1].toLowerCase();
+            entryCount += 1;
+            labelCounts[label] = (labelCounts[label] || 0) + 1;
+            allClientRandoms.add(clientRandom);
+
+            if (label === 'CLIENT_RANDOM') {
+                tls12ClientRandoms.add(clientRandom);
+            } else if (
+                label.includes('TRAFFIC_SECRET') ||
+                label.includes('EXPORTER_SECRET') ||
+                label.includes('HANDSHAKE')
+            ) {
+                tls13ClientRandoms.add(clientRandom);
+            }
+        } else {
+            malformedLineCount += 1;
+        }
+    }
+
+    return {
+        exists: true,
+        sha256,
+        bytes,
+        entryCount,
+        uniqueClientRandoms: allClientRandoms.size,
+        tls13SessionCount: tls13ClientRandoms.size,
+        tls12SessionCount: tls12ClientRandoms.size,
+        labelCounts,
+        malformedLineCount
+    };
+}
+
 /**
  * Normalize headers object and optional headersArray so Firefox's exact pre-TLS
  * header order is preserved whenever Playwright's `headersArray()` is available.
@@ -546,8 +791,374 @@ export class CamoufoxTrafficRecorder {
         this.anomaliesAndRiskSignals = [];
         this.recordedAnomalyKeys = new Set();
 
+        this.resetTrafficOnStart = options.resetTrafficOnStart === true;
+        if (this.resetTrafficOnStart) {
+            for (const artifactPath of [
+                this.trafficNdjsonPath,
+                this.preTlsWireLogPath,
+                this.attributionIndexPath,
+                this.harPath
+            ]) {
+                try {
+                    if (artifactPath && fs.existsSync(artifactPath)) {
+                        fs.rmSync(artifactPath, { force: true });
+                    }
+                } catch {}
+            }
+        }
+
         this._ensureDirectories();
+        if (!this.resetTrafficOnStart) {
+            this._resumeExistingChainIfPresent();
+        }
         this._ensureStepRecord(this.attribution.actionStep, this.attribution.stepIndex);
+    }
+
+    /**
+     * Resume an existing persistent profile's SHA-256 tamper-evident event hash chain
+     * across process restarts and self-heal any trailing truncated/crashed line in `traffic.ndjson`.
+     */
+    _resumeExistingChainIfPresent() {
+        if (!fs.existsSync(this.trafficNdjsonPath)) {
+            return;
+        }
+
+        let rawContent = '';
+        try {
+            rawContent = fs.readFileSync(this.trafficNdjsonPath, 'utf8');
+        } catch {
+            return;
+        }
+
+        const nonEmptyLines = rawContent
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter((l) => l.length > 0);
+
+        if (nonEmptyLines.length === 0) {
+            return;
+        }
+
+        const validLines = [];
+        const validEvents = [];
+        let needsRewrite = false;
+        let runningHead = this.genesisHash;
+
+        for (let i = 0; i < nonEmptyLines.length; i += 1) {
+            const rawLine = nonEmptyLines[i];
+            let parsed = null;
+            try {
+                parsed = JSON.parse(rawLine);
+            } catch {
+                needsRewrite = true;
+                continue;
+            }
+
+            if (
+                !parsed ||
+                typeof parsed !== 'object' ||
+                typeof parsed.eventHash !== 'string' ||
+                !/^[0-9a-f]{64}$/i.test(parsed.eventHash)
+            ) {
+                needsRewrite = true;
+                continue;
+            }
+
+            const canonicalPayload = JSON.stringify({ ...parsed, eventHash: undefined });
+            const preimage = `${parsed.prevEventHash ?? ''}|${parsed.seq ?? 0}|${canonicalPayload}`;
+            const expectedHash = crypto.createHash('sha256').update(preimage, 'utf8').digest('hex');
+            if (parsed.prevEventHash !== runningHead || parsed.eventHash !== expectedHash) {
+                needsRewrite = true;
+                break;
+            }
+
+            runningHead = parsed.eventHash;
+            validLines.push(rawLine);
+            validEvents.push(parsed);
+        }
+
+        if (needsRewrite) {
+            const cleanContent = validLines.length > 0 ? `${validLines.join('\n')}\n` : '';
+            try {
+                fs.writeFileSync(this.trafficNdjsonPath, cleanContent, 'utf8');
+            } catch {}
+        }
+
+        if (validEvents.length === 0) {
+            return;
+        }
+
+        const lastValidEvent = validEvents[validEvents.length - 1];
+        const maxSeq = validEvents.reduce((max, ev) => Math.max(max, Number(ev.seq) || 0), 0);
+
+        this.chainHeadHash = lastValidEvent.eventHash;
+        this.seq = maxSeq || validEvents.length;
+        this.chainedEventCount = validEvents.length;
+
+        // Load existing attribution-index.json if present
+        let existingIndex = null;
+        if (fs.existsSync(this.attributionIndexPath)) {
+            try {
+                existingIndex = JSON.parse(fs.readFileSync(this.attributionIndexPath, 'utf8'));
+            } catch {
+                existingIndex = null;
+            }
+        }
+
+        // Restore payloadManifest from attribution-index.json and cross-verify against validEvents
+        if (
+            existingIndex?.integrity?.payloadManifest &&
+            typeof existingIndex.integrity.payloadManifest === 'object'
+        ) {
+            for (const [relPath, entry] of Object.entries(existingIndex.integrity.payloadManifest)) {
+                const fullPayloadPath = path.join(this.trafficDir, relPath);
+                if (fs.existsSync(fullPayloadPath)) {
+                    this.payloadManifest[relPath] = { ...entry };
+                }
+            }
+        }
+
+        for (const ev of validEvents) {
+            if (ev.payloadFile && !this.payloadManifest[ev.payloadFile]) {
+                const fullPayloadPath = path.join(this.trafficDir, ev.payloadFile);
+                if (fs.existsSync(fullPayloadPath)) {
+                    try {
+                        const buf = fs.readFileSync(fullPayloadPath);
+                        const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
+                        this.payloadManifest[ev.payloadFile] = {
+                            sha256,
+                            bytes: buf.byteLength,
+                            truncated: Boolean(ev.payloadTruncated),
+                            seq: ev.seq ?? 0,
+                            prefix: ev.type === 'egress' ? 'req' : ev.type === 'ingress' ? 'res' : 'ws'
+                        };
+                    } catch {}
+                }
+            }
+            if (ev.type === 'trigger-action' && ev.actionId) {
+                this.triggerSeq += 1;
+            }
+            if (ev.type === 'ws-open') {
+                this.wsSeq += 1;
+            }
+        }
+
+        // Rebuild cumulative totals, byActionStep, byDomain, byTriggerAction, and anomalies from validEvents
+        // so stats are always consistent even if the previous session crashed before flushSummary()
+        const validCorrIds = new Set();
+        const txEgressEstimated = new Map();
+        const txIngressCounted = new Map();
+        const txStepByCorr = new Map();
+        const txTriggerByCorr = new Map();
+
+        for (const ev of validEvents) {
+            if (ev.correlationId) {
+                validCorrIds.add(ev.correlationId);
+            }
+            const stepName = ev.attribution?.actionStep || ev.actionStep || 'init';
+            const stepIndex = ev.attribution?.stepIndex ?? ev.stepIndex ?? 0;
+            this._ensureStepRecord(stepName, stepIndex);
+
+            if (ev.type === 'trigger-action' && ev.triggerAction) {
+                this._ensureTriggerActionRecord(ev.triggerAction);
+            } else if (ev.type === 'egress') {
+                const headersArr = Array.isArray(ev.headersArray) ? ev.headersArray : [];
+                const parsedUrl = parseUrlComponents(ev.url || '');
+                const headerByteEstimate = headersArr.reduce(
+                    (acc, h) => acc + Buffer.byteLength(`${h.name}: ${h.value}\r\n`, 'utf8'),
+                    Buffer.byteLength(
+                        `${ev.method || 'GET'} ${parsedUrl.pathname}${parsedUrl.search} HTTP/1.1\r\n\r\n`,
+                        'utf8'
+                    )
+                );
+                const estimatedEgressBytes = headerByteEstimate + (Number(ev.postDataBytes) || 0);
+                if (ev.correlationId) {
+                    txEgressEstimated.set(ev.correlationId, estimatedEgressBytes);
+                    txStepByCorr.set(ev.correlationId, { stepName, stepIndex });
+                    if (ev.triggerAction) {
+                        txTriggerByCorr.set(ev.correlationId, ev.triggerAction);
+                    }
+                }
+
+                this.totals.totalRequests += 1;
+                this.totals.totalEgressBytes += estimatedEgressBytes;
+
+                const stepBucket = this._ensureStepRecord(stepName, stepIndex);
+                stepBucket.requests += 1;
+                stepBucket.egressBytes += estimatedEgressBytes;
+                stepBucket.domainsSet.add(parsedUrl.host);
+
+                const domainBucket = this._ensureDomainRecord(parsedUrl.host);
+                domainBucket.requests += 1;
+                domainBucket.egressBytes += estimatedEgressBytes;
+
+                const triggerBucket = this._ensureTriggerActionRecord(ev.triggerAction);
+                if (triggerBucket) {
+                    triggerBucket.requests += 1;
+                    triggerBucket.egressBytes += estimatedEgressBytes;
+                    triggerBucket.domainsSet.add(parsedUrl.host);
+                    if (ev.correlationId) {
+                        triggerBucket.correlationIdsSet.add(ev.correlationId);
+                    }
+                }
+            } else if (ev.type === 'ingress') {
+                const headersArr = Array.isArray(ev.headersArray) ? ev.headersArray : [];
+                const parsedUrl = parseUrlComponents(ev.url || '');
+                const status = Number(ev.status ?? 0);
+                const statusText = ev.statusText || '';
+                const headerByteEstimate = headersArr.reduce(
+                    (acc, h) => acc + Buffer.byteLength(`${h.name}: ${h.value}\r\n`, 'utf8'),
+                    Buffer.byteLength(`HTTP/1.1 ${status} ${statusText}\r\n\r\n`, 'utf8')
+                );
+                const estimatedIngressBytes = headerByteEstimate + (Number(ev.bodyBytes) || 0);
+                if (ev.correlationId) {
+                    txIngressCounted.set(ev.correlationId, estimatedIngressBytes);
+                }
+
+                const txStep = ev.correlationId ? txStepByCorr.get(ev.correlationId) : null;
+                const effectiveStepName = txStep?.stepName || stepName;
+                const effectiveStepIndex = txStep?.stepIndex ?? stepIndex;
+                const effectiveTrigger =
+                    ev.triggerAction ||
+                    (ev.correlationId ? txTriggerByCorr.get(ev.correlationId) || null : null);
+
+                this.totals.totalResponses += 1;
+                this.totals.totalIngressBytes += estimatedIngressBytes;
+
+                const statusKey = String(status);
+                const stepBucket = this._ensureStepRecord(effectiveStepName, effectiveStepIndex);
+                stepBucket.responses += 1;
+                stepBucket.ingressBytes += estimatedIngressBytes;
+                stepBucket.domainsSet.add(parsedUrl.host);
+                stepBucket.statusCounts[statusKey] = (stepBucket.statusCounts[statusKey] || 0) + 1;
+
+                const domainBucket = this._ensureDomainRecord(parsedUrl.host);
+                domainBucket.responses += 1;
+                domainBucket.ingressBytes += estimatedIngressBytes;
+                domainBucket.statusCounts[statusKey] = (domainBucket.statusCounts[statusKey] || 0) + 1;
+
+                const triggerBucket = this._ensureTriggerActionRecord(effectiveTrigger);
+                if (triggerBucket) {
+                    triggerBucket.responses += 1;
+                    triggerBucket.ingressBytes += estimatedIngressBytes;
+                    triggerBucket.domainsSet.add(parsedUrl.host);
+                    if (ev.correlationId) {
+                        triggerBucket.correlationIdsSet.add(ev.correlationId);
+                    }
+                    triggerBucket.statusCounts[statusKey] = (triggerBucket.statusCounts[statusKey] || 0) + 1;
+                }
+            } else if (ev.type === 'request-finished') {
+                const parsedUrl = parseUrlComponents(ev.url || '');
+                const domainBucket = this._ensureDomainRecord(parsedUrl.host);
+                if (typeof ev.durationMs === 'number' && Number.isFinite(ev.durationMs)) {
+                    domainBucket.totalDurationMs += ev.durationMs;
+                    domainBucket.completedWithDurationCount += 1;
+                }
+                if (ev.sizes && typeof ev.sizes === 'object' && ev.correlationId) {
+                    const actualReqBytes =
+                        (Number(ev.sizes.requestHeadersSize) || 0) + (Number(ev.sizes.requestBodySize) || 0);
+                    const actualResBytes =
+                        (Number(ev.sizes.responseHeadersSize) || 0) + (Number(ev.sizes.responseBodySize) || 0);
+                    const prevEgress = txEgressEstimated.get(ev.correlationId) || 0;
+                    const prevIngress = txIngressCounted.get(ev.correlationId) || 0;
+                    const txStep = txStepByCorr.get(ev.correlationId);
+                    const stepBucket = this._ensureStepRecord(
+                        txStep?.stepName || stepName,
+                        txStep?.stepIndex ?? stepIndex
+                    );
+                    const triggerBucket = this._ensureTriggerActionRecord(
+                        ev.triggerAction || txTriggerByCorr.get(ev.correlationId) || null
+                    );
+                    if (prevEgress > 0 && actualReqBytes > prevEgress) {
+                        const delta = actualReqBytes - prevEgress;
+                        txEgressEstimated.set(ev.correlationId, actualReqBytes);
+                        this.totals.totalEgressBytes += delta;
+                        stepBucket.egressBytes += delta;
+                        domainBucket.egressBytes += delta;
+                        if (triggerBucket) triggerBucket.egressBytes += delta;
+                    }
+                    if (prevIngress > 0 && actualResBytes > prevIngress) {
+                        const delta = actualResBytes - prevIngress;
+                        txIngressCounted.set(ev.correlationId, actualResBytes);
+                        this.totals.totalIngressBytes += delta;
+                        stepBucket.ingressBytes += delta;
+                        domainBucket.ingressBytes += delta;
+                        if (triggerBucket) triggerBucket.ingressBytes += delta;
+                    }
+                }
+            } else if (ev.type === 'request-failed') {
+                const parsedUrl = parseUrlComponents(ev.url || '');
+                const txStep = ev.correlationId ? txStepByCorr.get(ev.correlationId) : null;
+                const effectiveStepName = txStep?.stepName || stepName;
+                const effectiveStepIndex = txStep?.stepIndex ?? stepIndex;
+                const effectiveTrigger =
+                    ev.triggerAction ||
+                    (ev.correlationId ? txTriggerByCorr.get(ev.correlationId) || null : null);
+
+                this.totals.failedRequests += 1;
+                const stepBucket = this._ensureStepRecord(effectiveStepName, effectiveStepIndex);
+                stepBucket.failedRequests += 1;
+                stepBucket.domainsSet.add(parsedUrl.host);
+
+                const domainBucket = this._ensureDomainRecord(parsedUrl.host);
+                domainBucket.failedRequests += 1;
+                if (typeof ev.durationMs === 'number' && Number.isFinite(ev.durationMs)) {
+                    domainBucket.totalDurationMs += ev.durationMs;
+                    domainBucket.completedWithDurationCount += 1;
+                }
+
+                const triggerBucket = this._ensureTriggerActionRecord(effectiveTrigger);
+                if (triggerBucket) {
+                    triggerBucket.failedRequests += 1;
+                    triggerBucket.domainsSet.add(parsedUrl.host);
+                    if (ev.correlationId) {
+                        triggerBucket.correlationIdsSet.add(ev.correlationId);
+                    }
+                }
+            } else if (ev.type === 'ws-egress' || ev.type === 'ws-ingress') {
+                const parsedUrl = parseUrlComponents(ev.url || '');
+                const bytes = Number(ev.payloadBytes) || 0;
+                const stepBucket = this._ensureStepRecord(stepName, stepIndex);
+                const domainBucket = this._ensureDomainRecord(parsedUrl.host);
+                const triggerBucket = this._ensureTriggerActionRecord(ev.triggerAction);
+                stepBucket.domainsSet.add(parsedUrl.host);
+
+                if (ev.type === 'ws-egress') {
+                    this.totals.wsFramesSent += 1;
+                    this.totals.totalEgressBytes += bytes;
+                    stepBucket.egressBytes += bytes;
+                    domainBucket.egressBytes += bytes;
+                    if (triggerBucket) {
+                        triggerBucket.wsFramesSent += 1;
+                        triggerBucket.egressBytes += bytes;
+                        triggerBucket.domainsSet.add(parsedUrl.host);
+                        if (ev.correlationId) triggerBucket.correlationIdsSet.add(ev.correlationId);
+                    }
+                } else {
+                    this.totals.wsFramesReceived += 1;
+                    this.totals.totalIngressBytes += bytes;
+                    stepBucket.ingressBytes += bytes;
+                    domainBucket.ingressBytes += bytes;
+                    if (triggerBucket) {
+                        triggerBucket.wsFramesReceived += 1;
+                        triggerBucket.ingressBytes += bytes;
+                        triggerBucket.domainsSet.add(parsedUrl.host);
+                        if (ev.correlationId) triggerBucket.correlationIdsSet.add(ev.correlationId);
+                    }
+                }
+            }
+        }
+
+        // Restore persisted anomalies from attribution-index.json if available
+        if (Array.isArray(existingIndex?.anomaliesAndRiskSignals)) {
+            for (const anomaly of existingIndex.anomaliesAndRiskSignals) {
+                if (!anomaly || typeof anomaly !== 'object') continue;
+                if (anomaly.correlationId && !validCorrIds.has(anomaly.correlationId)) {
+                    continue;
+                }
+                this._recordAnomaly(anomaly);
+            }
+        }
     }
 
     /**
@@ -589,6 +1200,42 @@ export class CamoufoxTrafficRecorder {
      */
     getSslKeyLogPath() {
         return this.sslKeyLogPath;
+    }
+
+    /**
+     * Append a validated NSS TLS secret line (`<LABEL> <CLIENT_RANDOM_HEX> <SECRET_HEX>`)
+     * to `this.sslKeyLogPath`.
+     *
+     * @param {string} label - NSS key log label (e.g. `CLIENT_RANDOM`, `CLIENT_TRAFFIC_SECRET_0`)
+     * @param {string} clientRandomHex - 64-character hex string (32-byte client random)
+     * @param {string} secretHex - Hex-encoded TLS secret material
+     * @returns {{ label: string, clientRandomHex: string, secretHex: string, line: string }}
+     */
+    recordSslKeyLogSecret(label, clientRandomHex, secretHex) {
+        const cleanLabel = String(label || '').trim().toUpperCase();
+        const cleanRandom = String(clientRandomHex || '').trim().toLowerCase();
+        const cleanSecret = String(secretHex || '').trim().toLowerCase();
+
+        if (
+            !/^[A-Z0-9_]+$/.test(cleanLabel) ||
+            !/^[0-9a-f]{64}$/.test(cleanRandom) ||
+            !/^[0-9a-f]{16,256}$/.test(cleanSecret) ||
+            cleanSecret.length % 2 !== 0
+        ) {
+            throw new Error(
+                `Invalid NSS SSLKEYLOGFILE secret format: label="${cleanLabel}" randomLen=${cleanRandom.length} secretLen=${cleanSecret.length}`
+            );
+        }
+
+        this._ensureDirectories();
+        const line = `${cleanLabel} ${cleanRandom} ${cleanSecret}`;
+        fs.appendFileSync(this.sslKeyLogPath, `${line}\n`, 'utf8');
+        return {
+            label: cleanLabel,
+            clientRandomHex: cleanRandom,
+            secretHex: cleanSecret,
+            line
+        };
     }
 
     /**
@@ -1565,6 +2212,29 @@ export class CamoufoxTrafficRecorder {
                 matchedSignals: riskSignals
             });
         }
+
+        // Inspect pre-TLS egress wire headers for Client-Hints leaks, UA/OS mismatch, and proxy anonymity leaks
+        const wireAnomalies = detectWireHeaderAnomalies({
+            headers,
+            headersArray,
+            expectedOs: attributionSnapshot.os,
+            direction: 'egress'
+        });
+        for (const wa of wireAnomalies) {
+            this._recordAnomaly({
+                timestamp,
+                correlationId,
+                actionStep: attributionSnapshot.actionStep,
+                triggerAction: triggerSnapshot,
+                type: wa.type,
+                severity: wa.severity,
+                method,
+                url,
+                status: null,
+                failureText: wa.reason,
+                payloadFile
+            });
+        }
     }
 
     /**
@@ -1865,6 +2535,29 @@ export class CamoufoxTrafficRecorder {
                 failureText: null,
                 payloadFile: payloadFile || tx?.requestPayloadFile || null,
                 matchedSignals: riskSignals
+            });
+        }
+
+        // Inspect post-TLS ingress headers for proxy anonymity leaks
+        const wireAnomalies = detectWireHeaderAnomalies({
+            headers,
+            headersArray,
+            expectedOs: attributionSnapshot.os,
+            direction: 'ingress'
+        });
+        for (const wa of wireAnomalies) {
+            this._recordAnomaly({
+                timestamp,
+                correlationId,
+                actionStep: effectiveStepName,
+                triggerAction: triggerSnapshot,
+                type: wa.type,
+                severity: wa.severity,
+                method,
+                url,
+                status,
+                failureText: wa.reason,
+                payloadFile: payloadFile || tx?.requestPayloadFile || null
             });
         }
     }
@@ -2380,6 +3073,8 @@ export class CamoufoxTrafficRecorder {
             };
         }
 
+        const sslKeyLogSummary = parseSslKeyLog(this.sslKeyLogPath);
+
         return {
             session: {
                 traceId: this.attribution.traceId,
@@ -2401,6 +3096,7 @@ export class CamoufoxTrafficRecorder {
                 harPath: this.harPath,
                 attributionIndexPath: this.attributionIndexPath
             },
+            sslKeyLog: sslKeyLogSummary,
             totals: {
                 totalRequests: this.totals.totalRequests,
                 totalResponses: this.totals.totalResponses,
@@ -2420,9 +3116,57 @@ export class CamoufoxTrafficRecorder {
                 eventCount: this.chainedEventCount,
                 chainHeadHash: this.chainHeadHash,
                 payloadCount: Object.keys(this.payloadManifest).length,
-                payloadManifest: { ...this.payloadManifest }
+                payloadManifest: { ...this.payloadManifest },
+                sslKeyLogSha256: sslKeyLogSummary.sha256,
+                sslKeyLogBytes: sslKeyLogSummary.bytes
             }
         };
+    }
+
+    /**
+     * Reconstruct a W3C HAR 1.2 archive object (`{ log: { version: '1.2', ... } }`)
+     * from this recorder's persisted `traffic.ndjson` events and `payloads/` directory.
+     *
+     * @returns {{ log: object }}
+     */
+    buildHarArchive() {
+        return buildHarFromTrafficDir(this.trafficDir, {
+            profileId: this.attribution.profileId,
+            accountId: this.attribution.accountId,
+            accountEmail: this.attribution.accountEmail,
+            traceId: this.attribution.traceId,
+            os: this.attribution.os,
+            proxyServer: this.attribution.proxyServer,
+            startedAt: this.startedAt
+        });
+    }
+
+    /**
+     * Export the recorded traffic to a W3C HAR 1.2 file on disk.
+     *
+     * @param {string} [outputPath=this.harPath]
+     * @returns {{
+     *   harPath: string,
+     *   outputPath: string,
+     *   entryCount: number,
+     *   entriesCount: number,
+     *   pageCount: number,
+     *   bytes: number,
+     *   log: object,
+     *   har: { log: object }
+     * }}
+     */
+    exportHar(outputPath = this.harPath) {
+        const resolvedOut = outputPath ? path.resolve(String(outputPath)) : this.harPath;
+        return exportTrafficToHar(this.trafficDir, resolvedOut, {
+            profileId: this.attribution.profileId,
+            accountId: this.attribution.accountId,
+            accountEmail: this.attribution.accountEmail,
+            traceId: this.attribution.traceId,
+            os: this.attribution.os,
+            proxyServer: this.attribution.proxyServer,
+            startedAt: this.startedAt
+        });
     }
 
     /**
@@ -2633,14 +3377,441 @@ export function verifyTrafficIntegrity(trafficDir) {
                 verifiedPayloads += 1;
             }
         }
+
+        const sslKeyLogPath = path.join(resolvedTrafficDir, 'sslkeylog.txt');
+        const sslKeyLogStats = parseSslKeyLog(sslKeyLogPath);
+        if (integrity.sslKeyLogSha256 && sslKeyLogStats.exists) {
+            if (sslKeyLogStats.sha256 !== integrity.sslKeyLogSha256) {
+                errors.push(
+                    `sslkeylog.txt SHA-256 mismatch: expected ${integrity.sslKeyLogSha256}, got ${sslKeyLogStats.sha256}`
+                );
+            }
+            if (
+                typeof integrity.sslKeyLogBytes === 'number' &&
+                sslKeyLogStats.bytes !== integrity.sslKeyLogBytes
+            ) {
+                errors.push(
+                    `sslkeylog.txt byte length mismatch: expected ${integrity.sslKeyLogBytes}, got ${sslKeyLogStats.bytes}`
+                );
+            }
+        }
+        if (sslKeyLogStats.exists && sslKeyLogStats.malformedLineCount > 0) {
+            errors.push(
+                `sslkeylog.txt contains ${sslKeyLogStats.malformedLineCount} malformed NSS keylog line(s)`
+            );
+        }
     }
+
+    const sslKeyLog = parseSslKeyLog(path.join(resolvedTrafficDir, 'sslkeylog.txt'));
 
     return {
         valid: errors.length === 0,
         eventCount,
         verifiedPayloads,
         chainHeadHash,
+        sslKeyLog,
         errors
+    };
+}
+
+/**
+ * Reconstruct a W3C HAR 1.2 document from a profile's `traffic/` directory.
+ *
+ * @param {string} trafficDir
+ * @param {object} [fallbackSession={}]
+ * @returns {{ log: object }}
+ */
+function buildHarFromTrafficDir(trafficDir, fallbackSession = {}) {
+    const resolvedTrafficDir = path.resolve(String(trafficDir));
+    const trafficNdjsonPath = path.join(resolvedTrafficDir, 'traffic.ndjson');
+    const attributionIndexPath = path.join(resolvedTrafficDir, 'attribution-index.json');
+
+    let indexData = null;
+    if (fs.existsSync(attributionIndexPath)) {
+        try {
+            indexData = JSON.parse(fs.readFileSync(attributionIndexPath, 'utf8'));
+        } catch {
+            indexData = null;
+        }
+    }
+
+    const sessionMeta = {
+        ...fallbackSession,
+        ...(indexData?.session || {})
+    };
+
+    const events = [];
+    if (fs.existsSync(trafficNdjsonPath)) {
+        const raw = fs.readFileSync(trafficNdjsonPath, 'utf8');
+        for (const line of raw.split(/\r?\n/)) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+                events.push(JSON.parse(trimmed));
+            } catch {
+                // Skip malformed trailing line
+            }
+        }
+    }
+
+    const pagesMap = new Map();
+    const ensurePageForStep = (stepName, stepIndex, timestamp) => {
+        const cleanStep = String(stepName || 'init');
+        const idx = Number.isFinite(Number(stepIndex)) ? Number(stepIndex) : pagesMap.size;
+        const pageKey = `${idx}:${cleanStep}`;
+        if (!pagesMap.has(pageKey)) {
+            pagesMap.set(pageKey, {
+                startedDateTime: timestamp || sessionMeta.startedAt || new Date().toISOString(),
+                id: `page_${idx}_${cleanStep}`,
+                title: `${cleanStep} (step ${idx})`,
+                pageTimings: {
+                    onContentLoad: -1,
+                    onLoad: -1
+                }
+            });
+        }
+        return pagesMap.get(pageKey).id;
+    };
+
+    // Seed pages from step-transition events and group HTTP transactions by correlationId
+    const txMap = new Map();
+    for (const ev of events) {
+        if (!ev || typeof ev !== 'object') continue;
+        if (ev.type === 'step-transition') {
+            ensurePageForStep(
+                ev.actionStep || ev.attribution?.actionStep || 'init',
+                ev.stepIndex ?? ev.attribution?.stepIndex ?? 0,
+                ev.timestamp
+            );
+            continue;
+        }
+
+        if (!ev.correlationId) continue;
+        if (
+            ev.type !== 'egress' &&
+            ev.type !== 'ingress' &&
+            ev.type !== 'request-finished' &&
+            ev.type !== 'request-failed'
+        ) {
+            continue;
+        }
+
+        if (!txMap.has(ev.correlationId)) {
+            txMap.set(ev.correlationId, {
+                correlationId: ev.correlationId,
+                egress: null,
+                ingress: null,
+                finished: null,
+                failed: null
+            });
+        }
+        const tx = txMap.get(ev.correlationId);
+        if (ev.type === 'egress') tx.egress = ev;
+        else if (ev.type === 'ingress') tx.ingress = ev;
+        else if (ev.type === 'request-finished') tx.finished = ev;
+        else if (ev.type === 'request-failed') tx.failed = ev;
+    }
+
+    const entries = [];
+    for (const [correlationId, tx] of txMap.entries()) {
+        const { egress, ingress, finished, failed } = tx;
+        const primary = egress || ingress || failed || finished;
+        if (!primary) continue;
+
+        const attribution =
+            egress?.attribution ||
+            ingress?.attribution ||
+            failed?.attribution ||
+            finished?.attribution ||
+            {};
+        const actionStep =
+            attribution.actionStep ||
+            egress?.actionStep ||
+            ingress?.actionStep ||
+            'init';
+        const stepIndex =
+            attribution.stepIndex ??
+            egress?.stepIndex ??
+            ingress?.stepIndex ??
+            0;
+        const triggerAction =
+            egress?.triggerAction ||
+            ingress?.triggerAction ||
+            failed?.triggerAction ||
+            finished?.triggerAction ||
+            null;
+
+        const startedDateTime =
+            egress?.timestamp ||
+            ingress?.timestamp ||
+            failed?.timestamp ||
+            finished?.timestamp ||
+            sessionMeta.startedAt ||
+            new Date().toISOString();
+
+        const pageref = ensurePageForStep(actionStep, stepIndex, startedDateTime);
+
+        let totalTimeMs = 0;
+        if (typeof finished?.durationMs === 'number' && Number.isFinite(finished.durationMs)) {
+            totalTimeMs = Math.max(0, finished.durationMs);
+        } else if (typeof failed?.durationMs === 'number' && Number.isFinite(failed.durationMs)) {
+            totalTimeMs = Math.max(0, failed.durationMs);
+        } else if (
+            typeof egress?.epochMs === 'number' &&
+            typeof ingress?.epochMs === 'number'
+        ) {
+            totalTimeMs = Math.max(0, ingress.epochMs - egress.epochMs);
+        }
+
+        const rawUrl = egress?.url || ingress?.url || failed?.url || finished?.url || '';
+        const method = egress?.method || ingress?.method || failed?.method || finished?.method || 'GET';
+
+        // Build request headers array
+        const reqHeaders =
+            Array.isArray(egress?.headersArray) && egress.headersArray.length > 0
+                ? egress.headersArray.map((h) => ({
+                      name: String(h.name ?? ''),
+                      value: String(h.value ?? '')
+                  }))
+                : Object.entries(egress?.headers || {}).map(([name, value]) => ({
+                      name: String(name),
+                      value: String(value ?? '')
+                  }));
+
+        // Build queryString array
+        const queryString = [];
+        try {
+            const parsed = new URL(rawUrl);
+            for (const [name, value] of parsed.searchParams.entries()) {
+                queryString.push({ name: String(name), value: String(value) });
+            }
+        } catch {
+            if (egress?.searchParams && typeof egress.searchParams === 'object') {
+                for (const [k, v] of Object.entries(egress.searchParams)) {
+                    if (Array.isArray(v)) {
+                        for (const item of v) {
+                            queryString.push({ name: String(k), value: String(item ?? '') });
+                        }
+                    } else {
+                        queryString.push({ name: String(k), value: String(v ?? '') });
+                    }
+                }
+            }
+        }
+
+        // Reconstruct request postData from payloadFile on disk or inline preview
+        const reqContentTypeHeader =
+            reqHeaders.find((h) => h.name.toLowerCase() === 'content-type')?.value || '';
+        let reqBodyText = '';
+        if (egress?.payloadFile) {
+            const fullReqPayloadPath = path.join(resolvedTrafficDir, egress.payloadFile);
+            if (fs.existsSync(fullReqPayloadPath)) {
+                try {
+                    const reqBuf = fs.readFileSync(fullReqPayloadPath);
+                    reqBodyText = reqBuf.toString('utf8');
+                } catch {}
+            }
+        }
+        if (!reqBodyText && (egress?.bodyPreview || egress?.postData)) {
+            reqBodyText = String(egress.bodyPreview ?? egress.postData ?? '');
+        }
+        const reqBodySize =
+            Number(egress?.postDataBytes) ||
+            Number(finished?.sizes?.requestBodySize) ||
+            (reqBodyText ? Buffer.byteLength(reqBodyText, 'utf8') : 0);
+
+        const postData = {
+            mimeType: reqContentTypeHeader || (reqBodyText ? 'application/octet-stream' : ''),
+            text: reqBodyText,
+            params: []
+        };
+
+        // Build response headers array
+        const resHeaders =
+            Array.isArray(ingress?.headersArray) && ingress.headersArray.length > 0
+                ? ingress.headersArray.map((h) => ({
+                      name: String(h.name ?? ''),
+                      value: String(h.value ?? '')
+                  }))
+                : Object.entries(ingress?.headers || {}).map(([name, value]) => ({
+                      name: String(name),
+                      value: String(value ?? '')
+                  }));
+
+        const resContentTypeHeader =
+            resHeaders.find((h) => h.name.toLowerCase() === 'content-type')?.value || '';
+        const resMimeType =
+            ingress?.mimeType ||
+            (resContentTypeHeader ? resContentTypeHeader.split(';')[0].trim() : '') ||
+            'application/octet-stream';
+
+        let resBodyText = '';
+        let resEncoding = null;
+        let resBodySize = Number(ingress?.bodyBytes) || Number(finished?.sizes?.responseBodySize) || 0;
+
+        if (ingress?.payloadFile) {
+            const fullResPayloadPath = path.join(resolvedTrafficDir, ingress.payloadFile);
+            if (fs.existsSync(fullResPayloadPath)) {
+                try {
+                    const resBuf = fs.readFileSync(fullResPayloadPath);
+                    resBodySize = resBuf.byteLength;
+                    const ext = inferPayloadExtension(resMimeType, resBuf);
+                    if (ext === 'bin') {
+                        resBodyText = resBuf.toString('base64');
+                        resEncoding = 'base64';
+                    } else {
+                        resBodyText = resBuf.toString('utf8');
+                    }
+                } catch {}
+            }
+        }
+        if (!resBodyText && ingress?.bodyPreview) {
+            resBodyText = String(ingress.bodyPreview);
+            if (!resBodySize) {
+                resBodySize = Buffer.byteLength(resBodyText, 'utf8');
+            }
+        }
+
+        const redirectURL =
+            resHeaders.find((h) => h.name.toLowerCase() === 'location')?.value || '';
+
+        const status = Number(ingress?.status ?? finished?.status ?? 0);
+        const statusText =
+            ingress?.statusText ??
+            (failed ? String(failed.failureText || 'FAILED') : '');
+
+        entries.push({
+            pageref,
+            startedDateTime,
+            time: totalTimeMs,
+            request: {
+                method,
+                url: rawUrl,
+                httpVersion: 'HTTP/1.1',
+                cookies: [],
+                headers: reqHeaders,
+                queryString,
+                postData,
+                headersSize: Number(finished?.sizes?.requestHeadersSize) || -1,
+                bodySize: reqBodySize
+            },
+            response: {
+                status,
+                statusText,
+                httpVersion: 'HTTP/1.1',
+                cookies: [],
+                headers: resHeaders,
+                content: {
+                    size: resBodySize,
+                    mimeType: resMimeType,
+                    text: resBodyText,
+                    ...(resEncoding ? { encoding: resEncoding } : {})
+                },
+                redirectURL,
+                headersSize: Number(finished?.sizes?.responseHeadersSize) || -1,
+                bodySize: resBodySize
+            },
+            cache: {},
+            timings: {
+                blocked: 0,
+                dns: -1,
+                connect: -1,
+                ssl: -1,
+                send: 0,
+                wait: totalTimeMs,
+                receive: 0
+            },
+            serverIPAddress: ingress?.serverAddr?.ipAddress || '',
+            _attribution: {
+                correlationId,
+                actionStep,
+                stepIndex,
+                triggerAction,
+                profileId: attribution.profileId || sessionMeta.profileId || 'default-profile',
+                accountId: attribution.accountId ?? sessionMeta.accountId ?? null,
+                accountEmail: attribution.accountEmail ?? sessionMeta.accountEmail ?? null,
+                traceId: attribution.traceId ?? sessionMeta.traceId ?? null,
+                os: attribution.os ?? sessionMeta.os ?? null,
+                proxyServer: attribution.proxyServer ?? sessionMeta.proxyServer ?? null,
+                preTlsStage:
+                    egress?.stage ||
+                    ingress?.stage ||
+                    failed?.stage ||
+                    'pre-tls-necko-channel',
+                redirectedFromCorrelationId:
+                    egress?.redirectedFromCorrelationId ||
+                    ingress?.redirectedFromCorrelationId ||
+                    null,
+                requestPayloadFile: egress?.payloadFile || null,
+                responsePayloadFile: ingress?.payloadFile || null,
+                failureText: failed?.failureText || null
+            }
+        });
+    }
+
+    if (pagesMap.size === 0) {
+        ensurePageForStep('init', 0, sessionMeta.startedAt || new Date().toISOString());
+    }
+
+    return {
+        log: {
+            version: '1.2',
+            creator: {
+                name: 'CamoufoxTrafficRecorder',
+                version: '1.0.0'
+            },
+            browser: {
+                name: 'Camoufox Firefox',
+                version: '135.0'
+            },
+            pages: Array.from(pagesMap.values()),
+            entries
+        }
+    };
+}
+
+/**
+ * Standalone exporter that reconstructs a W3C HAR 1.2 archive from a profile's
+ * `trafficDir` (`traffic.ndjson` + `payloads/`) and writes it to `outputPath`.
+ *
+ * @param {string} trafficDir
+ * @param {string} [outputPath]
+ * @param {object} [fallbackSession={}]
+ * @returns {{
+ *   harPath: string,
+ *   outputPath: string,
+ *   entryCount: number,
+ *   entriesCount: number,
+ *   pageCount: number,
+ *   bytes: number,
+ *   log: object,
+ *   har: { log: object }
+ * }}
+ */
+export function exportTrafficToHar(trafficDir, outputPath, fallbackSession = {}) {
+    if (!trafficDir) {
+        throw new Error('trafficDir is required for exportTrafficToHar');
+    }
+    const resolvedTrafficDir = path.resolve(String(trafficDir));
+    const resolvedOutputPath = outputPath
+        ? path.resolve(String(outputPath))
+        : path.join(resolvedTrafficDir, 'traffic.har');
+
+    const harArchive = buildHarFromTrafficDir(resolvedTrafficDir, fallbackSession);
+    fs.mkdirSync(path.dirname(resolvedOutputPath), { recursive: true });
+    const serialized = `${JSON.stringify(harArchive, null, 2)}\n`;
+    fs.writeFileSync(resolvedOutputPath, serialized, 'utf8');
+    const bytes = Buffer.byteLength(serialized, 'utf8');
+
+    return {
+        harPath: resolvedOutputPath,
+        outputPath: resolvedOutputPath,
+        entryCount: harArchive.log.entries.length,
+        entriesCount: harArchive.log.entries.length,
+        pageCount: harArchive.log.pages.length,
+        bytes,
+        log: harArchive.log,
+        har: harArchive
     };
 }
 

@@ -5,7 +5,7 @@
 
 import logger from '../utils/logger.js';
 import camoufoxClient from './client.js';
-import { auditProfileCoherence } from './coherence-auditor.js';
+import { auditProfileCoherence, evaluateWireToDomCoherence } from './coherence-auditor.js';
 
 const WAIT_UNTIL_MAP = {
     networkidle0: 'networkidle',
@@ -883,6 +883,13 @@ export class CamoufoxProfile {
         const page = await this.getPage();
         const targetOs = expectedOs || this.metadata?.os || this.options?.os || 'windows';
         this.coherenceReport = await auditProfileCoherence(page, targetOs);
+        if (this.trafficRecorder && this.coherenceReport?.telemetry) {
+            this.coherenceReport.wireToDomCoherence = evaluateWireToDomCoherence(
+                this.coherenceReport.telemetry,
+                this.trafficRecorder,
+                targetOs
+            );
+        }
         return this.coherenceReport;
     }
 

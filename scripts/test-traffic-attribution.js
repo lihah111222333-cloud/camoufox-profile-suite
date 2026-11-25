@@ -1774,6 +1774,351 @@ async function runTests() {
             }
         );
 
+        // =========================================================================
+        // Test 10: Pre-TLS Wire Header Anomalies (Sec-CH-UA, Wire UA OS Mismatch, Proxy Leak), NSS sslkeylog.txt Integrity & Crash Self-Healing
+        // =========================================================================
+        await testSection(
+            'Test 10: Pre-TLS Wire Header Anomalies (Sec-CH-UA, Wire UA OS Mismatch, Proxy Leak), NSS sslkeylog.txt Integrity & Crash Self-Healing',
+            async () => {
+                const profile = await createAndStartProfile(
+                    'Traffic_Test_10_WireAnomalies',
+                    'http://10.101.0.1:8080:proxyUser10:proxyPass10',
+                    {
+                        profileId: 'traffic-test-10-wire-anomalies',
+                        os: 'windows',
+                        profilesDir: tempProfilesDir,
+                        useSharedBrowser: false,
+                        accountId: 'acct-wire-10',
+                        accountEmail: 'wire10@gmail.com'
+                    }
+                );
+
+                const context = await profile.getContext();
+                const recorder = profile.getTrafficRecorder();
+                const trafficDir = profile.trafficPaths.trafficDir;
+                const ndjsonPath = profile.trafficPaths.trafficNdjsonPath;
+                const sslKeyLogPath = profile.trafficPaths.sslKeyLogPath;
+
+                profile.setTrafficStep('step-10-wire-header-inspection');
+
+                // 1) Emit an egress request on a Windows Firefox profile carrying Chromium Sec-CH-UA,
+                //    a mismatched macOS User-Agent, and an X-Forwarded-For proxy leak header
+                const anomalousReq = createMockRequest({
+                    method: 'POST',
+                    url: 'https://accounts.google.com/v3/signin/lookup?hl=en',
+                    headersArray: [
+                        { name: 'Host', value: 'accounts.google.com' },
+                        {
+                            name: 'User-Agent',
+                            value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0'
+                        },
+                        {
+                            name: 'Sec-CH-UA',
+                            value: '"Chromium";v="135", "Not-A.Brand";v="8"'
+                        },
+                        {
+                            name: 'X-Forwarded-For',
+                            value: '10.0.0.5'
+                        },
+                        { name: 'Content-Type', value: 'application/json' }
+                    ],
+                    postData: JSON.stringify({ identifier: 'wire10@gmail.com' })
+                });
+
+                const anomalousRes = createMockResponse({
+                    request: anomalousReq,
+                    status: 200,
+                    statusText: 'OK',
+                    headersArray: [{ name: 'Content-Type', value: 'application/json' }],
+                    body: JSON.stringify({ status: 'OK' })
+                });
+
+                await emitHttpTransaction(context, anomalousReq, anomalousRes);
+
+                // 2) Record valid NSS TLS 1.3 secrets via recordSslKeyLogSecret
+                const clientRandomHex =
+                    '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+                const tls13Secrets = [
+                    [
+                        'CLIENT_HANDSHAKE_TRAFFIC_SECRET',
+                        'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90'
+                    ],
+                    [
+                        'SERVER_HANDSHAKE_TRAFFIC_SECRET',
+                        'b1c2d3e4f5061728394a5b6c7d8e9f01b1c2d3e4f5061728394a5b6c7d8e9f01'
+                    ],
+                    [
+                        'CLIENT_TRAFFIC_SECRET_0',
+                        'c1d2e3f405162738495a6b7c8d9e0f12c1d2e3f405162738495a6b7c8d9e0f12'
+                    ],
+                    [
+                        'SERVER_TRAFFIC_SECRET_0',
+                        'd1e2f30415263748596a7b8c9d0e1f23d1e2f30415263748596a7b8c9d0e1f23'
+                    ]
+                ];
+
+                assert.equal(
+                    typeof recorder.recordSslKeyLogSecret,
+                    'function',
+                    'Expected recorder.recordSslKeyLogSecret to be a function'
+                );
+                for (const [label, secretHex] of tls13Secrets) {
+                    if (recorder.recordSslKeyLogSecret.length >= 2) {
+                        recorder.recordSslKeyLogSecret(label, clientRandomHex, secretHex);
+                    } else {
+                        recorder.recordSslKeyLogSecret(
+                            `${label} ${clientRandomHex} ${secretHex}`,
+                            clientRandomHex,
+                            secretHex
+                        );
+                    }
+                }
+
+                const summary = await profile.getTrafficAttribution();
+                const anomalyTypes = summary.anomaliesAndRiskSignals.map((a) => a.type);
+
+                assert.equal(
+                    anomalyTypes.includes('wire-header-anomaly:chromium-client-hints-on-gecko'),
+                    true,
+                    `Expected wire-header-anomaly:chromium-client-hints-on-gecko in [${anomalyTypes.join(', ')}]`
+                );
+                assert.equal(
+                    anomalyTypes.includes('wire-header-anomaly:ua-os-mismatch'),
+                    true,
+                    `Expected wire-header-anomaly:ua-os-mismatch in [${anomalyTypes.join(', ')}]`
+                );
+                assert.equal(
+                    anomalyTypes.includes('proxy-anonymity-leak'),
+                    true,
+                    `Expected proxy-anonymity-leak in [${anomalyTypes.join(', ')}]`
+                );
+
+                // Verify NSS sslKeyLog summary metrics and cryptographic integrity
+                assert.ok(summary.sslKeyLog, 'Expected summary.sslKeyLog block');
+                assert.ok(
+                    summary.sslKeyLog.tls13SessionCount >= 1,
+                    `Expected summary.sslKeyLog.tls13SessionCount >= 1, got ${summary.sslKeyLog.tls13SessionCount}`
+                );
+
+                const integrityValid = verifyTrafficIntegrity(trafficDir);
+                assert.equal(
+                    integrityValid.valid,
+                    true,
+                    `Expected valid integrity after recording TLS 1.3 secrets, got errors: ${integrityValid.errors.join('; ')}`
+                );
+
+                // Tamper with sslkeylog.txt and assert verifyTrafficIntegrity detects it
+                const originalSslKeyLog = fs.readFileSync(sslKeyLogPath, 'utf8');
+                fs.writeFileSync(
+                    sslKeyLogPath,
+                    `${originalSslKeyLog}CLIENT_TRAFFIC_SECRET_0 ${clientRandomHex} ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n`,
+                    'utf8'
+                );
+                const tamperedSslIntegrity = verifyTrafficIntegrity(trafficDir);
+                assert.equal(
+                    tamperedSslIntegrity.valid,
+                    false,
+                    'Expected verifyTrafficIntegrity(trafficDir).valid === false after tampering with sslkeylog.txt'
+                );
+
+                // Restore sslkeylog.txt and stop profile
+                fs.writeFileSync(sslKeyLogPath, originalSslKeyLog, 'utf8');
+                await profile.stop();
+                assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+
+                // 3) Simulate a crashed partial trailing line in traffic.ndjson and verify self-healing on resume
+                const preCrashIntegrity = verifyTrafficIntegrity(trafficDir);
+                assert.equal(preCrashIntegrity.valid, true);
+
+                fs.appendFileSync(ndjsonPath, '{"type":"egress","corrupted":', 'utf8');
+                const healedRecorder = new CamoufoxTrafficRecorder({
+                    profileId: 'traffic-test-10-wire-anomalies',
+                    trafficDir,
+                    sslKeyLogPath,
+                    os: 'windows'
+                });
+                await healedRecorder.flushSummary();
+
+                const rawNdjsonAfterHeal = fs.readFileSync(ndjsonPath, 'utf8');
+                assert.equal(
+                    rawNdjsonAfterHeal.includes('"corrupted"'),
+                    false,
+                    'Expected _resumeExistingChainIfPresent() to truncate corrupted partial trailing NDJSON line'
+                );
+
+                const postHealIntegrity = verifyTrafficIntegrity(trafficDir);
+                assert.equal(
+                    postHealIntegrity.valid,
+                    true,
+                    `Expected valid integrity after crash self-healing, got errors: ${postHealIntegrity.errors.join('; ')}`
+                );
+                assert.equal(postHealIntegrity.eventCount, preCrashIntegrity.eventCount);
+
+                await profile.delete();
+            }
+        );
+
+        // =========================================================================
+        // Test 11: W3C HAR 1.2 Export (recorder.exportHar() & query-traffic-attribution.js --export-har)
+        // =========================================================================
+        await testSection(
+            'Test 11: W3C HAR 1.2 Export (recorder.exportHar() & query-traffic-attribution.js --export-har)',
+            async () => {
+                const profile = await createAndStartProfile(
+                    'Traffic_Test_11_Har',
+                    'http://10.102.0.1:8080',
+                    {
+                        profileId: 'traffic-test-11-har',
+                        os: 'windows',
+                        profilesDir: tempProfilesDir,
+                        useSharedBrowser: false,
+                        accountId: 'acct-har-11',
+                        accountEmail: 'har11@gmail.com'
+                    }
+                );
+
+                const page = await profile.getPage();
+                const context = await profile.getContext();
+                const recorder = profile.getTrafficRecorder();
+                const trafficDir = profile.trafficPaths.trafficDir;
+
+                profile.setTrafficStep('step-11-har-export');
+                await page.click('#har-submit-btn');
+
+                const reqPostPayload = JSON.stringify({
+                    username: 'har11@gmail.com',
+                    flowName: 'GlifWebSignIn'
+                });
+                const resJsonPayload = JSON.stringify({
+                    status: 'HAR_EXPORT_READY',
+                    continuationToken: 'tok_har_11'
+                });
+
+                const req11 = createMockRequest({
+                    method: 'POST',
+                    url: 'https://accounts.google.com/v3/signin/identifier?hl=en&flowName=GlifWebSignIn',
+                    resourceType: 'fetch',
+                    headersArray: [
+                        { name: 'Host', value: 'accounts.google.com' },
+                        {
+                            name: 'User-Agent',
+                            value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0'
+                        },
+                        { name: 'Content-Type', value: 'application/json' },
+                        { name: 'X-Har-Test', value: 'pre-tls-egress' }
+                    ],
+                    postData: reqPostPayload,
+                    timing: { requestStart: 4.0, responseEnd: 46.5 }
+                });
+
+                const res11 = createMockResponse({
+                    request: req11,
+                    status: 200,
+                    statusText: 'OK',
+                    headersArray: [
+                        { name: 'Content-Type', value: 'application/json; charset=utf-8' },
+                        { name: 'X-Har-Response', value: 'post-tls-ingress' }
+                    ],
+                    body: resJsonPayload,
+                    serverAddr: { ipAddress: '142.250.185.78', port: 443 },
+                    securityDetails: {
+                        protocol: 'TLS 1.3',
+                        subjectName: 'accounts.google.com',
+                        issuer: 'GTS CA 1C3'
+                    }
+                });
+
+                await emitHttpTransaction(context, req11, res11);
+                await profile.stop();
+
+                // 1) Export HAR 1.2 directly via recorder.exportHar()
+                assert.equal(
+                    typeof recorder.exportHar,
+                    'function',
+                    'Expected recorder.exportHar to be a function'
+                );
+                const directHarPath = path.join(trafficDir, 'trace.har');
+                await recorder.exportHar(directHarPath);
+                assert.equal(
+                    fs.existsSync(directHarPath),
+                    true,
+                    `Expected trace.har to exist at ${directHarPath}`
+                );
+
+                const directHar = JSON.parse(fs.readFileSync(directHarPath, 'utf8'));
+                assert.ok(directHar && directHar.log, 'Expected top-level HAR log object');
+                assert.equal(directHar.log.version, '1.2');
+                assert.ok(directHar.log.creator && directHar.log.creator.name);
+                assert.ok(
+                    Array.isArray(directHar.log.entries) && directHar.log.entries.length >= 1,
+                    'Expected at least 1 HAR entry'
+                );
+
+                const harEntry = directHar.log.entries.find((e) =>
+                    e.request?.url?.includes('/v3/signin/identifier')
+                );
+                assert.ok(harEntry, 'Expected HAR entry for /v3/signin/identifier');
+                assert.equal(harEntry.request.method, 'POST');
+                assert.ok(
+                    harEntry.request.headers.some(
+                        (h) => h.name === 'X-Har-Test' && h.value === 'pre-tls-egress'
+                    ),
+                    'Expected HAR request headers to preserve X-Har-Test'
+                );
+                assert.ok(harEntry.request.postData, 'Expected HAR request.postData');
+                assert.equal(harEntry.request.postData.text, reqPostPayload);
+
+                assert.equal(harEntry.response.status, 200);
+                assert.ok(
+                    harEntry.response.headers.some(
+                        (h) => h.name === 'X-Har-Response' && h.value === 'post-tls-ingress'
+                    ),
+                    'Expected HAR response headers to preserve X-Har-Response'
+                );
+                assert.ok(harEntry.response.content, 'Expected HAR response.content');
+                assert.equal(harEntry.response.content.text, resJsonPayload);
+                assert.ok(harEntry.timings && typeof harEntry.timings.wait === 'number');
+                assert.ok(
+                    harEntry._attribution,
+                    'Expected HAR entry to include _attribution metadata'
+                );
+                assert.equal(harEntry._attribution.actionStep, 'step-11-har-export');
+
+                // 2) Export HAR 1.2 via scripts/query-traffic-attribution.js --export-har
+                const cliHarPath = path.join(trafficDir, 'cli-trace.har');
+                const cliScriptPath = path.join(__dirname, 'query-traffic-attribution.js');
+                execFileSync(
+                    process.execPath,
+                    [
+                        cliScriptPath,
+                        `--profiles-dir=${tempProfilesDir}`,
+                        '--profile=traffic-test-11-har',
+                        `--export-har=${cliHarPath}`
+                    ],
+                    { encoding: 'utf8' }
+                );
+
+                assert.equal(
+                    fs.existsSync(cliHarPath),
+                    true,
+                    `Expected CLI --export-har to write ${cliHarPath}`
+                );
+                const cliHar = JSON.parse(fs.readFileSync(cliHarPath, 'utf8'));
+                assert.equal(cliHar.log.version, '1.2');
+                assert.ok(Array.isArray(cliHar.log.entries) && cliHar.log.entries.length >= 1);
+                const cliHarEntry = cliHar.log.entries.find((e) =>
+                    e.request?.url?.includes('/v3/signin/identifier')
+                );
+                assert.ok(cliHarEntry);
+                assert.equal(cliHarEntry.request.postData.text, reqPostPayload);
+                assert.equal(cliHarEntry.response.content.text, resJsonPayload);
+                assert.ok(cliHarEntry._attribution);
+                assert.equal(cliHarEntry._attribution.actionStep, 'step-11-har-export');
+
+                await profile.delete();
+            }
+        );
+
         console.log(`\n🎉 All ${passedTests} Camoufox pre-TLS traffic attribution & isolation test suites passed!`);
     } finally {
         setCamoufoxModule(null);

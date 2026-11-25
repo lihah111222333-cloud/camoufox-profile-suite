@@ -38,6 +38,7 @@ import camoufoxClient, {
     unregisterProcessCleanupHooks
 } from '../src/camoufox/client.js';
 import { CamoufoxProfile, createAndStartProfile } from '../src/camoufox/profile.js';
+import { verifyTrafficIntegrity } from '../src/camoufox/traffic-recorder.js';
 
 /**
  * Create an isolated in-memory Mock Camoufox Engine that faithfully implements
@@ -919,6 +920,171 @@ async function runTests() {
                     assert.equal(attributionReport.totals.totalResponses, 1);
                 }
 
+                unregisterProcessCleanupHooks();
+            }
+        );
+
+        // =========================================================================
+        // 7. Multi-Session Profile Restart Traffic Hash-Chain Continuity
+        // =========================================================================
+        await testSection(
+            'Multi-session profile restart traffic hash-chain continuity (Restart_Chain_Win)',
+            async () => {
+                const profileSession1 = await createAndStartProfile(
+                    'Restart_Chain_Win',
+                    'http://10.40.1.1:8080',
+                    {
+                        profileId: 'Restart_Chain_Win',
+                        os: 'windows',
+                        profilesDir: tempProfilesDir,
+                        useSharedBrowser: false
+                    }
+                );
+
+                profileSession1.setTrafficStep('session-1-signup-init');
+                const session1ReqBody = JSON.stringify({
+                    session: 1,
+                    step: 'init',
+                    user: 'alice_s1'
+                });
+                const session1ResBody = JSON.stringify({
+                    ok: true,
+                    session: 1,
+                    token: 'tok_s1'
+                });
+
+                const mockReq1 = {
+                    method: () => 'POST',
+                    url: () => 'https://accounts.google.com/_/signup/session1',
+                    resourceType: () => 'fetch',
+                    isNavigationRequest: () => false,
+                    headers: () => ({ 'content-type': 'application/json' }),
+                    headersArray: async () => [{ name: 'content-type', value: 'application/json' }],
+                    postDataBuffer: () => Buffer.from(session1ReqBody, 'utf8')
+                };
+                const mockRes1 = {
+                    request: () => mockReq1,
+                    url: () => 'https://accounts.google.com/_/signup/session1',
+                    status: () => 200,
+                    statusText: () => 'OK',
+                    headers: () => ({ 'content-type': 'application/json' }),
+                    headersArray: async () => [{ name: 'content-type', value: 'application/json' }],
+                    body: async () => Buffer.from(session1ResBody, 'utf8'),
+                    serverAddr: async () => ({ ipAddress: '142.250.80.109', port: 443 }),
+                    securityDetails: async () => ({ protocol: 'TLS 1.3' })
+                };
+
+                profileSession1.context.emit('request', mockReq1);
+                await new Promise((resolve) => setImmediate(resolve));
+                profileSession1.context.emit('response', mockRes1);
+                await new Promise((resolve) => setImmediate(resolve));
+                profileSession1.context.emit('requestfinished', mockReq1);
+                await new Promise((resolve) => setImmediate(resolve));
+
+                const trafficDir = profileSession1.trafficPaths.trafficDir;
+                await profileSession1.stop();
+
+                const integrityAfterSession1 = verifyTrafficIntegrity(trafficDir);
+                assert.equal(
+                    integrityAfterSession1.valid,
+                    true,
+                    `Expected valid traffic integrity after Session 1, got errors: ${integrityAfterSession1.errors.join('; ')}`
+                );
+                assert.ok(integrityAfterSession1.eventCount >= 2);
+                assert.equal(integrityAfterSession1.verifiedPayloads, 2);
+                const session1EventCount = integrityAfterSession1.eventCount;
+                const session1ChainHead = integrityAfterSession1.chainHeadHash;
+
+                // Restart the exact same profileId in a new CamoufoxProfile instance
+                const profileSession2 = new CamoufoxProfile('Restart_Chain_Win', {
+                    profilesDir: tempProfilesDir,
+                    useSharedBrowser: false
+                });
+                await profileSession2.start();
+                profileSession2.setTrafficStep('session-2-resume-verify');
+
+                const session2ReqBody = JSON.stringify({
+                    session: 2,
+                    step: 'verify',
+                    code: '998877'
+                });
+                const session2ResBody = JSON.stringify({
+                    ok: true,
+                    session: 2,
+                    verified: true
+                });
+
+                const mockReq2 = {
+                    method: () => 'POST',
+                    url: () => 'https://accounts.google.com/_/signup/session2',
+                    resourceType: () => 'fetch',
+                    isNavigationRequest: () => false,
+                    headers: () => ({ 'content-type': 'application/json' }),
+                    headersArray: async () => [{ name: 'content-type', value: 'application/json' }],
+                    postDataBuffer: () => Buffer.from(session2ReqBody, 'utf8')
+                };
+                const mockRes2 = {
+                    request: () => mockReq2,
+                    url: () => 'https://accounts.google.com/_/signup/session2',
+                    status: () => 200,
+                    statusText: () => 'OK',
+                    headers: () => ({ 'content-type': 'application/json' }),
+                    headersArray: async () => [{ name: 'content-type', value: 'application/json' }],
+                    body: async () => Buffer.from(session2ResBody, 'utf8'),
+                    serverAddr: async () => ({ ipAddress: '142.250.80.109', port: 443 }),
+                    securityDetails: async () => ({ protocol: 'TLS 1.3' })
+                };
+
+                profileSession2.context.emit('request', mockReq2);
+                await new Promise((resolve) => setImmediate(resolve));
+                profileSession2.context.emit('response', mockRes2);
+                await new Promise((resolve) => setImmediate(resolve));
+                profileSession2.context.emit('requestfinished', mockReq2);
+                await new Promise((resolve) => setImmediate(resolve));
+
+                await profileSession2.stop();
+
+                const integrityAfterSession2 = verifyTrafficIntegrity(trafficDir);
+                assert.equal(
+                    integrityAfterSession2.valid,
+                    true,
+                    `Expected valid multi-session traffic integrity after Session 2, got errors: ${integrityAfterSession2.errors.join('; ')}`
+                );
+                assert.ok(
+                    integrityAfterSession2.eventCount >= session1EventCount + 2,
+                    `Expected multi-session eventCount (${integrityAfterSession2.eventCount}) to include Session 1 (${session1EventCount}) and Session 2 events`
+                );
+                assert.notEqual(integrityAfterSession2.chainHeadHash, session1ChainHead);
+                assert.equal(integrityAfterSession2.verifiedPayloads, 4);
+
+                const finalIndex = JSON.parse(
+                    fs.readFileSync(path.join(trafficDir, 'attribution-index.json'), 'utf8')
+                );
+                assert.equal(finalIndex.integrity.eventCount, integrityAfterSession2.eventCount);
+                assert.equal(Object.keys(finalIndex.integrity.payloadManifest).length, 4);
+
+                // Verify all 4 payload files from Session 1 and Session 2 exist on disk and are in payloadManifest
+                const ndjsonLines = fs
+                    .readFileSync(path.join(trafficDir, 'traffic.ndjson'), 'utf8')
+                    .trim()
+                    .split('\n')
+                    .map((l) => JSON.parse(l));
+                assert.equal(ndjsonLines.length, integrityAfterSession2.eventCount);
+                const payloadEvents = ndjsonLines.filter((e) => e.payloadFile);
+                assert.equal(payloadEvents.length, 4);
+                for (const ev of payloadEvents) {
+                    assert.ok(
+                        finalIndex.integrity.payloadManifest[ev.payloadFile],
+                        `Expected payloadManifest to include ${ev.payloadFile}`
+                    );
+                    assert.equal(
+                        fs.existsSync(path.join(trafficDir, ev.payloadFile)),
+                        true,
+                        `Expected payload file ${ev.payloadFile} to exist on disk`
+                    );
+                }
+
+                await profileSession2.delete();
                 unregisterProcessCleanupHooks();
             }
         );
