@@ -48,6 +48,190 @@ const SENSITIVE_HEADER_NAME_REGEX =
     /^(proxy-authorization|x-proxy-authorization|x-api-key|omocaptcha-key)$/i;
 
 /**
+ * Known anti-bot, risk-control, and session authentication cookie/token names across
+ * Google, Cloudflare, Meta/Instagram, TikTok, and X/Twitter.
+ */
+export const ANTI_BOT_COOKIE_REGEX =
+    /^(datr|sb|fr|c_user|xs|ig_did|mid|csrftoken|rur|ttwid|msToken|s_v_web_id|verifyFp|odin_tt|passport_csrf_token|guest_id|guest_id_marketing|guest_id_ads|ct0|auth_token|kdt|_twitter_sess|__cf_bm|cf_clearance|_cfuvid|NID|AEC|SOCS|SID|HSID|SSID|APISID|SAPISID|__Secure-[0-9A-Za-z_-]+|__Host-[0-9A-Za-z_-]+)$/i;
+
+/**
+ * Mask a cookie value so raw session secrets are never leaked while keeping a short
+ * diagnostic prefix/suffix for longer values (`first 3 chars + *** + last 2 chars`,
+ * or `[REDACTED]` for short values).
+ *
+ * @param {string} rawValue
+ * @returns {string}
+ */
+function maskCookieValue(rawValue) {
+    const str = String(rawValue ?? '');
+    if (str.length <= 6) {
+        return '[REDACTED]';
+    }
+    return `${str.slice(0, 3)}***${str.slice(-2)}`;
+}
+
+/**
+ * Parse a `Set-Cookie` response header string into structured metadata with a full
+ * SHA-256 value digest (`valueSha256`) and masked preview (`maskedValue`) for
+ * tamper-evident token rotation and lineage tracking.
+ *
+ * @param {string} rawSetCookieValue
+ * @returns {{
+ *   name: string,
+ *   value: string,
+ *   valueSha256: string,
+ *   maskedValue: string,
+ *   domain: string|null,
+ *   path: string|null,
+ *   secure: boolean,
+ *   httpOnly: boolean,
+ *   sameSite: string|null,
+ *   expires: string|null,
+ *   maxAge: number|null,
+ *   isDeleted: boolean,
+ *   isAntiBotToken: boolean
+ * }|null}
+ */
+export function parseSetCookieHeader(rawSetCookieValue) {
+    if (typeof rawSetCookieValue !== 'string') {
+        return null;
+    }
+    const trimmedHeader = rawSetCookieValue.trim();
+    if (!trimmedHeader) {
+        return null;
+    }
+
+    const parts = trimmedHeader.split(';');
+    const firstPart = (parts[0] || '').trim();
+    const eqIdx = firstPart.indexOf('=');
+    if (eqIdx <= 0) {
+        return null;
+    }
+
+    const name = firstPart.slice(0, eqIdx).trim();
+    if (!name) {
+        return null;
+    }
+    const value = firstPart.slice(eqIdx + 1).trim();
+    const valueSha256 = crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+    const maskedValue = maskCookieValue(value);
+
+    let domain = null;
+    let cookiePath = null;
+    let secure = false;
+    let httpOnly = false;
+    let sameSite = null;
+    let expires = null;
+    let maxAge = null;
+
+    for (let i = 1; i < parts.length; i += 1) {
+        const attrSegment = parts[i].trim();
+        if (!attrSegment) continue;
+
+        const attrEqIdx = attrSegment.indexOf('=');
+        const attrName = (attrEqIdx >= 0 ? attrSegment.slice(0, attrEqIdx) : attrSegment)
+            .trim()
+            .toLowerCase();
+        const attrVal = attrEqIdx >= 0 ? attrSegment.slice(attrEqIdx + 1).trim() : null;
+
+        if (attrName === 'domain') {
+            domain = attrVal || null;
+        } else if (attrName === 'path') {
+            cookiePath = attrVal || null;
+        } else if (attrName === 'secure') {
+            secure = true;
+        } else if (attrName === 'httponly') {
+            httpOnly = true;
+        } else if (attrName === 'samesite') {
+            sameSite = attrVal || null;
+        } else if (attrName === 'expires') {
+            expires = attrVal || null;
+        } else if (attrName === 'max-age') {
+            const parsedMaxAge = attrVal !== null && attrVal !== '' ? Number(attrVal) : NaN;
+            maxAge = Number.isFinite(parsedMaxAge) ? parsedMaxAge : null;
+        }
+    }
+
+    let expiredByDate = false;
+    if (expires) {
+        const parsedExpiresMs = Date.parse(expires);
+        if (Number.isFinite(parsedExpiresMs) && parsedExpiresMs <= Date.now()) {
+            expiredByDate = true;
+        }
+    }
+
+    const isDeleted =
+        value === '' ||
+        /^deleted$/i.test(value) ||
+        (maxAge !== null && maxAge <= 0) ||
+        expiredByDate;
+
+    const isAntiBotToken = ANTI_BOT_COOKIE_REGEX.test(name);
+
+    return {
+        name,
+        value,
+        valueSha256,
+        maskedValue,
+        domain,
+        path: cookiePath,
+        secure,
+        httpOnly,
+        sameSite,
+        expires,
+        maxAge,
+        isDeleted,
+        isAntiBotToken
+    };
+}
+
+/**
+ * Parse an egress `Cookie` request header string (`"k1=v1; k2=v2"`) into an array
+ * of structured cookie descriptors with SHA-256 value digests and masked previews.
+ *
+ * @param {string} rawCookieHeader
+ * @returns {Array<{
+ *   name: string,
+ *   value: string,
+ *   valueSha256: string,
+ *   maskedValue: string,
+ *   isAntiBotToken: boolean
+ * }>}
+ */
+export function parseCookieHeader(rawCookieHeader) {
+    if (typeof rawCookieHeader !== 'string' || !rawCookieHeader.trim()) {
+        return [];
+    }
+
+    const results = [];
+    const segments = rawCookieHeader.split(/[;\r\n]+/);
+
+    for (const seg of segments) {
+        const trimmed = seg.trim();
+        if (!trimmed) continue;
+        const eqIdx = trimmed.indexOf('=');
+        if (eqIdx <= 0) continue;
+
+        const name = trimmed.slice(0, eqIdx).trim();
+        if (!name) continue;
+        const value = trimmed.slice(eqIdx + 1).trim();
+        const valueSha256 = crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+        const maskedValue = maskCookieValue(value);
+        const isAntiBotToken = ANTI_BOT_COOKIE_REGEX.test(name);
+
+        results.push({
+            name,
+            value,
+            valueSha256,
+            maskedValue,
+            isAntiBotToken
+        });
+    }
+
+    return results;
+}
+
+/**
  * Redact a sensitive header value while preserving an authentication scheme prefix
  * (e.g. `Basic dXNlcjpzZWNyZXQ=` -> `Basic [REDACTED]`, raw API key -> `[REDACTED]`).
  *
@@ -611,6 +795,184 @@ export function parseSslKeyLog(sslKeyLogPath) {
 }
 
 /**
+ * Parse and validate a Firefox C++ Necko `MOZ_LOG` file (`necko-pre-tls.moz_log`
+ * generated with `MOZ_LOG=timestamp,nsHttp:5,nsSocketTransport:5,nsHostResolver:4,sync`),
+ * extracting `http request [ ... ]` and `http response [ ... ]` header blocks,
+ * HTTP/2 frame counts, DNS resolver lookups, socket transport events, and SHA-256 integrity.
+ *
+ * @param {string} neckoLogPath
+ * @returns {{
+ *   exists: boolean,
+ *   sha256: string|null,
+ *   bytes: number,
+ *   lineCount: number,
+ *   requestBlockCount: number,
+ *   responseBlockCount: number,
+ *   http2FrameCount: number,
+ *   dnsLookupCount: number,
+ *   socketEventCount: number,
+ *   parsedRequests: Array<{ requestLine: string, host: string|null, headers: Record<string, string> }>,
+ *   parsedResponses: Array<{ statusLine: string, headers: Record<string, string> }>
+ * }}
+ */
+export function parseNeckoMozLog(neckoLogPath) {
+    if (!neckoLogPath || !fs.existsSync(neckoLogPath)) {
+        return {
+            exists: false,
+            sha256: null,
+            bytes: 0,
+            lineCount: 0,
+            requestBlockCount: 0,
+            responseBlockCount: 0,
+            http2FrameCount: 0,
+            dnsLookupCount: 0,
+            socketEventCount: 0,
+            parsedRequests: [],
+            parsedResponses: []
+        };
+    }
+
+    const rawBuffer = fs.readFileSync(neckoLogPath);
+    if (rawBuffer.byteLength === 0) {
+        return {
+            exists: false,
+            sha256: null,
+            bytes: 0,
+            lineCount: 0,
+            requestBlockCount: 0,
+            responseBlockCount: 0,
+            http2FrameCount: 0,
+            dnsLookupCount: 0,
+            socketEventCount: 0,
+            parsedRequests: [],
+            parsedResponses: []
+        };
+    }
+
+    const sha256 = crypto.createHash('sha256').update(rawBuffer).digest('hex');
+    const bytes = rawBuffer.byteLength;
+    const rawLines = rawBuffer.toString('utf8').split(/\r?\n/);
+
+    let lineCount = 0;
+    let requestBlockCount = 0;
+    let responseBlockCount = 0;
+    let http2FrameCount = 0;
+    let dnsLookupCount = 0;
+    let socketEventCount = 0;
+    const parsedRequests = [];
+    const parsedResponses = [];
+
+    let currentBlock = null;
+
+    const finalizeBlock = (block) => {
+        if (!block || block.lines.length === 0) {
+            return;
+        }
+        const firstLine = block.lines[0].trim();
+        const headers = {};
+
+        for (let i = 1; i < block.lines.length; i += 1) {
+            const hdrLine = block.lines[i].trim();
+            if (!hdrLine) continue;
+
+            const colonIdx = hdrLine.startsWith(':')
+                ? hdrLine.indexOf(':', 1)
+                : hdrLine.indexOf(':');
+            if (colonIdx <= 0) continue;
+
+            const rawName = hdrLine.slice(0, colonIdx).trim();
+            const lowerName = rawName.toLowerCase();
+            const value = hdrLine.slice(colonIdx + 1).trim();
+
+            if (Object.prototype.hasOwnProperty.call(headers, lowerName)) {
+                headers[lowerName] = `${headers[lowerName]}\n${value}`;
+            } else {
+                headers[lowerName] = value;
+            }
+        }
+
+        if (block.type === 'request') {
+            requestBlockCount += 1;
+            const host = headers.host || headers[':authority'] || null;
+            parsedRequests.push({
+                requestLine: firstLine,
+                host,
+                headers
+            });
+        } else if (block.type === 'response') {
+            responseBlockCount += 1;
+            parsedResponses.push({
+                statusLine: firstLine,
+                headers
+            });
+        }
+    };
+
+    for (const rawLine of rawLines) {
+        const trimmedRaw = rawLine.trim();
+        if (!trimmedRaw) {
+            continue;
+        }
+        lineCount += 1;
+
+        if (
+            /\bHttp2Session\b|\bHttp2Stream\b|\bHTTP\/2\s+frame\b|\[(HEADERS|DATA|SETTINGS|WINDOW_UPDATE|PING|RST_STREAM|GOAWAY|PRIORITY|PUSH_PROMISE)\s+frame\]/i.test(
+                trimmedRaw
+            )
+        ) {
+            http2FrameCount += 1;
+        }
+
+        if (/\bnsHostResolver\b|\bResolving\s+host\b|\bDNS\s+lookup\b/i.test(trimmedRaw)) {
+            dnsLookupCount += 1;
+        }
+
+        if (
+            /\bnsSocketTransport\b|\bSocketTransport\b|\bPR_Connect\b|\bMSG_ENSURE_CONNECT\b|\bMSG_DNS_LOOKUP_COMPLETE\b/i.test(
+                trimmedRaw
+            )
+        ) {
+            socketEventCount += 1;
+        }
+
+        // Strip optional MOZ_LOG timestamp/thread/module prefix (e.g. "...: V/nsHttp ")
+        const nsHttpPrefixMatch = trimmedRaw.match(/(?:^|\s)[IDVWE]\/nsHttp:?\s+(.*)$/i);
+        const payloadText = nsHttpPrefixMatch ? nsHttpPrefixMatch[1].trim() : trimmedRaw;
+
+        if (!currentBlock) {
+            if (/^http\s+request\s*\[$/i.test(payloadText)) {
+                currentBlock = { type: 'request', lines: [] };
+            } else if (/^http\s+response\s*\[$/i.test(payloadText)) {
+                currentBlock = { type: 'response', lines: [] };
+            }
+        } else if (payloadText === ']') {
+            finalizeBlock(currentBlock);
+            currentBlock = null;
+        } else {
+            currentBlock.lines.push(payloadText);
+        }
+    }
+
+    if (currentBlock) {
+        finalizeBlock(currentBlock);
+    }
+
+    return {
+        exists: true,
+        sha256,
+        bytes,
+        lineCount,
+        requestBlockCount,
+        responseBlockCount,
+        http2FrameCount,
+        dnsLookupCount,
+        socketEventCount,
+        parsedRequests,
+        parsedResponses
+    };
+}
+
+/**
  * Normalize headers object and optional headersArray so Firefox's exact pre-TLS
  * header order is preserved whenever Playwright's `headersArray()` is available.
  *
@@ -788,6 +1150,7 @@ export class CamoufoxTrafficRecorder {
         this.byActionStep = new Map();
         this.byDomain = new Map();
         this.byTriggerAction = new Map();
+        this.cookieLineage = new Map();
         this.anomaliesAndRiskSignals = [];
         this.recordedAnomalyKeys = new Set();
 
@@ -796,6 +1159,7 @@ export class CamoufoxTrafficRecorder {
             for (const artifactPath of [
                 this.trafficNdjsonPath,
                 this.preTlsWireLogPath,
+                this.neckoMozLogPath,
                 this.attributionIndexPath,
                 this.harPath
             ]) {
@@ -955,6 +1319,64 @@ export class CamoufoxTrafficRecorder {
             if (ev.correlationId) {
                 validCorrIds.add(ev.correlationId);
             }
+        }
+
+        // Restore persisted cookieLineage from attribution-index.json if present
+        if (existingIndex?.cookieLineage && typeof existingIndex.cookieLineage === 'object') {
+            for (const [cookieName, rawEntry] of Object.entries(existingIndex.cookieLineage)) {
+                if (!rawEntry || typeof rawEntry !== 'object') continue;
+                const restoredSentCorrIds = new Set(
+                    Array.isArray(rawEntry.sentInCorrelationIds)
+                        ? rawEntry.sentInCorrelationIds.filter(
+                              (id) => !validCorrIds.size || validCorrIds.has(id)
+                          )
+                        : []
+                );
+                const restoredHistory = Array.isArray(rawEntry.valueHistory)
+                    ? rawEntry.valueHistory
+                          .filter(
+                              (h) =>
+                                  h &&
+                                  (!h.correlationId ||
+                                      !validCorrIds.size ||
+                                      validCorrIds.has(h.correlationId))
+                          )
+                          .map((h) => ({ ...h }))
+                    : [];
+                this.cookieLineage.set(cookieName, {
+                    name: rawEntry.name || cookieName,
+                    isAntiBotToken: Boolean(
+                        rawEntry.isAntiBotToken ?? ANTI_BOT_COOKIE_REGEX.test(cookieName)
+                    ),
+                    domain: rawEntry.domain ?? null,
+                    path: rawEntry.path ?? '/',
+                    secure: Boolean(rawEntry.secure),
+                    httpOnly: Boolean(rawEntry.httpOnly),
+                    sameSite: rawEntry.sameSite ?? null,
+                    firstSetAt: rawEntry.firstSetAt ?? null,
+                    firstSetByCorrelationId: rawEntry.firstSetByCorrelationId ?? null,
+                    firstSetAtStep: rawEntry.firstSetAtStep ?? null,
+                    firstSetByTrigger: rawEntry.firstSetByTrigger ?? null,
+                    firstSetUrl: rawEntry.firstSetUrl ?? null,
+                    lastSetAt: rawEntry.lastSetAt ?? null,
+                    lastSetByCorrelationId: rawEntry.lastSetByCorrelationId ?? null,
+                    lastSetAtStep: rawEntry.lastSetAtStep ?? null,
+                    lastValueSha256: rawEntry.lastValueSha256 ?? null,
+                    lastMaskedValue: rawEntry.lastMaskedValue ?? null,
+                    mutationsCount:
+                        Number(rawEntry.mutationsCount) || restoredHistory.length || 0,
+                    sentCount: Number(rawEntry.sentCount) || restoredSentCorrIds.size || 0,
+                    lastSentAt: rawEntry.lastSentAt ?? null,
+                    lastSentByCorrelationId: rawEntry.lastSentByCorrelationId ?? null,
+                    lastSentAtStep: rawEntry.lastSentAtStep ?? null,
+                    matchesLatestSetCookie: rawEntry.matchesLatestSetCookie ?? null,
+                    valueHistory: restoredHistory,
+                    sentInCorrelationIds: restoredSentCorrIds
+                });
+            }
+        }
+
+        for (const ev of validEvents) {
             const stepName = ev.attribution?.actionStep || ev.actionStep || 'init';
             const stepIndex = ev.attribution?.stepIndex ?? ev.stepIndex ?? 0;
             this._ensureStepRecord(stepName, stepIndex);
@@ -1001,6 +1423,16 @@ export class CamoufoxTrafficRecorder {
                         triggerBucket.correlationIdsSet.add(ev.correlationId);
                     }
                 }
+
+                this._updateCookieLineageFromEgress({
+                    headers: ev.headers || {},
+                    headersArray: headersArr,
+                    correlationId: ev.correlationId,
+                    actionStep: stepName,
+                    timestamp: ev.timestamp,
+                    parsedUrl,
+                    isReplay: true
+                });
             } else if (ev.type === 'ingress') {
                 const headersArr = Array.isArray(ev.headersArray) ? ev.headersArray : [];
                 const parsedUrl = parseUrlComponents(ev.url || '');
@@ -1047,6 +1479,18 @@ export class CamoufoxTrafficRecorder {
                     }
                     triggerBucket.statusCounts[statusKey] = (triggerBucket.statusCounts[statusKey] || 0) + 1;
                 }
+
+                this._updateCookieLineageFromIngress({
+                    headers: ev.headers || {},
+                    headersArray: headersArr,
+                    correlationId: ev.correlationId,
+                    actionStep: effectiveStepName,
+                    triggerAction: effectiveTrigger,
+                    timestamp: ev.timestamp,
+                    url: ev.url || '',
+                    parsedUrl,
+                    status
+                });
             } else if (ev.type === 'request-finished') {
                 const parsedUrl = parseUrlComponents(ev.url || '');
                 const domainBucket = this._ensureDomainRecord(parsedUrl.host);
@@ -1236,6 +1680,264 @@ export class CamoufoxTrafficRecorder {
             secretHex: cleanSecret,
             line
         };
+    }
+
+    /**
+     * Append raw or simulated Firefox C++ Necko `MOZ_LOG` lines to `this.neckoMozLogPath`.
+     *
+     * @param {string} rawLogText
+     * @returns {{ neckoMozLogPath: string, appendedBytes: number }}
+     */
+    recordNeckoMozLogBlock(rawLogText) {
+        if (rawLogText === null || rawLogText === undefined) {
+            return {
+                neckoMozLogPath: this.neckoMozLogPath,
+                appendedBytes: 0
+            };
+        }
+        const text = String(rawLogText);
+        if (text.length === 0) {
+            return {
+                neckoMozLogPath: this.neckoMozLogPath,
+                appendedBytes: 0
+            };
+        }
+
+        this._ensureDirectories();
+        const normalized = text.endsWith('\n') ? text : `${text}\n`;
+        fs.appendFileSync(this.neckoMozLogPath, normalized, 'utf8');
+        return {
+            neckoMozLogPath: this.neckoMozLogPath,
+            appendedBytes: Buffer.byteLength(normalized, 'utf8')
+        };
+    }
+
+    /**
+     * Extract `Set-Cookie` headers from an ingress response and update `this.cookieLineage`.
+     *
+     * @param {object} params
+     */
+    _updateCookieLineageFromIngress({
+        headers = {},
+        headersArray = [],
+        correlationId = null,
+        actionStep = 'init',
+        triggerAction = null,
+        timestamp = new Date().toISOString(),
+        url = '',
+        parsedUrl = null,
+        status = null
+    } = {}) {
+        const rawSetCookieValues = [];
+        if (Array.isArray(headersArray) && headersArray.length > 0) {
+            for (const h of headersArray) {
+                if (h && String(h.name || '').toLowerCase() === 'set-cookie' && h.value) {
+                    rawSetCookieValues.push(String(h.value));
+                }
+            }
+        }
+        if (rawSetCookieValues.length === 0 && headers && typeof headers === 'object') {
+            for (const [k, v] of Object.entries(headers)) {
+                if (String(k).toLowerCase() === 'set-cookie' && v) {
+                    if (Array.isArray(v)) {
+                        for (const item of v) {
+                            if (item) rawSetCookieValues.push(String(item));
+                        }
+                    } else {
+                        rawSetCookieValues.push(String(v));
+                    }
+                }
+            }
+        }
+
+        if (rawSetCookieValues.length === 0) {
+            return;
+        }
+
+        const fallbackDomain =
+            parsedUrl?.hostname && parsedUrl.hostname !== 'unknown'
+                ? parsedUrl.hostname
+                : parsedUrl?.host && parsedUrl.host !== 'unknown'
+                  ? parsedUrl.host
+                  : null;
+        const triggerActionId = triggerAction?.actionId || null;
+
+        for (const rawBlock of rawSetCookieValues) {
+            const lines = String(rawBlock).split(/\r?\n/);
+            for (const rawLine of lines) {
+                const parsed = parseSetCookieHeader(rawLine);
+                if (!parsed) continue;
+
+                let entry = this.cookieLineage.get(parsed.name);
+                if (!entry) {
+                    entry = {
+                        name: parsed.name,
+                        isAntiBotToken: Boolean(parsed.isAntiBotToken),
+                        domain: parsed.domain ?? fallbackDomain,
+                        path: parsed.path ?? '/',
+                        secure: Boolean(parsed.secure),
+                        httpOnly: Boolean(parsed.httpOnly),
+                        sameSite: parsed.sameSite ?? null,
+                        firstSetAt: timestamp,
+                        firstSetByCorrelationId: correlationId,
+                        firstSetAtStep: actionStep,
+                        firstSetByTrigger: triggerActionId,
+                        firstSetUrl: url || null,
+                        lastSetAt: timestamp,
+                        lastSetByCorrelationId: correlationId,
+                        lastSetAtStep: actionStep,
+                        lastValueSha256: null,
+                        lastMaskedValue: null,
+                        mutationsCount: 0,
+                        sentCount: 0,
+                        lastSentAt: null,
+                        lastSentByCorrelationId: null,
+                        lastSentAtStep: null,
+                        matchesLatestSetCookie: null,
+                        valueHistory: [],
+                        sentInCorrelationIds: new Set()
+                    };
+                    this.cookieLineage.set(parsed.name, entry);
+                } else {
+                    if (parsed.domain) entry.domain = parsed.domain;
+                    else if (!entry.domain && fallbackDomain) entry.domain = fallbackDomain;
+                    if (parsed.path) entry.path = parsed.path;
+                    entry.secure = Boolean(parsed.secure);
+                    entry.httpOnly = Boolean(parsed.httpOnly);
+                    if (parsed.sameSite) entry.sameSite = parsed.sameSite;
+                    if (!entry.firstSetAt) {
+                        entry.firstSetAt = timestamp;
+                        entry.firstSetByCorrelationId = correlationId;
+                        entry.firstSetAtStep = actionStep;
+                        entry.firstSetByTrigger = triggerActionId;
+                        entry.firstSetUrl = url || null;
+                    }
+                }
+
+                const alreadyInHistory = entry.valueHistory.some(
+                    (h) =>
+                        h.correlationId === correlationId &&
+                        h.valueSha256 === parsed.valueSha256
+                );
+                if (!alreadyInHistory) {
+                    if (entry.lastValueSha256 !== parsed.valueSha256) {
+                        entry.mutationsCount = (Number(entry.mutationsCount) || 0) + 1;
+                    }
+                    entry.lastSetAt = timestamp;
+                    entry.lastSetByCorrelationId = correlationId;
+                    entry.lastSetAtStep = actionStep;
+                    entry.lastValueSha256 = parsed.valueSha256;
+                    entry.lastMaskedValue = parsed.maskedValue;
+                    entry.valueHistory.push({
+                        correlationId,
+                        actionStep,
+                        triggerActionId,
+                        timestamp,
+                        status: status ?? null,
+                        valueSha256: parsed.valueSha256,
+                        maskedValue: parsed.maskedValue,
+                        isDeleted: Boolean(parsed.isDeleted)
+                    });
+                }
+            }
+        }
+    }
+
+    /**
+     * Extract `Cookie` headers from an egress request and update `this.cookieLineage`.
+     *
+     * @param {object} params
+     */
+    _updateCookieLineageFromEgress({
+        headers = {},
+        headersArray = [],
+        correlationId = null,
+        actionStep = 'init',
+        timestamp = new Date().toISOString(),
+        parsedUrl = null,
+        isReplay = false
+    } = {}) {
+        const rawCookieValues = [];
+        if (Array.isArray(headersArray) && headersArray.length > 0) {
+            for (const h of headersArray) {
+                if (h && String(h.name || '').toLowerCase() === 'cookie' && h.value) {
+                    rawCookieValues.push(String(h.value));
+                }
+            }
+        }
+        if (rawCookieValues.length === 0 && headers && typeof headers === 'object') {
+            for (const [k, v] of Object.entries(headers)) {
+                if (String(k).toLowerCase() === 'cookie' && v) {
+                    rawCookieValues.push(String(v));
+                }
+            }
+        }
+
+        if (rawCookieValues.length === 0) {
+            return;
+        }
+
+        const fallbackDomain =
+            parsedUrl?.hostname && parsedUrl.hostname !== 'unknown'
+                ? parsedUrl.hostname
+                : parsedUrl?.host && parsedUrl.host !== 'unknown'
+                  ? parsedUrl.host
+                  : null;
+
+        for (const rawCookieHeader of rawCookieValues) {
+            const parsedCookies = parseCookieHeader(rawCookieHeader);
+            for (const cookie of parsedCookies) {
+                let entry = this.cookieLineage.get(cookie.name);
+                if (!entry) {
+                    entry = {
+                        name: cookie.name,
+                        isAntiBotToken: Boolean(cookie.isAntiBotToken),
+                        domain: fallbackDomain,
+                        path: '/',
+                        secure: parsedUrl?.protocol === 'https',
+                        httpOnly: false,
+                        sameSite: null,
+                        firstSetAt: null,
+                        firstSetByCorrelationId: null,
+                        firstSetAtStep: null,
+                        firstSetByTrigger: null,
+                        firstSetUrl: null,
+                        lastSetAt: null,
+                        lastSetByCorrelationId: null,
+                        lastSetAtStep: null,
+                        lastValueSha256: null,
+                        lastMaskedValue: cookie.maskedValue,
+                        mutationsCount: 0,
+                        sentCount: 0,
+                        lastSentAt: null,
+                        lastSentByCorrelationId: null,
+                        lastSentAtStep: null,
+                        matchesLatestSetCookie: false,
+                        valueHistory: [],
+                        sentInCorrelationIds: new Set()
+                    };
+                    this.cookieLineage.set(cookie.name, entry);
+                }
+
+                if (isReplay && correlationId && entry.sentInCorrelationIds.has(correlationId)) {
+                    continue;
+                }
+
+                if (correlationId) {
+                    entry.sentInCorrelationIds.add(correlationId);
+                }
+                entry.sentCount = (Number(entry.sentCount) || 0) + 1;
+                entry.lastSentAt = timestamp;
+                entry.lastSentByCorrelationId = correlationId;
+                entry.lastSentAtStep = actionStep;
+                entry.matchesLatestSetCookie = Boolean(
+                    entry.lastValueSha256 && cookie.valueSha256 === entry.lastValueSha256
+                );
+                if (!entry.lastMaskedValue) {
+                    entry.lastMaskedValue = cookie.maskedValue;
+                }
+            }
+        }
     }
 
     /**
@@ -2189,6 +2891,16 @@ export class CamoufoxTrafficRecorder {
         this._appendNdjsonEvent(egressEvent);
         this._appendWireLogBlock(egressWireBlock);
 
+        // Update Cookie & Anti-Bot Token causal lineage on egress
+        this._updateCookieLineageFromEgress({
+            headers,
+            headersArray,
+            correlationId,
+            actionStep: attributionSnapshot.actionStep,
+            timestamp,
+            parsedUrl
+        });
+
         // Inspect pre-TLS request URL for risk-control / challenge endpoints
         const riskSignals = detectRiskSignals({ url, bodyPreview, headers });
         if (riskSignals.length > 0) {
@@ -2484,6 +3196,19 @@ export class CamoufoxTrafficRecorder {
 
         this._appendNdjsonEvent(ingressEvent);
         this._appendWireLogBlock(ingressWireBlock);
+
+        // Update Cookie & Anti-Bot Token causal lineage on ingress (Set-Cookie)
+        this._updateCookieLineageFromIngress({
+            headers,
+            headersArray,
+            correlationId,
+            actionStep: effectiveStepName,
+            triggerAction: triggerSnapshot,
+            timestamp,
+            url,
+            parsedUrl,
+            status
+        });
 
         // Automatic HTTP Status & Risk Signal Anomaly Attribution
         if (status === 401 || status === 403 || status === 429 || status >= 500) {
@@ -3074,6 +3799,40 @@ export class CamoufoxTrafficRecorder {
         }
 
         const sslKeyLogSummary = parseSslKeyLog(this.sslKeyLogPath);
+        const neckoMozLogSummary = parseNeckoMozLog(this.neckoMozLogPath);
+
+        const cookieLineageObj = {};
+        for (const [cookieName, entry] of this.cookieLineage.entries()) {
+            cookieLineageObj[cookieName] = {
+                name: entry.name,
+                isAntiBotToken: Boolean(entry.isAntiBotToken),
+                domain: entry.domain ?? null,
+                path: entry.path ?? null,
+                secure: Boolean(entry.secure),
+                httpOnly: Boolean(entry.httpOnly),
+                sameSite: entry.sameSite ?? null,
+                firstSetAt: entry.firstSetAt ?? null,
+                firstSetByCorrelationId: entry.firstSetByCorrelationId ?? null,
+                firstSetAtStep: entry.firstSetAtStep ?? null,
+                firstSetByTrigger: entry.firstSetByTrigger ?? null,
+                firstSetUrl: entry.firstSetUrl ?? null,
+                lastSetAt: entry.lastSetAt ?? null,
+                lastSetByCorrelationId: entry.lastSetByCorrelationId ?? null,
+                lastSetAtStep: entry.lastSetAtStep ?? null,
+                lastValueSha256: entry.lastValueSha256 ?? null,
+                lastMaskedValue: entry.lastMaskedValue ?? null,
+                mutationsCount: Number(entry.mutationsCount) || 0,
+                sentCount: Number(entry.sentCount) || 0,
+                lastSentAt: entry.lastSentAt ?? null,
+                lastSentByCorrelationId: entry.lastSentByCorrelationId ?? null,
+                lastSentAtStep: entry.lastSentAtStep ?? null,
+                matchesLatestSetCookie: entry.matchesLatestSetCookie ?? null,
+                valueHistory: Array.isArray(entry.valueHistory)
+                    ? entry.valueHistory.map((h) => ({ ...h }))
+                    : [],
+                sentInCorrelationIds: Array.from(entry.sentInCorrelationIds || [])
+            };
+        }
 
         return {
             session: {
@@ -3097,6 +3856,7 @@ export class CamoufoxTrafficRecorder {
                 attributionIndexPath: this.attributionIndexPath
             },
             sslKeyLog: sslKeyLogSummary,
+            neckoMozLog: neckoMozLogSummary,
             totals: {
                 totalRequests: this.totals.totalRequests,
                 totalResponses: this.totals.totalResponses,
@@ -3109,6 +3869,7 @@ export class CamoufoxTrafficRecorder {
             byActionStep: byActionStepObj,
             byDomain: byDomainObj,
             byTriggerAction: byTriggerActionObj,
+            cookieLineage: cookieLineageObj,
             anomaliesAndRiskSignals: [...this.anomaliesAndRiskSignals],
             integrity: {
                 algorithm: 'sha256-chain',
@@ -3118,7 +3879,9 @@ export class CamoufoxTrafficRecorder {
                 payloadCount: Object.keys(this.payloadManifest).length,
                 payloadManifest: { ...this.payloadManifest },
                 sslKeyLogSha256: sslKeyLogSummary.sha256,
-                sslKeyLogBytes: sslKeyLogSummary.bytes
+                sslKeyLogBytes: sslKeyLogSummary.bytes,
+                neckoMozLogSha256: neckoMozLogSummary.sha256,
+                neckoMozLogBytes: neckoMozLogSummary.bytes
             }
         };
     }
@@ -3400,9 +4163,47 @@ export function verifyTrafficIntegrity(trafficDir) {
                 `sslkeylog.txt contains ${sslKeyLogStats.malformedLineCount} malformed NSS keylog line(s)`
             );
         }
+
+        const neckoMozLogPath = path.join(resolvedTrafficDir, 'necko-pre-tls.moz_log');
+        const hasRecordedNeckoMozLog =
+            Boolean(integrity.neckoMozLogSha256) ||
+            (typeof integrity.neckoMozLogBytes === 'number' && integrity.neckoMozLogBytes > 0);
+        if (hasRecordedNeckoMozLog || fs.existsSync(neckoMozLogPath)) {
+            if (!fs.existsSync(neckoMozLogPath)) {
+                if (hasRecordedNeckoMozLog) {
+                    errors.push('Missing necko-pre-tls.moz_log on disk');
+                }
+            } else {
+                const rawNeckoBuf = fs.readFileSync(neckoMozLogPath);
+                const actualNeckoBytes = rawNeckoBuf.byteLength;
+                const actualNeckoSha256 =
+                    actualNeckoBytes > 0
+                        ? crypto.createHash('sha256').update(rawNeckoBuf).digest('hex')
+                        : null;
+
+                if (
+                    integrity.neckoMozLogSha256 &&
+                    actualNeckoSha256 !== integrity.neckoMozLogSha256
+                ) {
+                    errors.push(
+                        `necko-pre-tls.moz_log SHA-256 mismatch: expected ${integrity.neckoMozLogSha256}, got ${actualNeckoSha256 ?? 'empty'}`
+                    );
+                }
+                if (
+                    hasRecordedNeckoMozLog &&
+                    typeof integrity.neckoMozLogBytes === 'number' &&
+                    actualNeckoBytes !== integrity.neckoMozLogBytes
+                ) {
+                    errors.push(
+                        `necko-pre-tls.moz_log byte length mismatch: expected ${integrity.neckoMozLogBytes}, got ${actualNeckoBytes}`
+                    );
+                }
+            }
+        }
     }
 
     const sslKeyLog = parseSslKeyLog(path.join(resolvedTrafficDir, 'sslkeylog.txt'));
+    const neckoMozLog = parseNeckoMozLog(path.join(resolvedTrafficDir, 'necko-pre-tls.moz_log'));
 
     return {
         valid: errors.length === 0,
@@ -3410,6 +4211,7 @@ export function verifyTrafficIntegrity(trafficDir) {
         verifiedPayloads,
         chainHeadHash,
         sslKeyLog,
+        neckoMozLog,
         errors
     };
 }

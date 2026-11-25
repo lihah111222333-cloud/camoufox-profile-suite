@@ -15,6 +15,8 @@
  *   --anomalies-only           Show only anomalies & risk signals from attribution-index.json / traffic.ndjson
  *   --correlation=<corrId>     Reconstruct complete Pre-TLS Egress + Post-TLS Ingress wire dump & payloads
  *   --dump-wire=<corrId>       Alias for --correlation=<corrId>
+ *   --cookies                  List all tracked cookies & anti-bot tokens in cookieLineage
+ *   --cookie=<name>            Inspect full causal lineage and value history for a specific cookie name
  *   --verify-integrity         Verify cryptographic SHA-256 event hash chain & payload manifest integrity
  *   --json                     Emit structured JSON output to stdout
  */
@@ -26,6 +28,9 @@ import {
     verifyTrafficIntegrity,
     exportTrafficToHar,
     parseSslKeyLog,
+    parseNeckoMozLog,
+    parseSetCookieHeader,
+    parseCookieHeader,
     detectWireHeaderAnomalies
 } from '../src/camoufox/traffic-recorder.js';
 
@@ -65,6 +70,8 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
         anomaliesOnly: false,
         correlation: null,
         dumpWire: null,
+        cookies: false,
+        cookie: null,
         verifyIntegrity: false,
         exportHar: null,
         json: false,
@@ -131,6 +138,14 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
             case 'dumpWire':
                 opts.dumpWire = readNextValue();
                 opts.correlation = opts.correlation || opts.dumpWire;
+                break;
+            case 'cookies':
+                opts.cookies = value === null ? true : value !== 'false' && value !== '0';
+                break;
+            case 'cookie':
+            case 'cookie-name':
+            case 'cookieName':
+                opts.cookie = readNextValue();
                 break;
             case 'verify-integrity':
             case 'verifyIntegrity':
@@ -882,6 +897,184 @@ function buildTransactionsList(events) {
 }
 
 /**
+ * Rebuild cookieLineage map from recorded NDJSON events when attribution-index.json
+ * does not already contain a `cookieLineage` block.
+ *
+ * @param {Array<object>} events
+ * @returns {Record<string, object>}
+ */
+function buildCookieLineageFromEvents(events = []) {
+    const lineageMap = new Map();
+
+    for (const ev of events) {
+        if (!ev || typeof ev !== 'object') continue;
+        const headers = ev.headers || {};
+        const headersArray = Array.isArray(ev.headersArray) ? ev.headersArray : [];
+        const correlationId = ev.correlationId || null;
+        const actionStep = extractActionStep(ev) || 'init';
+        const triggerAction = extractTriggerAction(ev);
+        const triggerActionId = triggerAction?.actionId || null;
+        const timestamp = ev.timestamp || null;
+        const host = extractHost(ev) || null;
+
+        if (ev.type === 'ingress') {
+            const rawSetCookies = [];
+            for (const h of headersArray) {
+                if (h && String(h.name || '').toLowerCase() === 'set-cookie' && h.value) {
+                    rawSetCookies.push(String(h.value));
+                }
+            }
+            if (rawSetCookies.length === 0) {
+                for (const [k, v] of Object.entries(headers)) {
+                    if (String(k).toLowerCase() === 'set-cookie' && v) {
+                        rawSetCookies.push(String(v));
+                    }
+                }
+            }
+
+            for (const rawBlock of rawSetCookies) {
+                for (const line of String(rawBlock).split(/\r?\n/)) {
+                    const parsed = parseSetCookieHeader(line);
+                    if (!parsed) continue;
+                    let entry = lineageMap.get(parsed.name);
+                    if (!entry) {
+                        entry = {
+                            name: parsed.name,
+                            isAntiBotToken: Boolean(parsed.isAntiBotToken),
+                            domain: parsed.domain ?? host,
+                            path: parsed.path ?? '/',
+                            secure: Boolean(parsed.secure),
+                            httpOnly: Boolean(parsed.httpOnly),
+                            sameSite: parsed.sameSite ?? null,
+                            firstSetAt: timestamp,
+                            firstSetByCorrelationId: correlationId,
+                            firstSetAtStep: actionStep,
+                            firstSetByTrigger: triggerActionId,
+                            firstSetUrl: ev.url || null,
+                            lastSetAt: timestamp,
+                            lastSetByCorrelationId: correlationId,
+                            lastSetAtStep: actionStep,
+                            lastValueSha256: null,
+                            lastMaskedValue: null,
+                            mutationsCount: 0,
+                            sentCount: 0,
+                            lastSentAt: null,
+                            lastSentByCorrelationId: null,
+                            lastSentAtStep: null,
+                            matchesLatestSetCookie: null,
+                            valueHistory: [],
+                            sentInCorrelationIds: new Set()
+                        };
+                        lineageMap.set(parsed.name, entry);
+                    } else {
+                        if (parsed.domain) entry.domain = parsed.domain;
+                        if (parsed.path) entry.path = parsed.path;
+                        entry.secure = Boolean(parsed.secure);
+                        entry.httpOnly = Boolean(parsed.httpOnly);
+                        if (parsed.sameSite) entry.sameSite = parsed.sameSite;
+                        if (!entry.firstSetAt) {
+                            entry.firstSetAt = timestamp;
+                            entry.firstSetByCorrelationId = correlationId;
+                            entry.firstSetAtStep = actionStep;
+                            entry.firstSetByTrigger = triggerActionId;
+                            entry.firstSetUrl = ev.url || null;
+                        }
+                    }
+
+                    if (entry.lastValueSha256 !== parsed.valueSha256) {
+                        entry.mutationsCount += 1;
+                    }
+                    entry.lastSetAt = timestamp;
+                    entry.lastSetByCorrelationId = correlationId;
+                    entry.lastSetAtStep = actionStep;
+                    entry.lastValueSha256 = parsed.valueSha256;
+                    entry.lastMaskedValue = parsed.maskedValue;
+                    entry.valueHistory.push({
+                        correlationId,
+                        actionStep,
+                        triggerActionId,
+                        timestamp,
+                        status: ev.status ?? null,
+                        valueSha256: parsed.valueSha256,
+                        maskedValue: parsed.maskedValue,
+                        isDeleted: Boolean(parsed.isDeleted)
+                    });
+                }
+            }
+        } else if (ev.type === 'egress') {
+            const rawCookies = [];
+            for (const h of headersArray) {
+                if (h && String(h.name || '').toLowerCase() === 'cookie' && h.value) {
+                    rawCookies.push(String(h.value));
+                }
+            }
+            if (rawCookies.length === 0) {
+                for (const [k, v] of Object.entries(headers)) {
+                    if (String(k).toLowerCase() === 'cookie' && v) {
+                        rawCookies.push(String(v));
+                    }
+                }
+            }
+
+            for (const rawCookieHeader of rawCookies) {
+                for (const cookie of parseCookieHeader(rawCookieHeader)) {
+                    let entry = lineageMap.get(cookie.name);
+                    if (!entry) {
+                        entry = {
+                            name: cookie.name,
+                            isAntiBotToken: Boolean(cookie.isAntiBotToken),
+                            domain: host,
+                            path: '/',
+                            secure: String(ev.url || '').startsWith('https://'),
+                            httpOnly: false,
+                            sameSite: null,
+                            firstSetAt: null,
+                            firstSetByCorrelationId: null,
+                            firstSetAtStep: null,
+                            firstSetByTrigger: null,
+                            firstSetUrl: null,
+                            lastSetAt: null,
+                            lastSetByCorrelationId: null,
+                            lastSetAtStep: null,
+                            lastValueSha256: null,
+                            lastMaskedValue: cookie.maskedValue,
+                            mutationsCount: 0,
+                            sentCount: 0,
+                            lastSentAt: null,
+                            lastSentByCorrelationId: null,
+                            lastSentAtStep: null,
+                            matchesLatestSetCookie: false,
+                            valueHistory: [],
+                            sentInCorrelationIds: new Set()
+                        };
+                        lineageMap.set(cookie.name, entry);
+                    }
+                    if (correlationId) {
+                        entry.sentInCorrelationIds.add(correlationId);
+                    }
+                    entry.sentCount += 1;
+                    entry.lastSentAt = timestamp;
+                    entry.lastSentByCorrelationId = correlationId;
+                    entry.lastSentAtStep = actionStep;
+                    entry.matchesLatestSetCookie = Boolean(
+                        entry.lastValueSha256 && cookie.valueSha256 === entry.lastValueSha256
+                    );
+                }
+            }
+        }
+    }
+
+    const out = {};
+    for (const [name, entry] of lineageMap.entries()) {
+        out[name] = {
+            ...entry,
+            sentInCorrelationIds: Array.from(entry.sentInCorrelationIds)
+        };
+    }
+    return out;
+}
+
+/**
  * Query, filter, and reconstruct pre-TLS / post-TLS traffic attribution for one or all profiles.
  *
  * @param {object} [options={}]
@@ -900,6 +1093,9 @@ function buildTransactionsList(events) {
  * @param {string} [options.correlation]
  * @param {string} [options.correlationId]
  * @param {string} [options.dumpWire]
+ * @param {boolean} [options.cookies=false]
+ * @param {string} [options.cookie]
+ * @param {string} [options.cookieName]
  * @returns {object}
  */
 export function queryProfileTraffic(options = {}) {
@@ -907,6 +1103,13 @@ export function queryProfileTraffic(options = {}) {
     let targetProfileId = options.profile || options.profileId || null;
     const correlationId =
         options.dumpWire || options.correlation || options.correlationId || null;
+    const cookieNameFilter =
+        typeof options.cookie === 'string' && options.cookie.trim().length > 0
+            ? options.cookie.trim()
+            : typeof options.cookieName === 'string' && options.cookieName.trim().length > 0
+              ? options.cookieName.trim()
+              : null;
+    const cookiesRequested = Boolean(options.cookies || cookieNameFilter);
 
     const filters = {
         step: options.step || options.actionStep || null,
@@ -914,18 +1117,21 @@ export function queryProfileTraffic(options = {}) {
         domain: options.domain || options.host || null,
         status: options.status ?? null,
         anomaliesOnly: Boolean(options.anomaliesOnly),
-        correlation: correlationId
+        correlation: correlationId,
+        cookies: cookiesRequested,
+        cookie: cookieNameFilter
     };
 
     // If no profile is specified and no direct trafficDir or correlationId is given,
     // list and summarize all profiles in profilesDir that have a traffic/ directory
-    // (unless --verify-integrity or --export-har is requested, in which case we resolve single or all profiles).
+    // (unless --verify-integrity, --export-har, or --cookies/--cookie is requested).
     if (
         !targetProfileId &&
         !options.trafficDir &&
         !correlationId &&
         !options.verifyIntegrity &&
-        !options.exportHar
+        !options.exportHar &&
+        !cookiesRequested
     ) {
         const profiles = listTrafficProfiles(profilesDir);
         return {
@@ -996,7 +1202,7 @@ export function queryProfileTraffic(options = {}) {
                 profiles: perProfile
             };
         }
-    } else if (options.exportHar) {
+    } else if (options.exportHar || cookiesRequested) {
         const candidates = listTrafficProfiles(profilesDir);
         if (candidates.length >= 1) {
             resolvedPaths = {
@@ -1054,9 +1260,68 @@ export function queryProfileTraffic(options = {}) {
     const attributionIndexPath = path.join(trafficDir, 'attribution-index.json');
     const sslKeyLogPath = path.join(trafficDir, 'sslkeylog.txt');
     const preTlsWireLogPath = path.join(trafficDir, 'pre-tls-wire.log');
+    const neckoMozLogPath = path.join(trafficDir, 'necko-pre-tls.moz_log');
 
     const allEvents = readNdjsonEvents(trafficNdjsonPath);
     const indexData = readJsonSafe(attributionIndexPath);
+    const fullCookieLineage =
+        indexData?.cookieLineage &&
+        typeof indexData.cookieLineage === 'object' &&
+        Object.keys(indexData.cookieLineage).length > 0
+            ? indexData.cookieLineage
+            : buildCookieLineageFromEvents(allEvents);
+    const neckoMozLog = indexData?.neckoMozLog || parseNeckoMozLog(neckoMozLogPath);
+
+    if (cookiesRequested) {
+        if (cookieNameFilter) {
+            let matchedEntry = fullCookieLineage[cookieNameFilter] || null;
+            if (!matchedEntry) {
+                const lowerTarget = cookieNameFilter.toLowerCase();
+                for (const [k, v] of Object.entries(fullCookieLineage)) {
+                    if (k.toLowerCase() === lowerTarget) {
+                        matchedEntry = v;
+                        break;
+                    }
+                }
+            }
+            const matchedList = matchedEntry ? [matchedEntry] : [];
+            const filteredLineage = matchedEntry
+                ? { [matchedEntry.name || cookieNameFilter]: matchedEntry }
+                : {};
+            return {
+                mode: 'cookies',
+                profileId,
+                profileDir,
+                trafficDir,
+                filters,
+                cookieName: cookieNameFilter,
+                found: Boolean(matchedEntry),
+                count: matchedList.length,
+                antiBotTokenCount: matchedEntry?.isAntiBotToken ? 1 : 0,
+                cookie: matchedEntry,
+                cookies: matchedList,
+                cookieLineage: filteredLineage,
+                allCookieLineage: fullCookieLineage
+            };
+        }
+
+        const cookiesList = Object.values(fullCookieLineage);
+        const antiBotTokenCount = cookiesList.filter((c) => c && c.isAntiBotToken).length;
+        return {
+            mode: 'cookies',
+            profileId,
+            profileDir,
+            trafficDir,
+            filters,
+            cookieName: null,
+            found: cookiesList.length > 0,
+            count: cookiesList.length,
+            antiBotTokenCount,
+            cookie: null,
+            cookies: cookiesList,
+            cookieLineage: fullCookieLineage
+        };
+    }
 
     // Map correlationId -> HTTP status from ingress / request-finished events
     const txStatusByCorrelation = new Map();
@@ -1165,7 +1430,8 @@ export function queryProfileTraffic(options = {}) {
             trafficNdjsonPath: fs.existsSync(trafficNdjsonPath) ? trafficNdjsonPath : null,
             attributionIndexPath: fs.existsSync(attributionIndexPath) ? attributionIndexPath : null,
             sslKeyLogPath: fs.existsSync(sslKeyLogPath) ? sslKeyLogPath : null,
-            preTlsWireLogPath: fs.existsSync(preTlsWireLogPath) ? preTlsWireLogPath : null
+            preTlsWireLogPath: fs.existsSync(preTlsWireLogPath) ? preTlsWireLogPath : null,
+            neckoMozLogPath: fs.existsSync(neckoMozLogPath) ? neckoMozLogPath : null
         },
         totals: indexData?.totals || {
             totalRequests: allEvents.filter((e) => e.type === 'egress').length,
@@ -1175,6 +1441,8 @@ export function queryProfileTraffic(options = {}) {
         byActionStep: indexData?.byActionStep || {},
         byTriggerAction: indexData?.byTriggerAction || {},
         byDomain: indexData?.byDomain || {},
+        cookieLineage: fullCookieLineage,
+        neckoMozLog,
         anomalies: filteredAnomalies,
         anomaliesAndRiskSignals: filteredAnomalies,
         eventsCount: filteredEvents.length,
@@ -1250,6 +1518,44 @@ export function formatCliReport(result) {
         return lines.join('\n');
     }
 
+    if (result.mode === 'cookies') {
+        if (result.cookieName) {
+            lines.push(
+                `🍪 Cookie & Anti-Bot Token Lineage — Profile: ${result.profileId} | Filter: ${result.cookieName}`
+            );
+            if (!result.found || !result.cookie) {
+                lines.push(`   No cookie matching "${result.cookieName}" found in cookieLineage.`);
+                return lines.join('\n');
+            }
+        } else {
+            lines.push(
+                `🍪 Cookie & Anti-Bot Token Causal Lineage — Profile: ${result.profileId} (${result.count} total, ${result.antiBotTokenCount ?? 0} anti-bot/auth tokens)`
+            );
+        }
+
+        for (const c of result.cookies || []) {
+            const badge = c.isAntiBotToken ? '[ANTI-BOT/AUTH TOKEN]' : '[COOKIE]';
+            lines.push(
+                `  - ${c.name} ${badge} | domain=${c.domain || 'n/a'} path=${c.path || '/'} secure=${Boolean(c.secure)} httpOnly=${Boolean(c.httpOnly)} sameSite=${c.sameSite || 'n/a'}`
+            );
+            lines.push(
+                `    firstSet: corr=${c.firstSetByCorrelationId || 'n/a'} step=${c.firstSetAtStep || 'n/a'} trigger=${c.firstSetByTrigger || 'none'} url=${c.firstSetUrl || 'n/a'}`
+            );
+            lines.push(
+                `    latest  : masked=${c.lastMaskedValue || '[REDACTED]'} sha256=${c.lastValueSha256 || 'n/a'} mutations=${c.mutationsCount ?? 0} sent=${c.sentCount ?? 0} matchesLatestSetCookie=${c.matchesLatestSetCookie ?? 'n/a'}`
+            );
+            if (Array.isArray(c.valueHistory) && c.valueHistory.length > 0) {
+                lines.push(`    valueHistory (${c.valueHistory.length}):`);
+                for (const h of c.valueHistory) {
+                    lines.push(
+                        `      * corr=${h.correlationId || 'n/a'} step=${h.actionStep || 'n/a'} trigger=${h.triggerActionId || 'none'} status=${h.status ?? 'n/a'} masked=${h.maskedValue} sha256=${h.valueSha256} deleted=${Boolean(h.isDeleted)}`
+                    );
+                }
+            }
+        }
+        return lines.join('\n');
+    }
+
     lines.push(`📊 Pre-TLS Traffic Attribution Report — Profile: ${result.profileId}`);
     lines.push(
         `   Requests: ${result.totals?.totalRequests ?? 0} | Responses: ${result.totals?.totalResponses ?? 0} | Failed: ${result.totals?.failedRequests ?? 0}`
@@ -1305,6 +1611,8 @@ export function runCli(argv = process.argv.slice(2)) {
                 '  --anomalies-only            Show only anomalies & risk signals',
                 '  --correlation=<corrId>      Reconstruct Pre-TLS Egress + Post-TLS Ingress wire dump',
                 '  --dump-wire=<corrId>        Alias for --correlation=<corrId>',
+                '  --cookies                   List all tracked cookies & anti-bot tokens in cookieLineage',
+                '  --cookie=<name>             Show full lineage and value history for a specific cookie name',
                 '  --verify-integrity          Verify SHA-256 tamper-evident hash chain & payload manifest',
                 '  --export-har[=<path>]       Export recorded profile traffic to W3C HAR 1.2 archive',
                 '  --json                      Output structured JSON'
@@ -1323,6 +1631,8 @@ export function runCli(argv = process.argv.slice(2)) {
         anomaliesOnly: args.anomaliesOnly,
         correlation: args.correlation,
         dumpWire: args.dumpWire,
+        cookies: args.cookies,
+        cookie: args.cookie,
         verifyIntegrity: args.verifyIntegrity,
         exportHar: args.exportHar
     });
@@ -1359,6 +1669,9 @@ export {
     verifyTrafficIntegrity,
     exportTrafficToHar,
     parseSslKeyLog,
+    parseNeckoMozLog,
+    parseSetCookieHeader,
+    parseCookieHeader,
     detectWireHeaderAnomalies
 };
 
@@ -1369,6 +1682,9 @@ export default {
     verifyTrafficIntegrity,
     exportTrafficToHar,
     parseSslKeyLog,
+    parseNeckoMozLog,
+    parseSetCookieHeader,
+    parseCookieHeader,
     detectWireHeaderAnomalies,
     parseCliArgs,
     formatCliReport,

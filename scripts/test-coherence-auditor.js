@@ -265,7 +265,34 @@ function buildCoherentTelemetry(os = 'windows') {
             privateIpLeaked: false
         },
         speechVoices: p.speechVoices,
-        fonts: p.fonts
+        fonts: p.fonts,
+        iframeParity: {
+            ok: true,
+            userAgent: p.userAgent,
+            platform: p.platform,
+            oscpu: p.oscpu,
+            hardwareConcurrency: p.hardwareConcurrency,
+            webdriver: false,
+            language: 'en-US',
+            languages: ['en-US', 'en'],
+            width: p.width,
+            height: p.height,
+            colorDepth: p.colorDepth,
+            pixelDepth: p.colorDepth,
+            userAgentGetterNative: true,
+            webdriverGetterNative: true
+        },
+        geckoApiSurface: {
+            hasDeviceMemory: false,
+            hasGetBattery: false,
+            hasBluetooth: false,
+            hasUsb: false,
+            hasSerial: false,
+            hasHid: false,
+            hasOpenDatabase: false,
+            hasMozInnerScreenX: true,
+            performanceNowMonotonic: true
+        }
     };
 }
 
@@ -283,7 +310,7 @@ const tests = [
             const res = evaluatePlatformCoherence(telemetry, 'windows');
             assert.equal(res.passed, true);
             assert.equal(res.score, 100);
-            assert.equal(res.checks.length, 11);
+            assert.equal(res.checks.length, 13);
             assert.ok(res.checks.every((c) => c.passed));
         }
     },
@@ -577,7 +604,7 @@ const tests = [
             assert.equal(report.passed, true);
             assert.equal(report.score, 100);
             assert.equal(report.expectedOs, 'mac');
-            assert.equal(report.checks.length, 11);
+            assert.equal(report.checks.length, 13);
         }
     },
     {
@@ -673,7 +700,7 @@ const tests = [
                 const res = evaluatePlatformCoherence(telemetry, os);
                 assert.equal(res.passed, true, `Expected ${os} profile to pass`);
                 assert.equal(res.score, 100, `Expected ${os} score to be 100`);
-                assert.equal(res.checks.length, 11, `Expected 11 checks for ${os}`);
+                assert.equal(res.checks.length, 13, `Expected 13 checks for ${os}`);
                 assert.ok(res.checks.every((c) => c.passed));
 
                 // Also verify backward compatibility when older synthetic fixtures omit the optional fields
@@ -682,10 +709,12 @@ const tests = [
                 delete legacyTelemetry.webrtc;
                 delete legacyTelemetry.speechVoices;
                 delete legacyTelemetry.fonts;
+                delete legacyTelemetry.iframeParity;
+                delete legacyTelemetry.geckoApiSurface;
                 const legacyRes = evaluatePlatformCoherence(legacyTelemetry, os);
                 assert.equal(legacyRes.passed, true);
                 assert.equal(legacyRes.score, 100);
-                assert.equal(legacyRes.checks.length, 11);
+                assert.equal(legacyRes.checks.length, 13);
             }
         }
     },
@@ -823,6 +852,113 @@ const tests = [
             assert.equal(proxyCheck.passed, false);
             assert.match(proxyCheck.details, /X-Forwarded-For/);
             assert.match(proxyCheck.details, /Via/);
+        }
+    },
+    {
+        name: '35. Detects iframe.contentWindow.navigator (userAgent / platform / webdriver) divergence from top-level window.navigator',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('windows');
+            telemetry.iframeParity.userAgent =
+                'Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0';
+            telemetry.iframeParity.platform = 'Linux x86_64';
+            telemetry.iframeParity.webdriver = true;
+            const res = evaluatePlatformCoherence(telemetry, 'windows');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'iframe-contentwindow-parity');
+            assert.equal(check.passed, false);
+            assert.match(check.details, /iframe navigator\.userAgent mismatch/);
+            assert.match(check.details, /iframe navigator\.platform mismatch/);
+            assert.match(check.details, /iframe navigator\.webdriver mismatch/);
+        }
+    },
+    {
+        name: '36. Detects iframe.contentWindow.screen (width / colorDepth) or non-native getter divergence in dynamic iframe',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('macos');
+            telemetry.iframeParity.width = 1920;
+            telemetry.iframeParity.colorDepth = 24;
+            telemetry.iframeParity.userAgentGetterNative = false;
+            telemetry.iframeParity.webdriverGetterNative = false;
+            const res = evaluatePlatformCoherence(telemetry, 'macos');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'iframe-contentwindow-parity');
+            assert.equal(check.passed, false);
+            assert.match(check.details, /iframe screen\.width mismatch/);
+            assert.match(check.details, /iframe screen\.colorDepth mismatch/);
+            assert.match(check.details, /iframe Navigator\.prototype\.userAgent getter is not \[native code\]/);
+            assert.match(check.details, /iframe Navigator\.prototype\.webdriver getter is not \[native code\]/);
+        }
+    },
+    {
+        name: '37. Detects Chromium navigator.deviceMemory and navigator.getBattery leaked on Gecko',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('windows');
+            telemetry.geckoApiSurface.hasDeviceMemory = true;
+            telemetry.geckoApiSurface.hasGetBattery = true;
+            const res = evaluatePlatformCoherence(telemetry, 'windows');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'gecko-api-surface-coherence');
+            assert.equal(check.passed, false);
+            assert.match(check.details, /Chromium navigator\.deviceMemory leaked on Gecko/);
+            assert.match(check.details, /Chromium navigator\.getBattery leaked on Gecko/);
+        }
+    },
+    {
+        name: '38. Detects Chromium navigator.bluetooth, navigator.usb, navigator.serial, navigator.hid, or window.openDatabase leaked on Gecko',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('windows');
+            telemetry.geckoApiSurface.hasBluetooth = true;
+            telemetry.geckoApiSurface.hasUsb = true;
+            telemetry.geckoApiSurface.hasSerial = true;
+            telemetry.geckoApiSurface.hasHid = true;
+            telemetry.geckoApiSurface.hasOpenDatabase = true;
+            const res = evaluatePlatformCoherence(telemetry, 'windows');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'gecko-api-surface-coherence');
+            assert.equal(check.passed, false);
+            assert.match(check.details, /Chromium navigator\.bluetooth leaked on Gecko/);
+            assert.match(check.details, /Chromium navigator\.usb leaked on Gecko/);
+            assert.match(check.details, /Chromium navigator\.serial leaked on Gecko/);
+            assert.match(check.details, /Chromium navigator\.hid leaked on Gecko/);
+            assert.match(check.details, /Chromium window\.openDatabase WebSQL API leaked on Gecko/);
+        }
+    },
+    {
+        name: '39. Detects missing Firefox window.mozInnerScreenX or non-monotonic performance.now()',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('linux');
+            telemetry.geckoApiSurface.hasMozInnerScreenX = false;
+            telemetry.geckoApiSurface.performanceNowMonotonic = false;
+            const res = evaluatePlatformCoherence(telemetry, 'linux');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'gecko-api-surface-coherence');
+            assert.equal(check.passed, false);
+            assert.match(check.details, /Firefox window\.mozInnerScreenX property missing/);
+            assert.match(check.details, /performance\.now\(\) high-precision timer is non-monotonic or invalid/);
+        }
+    },
+    {
+        name: '40. Valid Windows, macOS, and Linux profiles with full 13/13 checks (iframeParity + geckoApiSurface included) pass 100/100',
+        fn: () => {
+            assert.deepEqual(CAMOUFOX_COHERENCE_CONSTANTS.forbiddenChromiumApisOnGecko, [
+                'deviceMemory',
+                'getBattery',
+                'bluetooth',
+                'usb',
+                'serial',
+                'hid',
+                'openDatabase'
+            ]);
+            for (const os of ['windows', 'macos', 'linux']) {
+                const telemetry = buildCoherentTelemetry(os);
+                const res = evaluatePlatformCoherence(telemetry, os);
+                assert.equal(res.passed, true, `Expected ${os} profile to pass`);
+                assert.equal(res.score, 100, `Expected ${os} score to be 100`);
+                assert.equal(res.checks.length, 13, `Expected 13 checks for ${os}`);
+                assert.ok(res.checks.every((c) => c.passed));
+                assert.equal(findCheck(res, 'iframe-contentwindow-parity').passed, true);
+                assert.equal(findCheck(res, 'gecko-api-surface-coherence').passed, true);
+            }
         }
     }
 ];

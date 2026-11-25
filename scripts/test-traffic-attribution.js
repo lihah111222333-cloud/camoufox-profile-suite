@@ -2119,6 +2119,343 @@ async function runTests() {
             }
         );
 
+        // =========================================================================
+        // Test 12: Cookie & Anti-Bot Token Causal Lineage (Set-Cookie -> Cookie Graph & --cookies / --cookie=<name> CLI)
+        // =========================================================================
+        await testSection(
+            'Test 12: Cookie & Anti-Bot Token Causal Lineage (Set-Cookie -> Cookie Graph & --cookies / --cookie=<name> CLI)',
+            async () => {
+                const profile = await createAndStartProfile(
+                    'Traffic_Test_12_Cookies',
+                    'http://10.103.0.1:8080',
+                    {
+                        profileId: 'traffic-test-12-cookies',
+                        os: 'windows',
+                        profilesDir: tempProfilesDir,
+                        useSharedBrowser: false,
+                        accountId: 'acct-cookies-12',
+                        accountEmail: 'cookies12@gmail.com'
+                    }
+                );
+
+                const context = await profile.getContext();
+                const recorder = profile.getTrafficRecorder();
+
+                // Step 1: step-1-landing -> ingress response returns multiple Set-Cookie headers
+                profile.setTrafficStep('step-1-landing');
+                const reqStep1 = createMockRequest({
+                    method: 'GET',
+                    url: 'https://www.tiktok.com/signup',
+                    resourceType: 'document',
+                    isNavigationRequest: true,
+                    headersArray: [
+                        { name: 'Host', value: 'www.tiktok.com' },
+                        {
+                            name: 'User-Agent',
+                            value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0'
+                        }
+                    ]
+                });
+                const resStep1 = createMockResponse({
+                    request: reqStep1,
+                    status: 200,
+                    statusText: 'OK',
+                    headersArray: [
+                        { name: 'Content-Type', value: 'text/html; charset=utf-8' },
+                        {
+                            name: 'Set-Cookie',
+                            value: 'ttwid=1%7Cabc123xyz987secret; Domain=.tiktok.com; Path=/; Secure; HttpOnly'
+                        },
+                        {
+                            name: 'Set-Cookie',
+                            value: 'msToken=ms_initial_secret_token_111; Domain=.tiktok.com; Path=/; Secure; SameSite=None'
+                        },
+                        {
+                            name: 'Set-Cookie',
+                            value: '__cf_bm=cf_bot_mgmt_999; Domain=.tiktok.com; Path=/; Secure; HttpOnly'
+                        }
+                    ],
+                    body: '<html><body>Landing</body></html>'
+                });
+                await emitHttpTransaction(context, reqStep1, resStep1);
+
+                // Step 2: step-2-submit (after recordTriggerAction('page.click', '#submit-btn'))
+                profile.setTrafficStep('step-2-submit');
+                recorder.recordTriggerAction('page.click', '#submit-btn');
+
+                const reqStep2 = createMockRequest({
+                    method: 'POST',
+                    url: 'https://www.tiktok.com/passport/web/account/create/',
+                    resourceType: 'fetch',
+                    headersArray: [
+                        { name: 'Host', value: 'www.tiktok.com' },
+                        {
+                            name: 'User-Agent',
+                            value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0'
+                        },
+                        {
+                            name: 'Cookie',
+                            value: 'ttwid=1%7Cabc123xyz987secret; msToken=ms_initial_secret_token_111; __cf_bm=cf_bot_mgmt_999'
+                        },
+                        { name: 'Content-Type', value: 'application/json' }
+                    ],
+                    postData: JSON.stringify({ email: 'cookies12@gmail.com' })
+                });
+                const resStep2 = createMockResponse({
+                    request: reqStep2,
+                    status: 200,
+                    statusText: 'OK',
+                    headersArray: [
+                        { name: 'Content-Type', value: 'application/json' },
+                        {
+                            name: 'Set-Cookie',
+                            value: 'msToken=ms_rotated_secret_token_222; Domain=.tiktok.com; Path=/; Secure'
+                        }
+                    ],
+                    body: JSON.stringify({ message: 'success', next: 'verify' })
+                });
+                await emitHttpTransaction(context, reqStep2, resStep2);
+
+                // Step 3: step-3-verify -> egress sends rotated msToken and original ttwid
+                profile.setTrafficStep('step-3-verify');
+                const reqStep3 = createMockRequest({
+                    method: 'POST',
+                    url: 'https://www.tiktok.com/passport/web/account/verify/',
+                    resourceType: 'fetch',
+                    headersArray: [
+                        { name: 'Host', value: 'www.tiktok.com' },
+                        {
+                            name: 'User-Agent',
+                            value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0'
+                        },
+                        {
+                            name: 'Cookie',
+                            value: 'ttwid=1%7Cabc123xyz987secret; msToken=ms_rotated_secret_token_222'
+                        },
+                        { name: 'Content-Type', value: 'application/json' }
+                    ],
+                    postData: JSON.stringify({ code: '654321' })
+                });
+                const resStep3 = createMockResponse({
+                    request: reqStep3,
+                    status: 200,
+                    statusText: 'OK',
+                    headersArray: [{ name: 'Content-Type', value: 'application/json' }],
+                    body: JSON.stringify({ verified: true })
+                });
+                await emitHttpTransaction(context, reqStep3, resStep3);
+
+                const summary = await profile.getTrafficAttribution();
+                await profile.stop();
+                const events = readNdjsonFile(profile.trafficPaths.trafficNdjsonPath);
+                const egressEvents = events.filter((e) => e.type === 'egress');
+                assert.equal(egressEvents.length, 3);
+                const [corr1, corr2, corr3] = egressEvents.map((e) => e.correlationId);
+
+                assert.ok(summary.cookieLineage, 'Expected summary.cookieLineage object');
+                const { ttwid, msToken, __cf_bm: cfBm } = summary.cookieLineage;
+                assert.ok(ttwid, 'Expected ttwid in summary.cookieLineage');
+                assert.ok(msToken, 'Expected msToken in summary.cookieLineage');
+                assert.ok(cfBm, 'Expected __cf_bm in summary.cookieLineage');
+
+                // Verify isAntiBotToken flags
+                assert.equal(ttwid.isAntiBotToken, true);
+                assert.equal(msToken.isAntiBotToken, true);
+                assert.equal(cfBm.isAntiBotToken, true);
+
+                // Verify firstSetByCorrelationId and firstSetAtStep
+                assert.equal(ttwid.firstSetByCorrelationId, corr1);
+                assert.equal(ttwid.firstSetAtStep, 'step-1-landing');
+                assert.equal(msToken.firstSetByCorrelationId, corr1);
+                assert.equal(msToken.firstSetAtStep, 'step-1-landing');
+                assert.equal(cfBm.firstSetByCorrelationId, corr1);
+                assert.equal(cfBm.firstSetAtStep, 'step-1-landing');
+
+                // Verify mutationsCount, valueHistory, and sentInCorrelationIds
+                assert.equal(msToken.mutationsCount, 2);
+                assert.equal(msToken.valueHistory.length, 2);
+                assert.notEqual(
+                    msToken.valueHistory[0].valueSha256,
+                    msToken.valueHistory[1].valueSha256
+                );
+                assert.equal(
+                    msToken.valueHistory[0].valueSha256,
+                    sha256Hex('ms_initial_secret_token_111')
+                );
+                assert.equal(
+                    msToken.valueHistory[1].valueSha256,
+                    sha256Hex('ms_rotated_secret_token_222')
+                );
+                assert.equal(msToken.lastSetByCorrelationId, corr2);
+                assert.equal(msToken.lastSetAtStep, 'step-2-submit');
+
+                assert.equal(ttwid.sentInCorrelationIds.length, 2);
+                assert.deepEqual(ttwid.sentInCorrelationIds, [corr2, corr3]);
+                assert.equal(msToken.sentInCorrelationIds.length, 2);
+                assert.deepEqual(msToken.sentInCorrelationIds, [corr2, corr3]);
+                assert.equal(cfBm.sentInCorrelationIds.length, 1);
+                assert.deepEqual(cfBm.sentInCorrelationIds, [corr2]);
+
+                // Verify masking of raw secrets and exact SHA-256 matching
+                assert.equal(
+                    msToken.lastValueSha256,
+                    sha256Hex('ms_rotated_secret_token_222')
+                );
+                assert.equal(
+                    msToken.lastMaskedValue.includes('rotated_secret_token'),
+                    false,
+                    'Raw secret substring must never be exposed in lastMaskedValue'
+                );
+                assert.equal(
+                    ttwid.lastMaskedValue.includes('abc123xyz987'),
+                    false,
+                    'Raw secret substring must never be exposed in ttwid.lastMaskedValue'
+                );
+                assert.equal(msToken.matchesLatestSetCookie, true);
+
+                // Verify query-traffic-attribution.js --cookies --json and --cookie=msToken --json
+                const cliScriptPath = path.join(__dirname, 'query-traffic-attribution.js');
+                const allCookiesOut = execFileSync(
+                    process.execPath,
+                    [
+                        cliScriptPath,
+                        `--profiles-dir=${tempProfilesDir}`,
+                        '--profile=traffic-test-12-cookies',
+                        '--cookies',
+                        '--json'
+                    ],
+                    { encoding: 'utf8' }
+                );
+                const allCookiesJson = JSON.parse(allCookiesOut);
+                assert.equal(allCookiesJson.mode, 'cookies');
+                assert.equal(allCookiesJson.count, 3);
+                assert.equal(allCookiesJson.antiBotTokenCount, 3);
+                assert.deepEqual(allCookiesJson.cookieLineage, summary.cookieLineage);
+
+                const msTokenOut = execFileSync(
+                    process.execPath,
+                    [
+                        cliScriptPath,
+                        `--profiles-dir=${tempProfilesDir}`,
+                        '--profile=traffic-test-12-cookies',
+                        '--cookie=msToken',
+                        '--json'
+                    ],
+                    { encoding: 'utf8' }
+                );
+                const msTokenJson = JSON.parse(msTokenOut);
+                assert.equal(msTokenJson.mode, 'cookies');
+                assert.equal(msTokenJson.cookieName, 'msToken');
+                assert.equal(msTokenJson.found, true);
+                assert.deepEqual(msTokenJson.cookie, summary.cookieLineage.msToken);
+
+                await profile.delete();
+            }
+        );
+
+        // =========================================================================
+        // Test 13: C++ Necko MOZ_LOG (necko-pre-tls.moz_log) Pre-TLS Wire Block Parser & SHA-256 Tamper Detection
+        // =========================================================================
+        await testSection(
+            'Test 13: C++ Necko MOZ_LOG (necko-pre-tls.moz_log) Pre-TLS Wire Block Parser & SHA-256 Tamper Detection',
+            async () => {
+                const profile = await createAndStartProfile(
+                    'Traffic_Test_13_NeckoMozLog',
+                    'http://10.104.0.1:8080',
+                    {
+                        profileId: 'traffic-test-13-necko-mozlog',
+                        os: 'linux',
+                        profilesDir: tempProfilesDir,
+                        useSharedBrowser: false,
+                        neckoMozLog: true
+                    }
+                );
+
+                const recorder = profile.getTrafficRecorder();
+                const trafficDir = profile.trafficPaths.trafficDir;
+                const neckoMozLogPath = profile.trafficPaths.neckoMozLogPath;
+
+                assert.equal(
+                    typeof recorder.recordNeckoMozLogBlock,
+                    'function',
+                    'Expected recorder.recordNeckoMozLogBlock to be a function'
+                );
+
+                const realisticNeckoMozLog = [
+                    '2026-11-25 17:20:01.102000 UTC - [Parent 41200: Main Thread]: D/nsHostResolver nsHostResolver::ResolveHost [host=accounts.google.com flags=0]',
+                    '2026-11-25 17:20:01.104500 UTC - [Parent 41200: Socket Thread]: V/nsSocketTransport nsSocketTransport::InitiateSocket [this=0x7f8b1c004000 host=accounts.google.com:443]',
+                    '2026-11-25 17:20:01.105200 UTC - [Parent 41200: Socket Thread]: V/nsSocketTransport nsSocketTransport::OnSocketEvent [this=0x7f8b1c004000 type=MSG_ENSURE_CONNECT]',
+                    '2026-11-25 17:20:01.112000 UTC - [Parent 41200: Main Thread]: V/nsHttp http request [',
+                    '2026-11-25 17:20:01.112010 UTC - [Parent 41200: Main Thread]: V/nsHttp   POST /v3/signin/_/signup/bg HTTP/2.0',
+                    '2026-11-25 17:20:01.112020 UTC - [Parent 41200: Main Thread]: V/nsHttp   Host: accounts.google.com',
+                    '2026-11-25 17:20:01.112030 UTC - [Parent 41200: Main Thread]: V/nsHttp   User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0',
+                    '2026-11-25 17:20:01.112040 UTC - [Parent 41200: Main Thread]: V/nsHttp   Accept: application/json',
+                    '2026-11-25 17:20:01.112050 UTC - [Parent 41200: Main Thread]: V/nsHttp   Content-Type: application/json',
+                    '2026-11-25 17:20:01.112060 UTC - [Parent 41200: Main Thread]: V/nsHttp ]',
+                    '2026-11-25 17:20:01.113500 UTC - [Parent 41200: Socket Thread]: V/nsHttp Http2Session::WriteSegments [stream=0x7f8b1c009800 frame=HEADERS]',
+                    '2026-11-25 17:20:01.148000 UTC - [Parent 41200: Socket Thread]: V/nsHttp Http2Session::ReadSegments [stream=0x7f8b1c009800 frame=DATA]',
+                    '2026-11-25 17:20:01.149000 UTC - [Parent 41200: Main Thread]: V/nsHttp http response [',
+                    '2026-11-25 17:20:01.149010 UTC - [Parent 41200: Main Thread]: V/nsHttp   HTTP/2.0 200 OK',
+                    '2026-11-25 17:20:01.149020 UTC - [Parent 41200: Main Thread]: V/nsHttp   Content-Type: application/json',
+                    '2026-11-25 17:20:01.149030 UTC - [Parent 41200: Main Thread]: V/nsHttp   Cache-Control: no-store',
+                    '2026-11-25 17:20:01.149040 UTC - [Parent 41200: Main Thread]: V/nsHttp ]'
+                ].join('\n');
+
+                recorder.recordNeckoMozLogBlock(realisticNeckoMozLog);
+                const summary = await recorder.flushSummary();
+                await profile.stop();
+
+                assert.ok(summary.neckoMozLog, 'Expected summary.neckoMozLog object');
+                assert.equal(summary.neckoMozLog.exists, true);
+                assert.ok(summary.neckoMozLog.requestBlockCount >= 1);
+                assert.ok(summary.neckoMozLog.responseBlockCount >= 1);
+                assert.ok(summary.neckoMozLog.http2FrameCount >= 1);
+                assert.ok(summary.neckoMozLog.dnsLookupCount >= 1);
+                assert.ok(summary.neckoMozLog.socketEventCount >= 1);
+                assert.equal(
+                    summary.neckoMozLog.parsedRequests[0].requestLine,
+                    'POST /v3/signin/_/signup/bg HTTP/2.0'
+                );
+                assert.equal(
+                    summary.neckoMozLog.parsedRequests[0].host,
+                    'accounts.google.com'
+                );
+                assert.equal(
+                    summary.neckoMozLog.parsedResponses[0].statusLine,
+                    'HTTP/2.0 200 OK'
+                );
+
+                // Verify untampered integrity passes
+                const validCheck = verifyTrafficIntegrity(trafficDir);
+                assert.equal(
+                    validCheck.valid,
+                    true,
+                    `Expected verifyTrafficIntegrity(trafficDir).valid === true, got errors: ${validCheck.errors.join('; ')}`
+                );
+
+                // Tamper with necko-pre-tls.moz_log on disk and verify tamper detection
+                const originalMozLog = fs.readFileSync(neckoMozLogPath, 'utf8');
+                fs.writeFileSync(
+                    neckoMozLogPath,
+                    `${originalMozLog}\n2026-11-25 17:20:02.000000 UTC - [Parent 41200: Main Thread]: V/nsHttp TAMPERED_LINE\n`,
+                    'utf8'
+                );
+
+                const tamperedCheck = verifyTrafficIntegrity(trafficDir);
+                assert.equal(
+                    tamperedCheck.valid,
+                    false,
+                    'Expected verifyTrafficIntegrity(trafficDir).valid === false after tampering with necko-pre-tls.moz_log'
+                );
+                assert.equal(
+                    tamperedCheck.errors.some((e) => e.includes('necko-pre-tls.moz_log')),
+                    true
+                );
+
+                await profile.delete();
+            }
+        );
+
         console.log(`\n🎉 All ${passedTests} Camoufox pre-TLS traffic attribution & isolation test suites passed!`);
     } finally {
         setCamoufoxModule(null);

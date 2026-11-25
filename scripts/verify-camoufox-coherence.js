@@ -233,7 +233,34 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
             privateIpLeaked: false
         },
         speechVoices: p.speechVoices,
-        fonts: p.fonts
+        fonts: p.fonts,
+        iframeParity: {
+            ok: true,
+            userAgent: p.userAgent,
+            platform: p.platform,
+            oscpu: p.oscpu,
+            hardwareConcurrency: p.hardwareConcurrency,
+            webdriver: false,
+            language: 'en-US',
+            languages: ['en-US', 'en'],
+            width: p.screenWidth,
+            height: p.screenHeight,
+            colorDepth: p.colorDepth,
+            pixelDepth: p.colorDepth,
+            userAgentGetterNative: true,
+            webdriverGetterNative: true
+        },
+        geckoApiSurface: {
+            hasDeviceMemory: false,
+            hasGetBattery: false,
+            hasBluetooth: false,
+            hasUsb: false,
+            hasSerial: false,
+            hasHid: false,
+            hasOpenDatabase: false,
+            hasMozInnerScreenX: true,
+            performanceNowMonotonic: true
+        }
     };
 }
 

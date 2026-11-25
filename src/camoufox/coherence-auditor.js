@@ -93,6 +93,15 @@ export const CAMOUFOX_COHERENCE_CONSTANTS = Object.freeze({
         'Cantarell',
         'Liberation Sans',
         'Noto Color Emoji'
+    ]),
+    forbiddenChromiumApisOnGecko: Object.freeze([
+        'deviceMemory',
+        'getBattery',
+        'bluetooth',
+        'usb',
+        'serial',
+        'hid',
+        'openDatabase'
     ])
 });
 
@@ -640,6 +649,96 @@ export async function collectBrowserFingerprint(page) {
             }
         } catch {}
 
+        // 8. Dynamic Same-Origin iframe (contentWindow) Parity Probe
+        const collectIframeParity = () => {
+            if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
+                return { ok: false, error: 'document.createElement unavailable' };
+            }
+            let ifr = null;
+            try {
+                ifr = document.createElement('iframe');
+                ifr.style.display = 'none';
+                const host = document.body || document.documentElement;
+                if (!host) {
+                    return { ok: false, error: 'document.body and document.documentElement unavailable' };
+                }
+                host.appendChild(ifr);
+                const cw = ifr.contentWindow;
+                if (!cw || !cw.navigator || !cw.screen) {
+                    return { ok: false, error: 'iframe.contentWindow or navigator/screen unavailable' };
+                }
+                const ifrNav = cw.navigator;
+                const ifrScr = cw.screen;
+                const ifrNavProto = Object.getPrototypeOf(ifrNav);
+                const uaGetterDesc = ifrNavProto
+                    ? Object.getOwnPropertyDescriptor(ifrNavProto, 'userAgent')
+                    : null;
+                const wdGetterDesc = ifrNavProto
+                    ? Object.getOwnPropertyDescriptor(ifrNavProto, 'webdriver')
+                    : null;
+                const userAgentGetterNative = Boolean(
+                    uaGetterDesc &&
+                        typeof uaGetterDesc.get === 'function' &&
+                        nativeCodeRegex.test(fnToString.call(uaGetterDesc.get))
+                );
+                const webdriverGetterNative = Boolean(
+                    wdGetterDesc &&
+                        typeof wdGetterDesc.get === 'function' &&
+                        nativeCodeRegex.test(fnToString.call(wdGetterDesc.get))
+                );
+                return {
+                    ok: true,
+                    userAgent: ifrNav.userAgent,
+                    platform: ifrNav.platform,
+                    oscpu: 'oscpu' in ifrNav ? ifrNav.oscpu : null,
+                    hardwareConcurrency: ifrNav.hardwareConcurrency,
+                    webdriver: ifrNav.webdriver,
+                    language: ifrNav.language,
+                    languages: Array.isArray(ifrNav.languages) ? [...ifrNav.languages] : [],
+                    width: ifrScr.width,
+                    height: ifrScr.height,
+                    colorDepth: ifrScr.colorDepth,
+                    pixelDepth: ifrScr.pixelDepth,
+                    userAgentGetterNative,
+                    webdriverGetterNative
+                };
+            } catch (err) {
+                return { ok: false, error: String(err) };
+            } finally {
+                try {
+                    if (ifr && ifr.parentNode) {
+                        ifr.parentNode.removeChild(ifr);
+                    } else if (ifr && typeof ifr.remove === 'function') {
+                        ifr.remove();
+                    }
+                } catch {}
+            }
+        };
+
+        const iframeParity = collectIframeParity();
+
+        // 9. Gecko API Surface & High-Precision Timer Probe
+        let performanceNowMonotonic = false;
+        try {
+            if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+                const t1 = performance.now();
+                const t2 = performance.now();
+                performanceNowMonotonic = Number.isFinite(t1) && Number.isFinite(t2) && t2 >= t1;
+            }
+        } catch {}
+
+        const geckoApiSurface = {
+            hasDeviceMemory: 'deviceMemory' in navigator,
+            hasGetBattery: 'getBattery' in navigator,
+            hasBluetooth: 'bluetooth' in navigator,
+            hasUsb: 'usb' in navigator,
+            hasSerial: 'serial' in navigator,
+            hasHid: 'hid' in navigator,
+            hasOpenDatabase: typeof window !== 'undefined' && 'openDatabase' in window,
+            hasMozInnerScreenX: typeof window !== 'undefined' && 'mozInnerScreenX' in window,
+            performanceNowMonotonic
+        };
+
         return {
             navigator: navigatorInfo,
             prototypeIntegrity,
@@ -653,7 +752,9 @@ export async function collectBrowserFingerprint(page) {
             automationGlobals,
             speechVoices,
             webrtc: webrtcInfo,
-            fonts
+            fonts,
+            iframeParity,
+            geckoApiSurface
         };
     });
 }
@@ -1315,6 +1416,150 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
             passed,
             details: passed
                 ? 'navigator.pdfViewerEnabled, navigator.cookieEnabled, and OS system font catalog are coherent'
+                : issues.join('; ')
+        });
+    }
+
+    // Check 12: Dynamic Same-Origin iframe (contentWindow) Parity
+    {
+        const iframeParity = telemetry.iframeParity;
+        const issues = [];
+
+        if (iframeParity && typeof iframeParity === 'object') {
+            if (iframeParity.ok === false) {
+                issues.push(`Dynamic iframe probe failed: ${iframeParity.error || 'unknown error'}`);
+            } else {
+                if (iframeParity.userAgent !== nav.userAgent) {
+                    issues.push(
+                        `iframe navigator.userAgent mismatch (main="${nav.userAgent}" vs iframe="${iframeParity.userAgent}")`
+                    );
+                }
+                if (iframeParity.platform !== nav.platform) {
+                    issues.push(
+                        `iframe navigator.platform mismatch (main="${nav.platform}" vs iframe="${iframeParity.platform}")`
+                    );
+                }
+                if (
+                    iframeParity.oscpu !== undefined &&
+                    nav.oscpu !== undefined &&
+                    iframeParity.oscpu !== nav.oscpu
+                ) {
+                    issues.push(
+                        `iframe navigator.oscpu mismatch (main="${nav.oscpu}" vs iframe="${iframeParity.oscpu}")`
+                    );
+                }
+                if (iframeParity.hardwareConcurrency !== nav.hardwareConcurrency) {
+                    issues.push(
+                        `iframe navigator.hardwareConcurrency mismatch (main=${nav.hardwareConcurrency} vs iframe=${iframeParity.hardwareConcurrency})`
+                    );
+                }
+                if (Boolean(iframeParity.webdriver) !== Boolean(nav.webdriver)) {
+                    issues.push(
+                        `iframe navigator.webdriver mismatch (main=${nav.webdriver} vs iframe=${iframeParity.webdriver})`
+                    );
+                }
+                if (
+                    iframeParity.language !== undefined &&
+                    nav.language !== undefined &&
+                    iframeParity.language !== nav.language
+                ) {
+                    issues.push(
+                        `iframe navigator.language mismatch (main="${nav.language}" vs iframe="${iframeParity.language}")`
+                    );
+                }
+                if (
+                    Array.isArray(iframeParity.languages) &&
+                    Array.isArray(nav.languages) &&
+                    JSON.stringify(iframeParity.languages) !== JSON.stringify(nav.languages)
+                ) {
+                    issues.push(
+                        `iframe navigator.languages mismatch (main=${JSON.stringify(nav.languages)} vs iframe=${JSON.stringify(iframeParity.languages)})`
+                    );
+                }
+                if (iframeParity.width !== scr.width) {
+                    issues.push(
+                        `iframe screen.width mismatch (main=${scr.width} vs iframe=${iframeParity.width})`
+                    );
+                }
+                if (iframeParity.height !== scr.height) {
+                    issues.push(
+                        `iframe screen.height mismatch (main=${scr.height} vs iframe=${iframeParity.height})`
+                    );
+                }
+                if (iframeParity.colorDepth !== scr.colorDepth) {
+                    issues.push(
+                        `iframe screen.colorDepth mismatch (main=${scr.colorDepth} vs iframe=${iframeParity.colorDepth})`
+                    );
+                }
+                if (
+                    iframeParity.pixelDepth !== undefined &&
+                    scr.pixelDepth !== undefined &&
+                    iframeParity.pixelDepth !== scr.pixelDepth
+                ) {
+                    issues.push(
+                        `iframe screen.pixelDepth mismatch (main=${scr.pixelDepth} vs iframe=${iframeParity.pixelDepth})`
+                    );
+                }
+                if (iframeParity.userAgentGetterNative === false) {
+                    issues.push('iframe Navigator.prototype.userAgent getter is not [native code]');
+                }
+                if (iframeParity.webdriverGetterNative === false) {
+                    issues.push('iframe Navigator.prototype.webdriver getter is not [native code]');
+                }
+            }
+        }
+
+        const passed = issues.length === 0;
+        checks.push({
+            name: 'iframe-contentwindow-parity',
+            passed,
+            details: passed
+                ? 'Dynamic same-origin iframe.contentWindow navigator, screen, and C++ WebIDL getters match top-level window 100%'
+                : issues.join('; ')
+        });
+    }
+
+    // Check 13: Gecko API Surface & High-Precision Timer Coherence
+    {
+        const geckoApiSurface = telemetry.geckoApiSurface;
+        const issues = [];
+
+        if (geckoApiSurface && typeof geckoApiSurface === 'object') {
+            if (geckoApiSurface.hasDeviceMemory) {
+                issues.push('Chromium navigator.deviceMemory leaked on Gecko');
+            }
+            if (geckoApiSurface.hasGetBattery) {
+                issues.push('Chromium navigator.getBattery leaked on Gecko');
+            }
+            if (geckoApiSurface.hasBluetooth) {
+                issues.push('Chromium navigator.bluetooth leaked on Gecko');
+            }
+            if (geckoApiSurface.hasUsb) {
+                issues.push('Chromium navigator.usb leaked on Gecko');
+            }
+            if (geckoApiSurface.hasSerial) {
+                issues.push('Chromium navigator.serial leaked on Gecko');
+            }
+            if (geckoApiSurface.hasHid) {
+                issues.push('Chromium navigator.hid leaked on Gecko');
+            }
+            if (geckoApiSurface.hasOpenDatabase) {
+                issues.push('Chromium window.openDatabase WebSQL API leaked on Gecko');
+            }
+            if (geckoApiSurface.hasMozInnerScreenX === false) {
+                issues.push('Firefox window.mozInnerScreenX property missing');
+            }
+            if (geckoApiSurface.performanceNowMonotonic === false) {
+                issues.push('performance.now() high-precision timer is non-monotonic or invalid');
+            }
+        }
+
+        const passed = issues.length === 0;
+        checks.push({
+            name: 'gecko-api-surface-coherence',
+            passed,
+            details: passed
+                ? 'Zero Chromium-only APIs leaked on Gecko, window.mozInnerScreenX present, and performance.now() is monotonic'
                 : issues.join('; ')
         });
     }
