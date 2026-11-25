@@ -17,6 +17,8 @@
  *   --dump-wire=<corrId>       Alias for --correlation=<corrId>
  *   --cookies                  List all tracked cookies & anti-bot tokens in cookieLineage
  *   --cookie=<name>            Inspect full causal lineage and value history for a specific cookie name
+ *   --signatures               List all detected anti-bot platform signatures and their causal actionStep / triggerAction
+ *   --platform=<platformName>  Filter signatures & events by platform (bytedance, twitter, meta, google, arkose, cloudflare)
  *   --verify-integrity         Verify cryptographic SHA-256 event hash chain & payload manifest integrity
  *   --json                     Emit structured JSON output to stdout
  */
@@ -31,7 +33,9 @@ import {
     parseNeckoMozLog,
     parseSetCookieHeader,
     parseCookieHeader,
-    detectWireHeaderAnomalies
+    detectWireHeaderAnomalies,
+    extractPlatformSignatures,
+    redactUrlSecrets
 } from '../src/camoufox/traffic-recorder.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -72,6 +76,8 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
         dumpWire: null,
         cookies: false,
         cookie: null,
+        signatures: false,
+        platform: null,
         verifyIntegrity: false,
         exportHar: null,
         json: false,
@@ -146,6 +152,16 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
             case 'cookie-name':
             case 'cookieName':
                 opts.cookie = readNextValue();
+                break;
+            case 'signatures':
+            case 'platform-signatures':
+            case 'platformSignatures':
+                opts.signatures = value === null ? true : value !== 'false' && value !== '0';
+                break;
+            case 'platform':
+            case 'platform-name':
+            case 'platformName':
+                opts.platform = readNextValue();
                 break;
             case 'verify-integrity':
             case 'verifyIntegrity':
@@ -359,7 +375,7 @@ function recordMatchesFilters(
     record,
     filters = {},
     txStatusByCorrelation = null,
-    { useTransactionStatusFallback = false } = {}
+    { useTransactionStatusFallback = false, platformCorrelations = null } = {}
 ) {
     if (!record || typeof record !== 'object') {
         return false;
@@ -379,7 +395,14 @@ function recordMatchesFilters(
     }
 
     if (filters.trigger) {
-        const triggerAction = extractTriggerAction(record);
+        const triggerAction =
+            extractTriggerAction(record) ||
+            (record.triggerActionId || record.triggerTarget
+                ? {
+                      actionId: record.triggerActionId || null,
+                      target: record.triggerTarget || null
+                  }
+                : null);
         if (!matchesTriggerFilter(triggerAction, filters.trigger)) {
             return false;
         }
@@ -391,6 +414,28 @@ function recordMatchesFilters(
         const domainNeedle = String(filters.domain).trim().toLowerCase();
         if (!host.includes(domainNeedle) && !url.includes(domainNeedle)) {
             return false;
+        }
+    }
+
+    if (filters.platform) {
+        const targetPlatform = String(filters.platform).trim().toLowerCase();
+        if (typeof record.platform === 'string') {
+            if (record.platform.toLowerCase() !== targetPlatform) {
+                return false;
+            }
+        } else {
+            const hasDirectPlatformSig =
+                Array.isArray(record.platformSignatures) &&
+                record.platformSignatures.some(
+                    (s) => s && String(s.platform || '').toLowerCase() === targetPlatform
+                );
+            const hasCorrelatedPlatformSig =
+                Boolean(record.correlationId) &&
+                platformCorrelations instanceof Set &&
+                platformCorrelations.has(record.correlationId);
+            if (!hasDirectPlatformSig && !hasCorrelatedPlatformSig) {
+                return false;
+            }
         }
     }
 
@@ -1075,6 +1120,88 @@ function buildCookieLineageFromEvents(events = []) {
 }
 
 /**
+ * Rebuild or normalize the list of detected anti-bot platform signatures from
+ * `attribution-index.json` or recorded NDJSON egress events.
+ *
+ * @param {Array<object>} events
+ * @param {object|null} [indexData=null]
+ * @returns {Array<object>}
+ */
+function buildPlatformSignaturesFromEvents(events = [], indexData = null) {
+    const triggerByCorr = new Map();
+    for (const ev of events) {
+        if (!ev || !ev.correlationId) continue;
+        const trig = extractTriggerAction(ev);
+        if (trig && !triggerByCorr.has(ev.correlationId)) {
+            triggerByCorr.set(ev.correlationId, trig);
+        }
+    }
+
+    if (
+        Array.isArray(indexData?.platformSignatures?.signatures) &&
+        indexData.platformSignatures.signatures.length > 0
+    ) {
+        return indexData.platformSignatures.signatures.map((sig) => {
+            const triggerAction =
+                sig.triggerAction ||
+                (sig.correlationId ? triggerByCorr.get(sig.correlationId) || null : null);
+            return {
+                ...sig,
+                triggerAction:
+                    triggerAction ||
+                    (sig.triggerActionId || sig.triggerTarget
+                        ? {
+                              actionId: sig.triggerActionId || null,
+                              target: sig.triggerTarget || null
+                          }
+                        : null)
+            };
+        });
+    }
+
+    const signatures = [];
+    for (const ev of events) {
+        if (!ev || ev.type !== 'egress') continue;
+        const actionStep = extractActionStep(ev) || 'init';
+        const stepIndex = ev.attribution?.stepIndex ?? ev.stepIndex ?? 0;
+        const triggerAction = extractTriggerAction(ev);
+        const host = extractHost(ev) || 'unknown';
+        const detected = Array.isArray(ev.platformSignatures)
+            ? ev.platformSignatures
+            : extractPlatformSignatures({
+                  url: ev.url || '',
+                  searchParams: ev.searchParams || null,
+                  headers: ev.headers || {},
+                  bodyPreview: ev.bodyPreview ?? ev.postData ?? null
+              });
+
+        for (const sig of detected) {
+            if (!sig || typeof sig !== 'object') continue;
+            signatures.push({
+                timestamp: ev.timestamp || null,
+                correlationId: ev.correlationId || null,
+                actionStep,
+                stepIndex,
+                triggerActionId: triggerAction?.actionId || null,
+                triggerTarget: triggerAction?.target || null,
+                triggerAction: triggerAction || null,
+                method: ev.method || 'GET',
+                url: ev.url || '',
+                host,
+                platform: sig.platform,
+                signatureName: sig.signatureName,
+                location: sig.location,
+                valueLength: sig.valueLength,
+                valueSha256: sig.valueSha256,
+                maskedPreview: sig.maskedPreview
+            });
+        }
+    }
+
+    return signatures;
+}
+
+/**
  * Query, filter, and reconstruct pre-TLS / post-TLS traffic attribution for one or all profiles.
  *
  * @param {object} [options={}]
@@ -1110,6 +1237,13 @@ export function queryProfileTraffic(options = {}) {
               ? options.cookieName.trim()
               : null;
     const cookiesRequested = Boolean(options.cookies || cookieNameFilter);
+    const signaturesRequested = Boolean(options.signatures);
+    const platformFilter =
+        typeof options.platform === 'string' && options.platform.trim().length > 0
+            ? options.platform.trim().toLowerCase()
+            : typeof options.platformName === 'string' && options.platformName.trim().length > 0
+              ? options.platformName.trim().toLowerCase()
+              : null;
 
     const filters = {
         step: options.step || options.actionStep || null,
@@ -1119,19 +1253,23 @@ export function queryProfileTraffic(options = {}) {
         anomaliesOnly: Boolean(options.anomaliesOnly),
         correlation: correlationId,
         cookies: cookiesRequested,
-        cookie: cookieNameFilter
+        cookie: cookieNameFilter,
+        signatures: signaturesRequested,
+        platform: platformFilter
     };
 
     // If no profile is specified and no direct trafficDir or correlationId is given,
     // list and summarize all profiles in profilesDir that have a traffic/ directory
-    // (unless --verify-integrity, --export-har, or --cookies/--cookie is requested).
+    // (unless --verify-integrity, --export-har, --cookies/--cookie, or --signatures/--platform is requested).
     if (
         !targetProfileId &&
         !options.trafficDir &&
         !correlationId &&
         !options.verifyIntegrity &&
         !options.exportHar &&
-        !cookiesRequested
+        !cookiesRequested &&
+        !signaturesRequested &&
+        !platformFilter
     ) {
         const profiles = listTrafficProfiles(profilesDir);
         return {
@@ -1202,7 +1340,7 @@ export function queryProfileTraffic(options = {}) {
                 profiles: perProfile
             };
         }
-    } else if (options.exportHar || cookiesRequested) {
+    } else if (options.exportHar || cookiesRequested || signaturesRequested || platformFilter) {
         const candidates = listTrafficProfiles(profilesDir);
         if (candidates.length >= 1) {
             resolvedPaths = {
@@ -1337,6 +1475,68 @@ export function queryProfileTraffic(options = {}) {
         }
     }
 
+    const allPlatformSignatures = buildPlatformSignaturesFromEvents(allEvents, indexData);
+    const filteredSignatures = allPlatformSignatures.filter((sig) =>
+        recordMatchesFilters(sig, filters, txStatusByCorrelation, {
+            useTransactionStatusFallback: true
+        })
+    );
+    const filteredByPlatform = {};
+    for (const sig of filteredSignatures) {
+        if (!sig || !sig.platform) continue;
+        filteredByPlatform[sig.platform] = (filteredByPlatform[sig.platform] || 0) + 1;
+    }
+
+    const platformCorrelations = new Set();
+    if (platformFilter) {
+        for (const sig of allPlatformSignatures) {
+            if (
+                sig &&
+                sig.correlationId &&
+                String(sig.platform || '').toLowerCase() === platformFilter
+            ) {
+                platformCorrelations.add(sig.correlationId);
+            }
+        }
+        for (const ev of allEvents) {
+            if (!ev || !ev.correlationId) continue;
+            const evSigs = Array.isArray(ev.platformSignatures)
+                ? ev.platformSignatures
+                : ev.type === 'egress'
+                  ? extractPlatformSignatures({
+                        url: ev.url || '',
+                        searchParams: ev.searchParams || null,
+                        headers: ev.headers || {},
+                        bodyPreview: ev.bodyPreview ?? ev.postData ?? null
+                    })
+                  : [];
+            if (evSigs.some((s) => s && String(s.platform || '').toLowerCase() === platformFilter)) {
+                platformCorrelations.add(ev.correlationId);
+            }
+        }
+    }
+
+    if (signaturesRequested) {
+        return {
+            mode: 'signatures',
+            profileId,
+            profileDir,
+            trafficDir,
+            filters,
+            platform: platformFilter,
+            found: filteredSignatures.length > 0,
+            count: filteredSignatures.length,
+            totalDetected: filteredSignatures.length,
+            byPlatform: filteredByPlatform,
+            signatures: filteredSignatures,
+            platformSignatures: {
+                totalDetected: filteredSignatures.length,
+                byPlatform: filteredByPlatform,
+                signatures: filteredSignatures
+            }
+        };
+    }
+
     // Collect anomalies from attribution-index.json (or synthesize from NDJSON if index missing)
     const rawAnomalies = Array.isArray(indexData?.anomaliesAndRiskSignals)
         ? indexData.anomaliesAndRiskSignals.map((a) => ({
@@ -1386,20 +1586,23 @@ export function queryProfileTraffic(options = {}) {
     // Filter anomalies and NDJSON events
     const filteredAnomalies = rawAnomalies.filter((anomaly) =>
         recordMatchesFilters(anomaly, filters, txStatusByCorrelation, {
-            useTransactionStatusFallback: true
+            useTransactionStatusFallback: true,
+            platformCorrelations
         })
     );
 
     const filteredEvents = allEvents.filter((event) =>
         recordMatchesFilters(event, filters, txStatusByCorrelation, {
-            useTransactionStatusFallback: false
+            useTransactionStatusFallback: false,
+            platformCorrelations
         })
     );
 
     // Build transactions matching filters (using transaction status fallback so egress+ingress stay paired)
     const eventsForTransactions = allEvents.filter((event) =>
         recordMatchesFilters(event, filters, txStatusByCorrelation, {
-            useTransactionStatusFallback: true
+            useTransactionStatusFallback: true,
+            platformCorrelations
         })
     );
     const transactions = buildTransactionsList(eventsForTransactions);
@@ -1442,6 +1645,13 @@ export function queryProfileTraffic(options = {}) {
         byTriggerAction: indexData?.byTriggerAction || {},
         byDomain: indexData?.byDomain || {},
         cookieLineage: fullCookieLineage,
+        platformSignatures: {
+            totalDetected: filteredSignatures.length,
+            byPlatform: filteredByPlatform,
+            signatures: filteredSignatures
+        },
+        signaturesCount: filteredSignatures.length,
+        signatures: filteredSignatures,
         neckoMozLog,
         anomalies: filteredAnomalies,
         anomaliesAndRiskSignals: filteredAnomalies,
@@ -1556,6 +1766,30 @@ export function formatCliReport(result) {
         return lines.join('\n');
     }
 
+    if (result.mode === 'signatures') {
+        const platformLabel = result.platform ? ` | Platform: ${result.platform}` : '';
+        lines.push(
+            `🛡️ Anti-Bot Platform Signature Attribution — Profile: ${result.profileId}${platformLabel} (${result.count} detected)`
+        );
+        if (result.byPlatform && Object.keys(result.byPlatform).length > 0) {
+            const breakdown = Object.entries(result.byPlatform)
+                .map(([plat, cnt]) => `${plat}=${cnt}`)
+                .join(', ');
+            lines.push(`   By Platform: ${breakdown}`);
+        }
+        for (const s of result.signatures || []) {
+            const trig = s.triggerActionId
+                ? `${s.triggerActionId}${s.triggerTarget ? `(${s.triggerTarget})` : ''}`
+                : s.triggerAction
+                  ? `${s.triggerAction.actionType || ''}:${s.triggerAction.target || ''}`
+                  : 'none';
+            lines.push(
+                `  - [${s.platform}] ${s.signatureName} (${s.location}) | corr=${s.correlationId || 'n/a'} | step=${s.actionStep || 'n/a'} | trigger=${trig} | len=${s.valueLength} masked=${s.maskedPreview} sha256=${s.valueSha256} | url=${s.url || ''}`
+            );
+        }
+        return lines.join('\n');
+    }
+
     lines.push(`📊 Pre-TLS Traffic Attribution Report — Profile: ${result.profileId}`);
     lines.push(
         `   Requests: ${result.totals?.totalRequests ?? 0} | Responses: ${result.totals?.totalResponses ?? 0} | Failed: ${result.totals?.failedRequests ?? 0}`
@@ -1613,6 +1847,8 @@ export function runCli(argv = process.argv.slice(2)) {
                 '  --dump-wire=<corrId>        Alias for --correlation=<corrId>',
                 '  --cookies                   List all tracked cookies & anti-bot tokens in cookieLineage',
                 '  --cookie=<name>             Show full lineage and value history for a specific cookie name',
+                '  --signatures                List all detected anti-bot platform signatures and causal step/trigger',
+                '  --platform=<platformName>   Filter signatures & events by platform (bytedance, twitter, meta, google, arkose, cloudflare)',
                 '  --verify-integrity          Verify SHA-256 tamper-evident hash chain & payload manifest',
                 '  --export-har[=<path>]       Export recorded profile traffic to W3C HAR 1.2 archive',
                 '  --json                      Output structured JSON'
@@ -1633,6 +1869,8 @@ export function runCli(argv = process.argv.slice(2)) {
         dumpWire: args.dumpWire,
         cookies: args.cookies,
         cookie: args.cookie,
+        signatures: args.signatures,
+        platform: args.platform,
         verifyIntegrity: args.verifyIntegrity,
         exportHar: args.exportHar
     });
@@ -1672,7 +1910,9 @@ export {
     parseNeckoMozLog,
     parseSetCookieHeader,
     parseCookieHeader,
-    detectWireHeaderAnomalies
+    detectWireHeaderAnomalies,
+    extractPlatformSignatures,
+    redactUrlSecrets
 };
 
 export default {
@@ -1686,6 +1926,8 @@ export default {
     parseSetCookieHeader,
     parseCookieHeader,
     detectWireHeaderAnomalies,
+    extractPlatformSignatures,
+    redactUrlSecrets,
     parseCliArgs,
     formatCliReport,
     runCli

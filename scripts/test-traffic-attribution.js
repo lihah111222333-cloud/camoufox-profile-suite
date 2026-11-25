@@ -2456,6 +2456,531 @@ async function runTests() {
             }
         );
 
+        // =========================================================================
+        // Test 14: Multi-Platform Anti-Bot Telemetry & Signature Attribution & --signatures / --platform CLI
+        // =========================================================================
+        await testSection(
+            'Test 14: Multi-Platform Anti-Bot Telemetry & Signature Attribution (ByteDance, Twitter, Meta, Google, Arkose) & --signatures / --platform CLI',
+            async () => {
+                const profile = await createAndStartProfile(
+                    'Traffic_Test_14_PlatformSignatures',
+                    'http://10.105.0.1:8080',
+                    {
+                        profileId: 'traffic-test-14-platform-signatures',
+                        os: 'windows',
+                        profilesDir: tempProfilesDir,
+                        useSharedBrowser: false,
+                        accountId: 'acct-sig-14',
+                        accountEmail: 'sig14@gmail.com'
+                    }
+                );
+
+                const context = await profile.getContext();
+                const recorder = profile.getTrafficRecorder();
+
+                // 1) ByteDance endpoint (a_bogus & msToken in query)
+                profile.setTrafficStep('step-14-bytedance');
+                const trigBytedance = recorder.recordTriggerAction('page.click', '#tiktok-feed-load');
+                const reqBytedance = createMockRequest({
+                    method: 'GET',
+                    url: 'https://www.tiktok.com/api/post/item_list/?aid=1988&msToken=ms_tok_12345&a_bogus=EX789abogusPayload123456',
+                    resourceType: 'fetch',
+                    headersArray: [
+                        { name: 'Host', value: 'www.tiktok.com' },
+                        {
+                            name: 'User-Agent',
+                            value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0'
+                        }
+                    ]
+                });
+                const resBytedance = createMockResponse({
+                    request: reqBytedance,
+                    status: 200,
+                    statusText: 'OK',
+                    headersArray: [{ name: 'Content-Type', value: 'application/json' }],
+                    body: JSON.stringify({ status_code: 0, itemList: [] })
+                });
+                await emitHttpTransaction(context, reqBytedance, resBytedance);
+
+                // 2) Twitter/X endpoint (x-client-transaction-id, x-csrf-token headers & ui_metrics in body)
+                profile.setTrafficStep('step-14-twitter');
+                const trigTwitter = recorder.recordTriggerAction('page.click', '#x-onboarding-next');
+                const reqTwitter = createMockRequest({
+                    method: 'POST',
+                    url: 'https://x.com/i/api/1.1/onboarding/task.json',
+                    resourceType: 'fetch',
+                    headersArray: [
+                        { name: 'Host', value: 'x.com' },
+                        {
+                            name: 'User-Agent',
+                            value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0'
+                        },
+                        { name: 'x-client-transaction-id', value: 'tx_id_987654321' },
+                        { name: 'x-csrf-token', value: 'ct0_csrf_token_abc' },
+                        { name: 'Content-Type', value: 'application/json' }
+                    ],
+                    postData: JSON.stringify({
+                        flow_token: 'flow_tok_1',
+                        subtask_inputs: [{ ui_metrics: '{"rf":{"a":123,"b":456}}' }]
+                    })
+                });
+                const resTwitter = createMockResponse({
+                    request: reqTwitter,
+                    status: 200,
+                    statusText: 'OK',
+                    headersArray: [{ name: 'Content-Type', value: 'application/json' }],
+                    body: JSON.stringify({ status: 'success' })
+                });
+                await emitHttpTransaction(context, reqTwitter, resTwitter);
+
+                // 3) Meta endpoint (x-ig-app-id, x-asbd-id, x-csrftoken headers & jazoest, lsd in form body)
+                profile.setTrafficStep('step-14-meta');
+                const trigMeta = recorder.recordTriggerAction('page.click', '#ig-signup-submit');
+                const reqMeta = createMockRequest({
+                    method: 'POST',
+                    url: 'https://www.instagram.com/api/v1/web/accounts/web_create_ajax/',
+                    resourceType: 'fetch',
+                    headersArray: [
+                        { name: 'Host', value: 'www.instagram.com' },
+                        {
+                            name: 'User-Agent',
+                            value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0'
+                        },
+                        { name: 'x-ig-app-id', value: '936619743392459' },
+                        { name: 'x-asbd-id', value: '129477' },
+                        { name: 'x-csrftoken', value: 'ig_csrf_999' },
+                        { name: 'Content-Type', value: 'application/x-www-form-urlencoded' }
+                    ],
+                    postData: 'jazoest=22145&lsd=AVq_lsd_token'
+                });
+                const resMeta = createMockResponse({
+                    request: reqMeta,
+                    status: 200,
+                    statusText: 'OK',
+                    headersArray: [{ name: 'Content-Type', value: 'application/json' }],
+                    body: JSON.stringify({ account_created: false })
+                });
+                await emitHttpTransaction(context, reqMeta, resMeta);
+
+                // 4) Google BotGuard endpoint (f.req & bgRequest in form body)
+                profile.setTrafficStep('step-14-google');
+                const trigGoogle = recorder.recordTriggerAction('page.click', '#google-next-btn');
+                const reqGoogle = createMockRequest({
+                    method: 'POST',
+                    url: 'https://accounts.google.com/_/signup/validatepersonaldetails',
+                    resourceType: 'fetch',
+                    headersArray: [
+                        { name: 'Host', value: 'accounts.google.com' },
+                        {
+                            name: 'User-Agent',
+                            value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0'
+                        },
+                        { name: 'Content-Type', value: 'application/x-www-form-urlencoded;charset=UTF-8' }
+                    ],
+                    postData: 'f.req=%5B%22bgRequest_token%22%5D&bgRequest=botguard_vm_payload_xyz'
+                });
+                const resGoogle = createMockResponse({
+                    request: reqGoogle,
+                    status: 200,
+                    statusText: 'OK',
+                    headersArray: [{ name: 'Content-Type', value: 'application/json' }],
+                    body: ')]}\'\n[["wrb.fr",null,"[]"]]'
+                });
+                await emitHttpTransaction(context, reqGoogle, resGoogle);
+
+                // 5) Arkose FunCaptcha endpoint (public_key in URL path & bda in body)
+                profile.setTrafficStep('step-14-arkose');
+                const trigArkose = recorder.recordTriggerAction('page.click', '#arkose-verify-btn');
+                const reqArkose = createMockRequest({
+                    method: 'POST',
+                    url: 'https://client-api.arkoselabs.com/fc/gt2/public_key/2F1CD804',
+                    resourceType: 'fetch',
+                    headersArray: [
+                        { name: 'Host', value: 'client-api.arkoselabs.com' },
+                        {
+                            name: 'User-Agent',
+                            value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0'
+                        },
+                        { name: 'Content-Type', value: 'application/x-www-form-urlencoded' }
+                    ],
+                    postData: 'bda=arkose_encrypted_browser_data_array_12345'
+                });
+                const resArkose = createMockResponse({
+                    request: reqArkose,
+                    status: 200,
+                    statusText: 'OK',
+                    headersArray: [{ name: 'Content-Type', value: 'application/json' }],
+                    body: JSON.stringify({ token: 'fc_tok_999' })
+                });
+                await emitHttpTransaction(context, reqArkose, resArkose);
+
+                const summary = await profile.getTrafficAttribution();
+                await profile.stop();
+
+                const events = readNdjsonFile(profile.trafficPaths.trafficNdjsonPath);
+                const egressEvents = events.filter((e) => e.type === 'egress');
+                assert.equal(egressEvents.length, 5);
+
+                const [egByteDance, egTwitter, egMeta, egGoogle, egArkose] = egressEvents;
+
+                // Verify per-event egressEvent.platformSignatures
+                assert.ok(
+                    Array.isArray(egByteDance.platformSignatures) &&
+                        egByteDance.platformSignatures.length >= 2
+                );
+                const abogusSig = egByteDance.platformSignatures.find(
+                    (s) => s.platform === 'bytedance' && s.signatureName === 'a_bogus'
+                );
+                assert.ok(abogusSig, 'Expected ByteDance a_bogus signature');
+                assert.equal(abogusSig.location, 'query');
+                assert.equal(abogusSig.valueLength, 'EX789abogusPayload123456'.length);
+                assert.equal(abogusSig.valueSha256, sha256Hex('EX789abogusPayload123456'));
+                assert.equal(abogusSig.maskedPreview, 'EX78***456');
+
+                const twitterTxSig = egTwitter.platformSignatures.find(
+                    (s) =>
+                        s.platform === 'twitter' &&
+                        s.signatureName === 'x-client-transaction-id'
+                );
+                const twitterMetricsSig = egTwitter.platformSignatures.find(
+                    (s) => s.platform === 'twitter' && s.signatureName === 'ui_metrics'
+                );
+                assert.ok(twitterTxSig, 'Expected Twitter x-client-transaction-id signature');
+                assert.equal(twitterTxSig.location, 'header');
+                assert.equal(twitterTxSig.valueSha256, sha256Hex('tx_id_987654321'));
+                assert.equal(twitterTxSig.maskedPreview, 'tx_i***321');
+                assert.ok(twitterMetricsSig, 'Expected Twitter ui_metrics signature');
+                assert.equal(twitterMetricsSig.location, 'body');
+
+                const metaJazoestSig = egMeta.platformSignatures.find(
+                    (s) => s.platform === 'meta' && s.signatureName === 'jazoest'
+                );
+                const metaLsdSig = egMeta.platformSignatures.find(
+                    (s) => s.platform === 'meta' && s.signatureName === 'lsd'
+                );
+                const metaAppIdSig = egMeta.platformSignatures.find(
+                    (s) => s.platform === 'meta' && s.signatureName === 'x-ig-app-id'
+                );
+                assert.ok(metaJazoestSig, 'Expected Meta jazoest signature');
+                assert.equal(metaJazoestSig.location, 'body');
+                assert.equal(metaJazoestSig.valueSha256, sha256Hex('22145'));
+                assert.ok(metaLsdSig, 'Expected Meta lsd signature');
+                assert.equal(metaLsdSig.valueSha256, sha256Hex('AVq_lsd_token'));
+                assert.ok(metaAppIdSig, 'Expected Meta x-ig-app-id signature');
+                assert.equal(metaAppIdSig.location, 'header');
+
+                const googleBgSig = egGoogle.platformSignatures.find(
+                    (s) => s.platform === 'google' && s.signatureName === 'bgRequest'
+                );
+                const googleFreqSig = egGoogle.platformSignatures.find(
+                    (s) => s.platform === 'google' && s.signatureName === 'f.req'
+                );
+                assert.ok(googleBgSig, 'Expected Google bgRequest signature');
+                assert.equal(googleBgSig.location, 'body');
+                assert.equal(googleBgSig.valueSha256, sha256Hex('botguard_vm_payload_xyz'));
+                assert.equal(googleBgSig.maskedPreview, 'botg***xyz');
+                assert.ok(googleFreqSig, 'Expected Google f.req signature');
+                assert.equal(googleFreqSig.location, 'body');
+
+                const arkoseBdaSig = egArkose.platformSignatures.find(
+                    (s) => s.platform === 'arkose' && s.signatureName === 'bda'
+                );
+                assert.ok(arkoseBdaSig, 'Expected Arkose bda signature');
+                assert.equal(arkoseBdaSig.location, 'body');
+                assert.equal(
+                    arkoseBdaSig.valueSha256,
+                    sha256Hex('arkose_encrypted_browser_data_array_12345')
+                );
+                assert.equal(arkoseBdaSig.maskedPreview, 'arko***345');
+
+                // Verify summary.platformSignatures aggregation and causal linking
+                assert.ok(summary.platformSignatures, 'Expected summary.platformSignatures block');
+                assert.ok(summary.platformSignatures.totalDetected >= 10);
+                for (const family of ['bytedance', 'twitter', 'meta', 'google', 'arkose']) {
+                    assert.ok(
+                        summary.platformSignatures.byPlatform[family] >= 1,
+                        `Expected summary.platformSignatures.byPlatform.${family} >= 1`
+                    );
+                }
+
+                const summaryAbogus = summary.platformSignatures.signatures.find(
+                    (s) => s.platform === 'bytedance' && s.signatureName === 'a_bogus'
+                );
+                assert.ok(summaryAbogus);
+                assert.equal(summaryAbogus.correlationId, egByteDance.correlationId);
+                assert.equal(summaryAbogus.actionStep, 'step-14-bytedance');
+                assert.equal(summaryAbogus.triggerActionId, trigBytedance.actionId);
+
+                const summaryTwitterTx = summary.platformSignatures.signatures.find(
+                    (s) =>
+                        s.platform === 'twitter' &&
+                        s.signatureName === 'x-client-transaction-id'
+                );
+                assert.ok(summaryTwitterTx);
+                assert.equal(summaryTwitterTx.correlationId, egTwitter.correlationId);
+                assert.equal(summaryTwitterTx.actionStep, 'step-14-twitter');
+                assert.equal(summaryTwitterTx.triggerActionId, trigTwitter.actionId);
+
+                const summaryMetaJazoest = summary.platformSignatures.signatures.find(
+                    (s) => s.platform === 'meta' && s.signatureName === 'jazoest'
+                );
+                assert.ok(summaryMetaJazoest);
+                assert.equal(summaryMetaJazoest.correlationId, egMeta.correlationId);
+                assert.equal(summaryMetaJazoest.actionStep, 'step-14-meta');
+                assert.equal(summaryMetaJazoest.triggerActionId, trigMeta.actionId);
+
+                const summaryGoogleBg = summary.platformSignatures.signatures.find(
+                    (s) => s.platform === 'google' && s.signatureName === 'bgRequest'
+                );
+                assert.ok(summaryGoogleBg);
+                assert.equal(summaryGoogleBg.correlationId, egGoogle.correlationId);
+                assert.equal(summaryGoogleBg.actionStep, 'step-14-google');
+                assert.equal(summaryGoogleBg.triggerActionId, trigGoogle.actionId);
+
+                const summaryArkoseBda = summary.platformSignatures.signatures.find(
+                    (s) => s.platform === 'arkose' && s.signatureName === 'bda'
+                );
+                assert.ok(summaryArkoseBda);
+                assert.equal(summaryArkoseBda.correlationId, egArkose.correlationId);
+                assert.equal(summaryArkoseBda.actionStep, 'step-14-arkose');
+                assert.equal(summaryArkoseBda.triggerActionId, trigArkose.actionId);
+
+                // Verify CLI --signatures --json and --platform=bytedance --json
+                const cliScriptPath = path.join(__dirname, 'query-traffic-attribution.js');
+                const allSigsOut = execFileSync(
+                    process.execPath,
+                    [
+                        cliScriptPath,
+                        `--profiles-dir=${tempProfilesDir}`,
+                        '--profile=traffic-test-14-platform-signatures',
+                        '--signatures',
+                        '--json'
+                    ],
+                    { encoding: 'utf8' }
+                );
+                const allSigsJson = JSON.parse(allSigsOut);
+                assert.equal(allSigsJson.mode, 'signatures');
+                assert.equal(allSigsJson.count, summary.platformSignatures.totalDetected);
+                assert.deepEqual(
+                    allSigsJson.byPlatform,
+                    summary.platformSignatures.byPlatform
+                );
+
+                const bytedanceSigsOut = execFileSync(
+                    process.execPath,
+                    [
+                        cliScriptPath,
+                        `--profiles-dir=${tempProfilesDir}`,
+                        '--profile=traffic-test-14-platform-signatures',
+                        '--signatures',
+                        '--platform=bytedance',
+                        '--json'
+                    ],
+                    { encoding: 'utf8' }
+                );
+                const bytedanceSigsJson = JSON.parse(bytedanceSigsOut);
+                assert.equal(bytedanceSigsJson.mode, 'signatures');
+                assert.equal(bytedanceSigsJson.platform, 'bytedance');
+                assert.equal(bytedanceSigsJson.count, 2);
+                assert.equal(
+                    bytedanceSigsJson.signatures.every((s) => s.platform === 'bytedance'),
+                    true
+                );
+
+                const bytedancePlatformQueryOut = execFileSync(
+                    process.execPath,
+                    [
+                        cliScriptPath,
+                        `--profiles-dir=${tempProfilesDir}`,
+                        '--profile=traffic-test-14-platform-signatures',
+                        '--platform=bytedance',
+                        '--json'
+                    ],
+                    { encoding: 'utf8' }
+                );
+                const bytedancePlatformQueryJson = JSON.parse(bytedancePlatformQueryOut);
+                assert.equal(bytedancePlatformQueryJson.transactionsCount, 1);
+                assert.equal(
+                    bytedancePlatformQueryJson.transactions[0].correlationId,
+                    egByteDance.correlationId
+                );
+                assert.equal(
+                    bytedancePlatformQueryJson.platformSignatures.signatures.every(
+                        (s) => s.platform === 'bytedance'
+                    ),
+                    true
+                );
+
+                await profile.delete();
+            }
+        );
+
+        // =========================================================================
+        // Test 15: pre-tls-wire.log SHA-256 Tamper Detection, Orphan Payload File Detection & URL Query / Authorization Secret Redaction
+        // =========================================================================
+        await testSection(
+            'Test 15: pre-tls-wire.log SHA-256 Tamper Detection, Orphan Payload File Detection & URL Query / Authorization Secret Redaction',
+            async () => {
+                const profile = await createAndStartProfile(
+                    'Traffic_Test_15_WireIntegrityAndSecrets',
+                    'http://10.106.0.1:8080',
+                    {
+                        profileId: 'traffic-test-15-wire-integrity',
+                        os: 'windows',
+                        profilesDir: tempProfilesDir,
+                        useSharedBrowser: false,
+                        accountId: 'acct-wire-15',
+                        accountEmail: 'wire15@gmail.com'
+                    }
+                );
+
+                const context = await profile.getContext();
+                const trafficDir = profile.trafficPaths.trafficDir;
+                const ndjsonPath = profile.trafficPaths.trafficNdjsonPath;
+                const wireLogPath = profile.trafficPaths.preTlsWireLogPath;
+                const payloadsDir = profile.trafficPaths.payloadsDir;
+
+                profile.setTrafficStep('step-15-auth-request');
+
+                const rawApiKey = 'my_raw_secret_api_key_999';
+                const rawPassword = 'my_raw_password_888';
+                const rawJwtBearer = 'my_raw_jwt_bearer_token_777';
+
+                const req15 = createMockRequest({
+                    method: 'POST',
+                    url: `https://api.example.com/v1/auth?api_key=${rawApiKey}&password=${rawPassword}`,
+                    resourceType: 'fetch',
+                    headersArray: [
+                        { name: 'Host', value: 'api.example.com' },
+                        {
+                            name: 'User-Agent',
+                            value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0'
+                        },
+                        { name: 'Authorization', value: `Bearer ${rawJwtBearer}` },
+                        { name: 'Content-Type', value: 'application/json' }
+                    ],
+                    postData: JSON.stringify({ client: 'camoufox-test-15' })
+                });
+
+                const res15 = createMockResponse({
+                    request: req15,
+                    status: 200,
+                    statusText: 'OK',
+                    headersArray: [{ name: 'Content-Type', value: 'application/json' }],
+                    body: JSON.stringify({ authenticated: true })
+                });
+
+                await emitHttpTransaction(context, req15, res15);
+                const summary = await profile.getTrafficAttribution();
+                await profile.stop();
+
+                const ndjsonRaw = fs.readFileSync(ndjsonPath, 'utf8');
+                const wireLogRaw = fs.readFileSync(wireLogPath, 'utf8');
+
+                // 1) Verify neither my_raw_secret_api_key_999, my_raw_password_888, nor my_raw_jwt_bearer_token_777
+                //    appears in plaintext anywhere in traffic.ndjson or pre-tls-wire.log
+                for (const secret of [rawApiKey, rawPassword, rawJwtBearer]) {
+                    assert.equal(
+                        ndjsonRaw.includes(secret),
+                        false,
+                        `Raw secret "${secret}" must never appear in traffic.ndjson`
+                    );
+                    assert.equal(
+                        wireLogRaw.includes(secret),
+                        false,
+                        `Raw secret "${secret}" must never appear in pre-tls-wire.log`
+                    );
+                }
+
+                const expectedApiKeyTag = `[REDACTED:${sha256Hex(rawApiKey).slice(0, 8)}]`;
+                const expectedPasswordTag = `[REDACTED:${sha256Hex(rawPassword).slice(0, 8)}]`;
+
+                assert.equal(
+                    ndjsonRaw.includes(expectedApiKeyTag),
+                    true,
+                    `Expected traffic.ndjson to contain ${expectedApiKeyTag}`
+                );
+                assert.equal(
+                    ndjsonRaw.includes(expectedPasswordTag),
+                    true,
+                    `Expected traffic.ndjson to contain ${expectedPasswordTag}`
+                );
+                assert.equal(
+                    wireLogRaw.includes(expectedApiKeyTag),
+                    true,
+                    `Expected pre-tls-wire.log to contain ${expectedApiKeyTag}`
+                );
+                assert.equal(
+                    wireLogRaw.includes(expectedPasswordTag),
+                    true,
+                    `Expected pre-tls-wire.log to contain ${expectedPasswordTag}`
+                );
+                assert.equal(
+                    wireLogRaw.includes('Authorization: Bearer [REDACTED]'),
+                    true,
+                    'Expected pre-tls-wire.log to show Authorization: Bearer [REDACTED]'
+                );
+
+                // 2) Verify verifyTrafficIntegrity(trafficDir).valid === true on the clean directory
+                assert.ok(
+                    summary.integrity.preTlsWireLogSha256,
+                    'Expected summary.integrity.preTlsWireLogSha256 to be recorded'
+                );
+                assert.ok(summary.integrity.preTlsWireLogBytes > 0);
+
+                const cleanCheck = verifyTrafficIntegrity(trafficDir);
+                assert.equal(
+                    cleanCheck.valid,
+                    true,
+                    `Expected clean trafficDir to pass verifyTrafficIntegrity, got errors: ${cleanCheck.errors.join('; ')}`
+                );
+
+                // 3) Modify 1 byte in pre-tls-wire.log and verify verifyTrafficIntegrity(trafficDir).valid === false
+                const originalWireBuf = fs.readFileSync(wireLogPath);
+                const tamperedWireBuf = Buffer.from(originalWireBuf);
+                tamperedWireBuf[0] = tamperedWireBuf[0] ^ 0xff;
+                fs.writeFileSync(wireLogPath, tamperedWireBuf);
+
+                const wireTamperCheck = verifyTrafficIntegrity(trafficDir);
+                assert.equal(
+                    wireTamperCheck.valid,
+                    false,
+                    'Expected verifyTrafficIntegrity(trafficDir).valid === false after modifying 1 byte in pre-tls-wire.log'
+                );
+                assert.equal(
+                    wireTamperCheck.errors.some((e) => e.includes('pre-tls-wire.log SHA-256 mismatch')),
+                    true,
+                    `Expected pre-tls-wire.log SHA-256 mismatch error, got: ${wireTamperCheck.errors.join('; ')}`
+                );
+
+                // Restore pre-tls-wire.log and verify integrity is valid again
+                fs.writeFileSync(wireLogPath, originalWireBuf);
+                assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+
+                // 4) Write an unindexed orphan file payloads/rogue-injected.bin into payloads/ and verify detection
+                const orphanPath = path.join(payloadsDir, 'rogue-injected.bin');
+                fs.writeFileSync(orphanPath, Buffer.from('rogue-unindexed-payload-bytes', 'utf8'));
+
+                const orphanCheck = verifyTrafficIntegrity(trafficDir);
+                assert.equal(
+                    orphanCheck.valid,
+                    false,
+                    'Expected verifyTrafficIntegrity(trafficDir).valid === false when unindexed orphan file exists in payloads/'
+                );
+                assert.equal(
+                    orphanCheck.errors.some((e) => e.includes('payloads/rogue-injected.bin')),
+                    true,
+                    `Expected orphan payload error referencing payloads/rogue-injected.bin, got: ${orphanCheck.errors.join('; ')}`
+                );
+
+                // Remove orphan file and confirm directory is clean again
+                fs.unlinkSync(orphanPath);
+                assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+
+                await profile.delete();
+            }
+        );
+
         console.log(`\n🎉 All ${passedTests} Camoufox pre-TLS traffic attribution & isolation test suites passed!`);
     } finally {
         setCamoufoxModule(null);

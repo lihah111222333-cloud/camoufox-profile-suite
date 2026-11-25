@@ -12,12 +12,18 @@
 import assert from 'node:assert/strict';
 import {
     CAMOUFOX_COHERENCE_CONSTANTS,
+    APPLE_SILICON_SKU_CATALOG,
+    PC_CPU_SKU_CATALOG,
+    PC_GPU_SKU_CATALOG,
+    parseAppleSiliconSkuName,
+    validateHardwareModelSpec,
     normalizeTargetOs,
     gpuFitsOs,
     evaluatePlatformCoherence,
     evaluateWireToDomCoherence,
     auditProfileCoherence
 } from '../src/camoufox/coherence-auditor.js';
+import { CamoufoxProfile } from '../src/camoufox/profile.js';
 
 function float64ToHex(val) {
     const buf = new ArrayBuffer(8);
@@ -200,7 +206,13 @@ function buildCoherentTelemetry(os = 'windows') {
             shadingLanguageVersion: 'WebGL GLSL ES 3.00',
             unmaskedVendor: p.unmaskedVendor,
             unmaskedRenderer: p.unmaskedRenderer,
-            extensionsCount: 28
+            extensionsCount: 28,
+            maxTextureSize: 16384,
+            maxCubeMapTextureSize: 16384,
+            maxRenderbufferSize: 16384,
+            maxViewportDims: os === 'windows' ? [32768, 32768] : [16384, 16384],
+            maxVertexAttribs: 16,
+            aliasedLineWidthRange: [1, 1]
         },
         canvas2d: {
             available: true,
@@ -292,6 +304,29 @@ function buildCoherentTelemetry(os = 'windows') {
             hasOpenDatabase: false,
             hasMozInnerScreenX: true,
             performanceNowMonotonic: true
+        },
+        webgpu: {
+            available: os !== 'linux',
+            requestAdapterNative: true
+        },
+        stackAndMediaHygiene: {
+            hasAtSignFormat: true,
+            leakedStackMarkers: [],
+            enumerateDevicesNative: true,
+            unpermittedLabelsLeaked: false,
+            mediaDevices: {
+                available: true,
+                enumerateDevicesNative: true,
+                unpermittedLabelsLeaked: false
+            }
+        },
+        hardwareProfile: {
+            ramGb: 16,
+            storageGb: 512
+        },
+        storageEstimate: {
+            quotaBytes: 21474836480,
+            usageBytes: 4096
         }
     };
 }
@@ -310,7 +345,7 @@ const tests = [
             const res = evaluatePlatformCoherence(telemetry, 'windows');
             assert.equal(res.passed, true);
             assert.equal(res.score, 100);
-            assert.equal(res.checks.length, 13);
+            assert.equal(res.checks.length, 16);
             assert.ok(res.checks.every((c) => c.passed));
         }
     },
@@ -604,7 +639,7 @@ const tests = [
             assert.equal(report.passed, true);
             assert.equal(report.score, 100);
             assert.equal(report.expectedOs, 'mac');
-            assert.equal(report.checks.length, 13);
+            assert.equal(report.checks.length, 16);
         }
     },
     {
@@ -700,7 +735,7 @@ const tests = [
                 const res = evaluatePlatformCoherence(telemetry, os);
                 assert.equal(res.passed, true, `Expected ${os} profile to pass`);
                 assert.equal(res.score, 100, `Expected ${os} score to be 100`);
-                assert.equal(res.checks.length, 13, `Expected 13 checks for ${os}`);
+                assert.equal(res.checks.length, 16, `Expected 16 checks for ${os}`);
                 assert.ok(res.checks.every((c) => c.passed));
 
                 // Also verify backward compatibility when older synthetic fixtures omit the optional fields
@@ -711,10 +746,14 @@ const tests = [
                 delete legacyTelemetry.fonts;
                 delete legacyTelemetry.iframeParity;
                 delete legacyTelemetry.geckoApiSurface;
+                delete legacyTelemetry.webgpu;
+                delete legacyTelemetry.stackAndMediaHygiene;
+                delete legacyTelemetry.hardwareProfile;
+                delete legacyTelemetry.storageEstimate;
                 const legacyRes = evaluatePlatformCoherence(legacyTelemetry, os);
                 assert.equal(legacyRes.passed, true);
                 assert.equal(legacyRes.score, 100);
-                assert.equal(legacyRes.checks.length, 13);
+                assert.equal(legacyRes.checks.length, 16);
             }
         }
     },
@@ -954,11 +993,538 @@ const tests = [
                 const res = evaluatePlatformCoherence(telemetry, os);
                 assert.equal(res.passed, true, `Expected ${os} profile to pass`);
                 assert.equal(res.score, 100, `Expected ${os} score to be 100`);
-                assert.equal(res.checks.length, 13, `Expected 13 checks for ${os}`);
+                assert.equal(res.checks.length, 16, `Expected 16 checks for ${os}`);
                 assert.ok(res.checks.every((c) => c.passed));
                 assert.equal(findCheck(res, 'iframe-contentwindow-parity').passed, true);
                 assert.equal(findCheck(res, 'gecko-api-surface-coherence').passed, true);
             }
+        }
+    },
+    {
+        name: '41. Detects navigator.gpu (WebGPU) exposed on a Linux Firefox profile or non-native requestAdapter',
+        fn: () => {
+            const linuxTelemetry = buildCoherentTelemetry('linux');
+            linuxTelemetry.webgpu = {
+                available: true,
+                requestAdapterNative: true
+            };
+            const linuxRes = evaluatePlatformCoherence(linuxTelemetry, 'linux');
+            assert.equal(linuxRes.passed, false);
+            const linuxCheck = findCheck(linuxRes, 'webgpu-os-coherence');
+            assert.equal(linuxCheck.passed, false);
+            assert.match(linuxCheck.details, /Linux identity exposes navigator\.gpu/);
+
+            const winTelemetry = buildCoherentTelemetry('windows');
+            winTelemetry.webgpu = {
+                available: true,
+                requestAdapterNative: false
+            };
+            const winRes = evaluatePlatformCoherence(winTelemetry, 'windows');
+            assert.equal(winRes.passed, false);
+            const winCheck = findCheck(winRes, 'webgpu-os-coherence');
+            assert.equal(winCheck.passed, false);
+            assert.match(winCheck.details, /navigator\.gpu\.requestAdapter is not \[native code\]/);
+        }
+    },
+    {
+        name: '42. Detects navigator.gpu (WebGPU) exposed on an Intel Mac (non-Apple-Silicon) profile',
+        fn: () => {
+            const macTelemetry = buildCoherentTelemetry('macos');
+            macTelemetry.webgl.unmaskedRenderer = 'Intel(R) Iris(TM) Plus Graphics 655';
+            macTelemetry.navigator.hardwareConcurrency = 8;
+            macTelemetry.worker.hardwareConcurrency = 8;
+            macTelemetry.iframeParity.hardwareConcurrency = 8;
+            macTelemetry.screen.width = 1440;
+            macTelemetry.screen.height = 900;
+            macTelemetry.screen.availWidth = 1440;
+            macTelemetry.screen.availHeight = 860;
+            macTelemetry.iframeParity.width = 1440;
+            macTelemetry.iframeParity.height = 900;
+            macTelemetry.webgpu = {
+                available: true,
+                requestAdapterNative: true
+            };
+            const res = evaluatePlatformCoherence(macTelemetry, 'macos');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'webgpu-os-coherence');
+            assert.equal(check.passed, false);
+            assert.match(check.details, /macOS identity exposes navigator\.gpu \(WebGPU\) on non-Apple-Silicon renderer/);
+        }
+    },
+    {
+        name: '43. Detects V8 "    at " Error.stack format or leaked __puppeteer_evaluation_script__ / __playwright stack frames',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('windows');
+            telemetry.stackAndMediaHygiene.hasAtSignFormat = false;
+            telemetry.stackAndMediaHygiene.leakedStackMarkers = [
+                '__puppeteer_evaluation_script__',
+                '__playwright'
+            ];
+            const res = evaluatePlatformCoherence(telemetry, 'windows');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'stack-trace-and-mediadevices-hygiene');
+            assert.equal(check.passed, false);
+            assert.match(check.details, /Error\.prototype\.stack uses V8\/Chromium/);
+            assert.match(check.details, /__puppeteer_evaluation_script__/);
+            assert.match(check.details, /__playwright/);
+        }
+    },
+    {
+        name: '44. Detects non-native MediaDevices.prototype.enumerateDevices or unpermitted device hardware labels leaked before permission grant',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('windows');
+            telemetry.stackAndMediaHygiene.enumerateDevicesNative = false;
+            telemetry.stackAndMediaHygiene.unpermittedLabelsLeaked = true;
+            const res = evaluatePlatformCoherence(telemetry, 'windows');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'stack-trace-and-mediadevices-hygiene');
+            assert.equal(check.passed, false);
+            assert.match(check.details, /MediaDevices\.prototype\.enumerateDevices is not \[native code\]/);
+            assert.match(check.details, /leaked non-empty hardware device labels without active media permission/);
+        }
+    },
+    {
+        name: '45. Full 16/16 coherence check validation across Windows, macOS, and Linux profiles (100/100)',
+        fn: () => {
+            assert.deepEqual(CAMOUFOX_COHERENCE_CONSTANTS.forbiddenStackMarkers, [
+                '__puppeteer_evaluation_script__',
+                '__playwright',
+                'UtilityScript',
+                'pptr:',
+                'evaluateOnNewDocument',
+                'juggler://',
+                'webdriver'
+            ]);
+            for (const os of ['windows', 'macos', 'linux']) {
+                const telemetry = buildCoherentTelemetry(os);
+                const res = evaluatePlatformCoherence(telemetry, os);
+                assert.equal(res.passed, true, `Expected ${os} profile to pass all 16 checks`);
+                assert.equal(res.score, 100, `Expected ${os} score to be 100`);
+                assert.equal(res.checks.length, 16, `Expected 16 checks for ${os}`);
+                assert.ok(res.checks.every((c) => c.passed));
+                assert.equal(findCheck(res, 'webgpu-os-coherence').passed, true);
+                assert.equal(findCheck(res, 'stack-trace-and-mediadevices-hygiene').passed, true);
+                assert.equal(findCheck(res, 'exact-hardware-sku-model-coherence').passed, true);
+            }
+        }
+    },
+    {
+        name: '46. End-to-end CamoufoxProfile.auditCoherence() integration with evaluateWireToDomCoherence on an active profile',
+        fn: async () => {
+            const telemetry = buildCoherentTelemetry('windows');
+            const profile = new CamoufoxProfile('unit-test-profile-win', { os: 'windows' });
+            profile.metadata = { os: 'windows' };
+            profile.page = {
+                isClosed: () => false,
+                async evaluate() {
+                    return telemetry;
+                }
+            };
+            profile.trafficRecorder = {
+                transactions: new Map([
+                    [
+                        'tx-1',
+                        {
+                            correlationId: 'tx-1',
+                            url: 'https://accounts.google.com/v3/signin',
+                            headers: {
+                                'User-Agent': telemetry.navigator.userAgent,
+                                'Accept-Language': 'en-US,en;q=0.5'
+                            }
+                        }
+                    ]
+                ])
+            };
+
+            const report = await profile.auditCoherence();
+            assert.equal(report.passed, true);
+            assert.equal(report.score, 100);
+            assert.equal(report.expectedOs, 'win');
+            assert.equal(report.checks.length, 16);
+            assert.ok(report.wireToDomCoherence, 'Expected wireToDomCoherence report to be attached');
+            assert.equal(report.wireToDomCoherence.passed, true);
+            assert.equal(report.wireToDomCoherence.score, 100);
+            assert.equal(report.wireToDomCoherence.inspectedRequests, 1);
+            assert.equal(report.wireToDomCoherence.checks.length, 4);
+        }
+    },
+    {
+        name: '47. Exact SKU Audit: Rejects Apple M1 CPU paired with Apple M2 GPU (Unified SoC die cannot mix different Apple M chips)',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('macos');
+            telemetry.hardwareProfile = {
+                cpuModel: 'Apple M1',
+                gpuModel: 'Apple M2',
+                ramGb: 16,
+                storageGb: 512
+            };
+            telemetry.webgl.unmaskedRenderer = 'Apple M2';
+            telemetry.navigator.hardwareConcurrency = 8;
+            telemetry.worker.hardwareConcurrency = 8;
+            telemetry.iframeParity.hardwareConcurrency = 8;
+            telemetry.screen.width = 1440;
+            telemetry.screen.height = 900;
+            telemetry.screen.availWidth = 1440;
+            telemetry.screen.availHeight = 860;
+            telemetry.iframeParity.width = 1440;
+            telemetry.iframeParity.height = 900;
+
+            const res = evaluatePlatformCoherence(telemetry, 'macos');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'exact-hardware-sku-model-coherence');
+            assert.equal(check.passed, false);
+            assert.match(
+                check.details,
+                /Apple Silicon SoC CPU\/GPU model mismatch: CPU is "Apple M1" but WebGL GPU renderer is "Apple M2"/
+            );
+        }
+    },
+    {
+        name: '48. Exact SKU Audit: Rejects base Apple M1 with 32GB/64GB/128GB RAM (M1 maxes out at 16GB) or 10/12 cores (M1 is 8-core only)',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('macos');
+            telemetry.webgl.unmaskedRenderer = 'Apple M1';
+            telemetry.hardwareProfile = {
+                cpuModel: 'Apple M1',
+                gpuModel: 'Apple M1',
+                ramGb: 128,
+                storageGb: 512
+            };
+            telemetry.navigator.hardwareConcurrency = 12;
+            telemetry.worker.hardwareConcurrency = 12;
+            telemetry.iframeParity.hardwareConcurrency = 12;
+            telemetry.screen.width = 1440;
+            telemetry.screen.height = 900;
+            telemetry.screen.availWidth = 1440;
+            telemetry.screen.availHeight = 860;
+            telemetry.iframeParity.width = 1440;
+            telemetry.iframeParity.height = 900;
+
+            const res = evaluatePlatformCoherence(telemetry, 'macos');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'exact-hardware-sku-model-coherence');
+            assert.equal(check.passed, false);
+            assert.match(
+                check.details,
+                /Apple M1 exact core count violation: navigator\.hardwareConcurrency=12 is invalid for Apple M1 \(physical options: \[8\] cores\)/
+            );
+            assert.match(
+                check.details,
+                /Apple M1 exact Unified Memory \(RAM\) violation: ramGb=128GB does not exist on Apple M1 \(factory RAM tiers: \[8GB, 16GB\]\)/
+            );
+        }
+    },
+    {
+        name: '49. Exact SKU Audit: Rejects Apple M1 Max with 128GB RAM (M1 Max ceiling is 64GB) or 8 cores (M1 Max is 10-core only)',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('macos');
+            telemetry.webgl.unmaskedRenderer = 'Apple M1 Max';
+            telemetry.hardwareProfile = {
+                cpuModel: 'Apple M1 Max',
+                gpuModel: 'Apple M1 Max',
+                ramGb: 128,
+                storageGb: 1024
+            };
+            telemetry.navigator.hardwareConcurrency = 8;
+            telemetry.worker.hardwareConcurrency = 8;
+            telemetry.iframeParity.hardwareConcurrency = 8;
+
+            const res = evaluatePlatformCoherence(telemetry, 'macos');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'exact-hardware-sku-model-coherence');
+            assert.equal(check.passed, false);
+            assert.match(
+                check.details,
+                /Apple M1 Max exact core count violation: navigator\.hardwareConcurrency=8 is invalid for Apple M1 Max \(physical options: \[10\] cores\)/
+            );
+            assert.match(
+                check.details,
+                /Apple M1 Max exact Unified Memory \(RAM\) violation: ramGb=128GB does not exist on Apple M1 Max \(factory RAM tiers: \[32GB, 64GB\]\)/
+            );
+        }
+    },
+    {
+        name: '50. Exact SKU Audit: Rejects Apple M3 Pro with 16GB or 32GB RAM (192-bit bus only supports 18GB/36GB) and 14-core M3 Max with 128GB RAM',
+        fn: () => {
+            const m3Pro = buildCoherentTelemetry('macos');
+            m3Pro.webgl.unmaskedRenderer = 'Apple M3 Pro';
+            m3Pro.hardwareProfile = {
+                cpuModel: 'Apple M3 Pro',
+                gpuModel: 'Apple M3 Pro',
+                ramGb: 32,
+                storageGb: 512
+            };
+            m3Pro.navigator.hardwareConcurrency = 12;
+            m3Pro.worker.hardwareConcurrency = 12;
+            m3Pro.iframeParity.hardwareConcurrency = 12;
+
+            const resPro = evaluatePlatformCoherence(m3Pro, 'macos');
+            assert.equal(resPro.passed, false);
+            const checkPro = findCheck(resPro, 'exact-hardware-sku-model-coherence');
+            assert.equal(checkPro.passed, false);
+            assert.match(
+                checkPro.details,
+                /Apple M3 Pro exact Unified Memory \(RAM\) violation: ramGb=32GB does not exist on Apple M3 Pro \(factory RAM tiers: \[18GB, 36GB\]\)/
+            );
+
+            // 14-core M3 Max only supports 36GB or 96GB (128GB requires 16-core M3 Max 512-bit bus)
+            const m3Max14 = buildCoherentTelemetry('macos');
+            m3Max14.webgl.unmaskedRenderer = 'Apple M3 Max';
+            m3Max14.hardwareProfile = {
+                cpuModel: 'Apple M3 Max',
+                gpuModel: 'Apple M3 Max',
+                ramGb: 128,
+                storageGb: 1024
+            };
+            m3Max14.navigator.hardwareConcurrency = 14;
+            m3Max14.worker.hardwareConcurrency = 14;
+            m3Max14.iframeParity.hardwareConcurrency = 14;
+
+            const resMax = evaluatePlatformCoherence(m3Max14, 'macos');
+            assert.equal(resMax.passed, false);
+            const checkMax = findCheck(resMax, 'exact-hardware-sku-model-coherence');
+            assert.equal(checkMax.passed, false);
+            assert.match(
+                checkMax.details,
+                /Apple M3 Max \(14-core die\) cannot be configured with 128GB Unified Memory \(allowed RAM for 14-core Apple M3 Max: \[36GB, 96GB\]\)/
+            );
+        }
+    },
+    {
+        name: '51. Exact SKU Audit: Rejects base Apple M1 behind notched 14" Pro panel (1512x982) and desktop-only Apple M2 Ultra behind laptop notched panel',
+        fn: () => {
+            const m1Notched = buildCoherentTelemetry('macos');
+            m1Notched.webgl.unmaskedRenderer = 'Apple M1';
+            m1Notched.hardwareProfile = {
+                cpuModel: 'Apple M1',
+                gpuModel: 'Apple M1',
+                ramGb: 16,
+                storageGb: 512
+            };
+            m1Notched.navigator.hardwareConcurrency = 8;
+            m1Notched.worker.hardwareConcurrency = 8;
+            m1Notched.iframeParity.hardwareConcurrency = 8;
+            // Keep 1512x982 notched 14" MacBook Pro screen resolution
+            const resM1 = evaluatePlatformCoherence(m1Notched, 'macos');
+            assert.equal(resM1.passed, false);
+            const checkM1 = findCheck(resM1, 'exact-hardware-sku-model-coherence');
+            assert.equal(checkM1.passed, false);
+            assert.match(
+                checkM1.details,
+                /Apple M1 \(2020 13\.3" MacBook Air\/Pro\) did not ship with a notched Liquid Retina display panel \(1512x982\)/
+            );
+
+            const m2UltraLaptop = buildCoherentTelemetry('macos');
+            m2UltraLaptop.webgl.unmaskedRenderer = 'Apple M2 Ultra';
+            m2UltraLaptop.hardwareProfile = {
+                cpuModel: 'Apple M2 Ultra',
+                gpuModel: 'Apple M2 Ultra',
+                ramGb: 128,
+                storageGb: 2048
+            };
+            m2UltraLaptop.navigator.hardwareConcurrency = 24;
+            m2UltraLaptop.worker.hardwareConcurrency = 24;
+            m2UltraLaptop.iframeParity.hardwareConcurrency = 24;
+            // 1512x982 is a laptop notched panel, impossible on Mac Studio / Mac Pro
+            const resUltra = evaluatePlatformCoherence(m2UltraLaptop, 'macos');
+            assert.equal(resUltra.passed, false);
+            const checkUltra = findCheck(resUltra, 'exact-hardware-sku-model-coherence');
+            assert.equal(checkUltra.passed, false);
+            assert.match(
+                checkUltra.details,
+                /Apple M2 Ultra is a desktop-only SoC \(Mac Studio \/ Mac Pro\) and cannot be paired with built-in MacBook laptop display panel 1512x982/
+            );
+        }
+    },
+    {
+        name: '52. Exact SKU Audit: Rejects impossible SSD storage capacities (Apple M1 with 4096GB SSD) and StorageManager quota exceeding physical disk size',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('macos');
+            telemetry.webgl.unmaskedRenderer = 'Apple M1';
+            telemetry.navigator.hardwareConcurrency = 8;
+            telemetry.worker.hardwareConcurrency = 8;
+            telemetry.iframeParity.hardwareConcurrency = 8;
+            telemetry.screen.width = 1440;
+            telemetry.screen.height = 900;
+            telemetry.screen.availWidth = 1440;
+            telemetry.screen.availHeight = 860;
+            telemetry.iframeParity.width = 1440;
+            telemetry.iframeParity.height = 900;
+            telemetry.hardwareProfile = {
+                cpuModel: 'Apple M1',
+                gpuModel: 'Apple M1',
+                ramGb: 16,
+                storageGb: 4096 // M1 maxes out at 2048GB (2TB)
+            };
+            telemetry.storageEstimate = {
+                quotaBytes: 5000 * 1024 ** 3, // 5000 GiB quota > 4096 GiB physical disk
+                usageBytes: 1024
+            };
+
+            const res = evaluatePlatformCoherence(telemetry, 'macos');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'exact-hardware-sku-model-coherence');
+            assert.equal(check.passed, false);
+            assert.match(
+                check.details,
+                /Apple M1 exact SSD storage capacity violation: storageGb=4096GB is not a valid factory SSD tier for Apple M1/
+            );
+            assert.match(
+                check.details,
+                /Browser StorageManager quotaBytes .* exceeds physical disk capacity storageGb/
+            );
+        }
+    },
+    {
+        name: '53. Exact SKU Audit: Rejects PC CPU model thread count mismatch, RAM ceiling overflow, and Intel CPU + AMD APU iGPU mismatch',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('windows');
+            telemetry.hardwareProfile = {
+                cpuModel: 'Intel Core i7-13700K', // 16C/24T, max 192GB RAM
+                gpuModel: 'NVIDIA GeForce RTX 3060',
+                ramGb: 256, // exceeds 192GB ceiling
+                storageGb: 1024
+            };
+            // Leave hardwareConcurrency at 8 (mismatch against i7-13700K allowed [16, 24])
+            const res = evaluatePlatformCoherence(telemetry, 'windows');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'exact-hardware-sku-model-coherence');
+            assert.equal(check.passed, false);
+            assert.match(
+                check.details,
+                /CPU SKU "Intel Core i7-13700K" thread count violation: navigator\.hardwareConcurrency=8 does not match Intel Core i7-13700K \(16C\/24T, allowed: \[16, 24\]\)/
+            );
+            assert.match(
+                check.details,
+                /CPU SKU "Intel Core i7-13700K" RAM capacity violation: ramGb=256GB exceeds 192GB hardware ceiling/
+            );
+
+            // Also verify Intel CPU paired with AMD Radeon integrated APU is rejected
+            const igpuMismatch = buildCoherentTelemetry('windows');
+            igpuMismatch.hardwareProfile = {
+                cpuModel: 'Intel Core i5-12400',
+                ramGb: 16,
+                storageGb: 512
+            };
+            igpuMismatch.navigator.hardwareConcurrency = 12;
+            igpuMismatch.worker.hardwareConcurrency = 12;
+            igpuMismatch.iframeParity.hardwareConcurrency = 12;
+            igpuMismatch.webgl.unmaskedVendor = 'Google Inc. (AMD)';
+            igpuMismatch.webgl.unmaskedRenderer =
+                'ANGLE (AMD, AMD Radeon(TM) Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)';
+
+            const resIgpu = evaluatePlatformCoherence(igpuMismatch, 'windows');
+            assert.equal(resIgpu.passed, false);
+            const checkIgpu = findCheck(resIgpu, 'exact-hardware-sku-model-coherence');
+            assert.equal(checkIgpu.passed, false);
+            assert.match(
+                checkIgpu.details,
+                /CPU SKU "Intel Core i5-12400" \(INTEL\) cannot pair with integrated AMD iGPU/
+            );
+        }
+    },
+    {
+        name: '54. Exact SKU Audit: Rejects Windows ANGLE unmaskedVendor vs unmaskedRenderer inner vendor mismatch and D3D11 vs_3_0 shader model contradiction',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('windows');
+            telemetry.webgl.unmaskedVendor = 'Google Inc. (Intel)';
+            telemetry.webgl.unmaskedRenderer =
+                'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_3_0 ps_3_0, D3D11)';
+
+            const res = evaluatePlatformCoherence(telemetry, 'windows');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'exact-hardware-sku-model-coherence');
+            assert.equal(check.passed, false);
+            assert.match(
+                check.details,
+                /Windows ANGLE vendor mismatch: unmaskedVendor is "Google Inc\. \(Intel\)" .* but unmaskedRenderer is "ANGLE \(NVIDIA/
+            );
+            assert.match(
+                check.details,
+                /Windows ANGLE Direct3D11 renderer .* reports legacy Direct3D9 shader model/
+            );
+        }
+    },
+    {
+        name: '55. Exact SKU Audit: Rejects WebGL hardware limit tampering (MAX_TEXTURE_SIZE=4096 or ALIASED_LINE_WIDTH_RANGE=[1, 10] on ANGLE/Metal)',
+        fn: () => {
+            const telemetry = buildCoherentTelemetry('macos');
+            telemetry.webgl.maxTextureSize = 4096;
+            telemetry.webgl.aliasedLineWidthRange = [1, 10];
+
+            const res = evaluatePlatformCoherence(telemetry, 'macos');
+            assert.equal(res.passed, false);
+            const check = findCheck(res, 'exact-hardware-sku-model-coherence');
+            assert.equal(check.passed, false);
+            assert.match(
+                check.details,
+                /WebGL MAX_TEXTURE_SIZE=4096 contradicts GPU SKU "Apple M2 Pro" hardware specification \(expected 16384\)/
+            );
+            assert.match(
+                check.details,
+                /WebGL ALIASED_LINE_WIDTH_RANGE=\[1, 10\] is invalid for macOS Metal \(must be \[1, 1\]\)/
+            );
+        }
+    },
+    {
+        name: '56. Exact SKU Audit: Valid exact device SKU profiles (Apple M3 Pro 12C/18GB/512GB, Intel i7-13700K 24T/32GB/1TB + RTX 3060, AMD Ryzen 7 7800X3D 16T/32GB/2TB) pass 16/16 checks (100/100)',
+        fn: () => {
+            assert.equal(parseAppleSiliconSkuName('Apple M3 Pro'), 'Apple M3 Pro');
+            assert.ok(APPLE_SILICON_SKU_CATALOG['Apple M1 Max'].allowedRamGb.includes(64));
+            assert.equal(APPLE_SILICON_SKU_CATALOG['Apple M1 Max'].allowedRamGb.includes(128), false);
+            assert.ok(PC_CPU_SKU_CATALOG['Intel Core i7-13700K']);
+            assert.ok(PC_GPU_SKU_CATALOG.length >= 10);
+
+            // 1. Apple M3 Pro (12-core, 18GB Unified Memory, 512GB SSD, 1512x982 14" Pro panel)
+            const macM3Pro = buildCoherentTelemetry('macos');
+            macM3Pro.webgl.unmaskedRenderer = 'Apple M3 Pro';
+            macM3Pro.navigator.hardwareConcurrency = 12;
+            macM3Pro.worker.hardwareConcurrency = 12;
+            macM3Pro.iframeParity.hardwareConcurrency = 12;
+            macM3Pro.hardwareProfile = {
+                cpuModel: 'Apple M3 Pro',
+                gpuModel: 'Apple M3 Pro',
+                ramGb: 18,
+                storageGb: 512
+            };
+            const resMac = evaluatePlatformCoherence(macM3Pro, 'macos');
+            assert.equal(resMac.passed, true);
+            assert.equal(resMac.score, 100);
+            assert.equal(resMac.checks.length, 16);
+
+            // 2. Windows Intel Core i7-13700K (24 threads, 32GB DDR5, 1024GB NVMe, RTX 3060)
+            const win13700k = buildCoherentTelemetry('windows');
+            win13700k.navigator.hardwareConcurrency = 24;
+            win13700k.worker.hardwareConcurrency = 24;
+            win13700k.iframeParity.hardwareConcurrency = 24;
+            win13700k.hardwareProfile = {
+                cpuModel: 'Intel Core i7-13700K',
+                gpuModel: 'NVIDIA GeForce RTX 3060',
+                ramGb: 32,
+                storageGb: 1024
+            };
+            const resWin = evaluatePlatformCoherence(win13700k, 'windows');
+            assert.equal(resWin.passed, true);
+            assert.equal(resWin.score, 100);
+            assert.equal(resWin.checks.length, 16);
+
+            // 3. Linux AMD Ryzen 7 7800X3D (16 threads, 32GB DDR5, 2048GB NVMe, Radeon RX 7800 XT)
+            const lin7800x3d = buildCoherentTelemetry('linux');
+            lin7800x3d.navigator.hardwareConcurrency = 16;
+            lin7800x3d.worker.hardwareConcurrency = 16;
+            lin7800x3d.iframeParity.hardwareConcurrency = 16;
+            lin7800x3d.webgl.unmaskedVendor = 'AMD';
+            lin7800x3d.webgl.unmaskedRenderer = 'AMD Radeon RX 7800 XT (radeonsi, navi32, LLVM 17.0.6)';
+            lin7800x3d.hardwareProfile = {
+                cpuModel: 'AMD Ryzen 7 7800X3D',
+                gpuModel: 'AMD Radeon RX 7800 XT',
+                ramGb: 32,
+                storageGb: 2048
+            };
+            const resLin = evaluatePlatformCoherence(lin7800x3d, 'linux');
+            assert.equal(resLin.passed, true);
+            assert.equal(resLin.score, 100);
+            assert.equal(resLin.checks.length, 16);
         }
     }
 ];

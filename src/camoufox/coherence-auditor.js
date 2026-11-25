@@ -8,6 +8,21 @@
 
 import fs from 'fs';
 import logger from '../utils/logger.js';
+import {
+    APPLE_SILICON_SKU_CATALOG,
+    PC_CPU_SKU_CATALOG,
+    PC_GPU_SKU_CATALOG,
+    parseAppleSiliconSkuName,
+    validateHardwareModelSpec
+} from './hardware-models.js';
+
+export {
+    APPLE_SILICON_SKU_CATALOG,
+    PC_CPU_SKU_CATALOG,
+    PC_GPU_SKU_CATALOG,
+    parseAppleSiliconSkuName,
+    validateHardwareModelSpec
+};
 
 /**
  * Hardware & OS coherence constants synchronized with Camoufox `launcher-constants.json`
@@ -102,6 +117,15 @@ export const CAMOUFOX_COHERENCE_CONSTANTS = Object.freeze({
         'serial',
         'hid',
         'openDatabase'
+    ]),
+    forbiddenStackMarkers: Object.freeze([
+        '__puppeteer_evaluation_script__',
+        '__playwright',
+        'UtilityScript',
+        'pptr:',
+        'evaluateOnNewDocument',
+        'juggler://',
+        'webdriver'
     ])
 });
 
@@ -360,6 +384,8 @@ export async function collectBrowserFingerprint(page) {
                 if (gl) {
                     const dbg = gl.getExtension('WEBGL_debug_renderer_info');
                     const exts = gl.getSupportedExtensions() || [];
+                    const rawViewportDims = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
+                    const rawLineWidthRange = gl.getParameter(gl.ALIASED_LINE_WIDTH_RANGE);
                     result.webgl = {
                         available: true,
                         vendor: gl.getParameter(gl.VENDOR),
@@ -370,7 +396,13 @@ export async function collectBrowserFingerprint(page) {
                         unmaskedRenderer: dbg
                             ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)
                             : gl.getParameter(gl.RENDERER),
-                        extensionsCount: exts.length
+                        extensionsCount: exts.length,
+                        maxTextureSize: gl.getParameter(gl.MAX_TEXTURE_SIZE),
+                        maxCubeMapTextureSize: gl.getParameter(gl.MAX_CUBE_MAP_TEXTURE_SIZE),
+                        maxRenderbufferSize: gl.getParameter(gl.MAX_RENDERBUFFER_SIZE),
+                        maxViewportDims: rawViewportDims ? Array.from(rawViewportDims) : null,
+                        maxVertexAttribs: gl.getParameter(gl.MAX_VERTEX_ATTRIBS),
+                        aliasedLineWidthRange: rawLineWidthRange ? Array.from(rawLineWidthRange) : null
                     };
                 }
             } catch (err) {
@@ -739,6 +771,112 @@ export async function collectBrowserFingerprint(page) {
             performanceNowMonotonic
         };
 
+        // 10. WebGPU Availability & Native Method Probe
+        const hasWebGpu = typeof navigator !== 'undefined' && 'gpu' in navigator && Boolean(navigator.gpu);
+        let requestAdapterNative = true;
+        if (hasWebGpu) {
+            try {
+                const reqAdapter = navigator.gpu.requestAdapter;
+                requestAdapterNative =
+                    typeof reqAdapter === 'function' &&
+                    nativeCodeRegex.test(fnToString.call(reqAdapter));
+            } catch {
+                requestAdapterNative = false;
+            }
+        }
+        const webgpu = {
+            available: hasWebGpu,
+            requestAdapterNative
+        };
+
+        // 11. Error Stack Trace & MediaDevices Hygiene Probe
+        const stackMarkerList = [
+            '__puppeteer_evaluation_script__',
+            '__playwright',
+            'UtilityScript',
+            'pptr:',
+            'evaluateOnNewDocument',
+            'juggler://',
+            'webdriver'
+        ];
+        let rawStack = '';
+        try {
+            rawStack = String(new Error('probe').stack || '');
+        } catch {}
+        const hasAtSignFormat = /@/.test(rawStack) && !/^\s+at\s+/m.test(rawStack);
+        const leakedStackMarkers = stackMarkerList.filter((marker) =>
+            rawStack.toLowerCase().includes(marker.toLowerCase())
+        );
+
+        const mediaDevicesAvailable =
+            typeof navigator !== 'undefined' &&
+            typeof navigator.mediaDevices !== 'undefined' &&
+            typeof navigator.mediaDevices?.enumerateDevices === 'function';
+        let enumerateDevicesNative = true;
+        if (typeof MediaDevices !== 'undefined' && MediaDevices.prototype) {
+            enumerateDevicesNative = inspectMethod(MediaDevices.prototype, 'enumerateDevices').isNative;
+        } else if (mediaDevicesAvailable) {
+            try {
+                enumerateDevicesNative = nativeCodeRegex.test(
+                    fnToString.call(navigator.mediaDevices.enumerateDevices)
+                );
+            } catch {
+                enumerateDevicesNative = false;
+            }
+        }
+
+        let unpermittedLabelsLeaked = false;
+        if (mediaDevicesAvailable) {
+            try {
+                const devices = await Promise.race([
+                    navigator.mediaDevices.enumerateDevices(),
+                    new Promise((resolve) => setTimeout(() => resolve([]), 500))
+                ]);
+                if (Array.isArray(devices)) {
+                    unpermittedLabelsLeaked = devices.some(
+                        (d) => d && typeof d.label === 'string' && d.label.trim().length > 0
+                    );
+                }
+            } catch {
+                unpermittedLabelsLeaked = false;
+            }
+        }
+
+        const stackAndMediaHygiene = {
+            hasAtSignFormat,
+            leakedStackMarkers,
+            enumerateDevicesNative,
+            unpermittedLabelsLeaked,
+            mediaDevices: {
+                available: mediaDevicesAvailable,
+                enumerateDevicesNative,
+                unpermittedLabelsLeaked
+            }
+        };
+
+        // 12. Browser StorageManager Quota Probe (for Disk Size vs Storage Quota Coherence)
+        let storageEstimate = null;
+        if (
+            typeof navigator !== 'undefined' &&
+            navigator.storage &&
+            typeof navigator.storage.estimate === 'function'
+        ) {
+            try {
+                const est = await Promise.race([
+                    navigator.storage.estimate(),
+                    new Promise((resolve) => setTimeout(() => resolve(null), 500))
+                ]);
+                if (est && typeof est === 'object') {
+                    storageEstimate = {
+                        quotaBytes: typeof est.quota === 'number' ? est.quota : null,
+                        usageBytes: typeof est.usage === 'number' ? est.usage : null
+                    };
+                }
+            } catch {
+                storageEstimate = null;
+            }
+        }
+
         return {
             navigator: navigatorInfo,
             prototypeIntegrity,
@@ -754,7 +892,10 @@ export async function collectBrowserFingerprint(page) {
             webrtc: webrtcInfo,
             fonts,
             iframeParity,
-            geckoApiSurface
+            geckoApiSurface,
+            webgpu,
+            stackAndMediaHygiene,
+            storageEstimate
         };
     });
 }
@@ -1564,6 +1705,117 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
         });
     }
 
+    // Check 14: WebGPU OS & GPU Architecture Coherence
+    {
+        const webgpu = telemetry.webgpu;
+        const renderer = String(webgl.unmaskedRenderer || webgl.renderer || '');
+        const issues = [];
+
+        if (webgpu && typeof webgpu === 'object') {
+            if (targetOs === 'lin' && webgpu.available === true) {
+                issues.push(
+                    'Linux identity exposes navigator.gpu (WebGPU is disabled by default on Linux Desktop Firefox/Camoufox)'
+                );
+            }
+            if (webgpu.requestAdapterNative === false) {
+                issues.push('navigator.gpu.requestAdapter is not [native code]');
+            }
+            if (targetOs === 'mac' && webgpu.available === true && renderer && !renderer.includes('Apple M')) {
+                issues.push(
+                    `macOS identity exposes navigator.gpu (WebGPU) on non-Apple-Silicon renderer "${renderer}" (Camoufox only enables WebGPU on Apple Silicon Macs)`
+                );
+            }
+        }
+
+        const passed = issues.length === 0;
+        checks.push({
+            name: 'webgpu-os-coherence',
+            passed,
+            details: passed
+                ? 'navigator.gpu (WebGPU) availability and native requestAdapter signature match OS and GPU architecture rules'
+                : issues.join('; ')
+        });
+    }
+
+    // Check 15: Error Stack Trace & MediaDevices Hygiene
+    {
+        const hygiene = telemetry.stackAndMediaHygiene;
+        const issues = [];
+
+        if (hygiene && typeof hygiene === 'object') {
+            let hasAtSignFormat = hygiene.hasAtSignFormat !== false;
+            const markerSet = new Set(
+                Array.isArray(hygiene.leakedStackMarkers) ? hygiene.leakedStackMarkers : []
+            );
+
+            if (typeof hygiene.stack === 'string' && hygiene.stack.length > 0) {
+                if (!/@/.test(hygiene.stack) || /^\s+at\s+/m.test(hygiene.stack)) {
+                    hasAtSignFormat = false;
+                }
+                for (const marker of CAMOUFOX_COHERENCE_CONSTANTS.forbiddenStackMarkers) {
+                    if (hygiene.stack.toLowerCase().includes(marker.toLowerCase())) {
+                        markerSet.add(marker);
+                    }
+                }
+            }
+
+            if (!hasAtSignFormat) {
+                issues.push(
+                    'Error.prototype.stack uses V8/Chromium "    at " format instead of SpiderMonkey/Firefox "fn@url:line:col" format'
+                );
+            }
+
+            const leakedMarkers = Array.from(markerSet);
+            if (leakedMarkers.length > 0) {
+                issues.push(
+                    `Error.prototype.stack leaked automation evaluation markers: [${leakedMarkers.join(', ')}]`
+                );
+            }
+
+            const enumerateDevicesNative =
+                hygiene.enumerateDevicesNative !== false &&
+                hygiene.mediaDevices?.enumerateDevicesNative !== false;
+            if (!enumerateDevicesNative) {
+                issues.push('MediaDevices.prototype.enumerateDevices is not [native code]');
+            }
+
+            const unpermittedLabelsLeaked =
+                hygiene.unpermittedLabelsLeaked === true ||
+                hygiene.mediaDevices?.unpermittedLabelsLeaked === true;
+            if (unpermittedLabelsLeaked) {
+                issues.push(
+                    'navigator.mediaDevices.enumerateDevices() leaked non-empty hardware device labels without active media permission'
+                );
+            }
+        }
+
+        const passed = issues.length === 0;
+        checks.push({
+            name: 'stack-trace-and-mediadevices-hygiene',
+            passed,
+            details: passed
+                ? 'SpiderMonkey Error.prototype.stack format is clean and MediaDevices.prototype.enumerateDevices is native without unpermitted label leaks'
+                : issues.join('; ')
+        });
+    }
+
+    // Check 16: Exact Hardware SKU & Device Model Parameter Coherence
+    // Validates exact CPU SKU, GPU SKU, Unified/System RAM capacity, SSD/Disk capacity,
+    // StorageManager quota vs physical disk size, laptop notched/non-notched display panel
+    // vs SoC SKU, Windows ANGLE vendor/shader model lockstep, and WebGL hardware limits.
+    {
+        const skuValidation = validateHardwareModelSpec(telemetry, targetOs);
+        const passed = skuValidation.passed;
+        const skuDesc = skuValidation.matchedSku ? ` [${skuValidation.matchedSku}]` : '';
+        checks.push({
+            name: 'exact-hardware-sku-model-coherence',
+            passed,
+            details: passed
+                ? `Exact hardware model parameters${skuDesc} (CPU cores/threads, GPU SKU, RAM capacity, SSD storage tier, panel form-factor, and WebGL hardware limits) are 100% coherent`
+                : skuValidation.issues.join('; ')
+        });
+    }
+
     const passedCount = checks.filter((c) => c.passed).length;
     const score = checks.length > 0 ? Math.round((passedCount / checks.length) * 100) : 0;
     const passed = passedCount === checks.length;
@@ -1928,6 +2180,11 @@ export async function auditProfileCoherence(page, expectedOs) {
 
 export default {
     CAMOUFOX_COHERENCE_CONSTANTS,
+    APPLE_SILICON_SKU_CATALOG,
+    PC_CPU_SKU_CATALOG,
+    PC_GPU_SKU_CATALOG,
+    parseAppleSiliconSkuName,
+    validateHardwareModelSpec,
     normalizeTargetOs,
     gpuFitsOs,
     collectBrowserFingerprint,

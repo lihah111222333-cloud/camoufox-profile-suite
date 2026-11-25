@@ -44,8 +44,13 @@ const RISK_SIGNAL_PATTERNS = [
 const TEXTUAL_MIME_PATTERNS =
     /\b(json|text|html|xml|javascript|ecmascript|x-www-form-urlencoded|graphql|csv|plain|svg|css)\b/i;
 
-const SENSITIVE_HEADER_NAME_REGEX =
-    /^(proxy-authorization|x-proxy-authorization|x-api-key|omocaptcha-key)$/i;
+export const SENSITIVE_HEADER_REGEX =
+    /^(proxy-authorization|x-proxy-authorization|authorization|x-api-key|omocaptcha-key)$/i;
+
+const SENSITIVE_HEADER_NAME_REGEX = SENSITIVE_HEADER_REGEX;
+
+export const SENSITIVE_URL_PARAM_REGEX =
+    /^(api_key|apikey|access_token|refresh_token|client_secret|password|passwd|pwd|secret|private_key)$/i;
 
 /**
  * Known anti-bot, risk-control, and session authentication cookie/token names across
@@ -233,18 +238,101 @@ export function parseCookieHeader(rawCookieHeader) {
 
 /**
  * Redact a sensitive header value while preserving an authentication scheme prefix
- * (e.g. `Basic dXNlcjpzZWNyZXQ=` -> `Basic [REDACTED]`, raw API key -> `[REDACTED]`).
+ * (e.g. `Basic dXNlcjpzZWNyZXQ=` -> `Basic [REDACTED]`, `Bearer eyJ...` -> `Bearer [REDACTED]`,
+ * raw API key -> `[REDACTED]`).
  *
  * @param {string} rawValue
  * @returns {string}
  */
 function redactSensitiveHeaderValue(rawValue) {
     const str = String(rawValue ?? '').trim();
-    const schemeMatch = str.match(/^([A-Za-z0-9._-]+)\s+\S+$/);
+    const schemeMatch = str.match(/^([A-Za-z0-9._-]+)\s+\S+.*$/);
     if (schemeMatch) {
         return `${schemeMatch[1]} [REDACTED]`;
     }
     return '[REDACTED]';
+}
+
+/**
+ * Redact sensitive query parameter values in a URL (`api_key`, `apikey`, `access_token`,
+ * `refresh_token`, `client_secret`, `password`, `passwd`, `pwd`, `secret`, `private_key`),
+ * replacing each value with `[REDACTED:${sha256_8}]` so plaintext credentials never leak
+ * to `traffic.ndjson` or `pre-tls-wire.log` while remaining deterministically traceable.
+ *
+ * @param {string} rawUrl
+ * @returns {string}
+ */
+export function redactUrlSecrets(rawUrl) {
+    if (rawUrl === null || rawUrl === undefined) {
+        return '';
+    }
+    const urlStr = String(rawUrl);
+    if (!urlStr || !urlStr.includes('?')) {
+        return urlStr;
+    }
+
+    const hashIdx = urlStr.indexOf('#');
+    const beforeHash = hashIdx >= 0 ? urlStr.slice(0, hashIdx) : urlStr;
+    const hashPart = hashIdx >= 0 ? urlStr.slice(hashIdx) : '';
+
+    const qIdx = beforeHash.indexOf('?');
+    if (qIdx < 0) {
+        return urlStr;
+    }
+
+    const basePart = beforeHash.slice(0, qIdx);
+    const queryPart = beforeHash.slice(qIdx + 1);
+    if (!queryPart) {
+        return urlStr;
+    }
+
+    let modified = false;
+    const redactedSegments = queryPart.split('&').map((segment) => {
+        if (!segment) return segment;
+        const eqIdx = segment.indexOf('=');
+        if (eqIdx <= 0) return segment;
+
+        const rawKey = segment.slice(0, eqIdx);
+        const rawVal = segment.slice(eqIdx + 1);
+        let decodedKey = rawKey;
+        try {
+            decodedKey = decodeURIComponent(rawKey.replace(/\+/g, '%20'));
+        } catch {
+            decodedKey = rawKey;
+        }
+
+        if (!SENSITIVE_URL_PARAM_REGEX.test(decodedKey)) {
+            return segment;
+        }
+
+        let decodedVal = rawVal;
+        try {
+            decodedVal = decodeURIComponent(rawVal.replace(/\+/g, '%20'));
+        } catch {
+            decodedVal = rawVal;
+        }
+
+        if (/^\[REDACTED:[0-9a-f]{8}\]$/i.test(decodedVal)) {
+            if (rawVal !== decodedVal) {
+                modified = true;
+            }
+            return `${rawKey}=${decodedVal}`;
+        }
+
+        const sha256_8 = crypto
+            .createHash('sha256')
+            .update(String(decodedVal), 'utf8')
+            .digest('hex')
+            .slice(0, 8);
+        modified = true;
+        return `${rawKey}=[REDACTED:${sha256_8}]`;
+    });
+
+    if (!modified) {
+        return urlStr;
+    }
+
+    return `${basePart}?${redactedSegments.join('&')}${hashPart}`;
 }
 
 /**
@@ -468,10 +556,23 @@ function buildBodyPreview(buffer, mimeType, maxBytes = DEFAULT_MAX_INLINE_PREVIE
  * }}
  */
 function parseUrlComponents(rawUrl) {
+    const redactedUrl = redactUrlSecrets(rawUrl);
     try {
-        const parsed = new URL(String(rawUrl));
+        const parsed = new URL(String(redactedUrl));
         const searchParams = {};
-        for (const [key, value] of parsed.searchParams.entries()) {
+        for (const [key, rawValue] of parsed.searchParams.entries()) {
+            let value = rawValue;
+            if (
+                SENSITIVE_URL_PARAM_REGEX.test(key) &&
+                !/^\[REDACTED:[0-9a-f]{8}\]$/i.test(value)
+            ) {
+                const sha256_8 = crypto
+                    .createHash('sha256')
+                    .update(String(value), 'utf8')
+                    .digest('hex')
+                    .slice(0, 8);
+                value = `[REDACTED:${sha256_8}]`;
+            }
             if (Object.prototype.hasOwnProperty.call(searchParams, key)) {
                 if (Array.isArray(searchParams[key])) {
                     searchParams[key].push(value);
@@ -482,13 +583,17 @@ function parseUrlComponents(rawUrl) {
                 searchParams[key] = value;
             }
         }
+        const cleanSearch = (parsed.search || '').replace(
+            /%5BREDACTED%3A([0-9a-f]{8})%5D/gi,
+            '[REDACTED:$1]'
+        );
         return {
             protocol: parsed.protocol ? parsed.protocol.replace(/:$/, '') : null,
             host: parsed.host || parsed.hostname || 'unknown',
             hostname: parsed.hostname || 'unknown',
             port: parsed.port || null,
             pathname: parsed.pathname || '/',
-            search: parsed.search || '',
+            search: cleanSearch,
             searchParams
         };
     } catch {
@@ -497,11 +602,362 @@ function parseUrlComponents(rawUrl) {
             host: 'unknown',
             hostname: 'unknown',
             port: null,
-            pathname: String(rawUrl || ''),
+            pathname: String(redactedUrl || ''),
             search: '',
             searchParams: {}
         };
     }
+}
+
+/**
+ * Mask a platform anti-bot signature / telemetry parameter value
+ * (`first 4 chars + '***' + last 3 chars`).
+ *
+ * @param {string} rawValue
+ * @returns {string}
+ */
+function maskPlatformSignatureValue(rawValue) {
+    const str = String(rawValue ?? '');
+    if (str.length === 0) {
+        return '***';
+    }
+    if (str.length <= 4) {
+        return `${str.slice(0, 1)}***${str.slice(-1)}`;
+    }
+    return `${str.slice(0, 4)}***${str.slice(-3)}`;
+}
+
+const PLATFORM_SIGNATURE_DEFINITIONS = [
+    // 1. bytedance (Douyin / TikTok)
+    { platform: 'bytedance', signatureName: 'a_bogus', regex: /^a[_-]bogus$/i, locations: ['query', 'header', 'body'] },
+    { platform: 'bytedance', signatureName: 'X-Bogus', regex: /^x[_-]bogus$/i, locations: ['query', 'header', 'body'] },
+    { platform: 'bytedance', signatureName: 'X-Gnarly', regex: /^x[_-]gnarly$/i, locations: ['query', 'header', 'body'] },
+    { platform: 'bytedance', signatureName: 'msToken', regex: /^mstoken$/i, locations: ['query', 'header', 'body'] },
+    { platform: 'bytedance', signatureName: 'verifyFp', regex: /^verifyfp$/i, locations: ['query', 'header', 'body'] },
+    { platform: 'bytedance', signatureName: 's_v_web_id', regex: /^s_v_web_id$/i, locations: ['query', 'header', 'body'] },
+    { platform: 'bytedance', signatureName: 'odin_tt', regex: /^odin_tt$/i, locations: ['query', 'header', 'body'] },
+    { platform: 'bytedance', signatureName: 'ttwid', regex: /^ttwid$/i, locations: ['query', 'header', 'body'] },
+
+    // 2. twitter (X)
+    { platform: 'twitter', signatureName: 'x-client-transaction-id', regex: /^x-client-transaction-id$/i, locations: ['header', 'query', 'body'] },
+    { platform: 'twitter', signatureName: 'x-csrf-token', regex: /^x-csrf-token$/i, locations: ['header', 'query', 'body'] },
+    { platform: 'twitter', signatureName: 'x-guest-token', regex: /^x-guest-token$/i, locations: ['header', 'query', 'body'] },
+    { platform: 'twitter', signatureName: 'ui_metrics', regex: /^ui_metrics$/i, locations: ['query', 'header', 'body'] },
+
+    // 3. meta (Facebook / Instagram)
+    { platform: 'meta', signatureName: 'x-ig-app-id', regex: /^x-ig-app-id$/i, locations: ['header', 'body', 'query'] },
+    { platform: 'meta', signatureName: 'x-asbd-id', regex: /^x-asbd-id$/i, locations: ['header', 'body', 'query'] },
+    { platform: 'meta', signatureName: 'x-csrftoken', regex: /^x-csrftoken$/i, locations: ['header', 'body', 'query'] },
+    { platform: 'meta', signatureName: 'x-ig-www-claim', regex: /^x-ig-www-claim$/i, locations: ['header', 'body', 'query'] },
+    { platform: 'meta', signatureName: 'x-fb-friendly-name', regex: /^x-fb-friendly-name$/i, locations: ['header', 'body', 'query'] },
+    { platform: 'meta', signatureName: 'x-fb-lsd', regex: /^x-fb-lsd$/i, locations: ['header', 'body', 'query'] },
+    { platform: 'meta', signatureName: 'jazoest', regex: /^jazoest$/i, locations: ['body', 'query', 'header'] },
+    { platform: 'meta', signatureName: 'lsd', regex: /^lsd$/i, locations: ['body', 'query', 'header'] },
+
+    // 4. google (Gmail / Accounts / BotGuard)
+    { platform: 'google', signatureName: 'bgRequest', regex: /^bgrequest$/i, locations: ['query', 'header', 'body'] },
+    { platform: 'google', signatureName: 'f.req', regex: /^f\.req$/i, locations: ['query', 'header', 'body'] },
+    { platform: 'google', signatureName: 'TL', regex: /^tl$/i, locations: ['query', 'header', 'body'] },
+    { platform: 'google', signatureName: 'at', regex: /^at$/i, locations: ['query', 'header', 'body'] },
+    { platform: 'google', signatureName: 'x-goog-ext-278367001-jspb', regex: /^x-goog-ext-278367001-jspb$/i, locations: ['header', 'query', 'body'] },
+
+    // 5. arkose (FunCaptcha)
+    { platform: 'arkose', signatureName: 'bda', regex: /^bda$/i, locations: ['body', 'query', 'header'] },
+    { platform: 'arkose', signatureName: 'fc-token', regex: /^fc[-_]token$/i, locations: ['body', 'query', 'header'] },
+    { platform: 'arkose', signatureName: 'public_key', regex: /^public_key$/i, locations: ['body', 'query'], requiresArkoseUrl: true },
+
+    // 6. cloudflare (Turnstile / Challenge)
+    { platform: 'cloudflare', signatureName: 'cf-turnstile-response', regex: /^cf-turnstile-response$/i, locations: ['body', 'query', 'header'] },
+    { platform: 'cloudflare', signatureName: 'cf_chl_opt', regex: /^_?cf_chl_opt$/i, locations: ['body', 'query', 'header'] },
+    { platform: 'cloudflare', signatureName: 'cf-ray', regex: /^cf-ray$/i, locations: ['header', 'query', 'body'] }
+];
+
+/**
+ * Recursively collect key-value pairs from a parsed JSON payload up to a bounded depth.
+ *
+ * @param {any} node
+ * @param {Array<{ key: string, value: string }>} out
+ * @param {number} [depth=0]
+ */
+function collectJsonKeyValues(node, out, depth = 0) {
+    if (!node || typeof node !== 'object' || depth > 6) {
+        return;
+    }
+    if (Array.isArray(node)) {
+        // Also detect Google / BotGuard ["bgRequest", "<value>"] tuple patterns in arrays
+        if (
+            node.length >= 2 &&
+            typeof node[0] === 'string' &&
+            /^(bgRequest|ui_metrics|bda|fc-token|cf_chl_opt)$/i.test(node[0]) &&
+            node[1] !== null &&
+            node[1] !== undefined
+        ) {
+            out.push({
+                key: node[0],
+                value: typeof node[1] === 'string' ? node[1] : JSON.stringify(node[1])
+            });
+        }
+        for (const item of node) {
+            collectJsonKeyValues(item, out, depth + 1);
+        }
+        return;
+    }
+    for (const [k, v] of Object.entries(node)) {
+        if (v !== null && v !== undefined) {
+            const strVal = typeof v === 'string' ? v : JSON.stringify(v);
+            out.push({ key: k, value: strVal });
+            if (typeof v === 'object') {
+                collectJsonKeyValues(v, out, depth + 1);
+            }
+        }
+    }
+}
+
+/**
+ * Detect and extract metadata for major platform anti-bot telemetry & cryptographic
+ * signature parameters across ByteDance (Douyin/TikTok), Twitter/X, Meta (Facebook/Instagram),
+ * Google (Gmail/Accounts/BotGuard), Arkose (FunCaptcha), and Cloudflare (Turnstile/Challenge).
+ *
+ * @param {object} [params={}]
+ * @param {string} [params.url='']
+ * @param {Record<string, string|string[]>|URLSearchParams|null} [params.searchParams=null]
+ * @param {Record<string, string>|Array<{ name: string, value: string }>} [params.headers={}]
+ * @param {string|null} [params.bodyPreview=null]
+ * @returns {Array<{
+ *   platform: 'bytedance'|'twitter'|'meta'|'google'|'arkose'|'cloudflare',
+ *   signatureName: string,
+ *   location: 'query'|'header'|'body',
+ *   valueLength: number,
+ *   valueSha256: string,
+ *   maskedPreview: string
+ * }>}
+ */
+export function extractPlatformSignatures({
+    url = '',
+    searchParams = null,
+    headers = {},
+    bodyPreview = null
+} = {}) {
+    const urlText = String(url || '');
+    const bodyText =
+        typeof bodyPreview === 'string' && !bodyPreview.startsWith('[binary ')
+            ? bodyPreview
+            : '';
+
+    const isArkoseContext =
+        /\b(arkose|arkoselabs|funcaptcha|client-api|enforcement\.[a-z0-9.-]+)\b/i.test(urlText) ||
+        /\b(bda|fc-token|fc_token|arkose|funcaptcha)\b/i.test(bodyText);
+
+    // 1. Collect query entries
+    const queryEntries = [];
+    const seenQueryKeys = new Set();
+    const pushQueryEntry = (k, v) => {
+        if (k === null || k === undefined || v === null || v === undefined) return;
+        const keyStr = String(k).trim();
+        const valStr = String(v);
+        if (!keyStr || !valStr) return;
+        const dedupe = `${keyStr}=${valStr}`;
+        if (seenQueryKeys.has(dedupe)) return;
+        seenQueryKeys.add(dedupe);
+        queryEntries.push({ key: keyStr, value: valStr });
+    };
+
+    if (searchParams) {
+        if (typeof searchParams.entries === 'function') {
+            for (const [k, v] of searchParams.entries()) {
+                pushQueryEntry(k, v);
+            }
+        } else if (typeof searchParams === 'object') {
+            for (const [k, v] of Object.entries(searchParams)) {
+                if (Array.isArray(v)) {
+                    for (const item of v) pushQueryEntry(k, item);
+                } else {
+                    pushQueryEntry(k, v);
+                }
+            }
+        }
+    }
+
+    if (urlText.includes('?')) {
+        try {
+            const parsed = new URL(urlText);
+            for (const [k, v] of parsed.searchParams.entries()) {
+                pushQueryEntry(k, v);
+            }
+        } catch {
+            const qIdx = urlText.indexOf('?');
+            const qStr = urlText.slice(qIdx + 1).split('#')[0];
+            const usp = new URLSearchParams(qStr);
+            for (const [k, v] of usp.entries()) {
+                pushQueryEntry(k, v);
+            }
+        }
+    }
+
+    // 2. Collect header entries
+    const headerEntries = [];
+    if (Array.isArray(headers)) {
+        for (const h of headers) {
+            if (h && h.name) {
+                headerEntries.push({
+                    key: String(h.name).trim(),
+                    value: String(h.value ?? '')
+                });
+            }
+        }
+    } else if (headers && typeof headers === 'object') {
+        for (const [k, v] of Object.entries(headers)) {
+            if (v !== null && v !== undefined && String(v) !== '') {
+                headerEntries.push({
+                    key: String(k).trim(),
+                    value: String(v)
+                });
+            }
+        }
+    }
+
+    // 3. Collect body entries (JSON, URL-encoded form parameters, or embedded telemetry)
+    const bodyEntries = [];
+    if (bodyText) {
+        const trimmedBody = bodyText.trim();
+        let jsonParsed = false;
+
+        if (trimmedBody.startsWith('{') || trimmedBody.startsWith('[')) {
+            try {
+                const parsedJson = JSON.parse(trimmedBody);
+                collectJsonKeyValues(parsedJson, bodyEntries);
+                jsonParsed = true;
+            } catch {
+                jsonParsed = false;
+            }
+        }
+
+        if (!jsonParsed && trimmedBody.includes('=') && !trimmedBody.startsWith('<')) {
+            try {
+                const formParams = new URLSearchParams(trimmedBody);
+                for (const [k, v] of formParams.entries()) {
+                    if (k && v !== '') {
+                        bodyEntries.push({ key: k.trim(), value: v });
+                        // If a form value itself is JSON (e.g. Google f.req), inspect nested tokens like bgRequest
+                        const trimVal = v.trim();
+                        if (trimVal.startsWith('{') || trimVal.startsWith('[')) {
+                            try {
+                                collectJsonKeyValues(JSON.parse(trimVal), bodyEntries);
+                            } catch {}
+                        }
+                    }
+                }
+            } catch {}
+        }
+
+        // Regex fallback for truncated JSON or script-embedded keys
+        const jsonKeyRegex =
+            /"(a_bogus|X-Bogus|X-Gnarly|msToken|verifyFp|s_v_web_id|odin_tt|ttwid|x-client-transaction-id|x-csrf-token|x-guest-token|ui_metrics|x-ig-app-id|x-asbd-id|x-csrftoken|x-ig-www-claim|x-fb-friendly-name|x-fb-lsd|jazoest|lsd|bgRequest|f\.req|TL|at|x-goog-ext-278367001-jspb|bda|fc-token|fc_token|public_key|cf-turnstile-response|cf_chl_opt|_cf_chl_opt|cf-ray)"\s*:\s*(?:"([^"\\]*(?:\\.[^"\\]*)*)"|(\{[^{}]*\})|(\[[^\[\]]*\])|([^,\s}\]]+))/gi;
+        let match;
+        while ((match = jsonKeyRegex.exec(bodyText)) !== null) {
+            const key = match[1];
+            const val = match[2] ?? match[3] ?? match[4] ?? match[5] ?? '';
+            if (key && val) {
+                bodyEntries.push({ key, value: val });
+            }
+        }
+    }
+
+    const results = [];
+    const seenSignatures = new Set();
+
+    const addSignature = (platform, signatureName, location, rawValue) => {
+        const valueStr = String(rawValue ?? '');
+        if (!valueStr) return;
+        const valueSha256 = crypto.createHash('sha256').update(valueStr, 'utf8').digest('hex');
+        const dedupeKey = `${platform}|${signatureName}|${location}|${valueSha256}`;
+        if (seenSignatures.has(dedupeKey)) {
+            return;
+        }
+        seenSignatures.add(dedupeKey);
+        results.push({
+            platform,
+            signatureName,
+            location,
+            valueLength: valueStr.length,
+            valueSha256,
+            maskedPreview: maskPlatformSignatureValue(valueStr)
+        });
+    };
+
+    const entriesByLocation = {
+        query: queryEntries,
+        header: headerEntries,
+        body: bodyEntries
+    };
+
+    for (const def of PLATFORM_SIGNATURE_DEFINITIONS) {
+        if (def.requiresArkoseUrl && !isArkoseContext) {
+            continue;
+        }
+        for (const loc of def.locations) {
+            const candidateEntries = entriesByLocation[loc] || [];
+            for (const entry of candidateEntries) {
+                if (def.regex.test(entry.key)) {
+                    addSignature(def.platform, def.signatureName, loc, entry.value);
+                }
+            }
+        }
+    }
+
+    // Special handling for Arkose URL path `/public_key/<KEY>`
+    if (isArkoseContext && !results.some((r) => r.platform === 'arkose' && r.signatureName === 'public_key')) {
+        const pkPathMatch = urlText.match(/\/public_key\/([A-Za-z0-9-]+)(?:[/?#]|$)/i);
+        if (pkPathMatch && pkPathMatch[1]) {
+            addSignature('arkose', 'public_key', 'query', pkPathMatch[1]);
+        }
+    }
+
+    // Special handling for Twitter `ui_metrics` when URL or body contains `ui_metrics`
+    if (!results.some((r) => r.platform === 'twitter' && r.signatureName === 'ui_metrics')) {
+        if (/ui_metrics/i.test(urlText)) {
+            const metricQueryEntry = queryEntries.find((e) => /ui_metrics/i.test(e.value));
+            addSignature(
+                'twitter',
+                'ui_metrics',
+                'query',
+                metricQueryEntry ? metricQueryEntry.value : urlText
+            );
+        }
+        if (/ui_metrics/i.test(bodyText)) {
+            addSignature('twitter', 'ui_metrics', 'body', bodyText);
+        }
+    }
+
+    // Special handling for Cloudflare `cf_chl_opt` script assignment in body (`window._cf_chl_opt = ...`)
+    if (
+        /cf_chl_opt/i.test(bodyText) &&
+        !results.some((r) => r.platform === 'cloudflare' && r.signatureName === 'cf_chl_opt')
+    ) {
+        const chlMatch = bodyText.match(/_?cf_chl_opt\s*=\s*(\{[\s\S]{1,1024}?\})/);
+        addSignature(
+            'cloudflare',
+            'cf_chl_opt',
+            'body',
+            chlMatch ? chlMatch[1] : bodyText
+        );
+    }
+
+    // Special handling for Google `bgRequest` embedded inside body (e.g. URL-encoded or nested JSON in f.req)
+    if (
+        /bgRequest/i.test(bodyText) &&
+        !results.some((r) => r.platform === 'google' && r.signatureName === 'bgRequest')
+    ) {
+        const bgMatch = bodyText.match(/bgRequest["'\\,\s:=]+([A-Za-z0-9_!.-]{8,})/i);
+        addSignature(
+            'google',
+            'bgRequest',
+            'body',
+            bgMatch ? bgMatch[1] : bodyText
+        );
+    }
+
+    return results;
 }
 
 /**
@@ -1151,6 +1607,7 @@ export class CamoufoxTrafficRecorder {
         this.byDomain = new Map();
         this.byTriggerAction = new Map();
         this.cookieLineage = new Map();
+        this.platformSignatures = [];
         this.anomaliesAndRiskSignals = [];
         this.recordedAnomalyKeys = new Set();
 
@@ -1169,6 +1626,11 @@ export class CamoufoxTrafficRecorder {
                     }
                 } catch {}
             }
+            try {
+                if (this.payloadsDir && fs.existsSync(this.payloadsDir)) {
+                    fs.rmSync(this.payloadsDir, { recursive: true, force: true });
+                }
+            } catch {}
         }
 
         this._ensureDirectories();
@@ -1433,6 +1895,35 @@ export class CamoufoxTrafficRecorder {
                     parsedUrl,
                     isReplay: true
                 });
+
+                const restoredSignatures = Array.isArray(ev.platformSignatures)
+                    ? ev.platformSignatures
+                    : extractPlatformSignatures({
+                          url: ev.url || '',
+                          searchParams: ev.searchParams || parsedUrl.searchParams,
+                          headers: ev.headers || {},
+                          bodyPreview: ev.bodyPreview ?? ev.postData ?? null
+                      });
+                for (const sig of restoredSignatures) {
+                    if (!sig || typeof sig !== 'object') continue;
+                    this.platformSignatures.push({
+                        timestamp: ev.timestamp || null,
+                        correlationId: ev.correlationId || null,
+                        actionStep: stepName,
+                        stepIndex,
+                        triggerActionId: ev.triggerAction?.actionId || null,
+                        triggerTarget: ev.triggerAction?.target || null,
+                        method: ev.method || 'GET',
+                        url: ev.url || '',
+                        host: parsedUrl.host,
+                        platform: sig.platform,
+                        signatureName: sig.signatureName,
+                        location: sig.location,
+                        valueLength: sig.valueLength,
+                        valueSha256: sig.valueSha256,
+                        maskedPreview: sig.maskedPreview
+                    });
+                }
             } else if (ev.type === 'ingress') {
                 const headersArr = Array.isArray(ev.headersArray) ? ev.headersArray : [];
                 const parsedUrl = parseUrlComponents(ev.url || '');
@@ -2732,11 +3223,13 @@ export class CamoufoxTrafficRecorder {
             if (typeof request.frame === 'function') {
                 const frame = request.frame();
                 if (frame && typeof frame.url === 'function') {
-                    frameUrl = frame.url() || null;
+                    const rawFrameUrl = frame.url() || null;
+                    frameUrl = rawFrameUrl ? redactUrlSecrets(rawFrameUrl) : null;
                 }
             }
         } catch {}
 
+        url = redactUrlSecrets(url);
         const parsedUrl = parseUrlComponents(url);
         const { headers, headersArray } = await extractHeadersWithOrder(request);
         const contentType = headers['content-type'] || headers['Content-Type'] || null;
@@ -2855,6 +3348,32 @@ export class CamoufoxTrafficRecorder {
             ingressWireBlock: null
         });
 
+        const platformSignatures = extractPlatformSignatures({
+            url,
+            searchParams: parsedUrl.searchParams,
+            headers,
+            bodyPreview
+        });
+        for (const sig of platformSignatures) {
+            this.platformSignatures.push({
+                timestamp,
+                correlationId,
+                actionStep: attributionSnapshot.actionStep,
+                stepIndex: attributionSnapshot.stepIndex,
+                triggerActionId: triggerSnapshot?.actionId || null,
+                triggerTarget: triggerSnapshot?.target || null,
+                method,
+                url,
+                host: parsedUrl.host,
+                platform: sig.platform,
+                signatureName: sig.signatureName,
+                location: sig.location,
+                valueLength: sig.valueLength,
+                valueSha256: sig.valueSha256,
+                maskedPreview: sig.maskedPreview
+            });
+        }
+
         const egressEvent = {
             type: 'egress',
             eventType: 'egress',
@@ -2884,6 +3403,7 @@ export class CamoufoxTrafficRecorder {
             postDataBytes,
             payloadFile,
             payloadTruncated,
+            platformSignatures,
             triggerAction: triggerSnapshot,
             attribution: attributionSnapshot
         };
@@ -3004,6 +3524,7 @@ export class CamoufoxTrafficRecorder {
             ok = status >= 200 && status < 300;
         }
 
+        url = redactUrlSecrets(url);
         const parsedUrl = parseUrlComponents(url);
         const { headers, headersArray } = await extractHeadersWithOrder(response);
 
@@ -3312,6 +3833,7 @@ export class CamoufoxTrafficRecorder {
             if (typeof request.method === 'function') method = request.method() || method;
         } catch {}
 
+        url = redactUrlSecrets(url);
         const parsedUrl = parseUrlComponents(url);
 
         let timing = null;
@@ -3444,6 +3966,7 @@ export class CamoufoxTrafficRecorder {
             }
         } catch {}
 
+        url = redactUrlSecrets(url);
         const parsedUrl = parseUrlComponents(url);
         const durationMs = tx && typeof tx.startedAtEpochMs === 'number'
             ? Math.max(0, epochMs - tx.startedAtEpochMs)
@@ -3534,6 +4057,7 @@ export class CamoufoxTrafficRecorder {
             }
         } catch {}
 
+        wsUrl = redactUrlSecrets(wsUrl);
         const parsedUrl = parseUrlComponents(wsUrl);
         const openEpochMs = Date.now();
 
@@ -3801,6 +4325,28 @@ export class CamoufoxTrafficRecorder {
         const sslKeyLogSummary = parseSslKeyLog(this.sslKeyLogPath);
         const neckoMozLogSummary = parseNeckoMozLog(this.neckoMozLogPath);
 
+        let preTlsWireLogSha256 = null;
+        let preTlsWireLogBytes = 0;
+        if (this.preTlsWireLogPath && fs.existsSync(this.preTlsWireLogPath)) {
+            try {
+                const rawWireBuf = fs.readFileSync(this.preTlsWireLogPath);
+                preTlsWireLogBytes = rawWireBuf.byteLength;
+                preTlsWireLogSha256 = crypto
+                    .createHash('sha256')
+                    .update(rawWireBuf)
+                    .digest('hex');
+            } catch {
+                preTlsWireLogSha256 = null;
+                preTlsWireLogBytes = 0;
+            }
+        }
+
+        const byPlatform = {};
+        for (const sig of this.platformSignatures) {
+            if (!sig || !sig.platform) continue;
+            byPlatform[sig.platform] = (byPlatform[sig.platform] || 0) + 1;
+        }
+
         const cookieLineageObj = {};
         for (const [cookieName, entry] of this.cookieLineage.entries()) {
             cookieLineageObj[cookieName] = {
@@ -3870,6 +4416,11 @@ export class CamoufoxTrafficRecorder {
             byDomain: byDomainObj,
             byTriggerAction: byTriggerActionObj,
             cookieLineage: cookieLineageObj,
+            platformSignatures: {
+                totalDetected: this.platformSignatures.length,
+                byPlatform,
+                signatures: [...this.platformSignatures]
+            },
             anomaliesAndRiskSignals: [...this.anomaliesAndRiskSignals],
             integrity: {
                 algorithm: 'sha256-chain',
@@ -3878,6 +4429,8 @@ export class CamoufoxTrafficRecorder {
                 chainHeadHash: this.chainHeadHash,
                 payloadCount: Object.keys(this.payloadManifest).length,
                 payloadManifest: { ...this.payloadManifest },
+                preTlsWireLogSha256,
+                preTlsWireLogBytes,
                 sslKeyLogSha256: sslKeyLogSummary.sha256,
                 sslKeyLogBytes: sslKeyLogSummary.bytes,
                 neckoMozLogSha256: neckoMozLogSummary.sha256,
@@ -4138,6 +4691,51 @@ export function verifyTrafficIntegrity(trafficDir) {
 
             if (payloadOk) {
                 verifiedPayloads += 1;
+            }
+        }
+
+        // Scan payloads/ directory on disk to detect any orphan/unindexed files not listed in payloadManifest
+        const payloadsDir = path.join(resolvedTrafficDir, 'payloads');
+        if (fs.existsSync(payloadsDir)) {
+            const indexedPayloadPaths = new Set(
+                Object.keys(manifest).map((k) => String(k).replace(/\\/g, '/'))
+            );
+            const diskEntries = fs.readdirSync(payloadsDir, { withFileTypes: true });
+            for (const entry of diskEntries) {
+                if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+                const relPosix = path.posix.join('payloads', entry.name);
+                if (!indexedPayloadPaths.has(relPosix) && !indexedPayloadPaths.has(entry.name)) {
+                    errors.push(`Orphan unindexed payload file found in payloads/: ${relPosix}`);
+                }
+            }
+        }
+
+        // Verify pre-tls-wire.log SHA-256 and byte length if recorded in summary.integrity
+        const preTlsWireLogPath = path.join(resolvedTrafficDir, 'pre-tls-wire.log');
+        if (integrity.preTlsWireLogSha256) {
+            if (!fs.existsSync(preTlsWireLogPath)) {
+                errors.push('Missing pre-tls-wire.log on disk');
+            } else {
+                const rawWireBuf = fs.readFileSync(preTlsWireLogPath);
+                const actualWireSha256 = crypto
+                    .createHash('sha256')
+                    .update(rawWireBuf)
+                    .digest('hex');
+                const actualWireBytes = rawWireBuf.byteLength;
+
+                if (actualWireSha256 !== integrity.preTlsWireLogSha256) {
+                    errors.push(
+                        `pre-tls-wire.log SHA-256 mismatch: expected ${integrity.preTlsWireLogSha256}, got ${actualWireSha256}`
+                    );
+                }
+                if (
+                    typeof integrity.preTlsWireLogBytes === 'number' &&
+                    actualWireBytes !== integrity.preTlsWireLogBytes
+                ) {
+                    errors.push(
+                        `pre-tls-wire.log byte length mismatch: expected ${integrity.preTlsWireLogBytes}, got ${actualWireBytes}`
+                    );
+                }
             }
         }
 

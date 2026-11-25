@@ -48,6 +48,12 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
             availHeight: 1040,
             webglVendor: 'Google Inc. (NVIDIA)',
             webglRenderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)',
+            hardwareProfile: {
+                cpuModel: 'Intel Core i7-10700K',
+                gpuModel: 'NVIDIA GeForce RTX 3060',
+                ramGb: 32,
+                storageGb: 1024
+            },
             candidatePorts: [54321, 61042],
             speechVoices: [
                 {
@@ -76,6 +82,12 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
             availHeight: 944,
             webglVendor: 'Apple',
             webglRenderer: 'Apple M2 Pro',
+            hardwareProfile: {
+                cpuModel: 'Apple M2 Pro',
+                gpuModel: 'Apple M2 Pro',
+                ramGb: 16,
+                storageGb: 512
+            },
             candidatePorts: [51234, 59876],
             speechVoices: [
                 {
@@ -104,6 +116,12 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
             availHeight: 1052,
             webglVendor: 'Intel',
             webglRenderer: 'Mesa Intel(R) UHD Graphics 620 (KBL GT2)',
+            hardwareProfile: {
+                cpuModel: 'Intel Core i5-8250U',
+                gpuModel: 'Intel(R) UHD Graphics 620',
+                ramGb: 16,
+                storageGb: 512
+            },
             candidatePorts: [42100, 55120],
             speechVoices: [
                 {
@@ -168,7 +186,13 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
             shadingLanguageVersion: 'WebGL GLSL ES 3.00',
             unmaskedVendor: p.webglVendor,
             unmaskedRenderer: p.webglRenderer,
-            extensionsCount: 28
+            extensionsCount: 28,
+            maxTextureSize: 16384,
+            maxCubeMapTextureSize: 16384,
+            maxRenderbufferSize: 16384,
+            maxViewportDims: targetOs === 'windows' ? [32768, 32768] : [16384, 16384],
+            maxVertexAttribs: 16,
+            aliasedLineWidthRange: [1, 1]
         },
         canvas2d: {
             available: true,
@@ -260,6 +284,26 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
             hasOpenDatabase: false,
             hasMozInnerScreenX: true,
             performanceNowMonotonic: true
+        },
+        webgpu: {
+            available: targetOs !== 'linux',
+            requestAdapterNative: true
+        },
+        stackAndMediaHygiene: {
+            hasAtSignFormat: true,
+            leakedStackMarkers: [],
+            enumerateDevicesNative: true,
+            unpermittedLabelsLeaked: false,
+            mediaDevices: {
+                available: true,
+                enumerateDevicesNative: true,
+                unpermittedLabelsLeaked: false
+            }
+        },
+        hardwareProfile: p.hardwareProfile,
+        storageEstimate: {
+            quotaBytes: 21474836480,
+            usageBytes: 4096
         }
     };
 }
