@@ -13,7 +13,16 @@ import {
     listUsableDevicePresets,
     resolveDeterministicDeviceProfile,
     sanitizeAdsPowerProfileToCoherentPreset,
-    sanitizeZiniaoProfileToCoherentPreset
+    sanitizeZiniaoProfileToCoherentPreset,
+    CanvasWebglConsistencyLedger,
+    attachZiniaoSecurityGuardsToContext,
+    evaluatePortScanRequest,
+    evaluateInternalSchemeAccess,
+    computeHexHammingDistance,
+    computeHashSimilarity,
+    shouldSkipCanvasNoiseForHost,
+    validateOsAndBrowserVersionMatch,
+    resolveGeoCoordinatesWithDeterministicJitter
 } from './device-presets.js';
 
 export {
@@ -21,7 +30,16 @@ export {
     listUsableDevicePresets,
     resolveDeterministicDeviceProfile,
     sanitizeAdsPowerProfileToCoherentPreset,
-    sanitizeZiniaoProfileToCoherentPreset
+    sanitizeZiniaoProfileToCoherentPreset,
+    CanvasWebglConsistencyLedger,
+    attachZiniaoSecurityGuardsToContext,
+    evaluatePortScanRequest,
+    evaluateInternalSchemeAccess,
+    computeHexHammingDistance,
+    computeHashSimilarity,
+    shouldSkipCanvasNoiseForHost,
+    validateOsAndBrowserVersionMatch,
+    resolveGeoCoordinatesWithDeterministicJitter
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -837,6 +855,8 @@ export async function createProfile(profileName, proxy = null, options = {}) {
             resolvedLanguages: deviceProfile.languages,
             acceptLanguage: deviceProfile.acceptLanguage,
             resolvedTimezoneId: deviceProfile.timeZone,
+            resolvedGeolocation: deviceProfile.geolocation,
+            securityPolicy: deviceProfile.securityPolicy,
             hardwareProfile: deviceProfile.hardwareProfile,
             seeds: deviceProfile.seeds,
             createdAt: new Date().toISOString(),
@@ -1136,6 +1156,20 @@ export async function startProfile(profileId, options = {}) {
                 await trafficRecorder.attachPage(page);
             }
 
+            const fingerprintLedger = new CanvasWebglConsistencyLedger({
+                profileId,
+                ledgerPath: path.join(storageInfo.profileDir, 'fingerprint-ledger.json'),
+                skipHosts: mergedOptions.securityPolicy?.canvasSkipHosts
+            });
+
+            let securityGuards = null;
+            if (options.enablePortScanProtection || mergedOptions.enablePortScanProtection) {
+                securityGuards = await attachZiniaoSecurityGuardsToContext(context, {
+                    profileId,
+                    portScanProtection: mergedOptions.securityPolicy?.portScanProtection
+                });
+            }
+
             const session = {
                 profileId,
                 browser,
@@ -1146,6 +1180,8 @@ export async function startProfile(profileId, options = {}) {
                 storageStatePath,
                 trafficRecorder,
                 trafficPaths,
+                fingerprintLedger,
+                securityGuards,
                 metadata: {
                     ...metadata,
                     os: targetOs,

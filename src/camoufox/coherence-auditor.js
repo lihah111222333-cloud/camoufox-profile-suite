@@ -41,7 +41,23 @@ import {
     createCoherentMediaDevices,
     resolveDeterministicDeviceProfile,
     sanitizeAdsPowerProfileToCoherentPreset,
-    sanitizeZiniaoProfileToCoherentPreset
+    sanitizeZiniaoProfileToCoherentPreset,
+    SENSITIVE_LOCAL_PORT_CATALOG,
+    BLOCKED_INTERNAL_URL_PATTERNS,
+    DEFAULT_CANVAS_SKIP_HOSTS,
+    COUNTRY_METRO_COORDINATES_CATALOG,
+    isLocalOrPrivateTarget,
+    classifyScannedPortRisk,
+    evaluatePortScanRequest,
+    evaluateInternalSchemeAccess,
+    computeHexHammingDistance,
+    computeHashSimilarity,
+    shouldSkipCanvasNoiseForHost,
+    isSoftwareRasterizerRenderer,
+    CanvasWebglConsistencyLedger,
+    validateOsAndBrowserVersionMatch,
+    resolveGeoCoordinatesWithDeterministicJitter,
+    attachZiniaoSecurityGuardsToContext
 } from './device-presets.js';
 
 export {
@@ -75,7 +91,23 @@ export {
     createCoherentMediaDevices,
     resolveDeterministicDeviceProfile,
     sanitizeAdsPowerProfileToCoherentPreset,
-    sanitizeZiniaoProfileToCoherentPreset
+    sanitizeZiniaoProfileToCoherentPreset,
+    SENSITIVE_LOCAL_PORT_CATALOG,
+    BLOCKED_INTERNAL_URL_PATTERNS,
+    DEFAULT_CANVAS_SKIP_HOSTS,
+    COUNTRY_METRO_COORDINATES_CATALOG,
+    isLocalOrPrivateTarget,
+    classifyScannedPortRisk,
+    evaluatePortScanRequest,
+    evaluateInternalSchemeAccess,
+    computeHexHammingDistance,
+    computeHashSimilarity,
+    shouldSkipCanvasNoiseForHost,
+    isSoftwareRasterizerRenderer,
+    CanvasWebglConsistencyLedger,
+    validateOsAndBrowserVersionMatch,
+    resolveGeoCoordinatesWithDeterministicJitter,
+    attachZiniaoSecurityGuardsToContext
 };
 
 /**

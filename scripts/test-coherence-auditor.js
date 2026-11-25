@@ -41,6 +41,21 @@ import {
     resolveDeterministicDeviceProfile,
     sanitizeAdsPowerProfileToCoherentPreset,
     sanitizeZiniaoProfileToCoherentPreset,
+    SENSITIVE_LOCAL_PORT_CATALOG,
+    DEFAULT_CANVAS_SKIP_HOSTS,
+    COUNTRY_METRO_COORDINATES_CATALOG,
+    isLocalOrPrivateTarget,
+    classifyScannedPortRisk,
+    evaluatePortScanRequest,
+    evaluateInternalSchemeAccess,
+    computeHexHammingDistance,
+    computeHashSimilarity,
+    shouldSkipCanvasNoiseForHost,
+    isSoftwareRasterizerRenderer,
+    CanvasWebglConsistencyLedger,
+    validateOsAndBrowserVersionMatch,
+    resolveGeoCoordinatesWithDeterministicJitter,
+    attachZiniaoSecurityGuardsToContext,
     normalizeTargetOs,
     gpuFitsOs,
     evaluatePlatformCoherence,
@@ -2535,6 +2550,243 @@ const tests = [
             );
             assert.equal(platformAudit.passed, true);
             assert.equal(platformAudit.score, 100);
+        }
+    },
+    {
+        name: '77. Ziniao-Absorbed Active Localhost / Private-LAN Port-Scan Protection (evaluatePortScanRequest & attachZiniaoSecurityGuardsToContext): Blocks RDP (3389), VNC (5900), CDP (9222), Marionette (2828), Clash (7890), v2rayN ([::1]:10808) & LAN Router (192.168.1.1)',
+        fn: async () => {
+            assert.ok(SENSITIVE_LOCAL_PORT_CATALOG[3389]);
+            assert.ok(SENSITIVE_LOCAL_PORT_CATALOG[9222]);
+            assert.ok(SENSITIVE_LOCAL_PORT_CATALOG[2828]);
+
+            // 1. Blocks localhost/loopback/LAN probes
+            const rdpProbe = evaluatePortScanRequest('http://127.0.0.1:3389/probe', {
+                initiatorUrl: 'https://www.ebay.com/'
+            });
+            assert.equal(rdpProbe.shouldBlock, true);
+            assert.equal(rdpProbe.isPortScanProbe, true);
+            assert.equal(rdpProbe.scope, 'loopback');
+            assert.equal(rdpProbe.port, 3389);
+            assert.match(rdpProbe.service, /Windows Remote Desktop \(RDP\)/);
+
+            const cdpProbe = evaluatePortScanRequest('ws://localhost:9222/devtools/browser', {
+                initiatorUrl: 'https://sellercentral.amazon.com/'
+            });
+            assert.equal(cdpProbe.shouldBlock, true);
+            assert.equal(cdpProbe.port, 9222);
+            assert.match(cdpProbe.service, /Chrome DevTools Protocol/);
+
+            const ipv6V2rayProbe = evaluatePortScanRequest('http://[::1]:10808/', {
+                initiatorUrl: 'https://www.tiktok.com/'
+            });
+            assert.equal(ipv6V2rayProbe.shouldBlock, true);
+            assert.equal(ipv6V2rayProbe.port, 10808);
+
+            const lanProbe = evaluatePortScanRequest('http://192.168.1.1/login.htm', {
+                initiatorUrl: 'https://www.shopee.com/'
+            });
+            assert.equal(lanProbe.shouldBlock, true);
+            assert.equal(lanProbe.scope, 'private-lan');
+
+            // 2. Allows whitelisted port and public URLs
+            const allowedWhitelisted = evaluatePortScanRequest('http://127.0.0.1:8080/api', {
+                allowedPorts: [8080]
+            });
+            assert.equal(allowedWhitelisted.shouldBlock, false);
+
+            const publicUrl = evaluatePortScanRequest('https://accounts.google.com/v3/signin');
+            assert.equal(publicUrl.shouldBlock, false);
+            assert.equal(publicUrl.isPortScanProbe, false);
+
+            // 3. Test live Playwright BrowserContext route interception mock
+            let registeredHandler = null;
+            const mockContext = {
+                route: async (_pattern, handler) => {
+                    registeredHandler = handler;
+                },
+                unroute: async () => {
+                    registeredHandler = null;
+                }
+            };
+
+            const guard = await attachZiniaoSecurityGuardsToContext(mockContext, {
+                profileId: 'ziniao_guard_test_1',
+                portScanProtection: { enabled: true, allowedPorts: [3000] }
+            });
+            assert.ok(typeof registeredHandler === 'function');
+
+            let abortedCode = null;
+            let continued = false;
+            await registeredHandler(
+                {
+                    abort: async (code) => {
+                        abortedCode = code;
+                    },
+                    continue: async () => {
+                        continued = true;
+                    }
+                },
+                {
+                    url: () => 'http://127.0.0.1:5900/',
+                    frame: () => ({ url: () => 'https://www.ebay.com/' })
+                }
+            );
+            assert.equal(abortedCode, 'connectionrefused');
+            assert.equal(continued, false);
+            assert.equal(guard.blockedPortScans.length, 1);
+            assert.equal(guard.blockedPortScans[0].port, 5900);
+            assert.match(guard.blockedPortScans[0].service, /VNC Remote Desktop/);
+        }
+    },
+    {
+        name: '78. Ziniao-Absorbed Per-Domain Canvas & WebGL Consistency Ledger + 64-Bit Hamming Distance Engine (CanvasWebglConsistencyLedger, computeHexHammingDistance, shouldSkipCanvasNoiseForHost)',
+        fn: () => {
+            // 1. Exact 64-bit bitwise Hamming distance & similarity %
+            assert.equal(computeHexHammingDistance('a94f3c1e8b204d71', 'a94f3c1e8b204d71'), 0);
+            assert.equal(computeHashSimilarity('a94f3c1e8b204d71', 'a94f3c1e8b204d71'), 100);
+            // Flip 2 bits in last nibble (0x1 -> 0x7: 0001 -> 0111 = 2 bits difference)
+            assert.equal(computeHexHammingDistance('a94f3c1e8b204d71', 'a94f3c1e8b204d77'), 2);
+            assert.equal(computeHashSimilarity('a94f3c1e8b204d71', 'a94f3c1e8b204d77'), 96.88);
+
+            // 2. Canvas productivity app noise-skip hosts (Canva, Figma, Photopea, Google Docs)
+            assert.ok(DEFAULT_CANVAS_SKIP_HOSTS.includes('canva.com'));
+            assert.equal(shouldSkipCanvasNoiseForHost('https://www.canva.com/design/123'), true);
+            assert.equal(shouldSkipCanvasNoiseForHost('https://www.figma.com/file/abc'), true);
+            assert.equal(shouldSkipCanvasNoiseForHost('https://docs.google.com/document/d/1'), true);
+            assert.equal(shouldSkipCanvasNoiseForHost('https://accounts.google.com/signin'), false);
+            assert.equal(isSoftwareRasterizerRenderer('Google SwiftShader'), true);
+            assert.equal(isSoftwareRasterizerRenderer('Apple M3 Pro'), false);
+
+            // 3. Per-domain ledger recording, consistency check, and drift alert detection
+            const ledger = new CanvasWebglConsistencyLedger({
+                profileId: 'acct_amz_01',
+                maxHammingDistance: 2
+            });
+
+            // Initial visit to sellercentral.amazon.com
+            const firstVisit = ledger.recordOrVerify({
+                kind: 'canvas',
+                url: 'https://sellercentral.amazon.com/home',
+                width: 280,
+                height: 60,
+                drewText: 'AmazonSellerFpCheck',
+                hash: 'a94f3c1e8b204d71'
+            });
+            assert.equal(firstVisit.status, 'recorded-initial');
+            assert.equal(firstVisit.driftDetected, false);
+
+            // Second visit with minor 1-bit difference (within maxHammingDistance=2)
+            const secondVisit = ledger.recordOrVerify({
+                kind: 'canvas',
+                url: 'https://sellercentral.amazon.com/orders',
+                width: 280,
+                height: 60,
+                drewText: 'AmazonSellerFpCheck',
+                hash: 'a94f3c1e8b204d73' // 0x1 ^ 0x3 = 1 bit
+            });
+            assert.equal(secondVisit.status, 'consistent');
+            assert.equal(secondVisit.hammingDistance, 1);
+            assert.equal(secondVisit.driftDetected, false);
+            assert.equal(secondVisit.canonicalHash, 'a94f3c1e8b204d71');
+
+            // Third visit after GPU/font change causing a 28-bit hash jump -> Drift detected!
+            const driftVisit = ledger.recordOrVerify({
+                kind: 'canvas',
+                url: 'https://sellercentral.amazon.com/inventory',
+                width: 280,
+                height: 60,
+                drewText: 'AmazonSellerFpCheck',
+                hash: 'f0129b8c3d410a2e'
+            });
+            assert.equal(driftVisit.status, 'drift-detected');
+            assert.equal(driftVisit.driftDetected, true);
+            assert.ok(driftVisit.hammingDistance > 10);
+            assert.equal(driftVisit.canonicalHash, 'a94f3c1e8b204d71');
+            assert.equal(ledger.driftAlerts.length, 1);
+
+            // Skipped host (Canva)
+            const canvaVisit = ledger.recordOrVerify({
+                kind: 'canvas',
+                url: 'https://www.canva.com/design',
+                width: 1920,
+                height: 1080,
+                hash: '1122334455667788'
+            });
+            assert.equal(canvaVisit.status, 'skipped-host');
+        }
+    },
+    {
+        name: '79. Ziniao-Absorbed Internal Browser Scheme Guard (evaluateInternalSchemeAccess) & OS/Hardware Release vs Browser Engine Version Floor Guard (validateOsAndBrowserVersionMatch)',
+        fn: () => {
+            // 1. Internal scheme probing blocked
+            assert.equal(evaluateInternalSchemeAccess('about:config').shouldBlock, true);
+            assert.equal(evaluateInternalSchemeAccess('about:debugging#/runtime/this-firefox').shouldBlock, true);
+            assert.equal(evaluateInternalSchemeAccess('about:support').shouldBlock, true);
+            assert.equal(evaluateInternalSchemeAccess('chrome://gpu').shouldBlock, true);
+            assert.equal(evaluateInternalSchemeAccess('moz-extension://12345678-90ab-cdef/manifest.json').shouldBlock, true);
+            assert.equal(
+                evaluateInternalSchemeAccess('moz-extension://allowed-uuid/index.html', {
+                    allowedExtensionIds: ['allowed-uuid']
+                }).shouldBlock,
+                false
+            );
+            assert.equal(evaluateInternalSchemeAccess('https://www.google.com/').shouldBlock, false);
+
+            // 2. OS & Silicon Generation vs Browser Engine Version Floor
+            const oldBrowserOnM4Sequoia = validateOsAndBrowserVersionMatch({
+                os: 'macos',
+                osVersion: '15.3.2',
+                cpuModel: 'Apple M4 Pro',
+                browserVersion: '115.0'
+            });
+            assert.equal(oldBrowserOnM4Sequoia.passed, false);
+            assert.equal(oldBrowserOnM4Sequoia.minRequiredBrowserMajor, 128);
+            assert.match(oldBrowserOnM4Sequoia.issues[0], /browser major version 115 is too old/);
+
+            const oldBrowserOnM5Tahoe = validateOsAndBrowserVersionMatch({
+                os: 'macos',
+                osVersion: '26.1.0',
+                cpuModel: 'Apple M5',
+                browserVersion: '128.0'
+            });
+            assert.equal(oldBrowserOnM5Tahoe.passed, false);
+            assert.equal(oldBrowserOnM5Tahoe.minRequiredBrowserMajor, 133);
+
+            const validModernFirefox = validateOsAndBrowserVersionMatch({
+                os: 'macos',
+                osVersion: '26.1.0',
+                cpuModel: 'Apple M5',
+                browserVersion: '135.0'
+            });
+            assert.equal(validModernFirefox.passed, true);
+        }
+    },
+    {
+        name: '80. Ziniao-Absorbed Deterministic Metropolitan Geolocation Micro-Jitter (resolveGeoCoordinatesWithDeterministicJitter): 40+ Countries with Street-Level Jitter & Zero Hardcoded Ningxia Fallback',
+        fn: () => {
+            assert.ok(Object.keys(COUNTRY_METRO_COORDINATES_CATALOG).length >= 40);
+
+            const us1 = resolveGeoCoordinatesWithDeterministicJitter('profile_ny_1', 'US');
+            const us1Repeat = resolveGeoCoordinatesWithDeterministicJitter('profile_ny_1', 'US');
+            const us2 = resolveGeoCoordinatesWithDeterministicJitter('profile_ny_2', 'US');
+
+            // Deterministic for the same profileId
+            assert.deepEqual(us1, us1Repeat);
+            assert.equal(us1.city, 'New York');
+            // Distinct street-level coordinates for two different profileIds in New York
+            assert.notEqual(us1.latitude, us2.latitude);
+            assert.notEqual(us1.longitude, us2.longitude);
+            // Within ±0.015° (~1.5km) of Manhattan (40.7128, -74.0060)
+            assert.ok(Math.abs(us1.latitude - 40.7128) <= 0.016);
+            assert.ok(Math.abs(us1.longitude - -74.006) <= 0.016);
+            assert.ok(us1.accuracy >= 18 && us1.accuracy <= 65);
+
+            // Never leaks Ziniao's hardcoded Ningxia coordinates (37.2534, 105.9976) on JP/DE/GB profiles
+            const jp = resolveGeoCoordinatesWithDeterministicJitter('profile_tokyo_1', 'JP');
+            assert.equal(jp.city, 'Tokyo');
+            assert.notEqual(jp.latitude, 37.2534);
+            assert.notEqual(jp.longitude, 105.9976);
+            assert.ok(Math.abs(jp.latitude - 35.6762) <= 0.016);
         }
     }
 ];

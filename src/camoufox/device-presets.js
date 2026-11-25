@@ -28,6 +28,43 @@ import {
     parseAppleSiliconSkuName,
     validateHardwareModelSpec
 } from './hardware-models.js';
+import {
+    SENSITIVE_LOCAL_PORT_CATALOG,
+    BLOCKED_INTERNAL_URL_PATTERNS,
+    DEFAULT_CANVAS_SKIP_HOSTS,
+    COUNTRY_METRO_COORDINATES_CATALOG,
+    isLocalOrPrivateTarget,
+    classifyScannedPortRisk,
+    evaluatePortScanRequest,
+    evaluateInternalSchemeAccess,
+    computeHexHammingDistance,
+    computeHashSimilarity,
+    shouldSkipCanvasNoiseForHost,
+    isSoftwareRasterizerRenderer,
+    CanvasWebglConsistencyLedger,
+    validateOsAndBrowserVersionMatch,
+    resolveGeoCoordinatesWithDeterministicJitter,
+    attachZiniaoSecurityGuardsToContext
+} from './ziniao-security.js';
+
+export {
+    SENSITIVE_LOCAL_PORT_CATALOG,
+    BLOCKED_INTERNAL_URL_PATTERNS,
+    DEFAULT_CANVAS_SKIP_HOSTS,
+    COUNTRY_METRO_COORDINATES_CATALOG,
+    isLocalOrPrivateTarget,
+    classifyScannedPortRisk,
+    evaluatePortScanRequest,
+    evaluateInternalSchemeAccess,
+    computeHexHammingDistance,
+    computeHashSimilarity,
+    shouldSkipCanvasNoiseForHost,
+    isSoftwareRasterizerRenderer,
+    CanvasWebglConsistencyLedger,
+    validateOsAndBrowserVersionMatch,
+    resolveGeoCoordinatesWithDeterministicJitter,
+    attachZiniaoSecurityGuardsToContext
+};
 
 /**
  * 1. OS-Specific Authentic Font Catalogs
@@ -1637,6 +1674,15 @@ export function resolveDeterministicDeviceProfile(profileId = 'camoufox-profile-
     const primaryLang = languages[0];
     const acceptLanguage = buildAcceptLanguageHeader(languages);
     const timeZone = options.timeZone || geo.timeZone;
+    const geolocation = resolveGeoCoordinatesWithDeterministicJitter(idStr, geo.country);
+    const securityPolicy = {
+        portScanProtection: {
+            enabled: options.portScanProtection !== undefined ? Boolean(options.portScanProtection) : true,
+            allowedPorts: Array.isArray(options.allowedLocalPorts) ? [...options.allowedLocalPorts] : []
+        },
+        canvasSkipHosts: [...DEFAULT_CANVAS_SKIP_HOSTS, ...(options.canvasSkipHosts || [])],
+        skipCpuSoftwareCanvasMask: true
+    };
 
     // User-Agent & Platform strings
     const userAgent =
@@ -1926,6 +1972,8 @@ export function resolveDeterministicDeviceProfile(profileId = 'camoufox-profile-
         languages,
         acceptLanguage,
         timeZone,
+        geolocation,
+        securityPolicy,
         seeds: {
             audioFp: audioFpSeed,
             clientRectFp: clientRectFpSeed,
