@@ -8,6 +8,19 @@ import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import logger from '../utils/logger.js';
 import { CamoufoxTrafficRecorder } from './traffic-recorder.js';
+import {
+    USABLE_DEVICE_PRESET_CATALOG,
+    listUsableDevicePresets,
+    resolveDeterministicDeviceProfile,
+    sanitizeAdsPowerProfileToCoherentPreset
+} from './device-presets.js';
+
+export {
+    USABLE_DEVICE_PRESET_CATALOG,
+    listUsableDevicePresets,
+    resolveDeterministicDeviceProfile,
+    sanitizeAdsPowerProfileToCoherentPreset
+};
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -787,6 +800,13 @@ export async function createProfile(profileName, proxy = null, options = {}) {
         const useSharedBrowser = Boolean(options.useSharedBrowser);
 
         const { profileDir, storageStatePath, metadataPath } = ensureProfileStorage(profileId, profilesDir);
+        const deviceProfile = resolveDeterministicDeviceProfile(profileId, {
+            os: targetOs,
+            presetId: options.presetId || options.preset || undefined,
+            country: options.country || undefined,
+            language: options.locale || undefined,
+            timeZone: options.timezoneId || undefined
+        });
 
         const metadata = {
             id: profileId,
@@ -807,6 +827,16 @@ export async function createProfile(profileName, proxy = null, options = {}) {
             geolocation: options.geolocation || null,
             ff_version: options.ff_version || null,
             preset: options.preset || null,
+            presetId: deviceProfile.presetId,
+            deviceModel: deviceProfile.hardwareProfile.deviceModel,
+            deviceName: deviceProfile.deviceName,
+            macAddress: deviceProfile.macAddress,
+            resolvedLocale: deviceProfile.language,
+            resolvedLanguages: deviceProfile.languages,
+            acceptLanguage: deviceProfile.acceptLanguage,
+            resolvedTimezoneId: deviceProfile.timeZone,
+            hardwareProfile: deviceProfile.hardwareProfile,
+            seeds: deviceProfile.seeds,
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString()
         };
@@ -1430,5 +1460,9 @@ export default {
     getActiveProfileIds,
     stopAllActiveProfiles,
     registerProcessCleanupHooks,
-    unregisterProcessCleanupHooks
+    unregisterProcessCleanupHooks,
+    USABLE_DEVICE_PRESET_CATALOG,
+    listUsableDevicePresets,
+    resolveDeterministicDeviceProfile,
+    sanitizeAdsPowerProfileToCoherentPreset
 };

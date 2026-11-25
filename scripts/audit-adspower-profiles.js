@@ -14,6 +14,11 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { validateHardwareModelSpec } from '../src/camoufox/hardware-models.js';
+import {
+    USABLE_DEVICE_PRESET_CATALOG,
+    listUsableDevicePresets,
+    sanitizeAdsPowerProfileToCoherentPreset
+} from '../src/camoufox/device-presets.js';
 
 const STD_BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 const ADSPOWER_CUSTOM_BASE64_ALPHABET =
@@ -105,6 +110,17 @@ export function auditAdsPowerProfileDir(profileDir) {
     };
 
     const result = validateHardwareModelSpec(telemetry, targetOs);
+    const healed = sanitizeAdsPowerProfileToCoherentPreset({
+        fbccId,
+        Platform: platform,
+        DeviceName: staticConfig.DeviceName || null,
+        HardwareConcurrency: staticConfig.HardwareConcurrency,
+        DeviceMemory: staticConfig.DeviceMemory,
+        UNMASKED_RENDERER_WEBGL: webglConfig.UNMASKED_RENDERER_WEBGL || null,
+        GPUAdapterInfo: webglConfig.GPUAdapterInfo || null,
+        UserAgentMetadata: uam
+    });
+
     return {
         profileDirName: dirName,
         fbccId,
@@ -118,11 +134,34 @@ export function auditAdsPowerProfileDir(profileDir) {
         webgpuArch: webglConfig.GPUAdapterInfo?.architecture || null,
         passed: result.passed,
         matchedSku: result.matchedSku,
-        issues: result.issues
+        issues: result.issues,
+        healed
     };
 }
 
+function printUsablePresets() {
+    const allPresets = listUsableDevicePresets();
+    console.log('================================================================================');
+    console.log(`🖥️  Camoufox Absorbed & 100% SKU-Verified Device Preset Catalog (${allPresets.length} Presets)`);
+    console.log('================================================================================');
+    for (const os of ['macos', 'windows', 'linux']) {
+        const group = listUsableDevicePresets({ os });
+        console.log(`\n▶ [${os.toUpperCase()}] (${group.length} verified device models):`);
+        for (const p of group) {
+            console.log(
+                `  • ${p.presetId.padEnd(36)} | ${p.deviceModel.padEnd(34)} | ${p.cpuModel.padEnd(32)} | ${String(p.hardwareConcurrency).padStart(2)}T | ${String(p.ramGb).padStart(3)}GB RAM | ${String(p.storageGb).padStart(4)}GB SSD | ${p.screen.width}x${p.screen.height}@${p.screen.devicePixelRatio}x`
+            );
+        }
+    }
+}
+
 function main() {
+    if (process.argv.includes('--list-presets')) {
+        printUsablePresets();
+        return;
+    }
+
+    const showHeal = process.argv.includes('--heal');
     const argDir = process.argv.find((a) => a.startsWith('--cache-dir='))?.split('=')[1];
     const cacheRoot =
         argDir || '/Volumes/hello/PrivacyData/adspower_global/cwd_global/source/cache';
@@ -145,12 +184,13 @@ function main() {
 
     const passedCount = reports.filter((r) => r.passed).length;
     const failedCount = reports.length - passedCount;
+    const healedPassCount = reports.filter((r) => r.healed?.validation?.passed).length;
 
     console.log('================================================================================');
     console.log('🔍 AdsPower Local Profile Cache Hardware SKU Coherence Audit');
     console.log('================================================================================');
     console.log(`📂 Cache Directory : ${cacheRoot}`);
-    console.log(`📊 Audited Profiles: ${reports.length} (Passed: ${passedCount}, Failed SKU Audit: ${failedCount})\n`);
+    console.log(`📊 Audited Profiles: ${reports.length} (Raw Passed: ${passedCount}, Raw Failed: ${failedCount}, Auto-Healed Passed: ${healedPassCount}/${reports.length})\n`);
 
     for (const r of reports) {
         const badge = r.passed ? '✅ PASS' : '❌ FAIL';
@@ -159,6 +199,12 @@ function main() {
         );
         for (const issue of r.issues) {
             console.log(`   ↳ ⚠️  ${issue}`);
+        }
+        if (!r.passed && showHeal && r.healed) {
+            const hp = r.healed.healedProfile.hardwareProfile;
+            console.log(
+                `   ↳ 🛠️  AUTO-HEALED -> Preset="${r.healed.healedPresetId}" (${hp.deviceModel} | ${hp.cpuModel} | ${r.healed.healedProfile.telemetry.navigator.hardwareConcurrency} Cores | ${hp.ramGb}GB RAM | ${hp.storageGb}GB SSD | GPU="${r.healed.healedProfile.telemetry.webgl.unmaskedRenderer}" | Host="${r.healed.healedProfile.deviceName}") [SKU Verified: ${r.healed.validation.passed ? '100% PASS' : 'FAIL'}]`
+            );
         }
     }
 }

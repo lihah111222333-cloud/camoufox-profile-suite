@@ -2495,6 +2495,12 @@ export function lookupPcGpuSku(renderer) {
  * }}
  */
 export function validateHardwareModelSpec(telemetry, targetOs = null) {
+    if (typeof targetOs === 'string') {
+        const lowerOs = targetOs.trim().toLowerCase();
+        if (lowerOs.startsWith('win')) targetOs = 'win';
+        else if (lowerOs.startsWith('mac') || lowerOs === 'darwin' || lowerOs === 'osx') targetOs = 'mac';
+        else if (lowerOs.startsWith('lin') || lowerOs === 'ubuntu') targetOs = 'lin';
+    }
     const issues = [];
     if (!telemetry || typeof telemetry !== 'object') {
         return {
@@ -2646,11 +2652,11 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
     const macProductLabel = String(hw.deviceName || hw.productType || deviceModel || '').trim();
     const cpuArchClaim = String(hw.architecture || telemetry.userAgentMetadata?.architecture || '').trim().toLowerCase();
     if (macProductLabel) {
-        const isMacStudio = /\bMac\s+Studio\b/i.test(macProductLabel);
-        const isMacBookAir = /\bMacBook\s+Air\b/i.test(macProductLabel);
-        const isMacMini = /\bMac\s+mini\b/i.test(macProductLabel);
-        const isIMac = /\biMac(?:\s+Pro)?\b/i.test(macProductLabel);
-        const isMacPro = /\bMac\s+Pro\b/i.test(macProductLabel);
+        const isMacStudio = /\bMac[\s_-]+Studio\b/i.test(macProductLabel);
+        const isMacBookAir = /\bMacBook[\s_-]+Air\b/i.test(macProductLabel);
+        const isMacMini = /\bMac[\s_-]+mini\b/i.test(macProductLabel);
+        const isIMac = /\biMac(?:[\s_-]+Pro)?\b/i.test(macProductLabel);
+        const isMacPro = /\bMac[\s_-]+Pro\b/i.test(macProductLabel);
 
         if (isMacStudio) {
             if (cpuArchClaim === 'x86' || (!activeAppleSkuName && /Intel|AMD|Radeon/i.test(renderer))) {

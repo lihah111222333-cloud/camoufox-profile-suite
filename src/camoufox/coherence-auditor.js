@@ -25,6 +25,23 @@ import {
     lookupPcGpuSku,
     validateHardwareModelSpec
 } from './hardware-models.js';
+import {
+    OS_FONT_CATALOG,
+    LOCALE_FALLBACK_CHAINS,
+    COUNTRY_GEO_PROFILE_CATALOG,
+    OS_SPEECH_VOICES_CATALOG,
+    OS_MEDIA_DEVICES_CATALOG,
+    USABLE_DEVICE_PRESET_CATALOG,
+    normalizePresetOs,
+    listUsableDevicePresets,
+    expandCompatibleLanguages,
+    buildAcceptLanguageHeader,
+    resolveCountryGeoProfile,
+    selectCoherentSpeechVoices,
+    createCoherentMediaDevices,
+    resolveDeterministicDeviceProfile,
+    sanitizeAdsPowerProfileToCoherentPreset
+} from './device-presets.js';
 
 export {
     APPLE_SILICON_SKU_CATALOG,
@@ -41,7 +58,22 @@ export {
     lookupOemDeviceSku,
     lookupPcCpuSku,
     lookupPcGpuSku,
-    validateHardwareModelSpec
+    validateHardwareModelSpec,
+    OS_FONT_CATALOG,
+    LOCALE_FALLBACK_CHAINS,
+    COUNTRY_GEO_PROFILE_CATALOG,
+    OS_SPEECH_VOICES_CATALOG,
+    OS_MEDIA_DEVICES_CATALOG,
+    USABLE_DEVICE_PRESET_CATALOG,
+    normalizePresetOs,
+    listUsableDevicePresets,
+    expandCompatibleLanguages,
+    buildAcceptLanguageHeader,
+    resolveCountryGeoProfile,
+    selectCoherentSpeechVoices,
+    createCoherentMediaDevices,
+    resolveDeterministicDeviceProfile,
+    sanitizeAdsPowerProfileToCoherentPreset
 };
 
 /**

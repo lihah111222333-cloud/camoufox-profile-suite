@@ -19,6 +19,12 @@ import {
     PC_CPU_SKU_CATALOG,
     PC_GPU_SKU_CATALOG,
     PCI_DEVICE_ID_CATALOG,
+    OS_FONT_CATALOG,
+    LOCALE_FALLBACK_CHAINS,
+    COUNTRY_GEO_PROFILE_CATALOG,
+    OS_SPEECH_VOICES_CATALOG,
+    OS_MEDIA_DEVICES_CATALOG,
+    USABLE_DEVICE_PRESET_CATALOG,
     parseAppleSiliconSkuName,
     lookupIntelMacSku,
     lookupSnapdragonSku,
@@ -26,6 +32,14 @@ import {
     lookupPcCpuSku,
     lookupPcGpuSku,
     validateHardwareModelSpec,
+    listUsableDevicePresets,
+    expandCompatibleLanguages,
+    buildAcceptLanguageHeader,
+    resolveCountryGeoProfile,
+    selectCoherentSpeechVoices,
+    createCoherentMediaDevices,
+    resolveDeterministicDeviceProfile,
+    sanitizeAdsPowerProfileToCoherentPreset,
     normalizeTargetOs,
     gpuFitsOs,
     evaluatePlatformCoherence,
@@ -2209,6 +2223,262 @@ const tests = [
             assert.equal(resStrix.passed, true);
             assert.equal(resStrix.score, 100);
             assert.equal(resStrix.checks.length, 17);
+        }
+    },
+    {
+        name: '71. Absorbed Usable Device Preset Catalog (31 Presets across macOS/Windows/Linux): Every preset in USABLE_DEVICE_PRESET_CATALOG passes 17/17 checks (100/100 score)',
+        fn: () => {
+            const allPresets = listUsableDevicePresets();
+            assert.ok(allPresets.length >= 31, `Expected >= 31 presets, got ${allPresets.length}`);
+
+            const macPresets = listUsableDevicePresets({ os: 'macos' });
+            const winPresets = listUsableDevicePresets({ os: 'windows' });
+            const linPresets = listUsableDevicePresets({ os: 'linux' });
+            assert.ok(macPresets.length >= 13);
+            assert.ok(winPresets.length >= 13);
+            assert.ok(linPresets.length >= 5);
+
+            for (const preset of allPresets) {
+                const resolved = resolveDeterministicDeviceProfile(`test-preset-${preset.presetId}`, {
+                    presetId: preset.presetId,
+                    country: 'US'
+                });
+                assert.equal(resolved.presetId, preset.presetId);
+                assert.equal(resolved.os, preset.os);
+
+                const skuRes = validateHardwareModelSpec(resolved.telemetry, preset.os);
+                assert.equal(
+                    skuRes.passed,
+                    true,
+                    `Preset ${preset.presetId} failed validateHardwareModelSpec: ${skuRes.issues.join(' | ')}`
+                );
+
+                const platformRes = evaluatePlatformCoherence(resolved.telemetry, preset.os);
+                assert.equal(
+                    platformRes.passed,
+                    true,
+                    `Preset ${preset.presetId} failed evaluatePlatformCoherence: ${platformRes.checks
+                        .filter((c) => !c.passed)
+                        .map((c) => `${c.name}: ${c.details}`)
+                        .join(' | ')}`
+                );
+                assert.equal(platformRes.score, 100);
+                assert.equal(platformRes.checks.length, 17);
+            }
+        }
+    },
+    {
+        name: '72. AdsPower-Absorbed Deterministic Profile Seeding, OS Font Isolation, OS Speech Voice URI Isolation & Media Device Hygiene',
+        fn: () => {
+            // 1. Same profileId yields identical deterministic preset, seeds, MAC address, hostname, and USB device IDs
+            const p1 = resolveDeterministicDeviceProfile('acct_seed_998877', { os: 'macos', country: 'JP' });
+            const p2 = resolveDeterministicDeviceProfile('acct_seed_998877', { os: 'macos', country: 'JP' });
+            assert.equal(p1.presetId, p2.presetId);
+            assert.equal(p1.deviceName, p2.deviceName);
+            assert.equal(p1.macAddress, p2.macAddress);
+            assert.deepEqual(p1.seeds, p2.seeds);
+            assert.deepEqual(p1.telemetry.media.devices, p2.telemetry.media.devices);
+            assert.match(p1.deviceName, /MacBook|iMac|Mac mini|Mac Studio/);
+            assert.equal(p1.language, 'ja-JP');
+            assert.equal(p1.timeZone, 'Asia/Tokyo');
+
+            // 2. Strict OS font catalog isolation (zero Windows/Linux signature fonts in macOS catalog and vice-versa)
+            const macFonts = new Set(OS_FONT_CATALOG.macos);
+            const winFonts = new Set(OS_FONT_CATALOG.windows);
+            const linFonts = new Set(OS_FONT_CATALOG.linux);
+            assert.equal(macFonts.has('Segoe UI'), false);
+            assert.equal(macFonts.has('Ubuntu'), false);
+            assert.equal(winFonts.has('Helvetica Neue'), false);
+            assert.equal(winFonts.has('PingFang SC'), false);
+            assert.equal(linFonts.has('Segoe UI'), false);
+            assert.equal(linFonts.has('Helvetica Neue'), false);
+
+            // 3. SpeechVoices OS & language lockstep
+            const winZhVoices = selectCoherentSpeechVoices('windows', 'zh-CN');
+            assert.ok(winZhVoices.every((v) => v.name.includes('Microsoft')));
+            assert.equal(winZhVoices[0].default, true);
+            assert.ok(winZhVoices[0].lang.toLowerCase().startsWith('zh'));
+
+            const macJaVoices = selectCoherentSpeechVoices('macos', 'ja-JP');
+            assert.ok(macJaVoices.every((v) => v.voiceURI.startsWith('com.apple.')));
+            assert.equal(macJaVoices[0].default, true);
+            assert.equal(macJaVoices[0].lang, 'ja-JP');
+
+            // 4. Pre-permission media devices hygiene (empty label unless includeLabels=true)
+            const anonDevices = createCoherentMediaDevices('seed_1', 'windows');
+            assert.equal(anonDevices.length, 3);
+            assert.ok(anonDevices.every((d) => d.label === ''));
+            const labeledDevices = createCoherentMediaDevices('seed_1', 'windows', { includeLabels: true });
+            assert.ok(labeledDevices.every((d) => d.label.length > 0));
+            const videoDev = labeledDevices.find((d) => d.kind === 'videoinput');
+            assert.ok(videoDev.label.includes('Camera') || videoDev.label.includes('Webcam') || videoDev.label.includes('HD'));
+        }
+    },
+    {
+        name: '73. AdsPower-Absorbed 50+ Locale Fallback Chains, RFC-9110 Accept-Language q-Factor Builder & 40+ Country Geo Profiles (Wire-to-DOM Coherence)',
+        fn: () => {
+            assert.ok(Object.keys(LOCALE_FALLBACK_CHAINS).length >= 50);
+            assert.ok(Object.keys(COUNTRY_GEO_PROFILE_CATALOG).length >= 40);
+
+            const zhChain = expandCompatibleLanguages('zh-CN');
+            assert.deepEqual(zhChain, ['zh-CN', 'zh']);
+            const zhHeader = buildAcceptLanguageHeader(zhChain);
+            assert.equal(zhHeader, 'zh-CN,zh;q=0.9');
+
+            const deProfile = resolveDeterministicDeviceProfile('berlin_user_01', {
+                os: 'windows',
+                country: 'DE'
+            });
+            assert.equal(deProfile.language, 'de-DE');
+            assert.equal(deProfile.timeZone, 'Europe/Berlin');
+            assert.equal(deProfile.acceptLanguage, 'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7');
+
+            const wireToDom = evaluateWireToDomCoherence(
+                deProfile.telemetry,
+                [
+                    {
+                        type: 'egress',
+                        url: 'https://accounts.google.com/',
+                        headers: deProfile.headers
+                    }
+                ],
+                'windows'
+            );
+            assert.equal(wireToDom.passed, true);
+            assert.equal(wireToDom.score, 100);
+        }
+    },
+    {
+        name: '74. Rule M / Rule N / Rule O (AdsPower Real-World Broken Profile Detection): Rejects 4-Core M1 Max on Mac mini, x86 Intel Iris Mac Studio, M5 Pro on MacBook Air with macOS 11, and AMD GPU with gen-12lp WebGPU',
+        fn: () => {
+            // 1. AdsPower broken profile pattern #1: Mac mini + 4-core Apple M1 Max + macOS 11.7.1
+            const brokenM1MaxMini = buildCoherentTelemetry('macos');
+            brokenM1MaxMini.navigator.hardwareConcurrency = 4;
+            brokenM1MaxMini.worker.hardwareConcurrency = 4;
+            brokenM1MaxMini.iframeParity.hardwareConcurrency = 4;
+            brokenM1MaxMini.webgl.unmaskedRenderer = 'ANGLE (Apple, ANGLE Metal Renderer: Apple M1 Max, Unspecified Version)';
+            brokenM1MaxMini.hardwareProfile = {
+                deviceName: 'Mac-mini.local',
+                architecture: 'arm',
+                osVersion: '11.7.1',
+                ramGb: 8
+            };
+            const res1 = validateHardwareModelSpec(brokenM1MaxMini, 'macos');
+            assert.equal(res1.passed, false);
+            assert.ok(res1.issues.some((i) => i.includes('navigator.hardwareConcurrency=4 is invalid for Apple M1 Max')));
+            assert.ok(res1.issues.some((i) => i.includes('ramGb=8GB does not exist on Apple M1 Max')));
+            assert.ok(res1.issues.some((i) => i.includes('(Mac mini) only ships with base or Pro Apple Silicon SoCs')));
+
+            // 2. AdsPower broken profile pattern #2: Mac Studio + x86 + Intel Iris Plus Graphics 645
+            const brokenMacStudio = buildCoherentTelemetry('macos');
+            brokenMacStudio.navigator.hardwareConcurrency = 4;
+            brokenMacStudio.worker.hardwareConcurrency = 4;
+            brokenMacStudio.iframeParity.hardwareConcurrency = 4;
+            brokenMacStudio.webgl.unmaskedVendor = 'Intel Inc.';
+            brokenMacStudio.webgl.unmaskedRenderer = 'ANGLE (Intel Inc., Intel(R) Iris(TM) Plus Graphics 645, OpenGL 4.1)';
+            brokenMacStudio.hardwareProfile = {
+                deviceName: 'Mac-Studio.local',
+                architecture: 'x86',
+                osVersion: '12.6.8',
+                ramGb: 8,
+                webgpuAdapterInfo: { vendor: 'intel', architecture: 'gen-9' }
+            };
+            const res2 = validateHardwareModelSpec(brokenMacStudio, 'macos');
+            assert.equal(res2.passed, false);
+            assert.ok(res2.issues.some((i) => i.includes('is Apple Silicon Max/Ultra exclusive and never existed with x86 Intel/AMD hardware')));
+
+            // 3. AdsPower broken profile pattern #3: MacBook Air + Apple M5 Pro + macOS 11.7.6 Big Sur
+            const brokenM5Air = buildCoherentTelemetry('macos');
+            brokenM5Air.navigator.hardwareConcurrency = 4;
+            brokenM5Air.worker.hardwareConcurrency = 4;
+            brokenM5Air.iframeParity.hardwareConcurrency = 4;
+            brokenM5Air.webgl.unmaskedRenderer = 'ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Pro, Unspecified Version)';
+            brokenM5Air.hardwareProfile = {
+                deviceName: 'MacBook-Air.local',
+                architecture: 'arm',
+                osVersion: '11.7.6',
+                ramGb: 8
+            };
+            const res3 = validateHardwareModelSpec(brokenM5Air, 'macos');
+            assert.equal(res3.passed, false);
+            assert.ok(res3.issues.some((i) => i.includes('(MacBook Air) only ships with base Apple M-series SoCs')));
+            assert.ok(res3.issues.some((i) => i.includes("minimum bootable macOS violation: osVersion=\"11.7.6\" is older than Apple M5 Pro's factory minimum macOS")));
+
+            // 4. AdsPower broken profile pattern #4: AMD Radeon Pro 5700 XT with Intel WebGPU architecture "gen-12lp"
+            const brokenWebGpuArch = buildCoherentTelemetry('macos');
+            brokenWebGpuArch.navigator.hardwareConcurrency = 16;
+            brokenWebGpuArch.worker.hardwareConcurrency = 16;
+            brokenWebGpuArch.iframeParity.hardwareConcurrency = 16;
+            brokenWebGpuArch.webgl.unmaskedVendor = 'ATI Technologies Inc.';
+            brokenWebGpuArch.webgl.unmaskedRenderer = 'ANGLE (AMD, ANGLE Metal Renderer: AMD Radeon Pro 5700 XT, Unspecified Version)';
+            brokenWebGpuArch.hardwareProfile = {
+                deviceName: 'iMac.local',
+                architecture: 'x86',
+                osVersion: '14.7.0',
+                ramGb: 32,
+                webgpuAdapterInfo: { vendor: 'intel', architecture: 'gen-12lp' }
+            };
+            const res4 = validateHardwareModelSpec(brokenWebGpuArch, 'macos');
+            assert.equal(res4.passed, false);
+            assert.ok(res4.issues.some((i) => i.includes('WebGPU GPUAdapterInfo.architecture="gen-12lp" (Intel/Apple architecture) contradicts AMD WebGL renderer')));
+        }
+    },
+    {
+        name: '75. Auto-Healer (sanitizeAdsPowerProfileToCoherentPreset): Repairs broken AdsPower profiles into 100/100 SKU-coherent profiles',
+        fn: () => {
+            const brokenRawProfiles = [
+                {
+                    fbccId: 'k1a953b8',
+                    Platform: 'MacIntel',
+                    DeviceName: 'Mac-mini.local',
+                    HardwareConcurrency: 4,
+                    DeviceMemory: 8,
+                    UNMASKED_RENDERER_WEBGL: 'ANGLE (Apple, ANGLE Metal Renderer: Apple M1 Max, Unspecified Version)',
+                    UserAgentMetadata: { architecture: 'arm', platformVersion: '11.7.1' }
+                },
+                {
+                    fbccId: 'k1a95b31',
+                    Platform: 'MacIntel',
+                    DeviceName: 'Mac-Studio.local',
+                    HardwareConcurrency: 4,
+                    DeviceMemory: 8,
+                    UNMASKED_RENDERER_WEBGL: 'ANGLE (Intel Inc., Intel(R) Iris(TM) Plus Graphics 645, OpenGL 4.1)',
+                    UserAgentMetadata: { architecture: 'x86', platformVersion: '12.6.8' }
+                },
+                {
+                    fbccId: 'k18yt91c',
+                    Platform: 'MacIntel',
+                    DeviceName: 'MacBook-Air.local',
+                    HardwareConcurrency: 4,
+                    DeviceMemory: 8,
+                    UNMASKED_RENDERER_WEBGL: 'ANGLE (Apple, ANGLE Metal Renderer: Apple M5 Pro, Unspecified Version)',
+                    UserAgentMetadata: { architecture: 'arm', platformVersion: '11.7.6' }
+                },
+                {
+                    fbccId: 'win_broken_kf',
+                    Platform: 'Win32',
+                    DeviceName: 'DESKTOP-BAD1234',
+                    HardwareConcurrency: 4,
+                    DeviceMemory: 8,
+                    UNMASKED_RENDERER_WEBGL: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 4090 Direct3D11 vs_5_0 ps_5_0, D3D11)',
+                    UserAgentMetadata: { architecture: 'x86', platformVersion: '15.0.0' }
+                }
+            ];
+
+            for (const raw of brokenRawProfiles) {
+                const healed = sanitizeAdsPowerProfileToCoherentPreset(raw);
+                assert.equal(
+                    healed.validation.passed,
+                    true,
+                    `Healed profile for ${raw.fbccId} failed SKU validation: ${healed.validation.issues.join(' | ')}`
+                );
+                const fullAudit = evaluatePlatformCoherence(
+                    healed.healedProfile.telemetry,
+                    healed.healedProfile.os
+                );
+                assert.equal(fullAudit.passed, true);
+                assert.equal(fullAudit.score, 100);
+            }
         }
     }
 ];
