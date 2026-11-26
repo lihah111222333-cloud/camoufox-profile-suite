@@ -14,6 +14,16 @@ const ORDER_STATUS = {
 };
 
 class SmsVerifyKeyError extends Error {}
+class SmsVerifyCanceledError extends Error {}
+
+class SmsVerifyOrderError extends Error {
+    constructor(message, orderId, status) {
+        super(message);
+        this.name = 'SmsVerifyOrderError';
+        this.orderId = orderId;
+        this.status = status;
+    }
+}
 
 function getApiKey() {
     const apiKey = process.env.SMS_VERIFY_API_KEY;
@@ -126,20 +136,24 @@ export async function getSmsVerifyServices(country, operator, service) {
     return makeRequest('getServicesAndCost', params);
 }
 
+function numberOrderParams(service, country, operator, { maxPrice }) {
+    if (maxPrice !== undefined && (!Number.isFinite(maxPrice) || maxPrice <= 0)) {
+        throw new RangeError('maxPrice must be a positive finite number when supplied');
+    }
+    return { service, country, operator, maxPrice };
+}
+
 /**
  * Buy a number for SMS verification
  * @param {string} service - Service code (e.g., 'fu' for Snapchat)
  * @param {number} country - Country ID (default: 16 for UK)
  * @param {string} operator - Operator code (default: 'any')
  * @param {Object} options - Additional options
- * @param {number} options.maxPrice - Maximum price willing to pay
+ * @param {number} [options.maxPrice] - Positive, finite spending cap
  * @returns {Promise<{id: number, phone: string, price?: number}>}
  */
 export async function buySmsVerifyNumber(service = 'fu', country = 16, operator = 'any', options = {}) {
-    const params = { service, country, operator };
-    if (options.maxPrice) params.maxPrice = options.maxPrice;
-
-    const response = await makeRequest('getNumber', params);
+    const response = await makeRequest('getNumber', numberOrderParams(service, country, operator, options));
 
     // Parse response: ACCESS_NUMBER:ID:NUMBER
     if (typeof response === 'string') {
@@ -170,13 +184,11 @@ export async function buySmsVerifyNumber(service = 'fu', country = 16, operator 
  * @param {number} country - Country ID
  * @param {string} operator - Operator code
  * @param {Object} options - Additional options
+ * @param {number} [options.maxPrice] - Positive, finite spending cap
  * @returns {Promise<Object>} Order data
  */
 export async function buySmsVerifyNumberV2(service = 'fu', country = 16, operator = 'any', options = {}) {
-    const params = { service, country, operator };
-    if (options.maxPrice) params.maxPrice = options.maxPrice;
-
-    const response = await makeRequest('getNumberV2', params);
+    const response = await makeRequest('getNumberV2', numberOrderParams(service, country, operator, options));
 
     if (typeof response === 'string') {
         if (response === 'NO_BALANCE') throw new Error('Insufficient balance');
@@ -197,6 +209,25 @@ export async function buySmsVerifyNumberV2(service = 'fu', country = 16, operato
     };
 }
 
+function classifyOrderStatus(response) {
+    if (typeof response === 'string') {
+        if (response === ORDER_STATUS.WAIT_CODE) return 'PENDING';
+        if (response === ORDER_STATUS.CANCEL) return 'CANCELED';
+        if (response.startsWith(`${ORDER_STATUS.OK}:`)) return 'RECEIVED';
+    }
+    return 'UNKNOWN';
+}
+
+/**
+ * Check the status of an existing order for reconciliation.
+ * @param {number} orderId - Order ID
+ * @returns {Promise<{status: string}>}
+ */
+export async function getSmsVerifyOrderStatus(orderId) {
+    const response = await makeRequest('getStatus', { id: orderId });
+    return { status: classifyOrderStatus(response) };
+}
+
 /**
  * Check order status and get SMS code
  * @param {number} orderId - Order ID
@@ -204,21 +235,9 @@ export async function buySmsVerifyNumberV2(service = 'fu', country = 16, operato
  */
 export async function checkSmsVerifyOrder(orderId) {
     const response = await makeRequest('getStatus', { id: orderId });
-
-    if (typeof response === 'string') {
-        if (response === ORDER_STATUS.WAIT_CODE) {
-            return { status: 'PENDING', code: null };
-        }
-        if (response === ORDER_STATUS.CANCEL) {
-            return { status: 'CANCELED', code: null };
-        }
-        if (response.startsWith(`${ORDER_STATUS.OK}:`)) {
-            const code = response.split(':')[1];
-            return { status: 'RECEIVED', code };
-        }
-    }
-
-    return { status: 'UNKNOWN', code: null };
+    const status = classifyOrderStatus(response);
+    const code = status === 'RECEIVED' ? response.split(':')[1] : null;
+    return { status, code };
 }
 
 /**
@@ -324,7 +343,7 @@ export async function waitForSmsVerifyCode(orderId, maxWaitTime = 300000, checkI
             if (result.code) return result.code;
 
             if (result.status === 'CANCELED') {
-                throw new Error('Order was canceled');
+                throw new SmsVerifyCanceledError('Order was canceled');
             }
         }
 
@@ -341,8 +360,9 @@ export async function waitForSmsVerifyCode(orderId, maxWaitTime = 300000, checkI
  * @param {number} options.country - Country ID (default: 16 for UK)
  * @param {string} options.operator - Operator code (default: 'any')
  * @param {number} options.maxWaitTime - Max wait time for SMS
- * @param {number} options.maxPrice - Maximum price
+ * @param {number} [options.maxPrice] - Positive, finite spending cap
  * @returns {Promise<{phone: string, code: string, orderId: number}>}
+ * @throws {SmsVerifyOrderError} After purchase, includes orderId and status when order cleanup needs review or has canceled the order.
  */
 export async function buyNumberAndGetSMS({
     service = 'fu',
@@ -351,21 +371,34 @@ export async function buyNumberAndGetSMS({
     maxWaitTime = 300000,
     maxPrice
 } = {}) {
-    let order = null;
-
+    const order = await buySmsVerifyNumber(service, country, operator, { maxPrice });
+    let code;
     try {
-        order = await buySmsVerifyNumber(service, country, operator, { maxPrice });
-        const code = await waitForSmsVerifyCode(order.id, maxWaitTime);
-        await finishSmsVerifyOrder(order.id);
-
-        return { phone: order.phone, code, orderId: order.id };
+        code = await waitForSmsVerifyCode(order.id, maxWaitTime);
     } catch (error) {
-        if (order?.id) {
-            // Wait 2 minutes before cancel if needed
-            await cancelSmsVerifyOrder(order.id).catch(() => {});
+        const canceled = error instanceof SmsVerifyCanceledError ||
+            await cancelSmsVerifyOrder(order.id).catch(() => false);
+        if (canceled) {
+            throw new SmsVerifyOrderError('SMS Verification order was canceled', order.id, 'CANCELED');
         }
-        throw error;
+        throw new SmsVerifyOrderError(
+            'SMS Verification cancellation is unconfirmed. Reconcile the order before ordering again.',
+            order.id,
+            'RECONCILIATION_REQUIRED'
+        );
     }
+
+    // A finish request can succeed even if its response is lost. Preserve the order for reconciliation.
+    const finished = await finishSmsVerifyOrder(order.id).catch(() => false);
+    if (!finished) {
+        throw new SmsVerifyOrderError(
+            'SMS Verification completion is unconfirmed. Reconcile the order before ordering again.',
+            order.id,
+            'RECONCILIATION_REQUIRED'
+        );
+    }
+
+    return { phone: order.phone, code, orderId: order.id };
 }
 
 // Country codes reference (commonly used)

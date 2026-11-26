@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -8,8 +9,9 @@ import test from 'node:test';
 import { CamoufoxTrafficRecorder, verifyTrafficIntegrity } from '../../src/camoufox/traffic-recorder.js';
 
 function fixture(t, options = {}) {
-    const trafficDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'recorder-integrity-'));
-    t.after(() => fs.rmSync(trafficDir, { force: true, recursive: true }));
+    const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'recorder-integrity-'));
+    t.after(() => fs.rmSync(root, { force: true, recursive: true }));
+    const trafficDir = path.join(root, 'traffic');
     const create = (overrides = {}) => new CamoufoxTrafficRecorder({
         trafficDir,
         sslKeyLog: false,
@@ -206,7 +208,7 @@ test('a failed append does not advance the chain or overwrite the existing index
 });
 
 test('recovery and verification require recorded payloads to be present and unchanged', async (t) => {
-    const { trafficDir, recorder, create, indexPath } = fixture(t, { maxInlinePreviewBytes: 0 });
+    const { trafficDir, recorder, create, indexPath } = fixture(t, { maxInlinePreviewBytes: 0, recordBodies: true });
     const page = new EventEmitter();
     const socket = Object.assign(new EventEmitter(), { url: () => 'wss://example.test/fixture' });
     recorder.attachPage(page);
@@ -227,34 +229,25 @@ test('recovery and verification require recorded payloads to be present and unch
     assert.deepEqual(fs.readFileSync(indexPath), originalIndex);
 });
 
-test('recovery respects the previous wire and native log checkpoints before trimming a torn append', async (t) => {
-    const { trafficDir, recorder, create, ledgerPath, indexPath } = fixture(t, {
-        sslKeyLog: true,
-        neckoMozLog: true
-    });
-    recorder.recordSslKeyLogSecret('CLIENT_RANDOM', 'a'.repeat(64), 'b'.repeat(96));
-    recorder.recordNeckoMozLogBlock('initial synthetic Necko entry');
+test('recovery respects the previous wire checkpoint before trimming a torn append', async (t) => {
+    const { trafficDir, recorder, create, ledgerPath, indexPath } = fixture(t);
     recorder.recordSecurityBlock({ type: 'fixture', url: 'https://example.test/one' });
     await recorder.flushSummary();
     const index = fs.readFileSync(indexPath);
 
-    recorder.recordSslKeyLogSecret('CLIENT_RANDOM', 'c'.repeat(64), 'd'.repeat(96));
-    recorder.recordNeckoMozLogBlock('another synthetic Necko entry');
     recorder.recordSecurityBlock({ type: 'fixture', url: 'https://example.test/two' });
     const prefix = fs.readFileSync(ledgerPath);
     fs.appendFileSync(ledgerPath, '{"type":"step-transiti');
     const torn = fs.readFileSync(ledgerPath);
 
-    for (const artifactPath of [recorder.preTlsWireLogPath, recorder.sslKeyLogPath, recorder.neckoMozLogPath]) {
-        const original = fs.readFileSync(artifactPath);
-        const altered = Buffer.from(original);
-        altered[0] ^= 1;
-        fs.writeFileSync(artifactPath, altered);
-        assert.throws(() => create(), /SHA-256 mismatch/);
-        assert.deepEqual(fs.readFileSync(ledgerPath), torn);
-        assert.deepEqual(fs.readFileSync(indexPath), index);
-        fs.writeFileSync(artifactPath, original);
-    }
+    const original = fs.readFileSync(recorder.preTlsWireLogPath);
+    const altered = Buffer.from(original);
+    altered[0] ^= 1;
+    fs.writeFileSync(recorder.preTlsWireLogPath, altered);
+    assert.throws(() => create(), /SHA-256 mismatch/);
+    assert.deepEqual(fs.readFileSync(ledgerPath), torn);
+    assert.deepEqual(fs.readFileSync(indexPath), index);
+    fs.writeFileSync(recorder.preTlsWireLogPath, original);
 
     const resumed = create();
     assert.deepEqual(fs.readFileSync(ledgerPath), prefix);
@@ -263,15 +256,16 @@ test('recovery respects the previous wire and native log checkpoints before trim
 });
 
 test('verification checks legacy wire, NSS and Necko declarations even when only size is recorded', async (t) => {
-    const { trafficDir, create, indexPath } = fixture(t);
-    const sslKeyLogPath = path.join(trafficDir, 'sslkeylog.txt');
-    const neckoMozLogPath = path.join(trafficDir, 'necko-pre-tls.moz_log');
-    const legacy = create({ sslKeyLog: true, neckoMozLog: true, sslKeyLogPath, neckoMozLogPath });
-    legacy.recordSslKeyLogSecret('CLIENT_RANDOM', 'a'.repeat(64), 'b'.repeat(96));
-    legacy.recordNeckoMozLogBlock('synthetic Necko fixture');
-    const summary = await legacy.stop();
-    delete summary.integrity.sslKeyLogFile;
-    delete summary.integrity.neckoMozLogFile;
+    const { trafficDir, recorder, indexPath } = fixture(t);
+    const summary = await recorder.stop();
+    for (const [field, name, text] of [
+        ['sslKeyLog', 'sslkeylog.txt', `CLIENT_RANDOM ${'a'.repeat(64)} ${'b'.repeat(96)}\n`],
+        ['neckoMozLog', 'necko-pre-tls.moz_log', 'synthetic Necko fixture\n']
+    ]) {
+        fs.writeFileSync(path.join(trafficDir, name), text);
+        summary.integrity[`${field}Sha256`] = createHash('sha256').update(text).digest('hex');
+        summary.integrity[`${field}Bytes`] = Buffer.byteLength(text);
+    }
     const writeIndex = (value) => fs.writeFileSync(indexPath, JSON.stringify(value));
     writeIndex(summary);
     assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
@@ -313,11 +307,16 @@ test('verification accepts absent optional artifacts and checks newly recorded p
     recorder.recordSslKeyLogSecret('CLIENT_RANDOM', 'c'.repeat(64), 'd'.repeat(96));
     recorder.recordNeckoMozLogBlock('synthetic Necko fixture');
     const summary = await recorder.stop();
-    assert.equal(summary.integrity.sslKeyLogFile, '.private/sslkeylog.txt');
-    assert.equal(summary.integrity.neckoMozLogFile, '.private/necko-pre-tls.moz_log');
-    assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+    assert.equal(summary.integrity.sslKeyLogFile, undefined);
+    assert.equal(summary.integrity.neckoMozLogFile, undefined);
+    const portable = verifyTrafficIntegrity(trafficDir);
+    assert.equal(portable.valid, true);
+    assert.deepEqual(portable.unverifiedNativeArtifacts.sort(), ['necko-pre-tls.moz_log', 'sslkeylog.txt']);
+    const profile = { nativeDir: recorder.profileNativeDir };
+    assert.equal(verifyTrafficIntegrity(trafficDir, profile).valid, true);
     fs.unlinkSync(recorder.sslKeyLogPath);
-    assert.ok(verifyTrafficIntegrity(trafficDir).errors.includes('Missing .private/sslkeylog.txt on disk'));
+    assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+    assert.equal(verifyTrafficIntegrity(trafficDir, profile).valid, false);
 });
 
 test('a private native log outside the capture directory is outside the archive integrity scope', async (t) => {

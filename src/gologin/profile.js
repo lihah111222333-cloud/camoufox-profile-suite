@@ -4,17 +4,38 @@
  */
 
 import { GologinApi } from 'gologin';
-import puppeteer from 'puppeteer-core';
 import logger from '../utils/logger.js';
-import gologinClient from './client.js';
+import { requireControllerProfileId } from '../utils/controller-id.js';
+import { GoLoginClient, getGoLoginApiKey } from './client.js';
 import config from '../config.js';
 
+function bindGoLoginSession() {
+    const token = getGoLoginApiKey();
+    return {
+        client: new GoLoginClient(token),
+        createSdk: () => GologinApi({ token })
+    };
+}
+
 class GoLoginProfile {
-    constructor(profileId, gologinApi = null) {
-        this.profileId = profileId;
+    #profileId;
+    #gologinApi;
+    #session;
+
+    constructor(profileId, gologinApi = null, session = null) {
+        this.#profileId = requireControllerProfileId(profileId);
+        this.#gologinApi = gologinApi;
+        this.#session = session;
         this.browser = null;
         this.page = null;
-        this.gologinApi = gologinApi;
+    }
+
+    get profileId() {
+        return this.#profileId;
+    }
+
+    get gologinApi() {
+        return this.#gologinApi;
     }
 
     /**
@@ -25,13 +46,9 @@ class GoLoginProfile {
         try {
             logger.info('Starting GoLogin profile (Remote Mode)', { profileId: this.profileId });
 
-            if (!this.gologinApi) {
-                const apiKey = process.env.GOLOGIN_API_KEY;
-                if (!apiKey) {
-                    throw new Error('GOLOGIN_API_KEY is not set');
-                }
-                // Use Remote Mode (Cloud Browser)
-                this.gologinApi = GologinApi({ token: apiKey });
+            if (!this.#gologinApi) {
+                this.#session ??= bindGoLoginSession();
+                this.#gologinApi = this.#session.createSdk();
             }
 
             // Start browser using Remote Mode (Cloud Browser)
@@ -137,18 +154,28 @@ class GoLoginProfile {
      * إيقاف البروفايل
      */
     async stop() {
-        try {
-            if (this.browser) {
+        let stopped = false;
+        if (this.browser) {
+            try {
                 await this.browser.close();
                 this.browser = null;
                 this.page = null;
+                stopped = true;
+            } catch (error) {
+                logger.warn('Error closing GoLogin browser', { profileId: this.profileId, error: error.message });
             }
+        }
 
-            if (this.gologinApi) {
-                await this.gologinApi.stop();
+        try {
+            if (typeof this.#gologinApi?.stop === 'function') {
+                stopped = (await this.#gologinApi.stop()) !== false;
             }
-
-            await gologinClient.stopProfile(this.profileId);
+            if (!stopped) {
+                logger.warn('GoLogin session stop could not be confirmed', { profileId: this.profileId });
+                return false;
+            }
+            this.browser = null;
+            this.page = null;
             logger.info('Profile stopped', { profileId: this.profileId });
             return true;
         } catch (error) {
@@ -163,8 +190,12 @@ class GoLoginProfile {
      */
     async delete() {
         try {
+            if (this.#gologinApi && !this.#session) {
+                throw new Error('Deleting an externally managed GoLogin profile requires a bound REST credential');
+            }
+            this.#session ??= bindGoLoginSession();
             await this.stop();
-            await gologinClient.deleteProfile(this.profileId);
+            await this.#session.client.deleteProfile(this.profileId);
             logger.info('Profile deleted', { profileId: this.profileId });
             return true;
         } catch (error) {
@@ -180,22 +211,18 @@ class GoLoginProfile {
  */
 export async function createAndStartProfile(name, proxy = null) {
     try {
-        // Get API key
-        const apiKey = process.env.GOLOGIN_API_KEY;
-        if (!apiKey) {
-            throw new Error('GOLOGIN_API_KEY is not set');
-        }
-
-        // Use GologinApi to create profile (uses /browser/quick which is more efficient)
-        const gologinApi = GologinApi({ token: apiKey });
+        const session = bindGoLoginSession();
+        const gologinApi = session.createSdk();
         
         // Create profile using gologinClient (uses /browser/quick - more efficient)
         // This reduces API calls and works better with free tier
         logger.info('Creating GoLogin profile using quick method (Android)...');
         // Use config to determine if proxy testing should be enabled
         const testProxy = config.app.testProxy !== false;
-        const profile = await gologinClient.createProfileWithProxy(name, proxy, testProxy);
-        logger.info('Profile created', { profileId: profile.id, name });
+        const profile = await session.client.createProfileWithProxy(name, proxy, testProxy);
+        const profileManager = new GoLoginProfile(profile.id, gologinApi, session);
+        const { profileId } = profileManager;
+        logger.info('Profile created', { profileId, name });
 
         // Wait a bit after profile creation to ensure it's fully initialized on GoLogin servers
         // الانتظار قليلاً بعد إنشاء البروفايل لضمان تهيئته بالكامل على خوادم GoLogin
@@ -205,11 +232,11 @@ export async function createAndStartProfile(name, proxy = null) {
         // Verify profile is ready by checking it exists
         // التحقق من أن البروفايل جاهز عن طريق التحقق من وجوده
         try {
-            await gologinClient.getProfile(profile.id);
-            logger.info('Profile verified and ready', { profileId: profile.id });
+            await session.client.getProfile(profileId);
+            logger.info('Profile verified and ready', { profileId });
         } catch (verifyError) {
             logger.warn('Profile verification failed, continuing anyway', { 
-                profileId: profile.id,
+                profileId,
                 error: verifyError.message 
             });
         }
@@ -239,18 +266,18 @@ export async function createAndStartProfile(name, proxy = null) {
                 
                 const launchResult = await Promise.race([
                     gologinApi.launch({ 
-                        profileId: profile.id,
+                        profileId,
                         cloud: true // Use Remote Mode (Cloud Browser)
                     }).catch(async (launchError) => {
                         // If launch fails with 500, wait a bit and try to verify profile
                         if (launchError.message.includes('500') || launchError.message.includes('Unexpected server response')) {
                             logger.warn('Launch failed with server error, verifying profile status...', { 
-                                profileId: profile.id 
+                                profileId
                             });
                             // Wait a bit and verify profile exists
                             await new Promise(resolve => setTimeout(resolve, 3000));
                             try {
-                                await gologinClient.getProfile(profile.id);
+                                await session.client.getProfile(profileId);
                                 logger.info('Profile exists, server may be busy');
                             } catch (e) {
                                 logger.warn('Profile verification failed', { error: e.message });
@@ -277,7 +304,7 @@ export async function createAndStartProfile(name, proxy = null) {
                             )
                         ]);
                         logger.info('Browser started successfully (Remote Mode)', { 
-                            profileId: profile.id,
+                            profileId,
                             pagesCount: pages.length 
                         });
                         break;
@@ -328,7 +355,7 @@ export async function createAndStartProfile(name, proxy = null) {
                     isServerError,
                     isTimeout,
                     serverErrorCount,
-                    profileId: profile.id,
+                    profileId,
                     // إضافة معلومات إضافية للأخطاء المتكررة
                     suggestion: isServerError && serverErrorCount >= 3 
                         ? 'خادم GoLogin يواجه مشاكل. جرب لاحقاً أو تحقق من حالة الخدمة.'
@@ -366,11 +393,10 @@ export async function createAndStartProfile(name, proxy = null) {
         // Browser is already connected via Remote Mode
         const page = await browser.newPage();
         
-        const profileManager = new GoLoginProfile(profile.id, gologinApi);
         profileManager.browser = browser;
         profileManager.page = page;
         
-        logger.info('Profile created and started (Remote Mode)', { profileId: profile.id, name });
+        logger.info('Profile created and started (Remote Mode)', { profileId, name });
         return profileManager;
     } catch (error) {
         logger.error('Failed to create and start profile', { error: error.message });

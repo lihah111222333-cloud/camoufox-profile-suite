@@ -2,13 +2,13 @@
 
 ## إضافة API Keys
 
-قم بإنشاء ملف `.env` في المجلد الرئيسي وأضف التالي:
+أنشئ ملف `.env` في مجلد الحالة باتباع [خطوات إعداد الملفات الخاصة](README_AR.md#2-إنشاء-ملفات-الإعدادات-الخاصة) ثم أضف الإعدادات التالية.
 
 ```env
 # GoLogin API Configuration (if you use GoLogin paths — optional for GPM/Dolphin-only flows)
 GOLOGIN_API_KEY=your_gologin_api_key_here
 
-# SMS Verification API Configuration
+# Optional settings for separate SMS Verification library use
 SMS_VERIFY_API_KEY=your_sms_verify_api_key_here
 SMS_VERIFY_LANG=ru
 
@@ -35,9 +35,9 @@ npm start
 
 ## ملاحظات
 
-- تأكد من إضافة البروكسيات في `config/proxies.txt`
+- أضف البروكسيات في `config/proxies.txt` داخل مجلد الحالة عندما يتطلب وضع البروفايل بروكسي.
 - ضع مفاتيحك الحقيقية في `.env` فقط ولا ترفعها إلى Git
-- Extension ID لـ OMO Captcha: `dfjghhjachoacpgpkmbpdlpppeagojhe`
+- أكمل التحقق والموافقة وتأكيد هوية الحساب يدوياً عند ظهور `MANUAL_SIGNUP_REQUIRED`.
 - يمكن تحديد عدد الحسابات والـ threads من `.env` أو من سطر الأوامر
 - راجع `USAGE.md` لأمثلة مفصلة
 

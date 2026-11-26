@@ -4,7 +4,7 @@
 
 ### الطريقة 1: استخدام متغيرات البيئة
 
-أضف في ملف `.env`:
+أضف القيم في ملف `.env` داخل [مجلد حالة التطبيق](ENV_VARIABLES.md#configuration-and-local-state).
 ```env
 ACCOUNTS_COUNT=10
 THREADS_COUNT=3
@@ -55,52 +55,24 @@ npm start -- --accounts=20 --threads=5
 npm start -- --accounts=100 --threads=10
 ```
 
-## ملاحظات مهمة
+## النتائج وحالة التسليم اليدوي
 
-1. **عدد البروكسيات**: تأكد من وجود عدد كافٍ من البروكسيات في `config/proxies.txt`
+عندما يسجّل التطبيق `MANUAL_SIGNUP_REQUIRED`، أكمل التحقق والموافقة وتأكيد هوية الحساب في متصفح موثوق. راجع `summary.json` لأي بروفايل تعذّر تأكيد إيقافه.
+
+1. تأكد من وجود عدد كافٍ من البروكسيات في `config/proxies.txt` داخل مجلد الحالة عندما يتطلب وضع البروفايل بروكسي.
    - إذا كان لديك 5 بروكسيات وطلبت 10 threads، سيتم إعادة استخدام البروكسيات
 
 2. **الأداء**: 
    - عدد threads أكبر = أسرع لكن استهلاك موارد أكبر
    - عدد threads أقل = أبطأ لكن أكثر استقراراً
 
-3. **النتائج**: 
-   - النتائج تُحفظ في `results.json`
-   - الملخص يُحفظ في `summary.json`
-
-4. **السجلات**: 
-   - جميع السجلات في مجلد `logs/`
-   - كل thread له رقم معرّف في السجلات
+3. يحفظ التطبيق `results.json` و`summary.json` والسجلات `logs/` في مجلد الحالة.
 
 ## إعدادات افتراضية
 
 - `ACCOUNTS_COUNT=1` (حساب واحد)
 - `THREADS_COUNT=1` (thread واحد)
 
-## مثال على المخرجات
-
-```
-=== Gmail Account Creator Bot Started ===
-Configuration: {
-  accountsCount: 10,
-  threadsCount: 3,
-  proxyCount: 50,
-  availableProxies: 50
-}
-Starting creation of 10 accounts with 3 concurrent threads
-[Thread 1] Starting account creation 1/10
-[Thread 2] Starting account creation 2/10
-[Thread 3] Starting account creation 3/10
-...
-=== Execution Summary ===
-Statistics: {
-  total: 10,
-  completed: 8,
-  failed: 2,
-  successRate: '80.00%',
-  duration: '245.30s',
-  averageTime: '24.53s per account'
-}
-```
+اضبط عدد المحاولات والتزامن على أعداد صحيحة موجبة ضمن نطاق الأعداد الصحيحة الآمنة في JavaScript. يحدّ التطبيق التزامن بعدد المحاولات المطلوبة.
 
 

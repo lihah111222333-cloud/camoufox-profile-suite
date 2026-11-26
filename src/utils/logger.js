@@ -4,11 +4,8 @@
  */
 
 import path from 'path';
-import { fileURLToPath } from 'url';
 import { appendPrivateFile, ensurePrivateDirectory } from './private-storage.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import { ensureStateDirectory, STATE_DIRECTORY } from './state-paths.js';
 
 const LOG_LEVELS = {
     ERROR: 0,
@@ -18,10 +15,11 @@ const LOG_LEVELS = {
 };
 
 const LOG_LEVEL = process.env.LOG_LEVEL?.toUpperCase() || 'INFO';
-const LOG_DIR = path.join(__dirname, '../../logs');
+const LOG_DIR = path.join(STATE_DIRECTORY, 'logs');
 
 try {
-    ensurePrivateDirectory(LOG_DIR);
+    ensureStateDirectory();
+    ensurePrivateDirectory(LOG_DIR, { requireOwner: true });
 } catch {
     throw new Error('Could not secure the application log directory');
 }
@@ -106,7 +104,7 @@ function writeLog(level, message, data = null) {
 
     // File output
     try {
-        appendPrivateFile(logFile, formatted);
+        appendPrivateFile(logFile, formatted, { requireOwner: true });
     } catch {
         console.error('Failed to write to the application log file');
     }

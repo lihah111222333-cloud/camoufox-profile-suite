@@ -198,9 +198,9 @@ test('recording follows context ownership and sanitizes navigation metadata', as
         'page.click',
         'elementHandle.click'
     ]);
-    assert.match(actions[0].target, /access_token=\[REDACTED:/);
+    assert.match(actions[0].target, /access_token=\[REDACTED\]/);
     assert.match(actions[0].metadata.url, /view=compact/);
-    assert.match(actions[1].metadata.pageUrl, /access_token=\[REDACTED:/);
+    assert.match(actions[1].metadata.pageUrl, /access_token=\[REDACTED\]/);
     assert.doesNotMatch(recorded, /fixture-credential/);
     await recorder.flushSummary();
     const summary = await fs.readFile(recorder.attributionIndexPath, 'utf8');

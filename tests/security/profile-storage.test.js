@@ -276,11 +276,12 @@ test('shared processes suppress inherited native diagnostics and isolate complet
     const legacyKeyPath = path.join(root, '_shared_sslkeylog.txt');
     fs.writeFileSync(legacyKeyPath, 'synthetic process-wide fixture\n');
     const legacyFiles = {
-        'sslkeylog.txt': 'synthetic legacy fixture\n',
-        'necko-pre-tls.moz_log.child-1': 'synthetic native fixture\n',
+        '.private/sslkeylog.txt.1': 'synthetic legacy fixture\n',
+        '.private/necko-pre-tls.moz_log.child-1': 'synthetic native fixture\n',
         'attribution-index.json': '{"fixture":"preserved manifest"}\n'
     };
     const { profileDir } = await createProfile('profile-a', null, { ...options, profileId: 'profile-a' });
+    fs.mkdirSync(path.join(profileDir, 'traffic', '.private'));
     for (const [name, value] of Object.entries(legacyFiles)) {
         fs.writeFileSync(path.join(profileDir, 'traffic', name), value);
     }
@@ -311,7 +312,7 @@ test('shared processes suppress inherited native diagnostics and isolate complet
         assert.equal(session.trafficPaths.sslKeyLogPath, null);
         assert.equal(session.trafficPaths.neckoMozLogPath, null);
         const files = fs.readdirSync(session.trafficPaths.trafficDir);
-        assert.equal(files.some((name) => name.includes('sslkeylog') || name.includes('moz_log')), false);
+        assert.equal(files.some((name) => name === '.private' || name.includes('sslkeylog') || name.includes('moz_log')), false);
         const index = readJson(session.trafficPaths.attributionIndexPath);
         assert.equal(index.artifacts.sslKeyLogPath, null);
         assert.equal(index.artifacts.neckoMozLogPath, null);
@@ -472,7 +473,7 @@ test('dedicated profile integrity checks declared native logs after browser shut
     const capture = queryProfileTraffic({ trafficDir, verifyIntegrity: true });
     assert.equal(capture.scope, 'capture');
     assert.equal(capture.valid, true);
-    assert.deepEqual(capture.unverifiedNativeArtifacts.sort(), ['necko-pre-tls.moz_log', 'sslkeylog.txt']);
+    assert.deepEqual([...capture.unverifiedNativeArtifacts].sort(), ['necko-pre-tls.moz_log', 'sslkeylog.txt']);
     assert.match(formatCliReport(capture), /Unverified profile files/);
 
     const disabled = { ...options, sslKeyLog: false, neckoMozLog: false };

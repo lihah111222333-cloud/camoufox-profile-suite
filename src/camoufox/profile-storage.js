@@ -1,12 +1,16 @@
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { readCaptureFile } from './capture-io.js';
+import { listCaptureDirectory, readCaptureFile } from './capture-io.js';
 import {
     ensurePrivateDirectory,
     readPrivateFile,
     restrictPrivateFile,
     writePrivateFile
 } from '../utils/private-storage.js';
+
+// This directory name cannot be a valid profile ID.
+export const PROFILE_LEASE_DIRECTORY = '.camoufox-leases~';
 
 const EMPTY_STORAGE_STATE = { cookies: [], origins: [] };
 const NATIVE_LOG_NAMES = {
@@ -52,30 +56,22 @@ export function locateProfile(profileId, profilesDir, create = false) {
     };
 }
 
-function inspectProfileDirectory({ profileDir }) {
-    let stats;
+export function inspectProfileDirectory({ profileDir }) {
     try {
-        stats = fs.lstatSync(profileDir);
+        const stats = fs.lstatSync(profileDir, { bigint: true });
+        if (!stats.isDirectory() || fs.realpathSync.native(profileDir) !== profileDir) {
+            throw new Error(`Expected a direct Camoufox profile directory: ${profileDir}`);
+        }
+        return stats;
     } catch (error) {
         if (error.code === 'ENOENT') return null;
         throw error;
     }
-    if (!stats.isDirectory() || fs.realpathSync.native(profileDir) !== profileDir) {
-        throw new Error(`Expected a direct Camoufox profile directory: ${profileDir}`);
-    }
-    return stats;
 }
 
-function readProfileMetadataFile(location, requireMetadata) {
+function readProfileMetadataFile(location) {
     const metadataPath = path.join(location.profileDir, 'profile.json');
-    let metadata;
-    try {
-        metadata = JSON.parse(readPrivateFile(metadataPath));
-    } catch (error) {
-        if (error.code === 'ENOENT' && !requireMetadata) return null;
-        throw error;
-    }
-    return requireProfileIdentity(metadata, location.id);
+    return requireProfileIdentity(JSON.parse(readPrivateFile(metadataPath)), location.id);
 }
 
 function requireProfileIdentity(metadata, expectedId) {
@@ -88,14 +84,127 @@ function requireProfileIdentity(metadata, expectedId) {
     return metadata;
 }
 
-export function readProfileMetadata(location) {
-    return inspectProfileDirectory(location) ? readProfileMetadataFile(location, false) : null;
+export function readProfileMetadata(location, { readOnly = false } = {}) {
+    if (!inspectProfileDirectory(location)) return null;
+    if (!readOnly) return readProfileMetadataFile(location);
+    const raw = readCaptureFile(location.profileDir, 'profile.json', { trustedLocal: true });
+    return requireProfileIdentity(JSON.parse(raw.toString('utf8')), location.id);
 }
 
 export function inspectProfileForDeletion(location) {
     const stats = inspectProfileDirectory(location);
-    if (stats) readProfileMetadataFile(location, true);
-    return stats;
+    if (!stats) return null;
+    const metadata = readProfileMetadataFile(location);
+    return { dev: stats.dev, ino: stats.ino, generation: metadata._storageGeneration };
+}
+
+export function stampProfileIdentity(location, metadataPath, metadata) {
+    const stats = inspectProfileDirectory(location);
+    if (!stats) throw new Error('Camoufox profile directory is missing');
+    const generation = randomUUID();
+    writePrivateFile(metadataPath, JSON.stringify({ ...metadata, _storageGeneration: generation }, null, 2));
+    return { dev: stats.dev, ino: stats.ino, generation };
+}
+
+export function assertProfileIdentity(location, identity) {
+    const current = inspectProfileForDeletion(location);
+    if (!current || !identity || current.dev !== identity.dev ||
+        current.ino !== identity.ino || current.generation !== identity.generation) {
+        throw Object.assign(new Error('Camoufox profile no longer matches the acquired storage identity'), {
+            code: 'ERR_CAMOUFOX_PROFILE_STALE'
+        });
+    }
+}
+
+function processIsAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (error) {
+        if (error.code === 'ESRCH') return false;
+        if (error.code === 'EPERM') return true;
+        throw error;
+    }
+}
+
+function leaseOwner(directory) {
+    if (!inspectProfileDirectory({ profileDir: directory })) return null;
+    let owners;
+    try {
+        owners = fs.readdirSync(directory, { withFileTypes: true });
+    } catch (error) {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+    }
+    if (!owners.length) return null;
+
+    const [owner] = owners;
+    const pid = Number(/^([1-9]\d*)-[0-9a-f-]{36}$/.exec(owner.name)?.[1]);
+    if (owners.length !== 1 || !owner.isFile() || !Number.isSafeInteger(pid) || pid > 0x7fffffff) {
+        throw new Error('Invalid Camoufox profile lease');
+    }
+    return { pid, name: owner.name };
+}
+
+function removeLeaseOwner(directory, owner) {
+    if (owner) fs.rmSync(path.join(directory, owner), { force: true });
+    try {
+        fs.rmdirSync(directory);
+    } catch (error) {
+        if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error;
+    }
+}
+
+export function acquireProfileLease(location) {
+    const leaseRoot = path.join(location.profilesDir, PROFILE_LEASE_DIRECTORY);
+    try {
+        fs.mkdirSync(leaseRoot, { mode: 0o700 });
+    } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+    }
+    ensurePrivateDirectory(leaseRoot);
+    const directory = path.join(leaseRoot, location.id);
+    const owner = `${process.pid}-${randomUUID()}`;
+    const candidate = fs.mkdtempSync(path.join(leaseRoot, '~candidate-'));
+
+    try {
+        fs.writeFileSync(path.join(candidate, owner), '', { flag: 'wx', mode: 0o600 });
+        // Publish a populated lease atomically. An incumbent's marker prevents
+        // replacement, and cleanup can only remove a specific marker and an empty directory.
+        while (true) {
+            try {
+                fs.renameSync(candidate, directory);
+                return Object.freeze({ directory, owner });
+            } catch (error) {
+                const occupied = error.code === 'EEXIST' || error.code === 'ENOTEMPTY' ||
+                    (process.platform === 'win32' && error.code === 'EPERM' && fs.existsSync(directory));
+                if (!occupied) throw error;
+            }
+
+            const incumbent = leaseOwner(directory);
+            if (incumbent && processIsAlive(incumbent.pid)) {
+                throw Object.assign(new Error('Camoufox profile is in use by an active owner'), {
+                    code: 'ERR_CAMOUFOX_PROFILE_BUSY'
+                });
+            }
+            removeLeaseOwner(directory, incumbent?.name);
+        }
+    } catch (error) {
+        fs.rmSync(candidate, { recursive: true, force: true });
+        throw error;
+    }
+}
+
+export function assertProfileLease({ directory, owner }) {
+    if (leaseOwner(directory)?.name !== owner) {
+        throw Object.assign(new Error('Camoufox profile lease is no longer held by this session'), {
+            code: 'ERR_CAMOUFOX_PROFILE_STALE'
+        });
+    }
+}
+
+export function releaseProfileLease({ directory, owner }) {
+    if (leaseOwner(directory)?.name === owner) removeLeaseOwner(directory, owner);
 }
 
 export function resolveProfileNativeDirectory(profileId, profilesDir, { trustedLocal = false } = {}) {
@@ -123,9 +232,33 @@ export function restrictLegacySharedKeyLog(profilesDir) {
     restrictIfPresent(path.join(profilesDir, '_shared_sslkeylog.txt'));
 }
 
-export function ensureProfileStorageAt(location) {
+export function initializeProfileStorageAt(location, metadata) {
     const { profileDir } = location;
-    inspectProfileDirectory(location);
+    fs.mkdirSync(profileDir, { mode: 0o700 });
+    const created = inspectProfileDirectory(location);
+    try {
+        const storage = prepareProfileStorage(location);
+        const initialized = { ...metadata, _storageGeneration: randomUUID() };
+        writePrivateFile(storage.metadataPath, JSON.stringify(initialized, null, 2));
+        return { storage, metadata: initialized };
+    } catch (error) {
+        const current = inspectProfileDirectory(location);
+        if (created && current?.dev === created.dev && current.ino === created.ino) {
+            fs.rmSync(profileDir, { recursive: true, force: true });
+        }
+        throw error;
+    }
+}
+
+export function ensureProfileStorageAt(location) {
+    if (!readProfileMetadata(location)) {
+        throw Object.assign(new Error('Camoufox profile directory is missing'), { code: 'ENOENT' });
+    }
+    return prepareProfileStorage(location);
+}
+
+function prepareProfileStorage(location) {
+    const { profileDir } = location;
     const trafficDir = path.join(profileDir, 'traffic');
     const payloadsDir = path.join(trafficDir, 'payloads');
     const nativeDir = path.join(profileDir, '.native');
@@ -133,7 +266,6 @@ export function ensureProfileStorageAt(location) {
 
     const storageStatePath = path.join(profileDir, 'storage-state.json');
     const metadataPath = path.join(profileDir, 'profile.json');
-    restrictIfPresent(metadataPath);
     if (!restrictIfPresent(storageStatePath)) {
         writePrivateFile(storageStatePath, JSON.stringify(EMPTY_STORAGE_STATE, null, 2));
     }
@@ -153,53 +285,96 @@ export function ensureProfileStorageAt(location) {
     };
 }
 
-function nativeLogNames(directory) {
+function captureEntriesIfPresent(directory) {
     try {
-        return fs.readdirSync(directory).filter((name) =>
-            Object.values(NATIVE_LOG_NAMES).some((base) => name === base || name.startsWith(`${base}.`))
-        );
+        return listCaptureDirectory(directory, { trustedLocal: true });
     } catch (error) {
         if (error.code !== 'ENOENT') throw error;
         return [];
     }
 }
 
+function isNativeLogName({ name }) {
+    return Object.values(NATIVE_LOG_NAMES).some((base) => name === base || name.startsWith(`${base}.`));
+}
+
+function resolveExistingAncestors(filePath) {
+    try {
+        return fs.realpathSync.native(filePath);
+    } catch (error) {
+        const parent = path.dirname(filePath);
+        if (error.code !== 'ENOENT' || parent === filePath) throw error;
+        return path.join(resolveExistingAncestors(parent), path.basename(filePath));
+    }
+}
+
+export function assertExternalNativePath(trafficDir, nativePath) {
+    const inside = (capture, candidate) => {
+        const relative = path.relative(capture, candidate);
+        return !path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`);
+    };
+    if (inside(trafficDir, nativePath) ||
+        inside(resolveExistingAncestors(trafficDir), resolveExistingAncestors(nativePath))) {
+        throw new Error('Native logs require storage outside the traffic directory');
+    }
+}
+
 export function restrictNativeLogs(storage) {
     if (!fs.existsSync(storage.nativeDir)) return;
     ensurePrivateDirectory(storage.nativeDir);
-    for (const name of nativeLogNames(storage.nativeDir)) {
+    for (const { name } of captureEntriesIfPresent(storage.nativeDir).filter(isNativeLogName)) {
         restrictPrivateFile(path.join(storage.nativeDir, name));
     }
 }
 
-export function prepareNativeLogs(storage, { sslKeyLog, neckoMozLog, harPath }) {
-    const legacyFiles = nativeLogNames(storage.trafficDir);
-    if (legacyFiles.length > 0 || sslKeyLog || neckoMozLog) {
-        ensurePrivateDirectory(storage.nativeDir);
-    }
-    if (legacyFiles.length > 0) {
-        // Keep the full legacy archive together so its manifest still describes the preserved files.
-        for (const directory of [storage.trafficDir, storage.payloadsDir]) {
-            for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-                if (entry.isFile() || (directory === storage.trafficDir && legacyFiles.includes(entry.name))) {
-                    restrictPrivateFile(path.join(directory, entry.name));
-                }
-            }
+export function archiveLegacyNativeLogs(storage) {
+    const capture = captureEntriesIfPresent(storage.trafficDir);
+    const privateEntry = capture.find(({ name }) => name === '.private');
+    const legacyPrivateDir = path.join(storage.trafficDir, '.private');
+    const nested = privateEntry?.isDirectory() ? captureEntriesIfPresent(legacyPrivateDir) : [];
+    if (!capture.some(isNativeLogName) && !nested.some(isNativeLogName) &&
+        (!privateEntry || privateEntry.isDirectory())) return;
+
+    assertExternalNativePath(storage.trafficDir, storage.nativeDir);
+    ensurePrivateDirectory(storage.nativeDir);
+    // Preserve the whole archive with its manifest. Never dereference entries during the move.
+    const directories = [
+        [storage.trafficDir, capture],
+        [storage.payloadsDir, captureEntriesIfPresent(storage.payloadsDir)],
+        [legacyPrivateDir, nested]
+    ];
+    for (const [directory, entries] of directories) {
+        if (entries.length === 0) continue;
+        ensurePrivateDirectory(directory);
+        for (const entry of entries) {
+            if (entry.isFile()) restrictPrivateFile(path.join(directory, entry.name));
         }
-        const legacyDir = fs.mkdtempSync(path.join(storage.nativeDir, 'legacy-'));
-        fs.renameSync(storage.trafficDir, path.join(legacyDir, 'traffic'));
-        ensurePrivateDirectory(storage.trafficDir);
-        ensurePrivateDirectory(storage.payloadsDir);
     }
+    const legacyDir = fs.mkdtempSync(path.join(storage.nativeDir, 'legacy-'));
+    try {
+        fs.renameSync(storage.trafficDir, path.join(legacyDir, 'traffic'));
+    } catch (error) {
+        fs.rmdirSync(legacyDir);
+        throw error;
+    }
+    ensurePrivateDirectory(storage.trafficDir);
+    ensurePrivateDirectory(storage.payloadsDir);
+}
+
+export function prepareNativeLogs(storage, {
+    sslKeyLog, neckoMozLog, harPath,
+    sslKeyLogPath = storage.sslKeyLogPath, neckoMozLogPath = storage.neckoMozLogPath
+}) {
+    if (sslKeyLog || neckoMozLog) ensurePrivateDirectory(storage.nativeDir);
     restrictIfPresent(storage.harPath);
     if (harPath && harPath !== storage.harPath) restrictIfPresent(harPath);
     restrictNativeLogs(storage);
 
-    if (sslKeyLog && !restrictIfPresent(storage.sslKeyLogPath)) {
-        writePrivateFile(storage.sslKeyLogPath, '# NSS SSL/TLS Secrets Log\n');
+    if (sslKeyLog && !restrictIfPresent(sslKeyLogPath)) {
+        writePrivateFile(sslKeyLogPath, '# NSS SSL/TLS Secrets Log\n');
     }
-    if (neckoMozLog && !restrictIfPresent(storage.neckoMozLogPath)) {
-        writePrivateFile(storage.neckoMozLogPath, '');
+    if (neckoMozLog && !restrictIfPresent(neckoMozLogPath)) {
+        writePrivateFile(neckoMozLogPath, '');
     }
 }
 
@@ -211,6 +386,7 @@ export function readStorageState(storageStatePath) {
     } catch (error) {
         if (!(error instanceof SyntaxError)) throw error;
     }
-    writePrivateFile(storageStatePath, JSON.stringify(EMPTY_STORAGE_STATE, null, 2));
-    return EMPTY_STORAGE_STATE;
+    throw Object.assign(new Error('Invalid Camoufox storage state. Restore or move the damaged snapshot before retrying.'), {
+        code: 'ERR_CAMOUFOX_STORAGE_STATE_INVALID'
+    });
 }

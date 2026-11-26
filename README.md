@@ -28,7 +28,7 @@
 **Architecture diagrams**
 
 - [System context](#system-context)
-- [One account — sequence (happy path)](#one-account--sequence-happy-path)
+- [One attempt through handoff](#one-attempt-through-handoff)
 - [Gmail signup sub-flow (logical)](#gmail-signup-sub-flow-logical)
 - [Concurrency model](#concurrency-model)
 
@@ -47,7 +47,7 @@
 
 ## About
 
-**Gmail Account Creator** runs a Google signup flow in a browser profile and records the outcome in JSON. When a page requires a password or phone verification, the CLI records a manual-action result and closes its managed session. The account holder completes that step in a trusted browser.
+**Gmail Account Creator** opens a Google signup flow in a browser profile and records the outcome in JSON. The CLI handles recognized initial fields and hands off password entry, verification, consent and account confirmation to the account holder. On handoff it records `MANUAL_SIGNUP_REQUIRED` and requests managed profile shutdown. Complete the remaining steps in a trusted browser and confirm the account identity there.
 
 | | |
 |--|--|
@@ -83,15 +83,14 @@ These values are configured on the GitHub **About** sidebar (description, websit
   - **32 SKU-Verified Device Presets & AdsPower / Ziniao Auto-Healers (`src/camoufox/device-presets.js`, `scripts/audit-adspower-profiles.js`)**: Absorbs AdsPower's OS font, 50+ locale fallback, RFC-9110 `Accept-Language`, SpeechSynthesis voice, and MediaDevices catalogs while repairing broken AdsPower/Ziniao profiles to 100/100 SKU coherence (`--list-presets`, `--heal`).
   - **Ziniao V6 Absorbed Active Security & Consistency Engine (`src/camoufox/ziniao-security.js`)**: URL-based localhost/RFC1918 filtering (`SENSITIVE_LOCAL_PORT_CATALOG`), per-domain 64-bit Hamming distance Canvas/WebGL consistency ledger (`CanvasWebglConsistencyLedger`), internal browser scheme guard (`BLOCKED_INTERNAL_URL_PATTERNS`), OS/silicon vs browser engine version floor guard, and 40+ country metropolitan geolocation micro-jitter.
   - **Host-Mac-Calibrated GPU Performance Weighting & Anti-Penetration Engine (`src/camoufox/gpu-performance-scaler.js`)**: Calibrates against the local host Mac baseline (`Apple M5 Pro`, 18C CPU / 20C GPU / 64GB RAM / 11.5 TFLOPS) and weights WebGL/WebGL2 (`drawArrays`, `drawElements`, `finish`, `flush`, `readPixels`, `clientWaitSync`, `EXT_disjoint_timer_query`), Canvas (`toDataURL`, `toBlob`, `OffscreenCanvas.convertToBlob`), and WebGPU (`onSubmittedWorkDone`, `GPUBuffer.mapAsync`) execution timing to match the target GPU SKU (e.g., `RTX 4090` 7.18x faster, `Intel UHD 620` 26.14x slower) with full `.name`, `.length`, and `[native code]` prototype stealth.
-  - **Pre-TLS Egress/Ingress Traffic Recorder & Attribution CLI (`src/camoufox/traffic-recorder.js`, `scripts/query-traffic-attribution.js`)**: Keeps optional native TLS and Necko diagnostics in dedicated profiles’ private storage. Shareable exports include a redacted wire stream (`pre-tls-wire.log`), W3C HAR 1.2 (`trace.har`), causal UI triggers, cookie lineage, anti-bot signatures, Ziniao security blocks, and a SHA-256 tamper-evident hash chain.
+  - **Pre-TLS Egress/Ingress Traffic Recorder & Attribution CLI (`src/camoufox/traffic-recorder.js`, `scripts/query-traffic-attribution.js`)** collects metadata by default. `CAMOUFOX_RECORD_BODIES=true` retains eligible raw request and WebSocket attachments under the profile's private `traffic/payloads/` directory. Redacted wire and HAR views can include selected fields from eligible complete structured bodies. Reconstruct older wire output through the CLI and review the export before sharing. Keep raw attachments and optional native TLS and Necko diagnostics in private storage.
 - **Antidetect profiles** — Create/start/stop browser profiles via Camoufox (`PROFILE_SERVICE=camoufox`), GPM Login (default), or Dolphin Anty API.
 - **Puppeteer control** — Attaches to the profile’s Chrome over remote debugging (no bundled Chromium in `puppeteer-core`).
-- **OMO Captcha** — Extension-based reCAPTCHA handling (extension ID configured in code).
-- **SMS provider** — The SMS Verification library uses its own key. The legacy 5SIM adapter rejects requests locally.
-- **Proxies** — Rotating proxies from `config/proxies.txt` (`ip:port` or `ip:port:user:pass`).
+- **Verification and consent** — The account holder completes prompts in a trusted browser. The separate SMS Verification library uses its own key. The legacy 5SIM adapter rejects requests locally.
+- **Proxies** — Rotating proxies from the state directory's `config/proxies.txt` (`ip:port` or `ip:port:user:pass`).
 - **Human-like behavior** — Delays, scrolling, and typing patterns to reduce rigid automation signals.
 - **Concurrency** — `--accounts` / `--threads` (or env vars) with a bounded worker pool.
-- **Outputs** — Per-attempt status in `results.json`, run totals in `summary.json`, and private diagnostic logs under `logs/`. Passwords, codes and proxy credentials are omitted from routine results.
+- **Outputs** — Per-attempt status in `results.json`, run totals in `summary.json`, and private diagnostic logs under `logs/` in the [app state directory](ENV_VARIABLES.md#configuration-and-local-state). Passwords, codes and proxy credentials are omitted from routine results.
 
 ---
 
@@ -102,23 +101,23 @@ These values are configured on the GitHub **About** sidebar (description, websit
 | Runtime | **Node.js** (ESM, `"type": "module"`) |
 | Browser automation | **puppeteer-core** (connects to profile browser) |
 | HTTP | **axios** |
-| Config | **dotenv** (`.env` / optional `.emv`) |
+| Config | Private `.env` / optional `.emv` |
 | Profile cloud (optional path) | **gologin** package present in dependencies; primary flow uses **GPM** or **Dolphin** per `PROFILE_SERVICE` |
 
 ---
 
 ## How it works (high level)
 
-1. **Load config** from `.env` (see [`ENV_VARIABLES.md`](ENV_VARIABLES.md), [`.env.example`](.env.example)).
-2. **Pick a proxy** from `config/proxies.txt`.
+1. **Load config** from the state directory's `.env`. See [`ENV_VARIABLES.md`](ENV_VARIABLES.md) and [`.env.example`](.env.example).
+2. **Pick a proxy** from the state directory's `config/proxies.txt` when the profile requires one.
 3. **Generate identity** (names/usernames from `config/names.json` via `src/utils/name-generator.js`).
 4. **Create & start** an antidetect profile (GPM or Dolphin) with that proxy.
 5. **Connect Puppeteer** to the profile’s debugging endpoint and open the signup flow (`src/gmail/creator.js`).
-6. Configure extension credentials in the trusted extension UI when required.
-7. A required password or phone verification ends the automated attempt with a manual-action status. Optional recovery email enrollment is skipped.
-8. **Persist results** to `results.json` and aggregate stats to `summary.json`; **stop** the profile in `finally`.
+6. Fill only supported initial forms that the CLI can verify as part of the current attempt. An optional enrollment prompt may be skipped when the action and empty fields are verified.
+7. Hand off password entry, verification, uncertain pages, consent and final account confirmation for manual action.
+8. **Persist results** to `results.json` and run totals to `summary.json`, and stop the profile. Check `summary.json` for any unconfirmed cleanup.
 
-Intelligent page handling lives in `src/gmail/page-detector.js`.
+The signup boundary lives in `src/gmail/creator.js` and `src/gmail/credential-handoff.js`.
 
 ---
 
@@ -140,10 +139,8 @@ flowchart TB
   end
   subgraph Browser["Real Chrome in profile"]
     PU[Puppeteer connects via CDP]
-    EXT[OMO Captcha extension]
     WEB[accounts.google.com signup]
   end
-  SMS[SMS provider API]
   CFG[(config: .env names.json proxies.txt)]
   OUT[(results.json summary.json logs)]
 
@@ -154,12 +151,10 @@ flowchart TB
   GPM --> PU
   DOL --> PU
   PU --> WEB
-  EXT --> WEB
-  CA --> SMS
   CA --> OUT
 ```
 
-### One account — sequence (happy path)
+### One attempt through handoff
 
 ```mermaid
 sequenceDiagram
@@ -176,7 +171,7 @@ sequenceDiagram
   Pr->>PP: getBrowser / getPage
   M->>G: createGmailAccount(page, data)
   G->>PP: Navigate and determine the required step
-  G-->>M: result object
+  G-->>M: manual action required
   M->>M: saveResult results.json
   M->>Pr: stop
 ```
@@ -186,17 +181,10 @@ sequenceDiagram
 ```mermaid
 flowchart TD
   A[createGmailAccount] --> B[Navigate to signup]
-  B --> C[Fill name / basics]
-  C --> D{Page state}
-  D -->|suggested emails| E[Pick or custom username]
-  D -->|password required| F[Manual action required]
-  D -->|birthday gender| G[fillBirthdayAndGenderForm]
-  E --> D
-  G --> H[waitForRecaptcha + OMO]
-  H --> I[handlePhoneVerification]
-  I -->|optional step skipped| J[completeAccountCreation]
-  I -->|code required| F
-  J --> K[Return status]
+  B --> C{Verified current signup form}
+  C -->|Supported initial form| D[Fill name or username]
+  D --> C
+  C -->|Verification, consent, or uncertain state| E[Report manual action required]
 ```
 
 ### Concurrency model
@@ -237,7 +225,7 @@ flowchart TD
 
 ## Function reference
 
-Below: **every exported function** and **named public methods on exported singletons/classes** used across the app. Internal helpers inside `creator.js` are listed in a separate subsection (they are not `import`able).
+Public entry points and selected helper methods used across the app.
 
 ### `src/index.js`
 
@@ -260,24 +248,7 @@ Below: **every exported function** and **named public methods on exported single
 
 | Symbol | Description |
 |--------|-------------|
-| `createGmailAccount(page, accountData)` | **Main export.** Drives the entire Google registration UI flow on the given Puppeteer `page`. |
-
-**Internal helpers** (used only inside this file; roughly in call order):
-
-| Function | Role |
-|----------|------|
-| `humanLikeType(page, input, text, options)` | Types into an input with variable speed and occasional corrections. |
-| `ensurePageOpen(page, operation)` | Guards against closed/disconnected pages before actions. |
-| `navigateToSignUp(page)` | Opens Gmail / Google signup entry. |
-| `fillSignUpForm(page, accountData)` | Name and initial signup fields. |
-| `selectRandomSuggestedEmail(page)` | Chooses from Google’s suggested addresses when shown. |
-| `clickCreateOwnGmailAddress(page)` | Clicks “create your own” / custom username path. |
-| `fillUsernameAndPassword(page, accountData)` | Username + password steps and related prompts. |
-| `fillBirthdayAndGenderForm(page, accountData)` | Birthday and gender screens. |
-| `waitForRecaptcha(page)` | Waits for / interacts with reCAPTCHA with OMO support. |
-| `handlePhoneVerification` | Skips optional phone verification or reports that the operator must complete it. |
-| `completeAccountCreation(page, accountData)` | Final confirmations, review screens, wrap-up. |
-| `clickNextButton(page)` | Finds and clicks Google’s “Next” / continue buttons with fallbacks. |
+| `createGmailAccount(page, accountData, options)` | Advances supported initial steps and throws `MANUAL_SIGNUP_REQUIRED` with a stage when the account holder must take over. The caller owns the supplied profile. |
 
 ### `src/gmail/page-detector.js`
 
@@ -407,7 +378,7 @@ Representative methods (the file is large; these are the usual integration point
 | `loadProxies()` | Reads and parses `config/proxies.txt`. |
 | `getNextProxy()` | Returns a random unused proxy; resets set if exhausted. |
 | `markAsUsed` / `releaseProxy` / `reset` | Track or free proxy lines. |
-| `getGPMLoginFormat` / `getGoLoginFormat` / `getStringFormat` | Adapter shapes for profile APIs + logging. |
+| `getGPMLoginFormat` / `getGoLoginFormat` / `getStringFormat` | Adapter shapes for profile APIs. |
 | `getAvailableCount()` | Approximate free proxy count. |
 
 ### `src/utils/name-generator.js` — class `NameGenerator` (default instance)
@@ -443,10 +414,8 @@ Representative methods (the file is large; these are the usual integration point
 ## Prerequisites
 
 - **Node.js 18+** recommended.
-- **GPM Login** running locally with API reachable at `GPM_API_URL` (default `http://127.0.0.1:14517`), **or** **Dolphin Anty** with `DOLPHIN_API_KEY`, `DOLPHIN_API_URL`, and optional `DOLPHIN_FOLDER_ID`.
-- **OMO Captcha** extension installed/configured in the profile template you use (extension ID: `dfjghhjachoacpgpkmbpdlpppeagojhe`).
-- **SMS provider** API key(s) as documented in [`ENV_VARIABLES.md`](ENV_VARIABLES.md).
-- **Proxies** listed in `config/proxies.txt`.
+- **GPM Login**, **Dolphin Anty**, or a locally installed **Camoufox** SDK. For GPM and Dolphin, configure the verified HTTPS API origin or explicitly approve the numeric loopback HTTP base on a trusted host. See [controller configuration](ENV_VARIABLES.md#browser-controller-connection).
+- **Proxies** listed in the state directory's `config/proxies.txt` when required by the selected profile mode.
 
 ---
 
@@ -458,13 +427,22 @@ cd gmail-account-creator
 npm install
 ```
 
-Copy environment template and edit:
+On POSIX, create the state directory and the credential files as the application user before entering secrets. This example uses a dedicated directory in your home directory.
 
 ```bash
-cp .env.example .env
+export GMAIL_CREATOR_STATE_DIR="$HOME/.local/state/gmail-account-creator"
+(
+  umask 077
+  mkdir -p "$GMAIL_CREATOR_STATE_DIR/config" &&
+    set -C &&
+    cat .env.example > "$GMAIL_CREATOR_STATE_DIR/.env" &&
+    : > "$GMAIL_CREATOR_STATE_DIR/config/proxies.txt"
+)
 ```
 
-Add proxies (one per line):
+For existing regular files, set mode `0600` before editing `.env`, the optional `.emv`, or `config/proxies.txt`. On Windows, configure the state directory's NTFS ACL before adding credentials and verify that both existing and newly created files allow access only to the run account and authorized system principals.
+
+Add one proxy per line in `config/proxies.txt` under the state directory. Startup requires every non-comment line to be valid. To keep using an inventory from an older installation, move it into the state directory or set `GMAIL_CREATOR_LEGACY_DIR` to its installation directory.
 
 ```text
 # config/proxies.txt
@@ -478,10 +456,12 @@ Add proxies (one per line):
 
 | Variable | Role |
 |----------|------|
-| `PROFILE_SERVICE` | `gpm` (default) or `dolphin` |
-| `GPM_API_URL` | GPM Login local API base URL |
+| `PROFILE_SERVICE` | `gpm` (default), `dolphin` or `camoufox` |
+| `GMAIL_CREATOR_STATE_DIR`, `GMAIL_CREATOR_LEGACY_DIR` | Absolute state and legacy directory paths set in the shell environment |
+| `GPM_API_URL` | GPM Login API base URL |
 | `DOLPHIN_API_KEY`, `DOLPHIN_API_URL`, `DOLPHIN_FOLDER_ID` | Dolphin Anty integration |
-| `SMS_VERIFY_API_KEY`, `SMS_VERIFY_LANG`, `SMS_VERIFY_COUNTRIES` | SMS Verification provider |
+| `GPM_TRUSTED_HTTP_API_URL`, `DOLPHIN_TRUSTED_HTTP_API_URL` | Explicit matching numeric loopback HTTP base for a trusted host |
+| `SMS_VERIFY_API_KEY`, `SMS_VERIFY_LANG`, `SMS_VERIFY_COUNTRIES` | Optional separate use of the SMS Verification library |
 | `SMS_PROVIDER` | `sms-verification`. The legacy adapter is disabled. |
 | `ACCOUNTS_COUNT`, `THREADS_COUNT` | Batch size and concurrency |
 | `LOG_LEVEL`, `MAX_RETRIES`, `TEST_PROXY`, `SETUP_OMO_CAPTCHA` | Runtime tuning |
@@ -590,11 +570,11 @@ Workflows that attach `.tgz` or run `npm publish` need **Actions** enabled on th
 
 ### Install from GitHub Packages
 
-Configure npm for the `@code-root` scope (use a [GitHub personal access token](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-npm-registry#authenticating-to-github-packages) with `read:packages`):
+Add these settings to your user npm configuration (usually `~/.npmrc`). Load `GITHUB_PACKAGES_TOKEN` into your environment from your credential store before running npm. Use a [GitHub personal access token](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-npm-registry#authenticating-to-github-packages) with `read:packages`.
 
 ```text
 @code-root:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=YOUR_GITHUB_TOKEN
+//npm.pkg.github.com/:_authToken=${GITHUB_PACKAGES_TOKEN}
 ```
 
 Then:
@@ -621,10 +601,12 @@ When a **GitHub Release is published**, **Publish to GitHub Packages** (`.github
 
 | Workflow | Purpose |
 |----------|---------|
-| **CI** (`.github/workflows/ci.yml`) | `npm ci` + `node --check` on main source files on push/PR |
-| **Release** (`.github/workflows/release.yml`) | On tag `v*`: GitHub Release + attached npm tarball |
-| **Publish to GitHub Packages** (`.github/workflows/publish-github-packages.yml`) | On `release: published`: `npm publish` to `npm.pkg.github.com` |
+| **CI** (`.github/workflows/ci.yml`) | On push or PR, install dependencies, check syntax and run security tests |
+| **Release** (`.github/workflows/release.yml`) | On tag `v*`, run security tests and attach the npm tarball to the GitHub Release |
+| **Publish to GitHub Packages** (`.github/workflows/publish-github-packages.yml`) | On `release: published`, run security tests before `npm publish` |
 | **Dependabot** (optional) | Weekly `npm` dependency updates — add `.github/dependabot.yml` if you want automated PRs |
+
+Run `npm run test:security` from a source checkout with dependencies installed. The npm tarball ships the CLI, library and public assets. Run the security tests from the matching release tag when validating an installed version.
 
 To add **Dependabot**, create `.github/dependabot.yml`:
 

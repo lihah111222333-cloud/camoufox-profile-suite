@@ -123,6 +123,7 @@ function createMockRequest({
     resourceType = 'document',
     isNavigationRequest = false,
     frameUrl = 'https://accounts.google.com/',
+    frame = null,
     headersArray = null,
     headers = null,
     postData = null,
@@ -153,7 +154,7 @@ function createMockRequest({
         url: () => url,
         resourceType: () => resourceType,
         isNavigationRequest: () => Boolean(isNavigationRequest),
-        frame: () => ({ url: () => frameUrl }),
+        frame: () => frame || { url: () => frameUrl },
         headers: () => ({ ...resolvedHeadersObj }),
         headersArray: async () => resolvedHeadersArray.map((h) => ({ ...h })),
         postData: () => (postBuffer ? postBuffer.toString('utf8') : null),
@@ -255,11 +256,14 @@ function createMockCamoufoxEngine() {
         const pageId = ++pageIdSeq;
         let closed = false;
         let currentUrl = 'about:blank';
+        const mainFrame = { url: () => currentUrl };
         const hub = createEventHub();
 
         return {
             ...hub,
             pageId,
+            mainFrame: () => mainFrame,
+            frames: () => [mainFrame],
             context: () => context,
             url: () => currentUrl,
             isClosed: () => closed,
@@ -433,6 +437,7 @@ async function runTests() {
                     'http://10.0.1.15:8080:proxyUser:topSecretPass123',
                     {
                         profileId: 'traffic-test-1',
+                        recordBodies: true,
                         os: 'windows',
                         profilesDir: tempProfilesDir
                     }
@@ -457,7 +462,6 @@ async function runTests() {
 
                 const postPayloadObj = { username: 'alice', token: 'xyz' };
                 const postPayloadJson = JSON.stringify(postPayloadObj);
-                const expectedPostSha256 = sha256Hex(postPayloadJson);
 
                 // Hop 1: POST request receiving 302 redirect
                 const reqHop1 = createMockRequest({
@@ -564,15 +568,12 @@ async function runTests() {
                     flowName: 'GlifWebSignIn'
                 });
 
-                // Verify pre-TLS POST payload SHA-256 and saved payload file on disk
-                assert.equal(egress1.postDataSha256, expectedPostSha256);
-                assert.equal(egress1.postDataBytes, Buffer.byteLength(postPayloadJson));
-                assert.equal(egress1.bodyPreview, postPayloadJson);
-                assert.ok(egress1.payloadFile && egress1.payloadFile.startsWith('payloads/req-'));
-
-                const reqPayloadDiskPath = path.join(profile.trafficPaths.trafficDir, egress1.payloadFile);
-                assert.equal(fs.existsSync(reqPayloadDiskPath), true);
-                assert.equal(fs.readFileSync(reqPayloadDiskPath, 'utf8'), postPayloadJson);
+                // An authentication upload leaves only metadata, even with body capture enabled.
+                assert.equal(egress1.postDataSha256, null);
+                assert.equal(egress1.postDataBytes, 0);
+                assert.equal(egress1.bodyPreview, null);
+                assert.equal(egress1.payloadFile, null);
+                assert.equal(egress1.bodyOmittedReason, 'sensitive-or-unsupported-url');
 
                 // Verify response metadata and the reason each response body was omitted.
                 assert.equal(responseBodyReads, 0);
@@ -592,7 +593,7 @@ async function runTests() {
                     protocol: 'TLS 1.3',
                     subjectName: 'accounts.google.com'
                 });
-                assert.deepEqual(fs.readdirSync(profile.trafficPaths.payloadsDir), [path.basename(egress1.payloadFile)]);
+                assert.deepEqual(fs.readdirSync(profile.trafficPaths.payloadsDir), []);
 
                 await profile.delete();
             }
@@ -716,6 +717,7 @@ async function runTests() {
                     'http://203.0.113.50:3128:user3:pass3',
                     {
                         profileId: 'traffic-test-3',
+                        recordBodies: true,
                         os: 'windows',
                         profilesDir: tempProfilesDir,
                         accountId: 'acct-anomaly-99',
@@ -841,9 +843,13 @@ async function runTests() {
                 for (const anomaly of [rateLimitAnomaly, forbiddenAnomaly]) {
                     const egress = httpEvents.find((e) => e.type === 'egress' && e.correlationId === anomaly.correlationId);
                     const ingress = httpEvents.find((e) => e.type === 'ingress' && e.correlationId === anomaly.correlationId);
-                    assert.ok(egress?.payloadFile?.startsWith('payloads/req-'));
                     assert.equal(anomaly.payloadFile, egress.payloadFile);
-                    assert.equal(fs.existsSync(path.join(profile.trafficPaths.trafficDir, anomaly.payloadFile)), true);
+                    if (anomaly === forbiddenAnomaly) {
+                        assert.ok(egress.payloadFile?.startsWith('payloads/req-'));
+                        assert.ok(fs.existsSync(path.join(profile.trafficPaths.trafficDir, anomaly.payloadFile)));
+                    } else {
+                        assert.equal(egress.payloadFile, null);
+                    }
                     assert.equal(ingress.status, anomaly.status);
                     assert.equal(ingress.bodyOmittedReason, 'unbounded-response-reader');
                     assert.equal(ingress.payloadFile, null);
@@ -856,10 +862,7 @@ async function runTests() {
                 assert.equal(proxyFailureAnomaly.type, 'network-proxy-or-tls-failure');
                 assert.equal(proxyFailureAnomaly.actionStep, 'step-proxy-failure');
                 assert.equal(proxyFailureAnomaly.status, null);
-                assert.ok(
-                    proxyFailureAnomaly.payloadFile &&
-                        proxyFailureAnomaly.payloadFile.startsWith('payloads/req-')
-                );
+                assert.equal(proxyFailureAnomaly.payloadFile, null);
 
                 await profile.delete();
             }
@@ -873,6 +876,7 @@ async function runTests() {
             async () => {
                 const profile = await createAndStartProfile('Traffic_Test_4', null, {
                     profileId: 'traffic-test-4',
+                    recordBodies: true,
                     os: 'linux',
                     profilesDir: tempProfilesDir
                 });
@@ -880,7 +884,7 @@ async function runTests() {
                 const page = await profile.getPage();
                 profile.setTrafficStep('step-websocket-handshake');
 
-                const wsUrl = 'wss://accounts.google.com/v3/signin/ws?client=firefox';
+                const wsUrl = 'wss://fixture.test/events?client=firefox';
                 const mockWs = createMockWebSocket(wsUrl);
 
                 page.emit('websocket', mockWs);
@@ -916,13 +920,14 @@ async function runTests() {
                 assert.equal(wsIngress[0].correlationId, wsCorrId);
                 assert.equal(wsClose[0].correlationId, wsCorrId);
 
-                assert.equal(wsEgress[0].bodyPreview, outboundFrame1);
-                assert.equal(wsEgress[0].payloadSha256, sha256Hex(outboundFrame1));
-                assert.equal(wsEgress[1].bodyPreview, outboundFrame2);
-                assert.equal(wsEgress[1].payloadSha256, sha256Hex(outboundFrame2));
-
-                assert.equal(wsIngress[0].bodyPreview, inboundFrame1);
-                assert.equal(wsIngress[0].payloadSha256, sha256Hex(inboundFrame1));
+                const frameEvents = [wsEgress[0], wsEgress[1], wsIngress[0]];
+                const frameBodies = [outboundFrame1, outboundFrame2, inboundFrame1];
+                for (const [index, event] of frameEvents.entries()) {
+                    const body = frameBodies[index];
+                    assert.equal(event.bodyPreview, null);
+                    assert.equal(event.payloadSha256, sha256Hex(body));
+                    assert.equal(fs.readFileSync(path.join(profile.trafficPaths.trafficDir, event.payloadFile), 'utf8'), body);
+                }
                 assert.equal(wsIngress[0].attribution.actionStep, 'step-websocket-handshake');
 
                 await profile.delete();
@@ -1087,6 +1092,7 @@ async function runTests() {
                     'http://10.20.30.40:8080',
                     {
                         profileId: 'traffic-test-6-trunc',
+                        recordBodies: true,
                         os: 'windows',
                         profilesDir: tempProfilesDir,
                         useSharedBrowser: false,
@@ -1111,7 +1117,7 @@ async function runTests() {
 
                 const req6 = createMockRequest({
                     method: 'POST',
-                    url: 'https://accounts.google.com/v3/signin/wire-test?hl=en',
+                    url: 'https://fixture.test/diagnostics/wire-test?hl=en',
                     headersArray: [
                         { name: 'Host', value: 'accounts.google.com' },
                         { name: 'Content-Type', value: 'application/json' },
@@ -1147,7 +1153,7 @@ async function runTests() {
                     true,
                     'Expected pre-tls-wire.log to contain <<< INGRESS [POST-TLS NECKO CHANNEL]'
                 );
-                assert.equal(wireLogContent.includes('POST /v3/signin/wire-test?hl=en HTTP/1.1'), true);
+                assert.equal(wireLogContent.includes('POST /diagnostics/wire-test?hl=en HTTP/1.1'), true);
                 assert.equal(wireLogContent.includes('X-Custom-Order: first-before-tls'), true);
                 assert.equal(wireLogContent.includes('HTTP/1.1 200 OK'), true);
                 const responsePrefix = longResPayload.slice(0, 32);
@@ -1164,7 +1170,7 @@ async function runTests() {
                 assert.equal(wireDump6.includes('>>> EGRESS [PRE-TLS NECKO CHANNEL]'), true);
                 assert.equal(wireDump6.includes('<<< INGRESS [POST-TLS NECKO CHANNEL]'), true);
                 assert.equal(wireDump6.includes(egress6.correlationId), true);
-                assert.equal(wireDump6.includes(longReqPayload), true);
+                assert.equal(wireDump6.includes(longReqPayload), false);
                 assert.equal(wireDump6.includes(responsePrefix), false);
 
                 // Verify the 32-byte request attachment and request digest.
@@ -1287,6 +1293,7 @@ async function runTests() {
                 await page.fill('input[name="firstName"]', 'Alice');
 
                 const nameReq = createMockRequest({
+                    frame: page.mainFrame(),
                     method: 'POST',
                     url: 'https://accounts.google.com/lifecycle/steps/signup/name?hl=en',
                     postData: JSON.stringify({ firstName: 'Alice', lastName: 'Smith' })
@@ -1311,6 +1318,7 @@ async function runTests() {
                 await page.click('#next-button');
 
                 const phoneReq = createMockRequest({
+                    frame: page.mainFrame(),
                     method: 'POST',
                     url: 'https://accounts.google.com/v3/signin/challenge/phone?flow=signup',
                     postData: JSON.stringify({ code: '123456' })
@@ -1468,6 +1476,7 @@ async function runTests() {
                 });
 
                 const req8 = createMockRequest({
+                    frame: page.mainFrame(),
                     method: 'POST',
                     url: 'https://accounts.google.com/v3/signin/challenge/arkose?hl=en',
                     headersArray: [
@@ -1614,6 +1623,7 @@ async function runTests() {
                     'http://10.99.0.1:8080:proxyUser9:proxySecret9',
                     {
                         profileId: 'traffic-test-9-integrity',
+                        recordBodies: true,
                         os: 'windows',
                         profilesDir: tempProfilesDir,
                         useSharedBrowser: false,
@@ -1641,7 +1651,7 @@ async function runTests() {
 
                 const req9 = createMockRequest({
                     method: 'POST',
-                    url: 'https://accounts.google.com/v3/signin/challenge/verify?hl=en',
+                    url: 'https://fixture.test/diagnostics/integrity?hl=en',
                     headersArray: [
                         { name: 'Host', value: 'accounts.google.com' },
                         { name: 'Proxy-Authorization', value: `Basic ${proxySecretBase64}` },
@@ -1860,7 +1870,7 @@ async function runTests() {
         // Test 10: Pre-TLS Wire Header Anomalies (Sec-CH-UA, Wire UA OS Mismatch, Proxy Leak), NSS sslkeylog.txt Integrity & Crash Self-Healing
         // =========================================================================
         await testSection(
-            'Test 10: Pre-TLS Wire Header Anomalies (Sec-CH-UA, Wire UA OS Mismatch, Proxy Leak), NSS sslkeylog.txt Integrity & Crash Self-Healing',
+            'Test 10: Pre-TLS Wire Header Anomalies, NSS Integrity & Legacy Capture Preservation',
             async () => {
                 const profile = await createAndStartProfile(
                     'Traffic_Test_10_WireAnomalies',
@@ -1888,7 +1898,7 @@ async function runTests() {
                 //    a mismatched macOS User-Agent, and an X-Forwarded-For proxy leak header
                 const anomalousReq = createMockRequest({
                     method: 'POST',
-                    url: 'https://accounts.google.com/v3/signin/lookup?hl=en',
+                    url: 'https://fixture.test/diagnostics/header-audit?hl=en',
                     headersArray: [
                         { name: 'Host', value: 'accounts.google.com' },
                         {
@@ -1943,8 +1953,7 @@ async function runTests() {
                 const legacyDir = fs.mkdtempSync(path.join(tempProfilesDir, 'legacy-nss-'));
                 const legacyOptions = {
                     trafficDir: legacyDir,
-                    sslKeyLog: true,
-                    sslKeyLogPath: path.join(legacyDir, 'sslkeylog.txt'),
+                    sslKeyLog: false,
                     neckoMozLog: false,
                     recordBodies: true,
                     recordWireLog: false
@@ -1952,7 +1961,6 @@ async function runTests() {
                 const legacyRecorder = new CamoufoxTrafficRecorder(legacyOptions);
                 for (const [label, secretHex] of tls13Secrets) {
                     recorder.recordSslKeyLogSecret(label, clientRandomHex, secretHex);
-                    legacyRecorder.recordSslKeyLogSecret(label, clientRandomHex, secretHex);
                 }
 
                 const summary = await profile.getTrafficAttribution();
@@ -1994,11 +2002,11 @@ async function runTests() {
                 legacyRecorder.attachContext(legacyContext);
                 await emitHttpTransaction(legacyContext, anomalousReq, anomalousRes);
                 const legacyIndex = await legacyRecorder.stop();
-                const { sslKeyLogPath: archivedKeyLog } = legacyOptions;
-                const originalKeyLog = fs.readFileSync(archivedKeyLog, 'utf8');
-                assert.equal(legacyIndex.integrity.sslKeyLogSha256, sha256Hex(originalKeyLog));
-                assert.equal(legacyIndex.integrity.sslKeyLogBytes, Buffer.byteLength(originalKeyLog));
-                delete legacyIndex.integrity.sslKeyLogFile;
+                const archivedKeyLog = path.join(legacyDir, 'sslkeylog.txt');
+                const originalKeyLog = tls13Secrets.map(([label, secret]) => `${label} ${clientRandomHex} ${secret}\n`).join('');
+                fs.writeFileSync(archivedKeyLog, originalKeyLog, 'utf8');
+                legacyIndex.integrity.sslKeyLogSha256 = sha256Hex(originalKeyLog);
+                legacyIndex.integrity.sslKeyLogBytes = Buffer.byteLength(originalKeyLog);
                 fs.writeFileSync(legacyRecorder.attributionIndexPath, JSON.stringify(legacyIndex), 'utf8');
 
                 const legacyCheck = verifyTrafficIntegrity(legacyDir);
@@ -2015,22 +2023,21 @@ async function runTests() {
                 assert.ok(tamperedCheck.errors.includes('sslkeylog.txt SHA-256 mismatch'));
                 fs.writeFileSync(archivedKeyLog, originalKeyLog, 'utf8');
 
-                // Recover an interrupted JSON record while retaining the original ledger.
+                // Reopening the capture keeps the original ledger with its legacy native files.
                 const ndjsonPath = legacyRecorder.trafficNdjsonPath;
                 const originalLedger = fs.readFileSync(ndjsonPath);
-                fs.appendFileSync(ndjsonPath, '{"type":"egress","interrupted":', 'utf8');
-                assert.equal(verifyTrafficIntegrity(legacyDir).valid, false);
-
                 const healedRecorder = new CamoufoxTrafficRecorder(legacyOptions);
                 await healedRecorder.stop();
-                assert.deepEqual(fs.readFileSync(ndjsonPath), originalLedger);
-
-                const healedCheck = verifyTrafficIntegrity(legacyDir);
-                assert.equal(healedCheck.valid, true, healedCheck.errors.join('; '));
-                assert.equal(healedCheck.eventCount, legacyCheck.eventCount);
-                assert.equal(healedCheck.chainHeadHash, legacyCheck.chainHeadHash);
-                assert.equal(healedCheck.verifiedPayloads, legacyCheck.verifiedPayloads);
-                assert.equal(healedCheck.sslKeyLog.sha256, legacyCheck.sslKeyLog.sha256);
+                const archive = fs.readdirSync(healedRecorder.profileNativeDir).find((name) => name.startsWith('legacy-'));
+                const preserved = path.join(healedRecorder.profileNativeDir, archive, 'traffic');
+                assert.deepEqual(fs.readFileSync(path.join(preserved, 'traffic.ndjson')), originalLedger);
+                assert.equal(fs.existsSync(archivedKeyLog), false);
+                const preservedCheck = verifyTrafficIntegrity(preserved);
+                assert.equal(preservedCheck.valid, true, preservedCheck.errors.join('; '));
+                assert.equal(preservedCheck.eventCount, legacyCheck.eventCount);
+                assert.equal(preservedCheck.chainHeadHash, legacyCheck.chainHeadHash);
+                assert.equal(preservedCheck.verifiedPayloads, legacyCheck.verifiedPayloads);
+                assert.equal(preservedCheck.sslKeyLog.sha256, legacyCheck.sslKeyLog.sha256);
 
                 await profile.delete();
             }
@@ -2047,6 +2054,7 @@ async function runTests() {
                     'http://10.102.0.1:8080',
                     {
                         profileId: 'traffic-test-11-har',
+                        recordBodies: true,
                         os: 'windows',
                         profilesDir: tempProfilesDir,
                         useSharedBrowser: false,
@@ -2107,7 +2115,7 @@ async function runTests() {
                 });
 
                 await emitHttpTransaction(context, req11, res11);
-                const publicBody = JSON.stringify({ label: 'synthetic-public-attachment' });
+                const publicBody = JSON.stringify({ count: 7, ok: true });
                 const publicRequest = createMockRequest({
                     method: 'POST',
                     url: 'https://example.test/notes',
@@ -2233,6 +2241,7 @@ async function runTests() {
                     }
                 );
 
+                const page = await profile.getPage();
                 const context = await profile.getContext();
                 const recorder = profile.getTrafficRecorder();
 
@@ -2276,9 +2285,10 @@ async function runTests() {
 
                 // Step 2: step-2-submit (after recordTriggerAction('page.click', '#submit-btn'))
                 profile.setTrafficStep('step-2-submit');
-                recorder.recordTriggerAction('page.click', '#submit-btn');
+                recorder.recordTriggerAction('page.click', '#submit-btn', {}, page);
 
                 const reqStep2 = createMockRequest({
+                    frame: page.mainFrame(),
                     method: 'POST',
                     url: 'https://www.tiktok.com/passport/web/account/create/',
                     resourceType: 'fetch',
@@ -2539,16 +2549,13 @@ async function runTests() {
                 const legacyRecorder = new CamoufoxTrafficRecorder({
                     trafficDir: legacyDir,
                     sslKeyLog: false,
-                    neckoMozLog: true,
-                    neckoMozLogPath: archivedMozLog,
                     recordWireLog: false
                 });
-                legacyRecorder.recordNeckoMozLogBlock(realisticNeckoMozLog);
                 const legacyIndex = await legacyRecorder.stop();
-                const originalMozLog = fs.readFileSync(archivedMozLog, 'utf8');
-                assert.equal(legacyIndex.integrity.neckoMozLogSha256, sha256Hex(originalMozLog));
-                assert.equal(legacyIndex.integrity.neckoMozLogBytes, Buffer.byteLength(originalMozLog));
-                delete legacyIndex.integrity.neckoMozLogFile;
+                const originalMozLog = `${realisticNeckoMozLog.trimEnd()}\n`;
+                fs.writeFileSync(archivedMozLog, originalMozLog, 'utf8');
+                legacyIndex.integrity.neckoMozLogSha256 = sha256Hex(originalMozLog);
+                legacyIndex.integrity.neckoMozLogBytes = Buffer.byteLength(originalMozLog);
                 fs.writeFileSync(legacyRecorder.attributionIndexPath, JSON.stringify(legacyIndex), 'utf8');
 
                 const legacyCheck = verifyTrafficIntegrity(legacyDir);
@@ -2580,6 +2587,7 @@ async function runTests() {
                     'http://10.105.0.1:8080',
                     {
                         profileId: 'traffic-test-14-platform-signatures',
+                        recordBodies: true,
                         os: 'windows',
                         profilesDir: tempProfilesDir,
                         useSharedBrowser: false,
@@ -2588,13 +2596,15 @@ async function runTests() {
                     }
                 );
 
+                const page = await profile.getPage();
                 const context = await profile.getContext();
                 const recorder = profile.getTrafficRecorder();
 
                 // 1) ByteDance endpoint (a_bogus & msToken in query)
                 profile.setTrafficStep('step-14-bytedance');
-                const trigBytedance = recorder.recordTriggerAction('page.click', '#tiktok-feed-load');
+                const trigBytedance = recorder.recordTriggerAction('page.click', '#tiktok-feed-load', {}, page);
                 const reqBytedance = createMockRequest({
+                    frame: page.mainFrame(),
                     method: 'GET',
                     url: 'https://www.tiktok.com/api/post/item_list/?aid=1988&msToken=ms_tok_12345&a_bogus=EX789abogusPayload123456',
                     resourceType: 'fetch',
@@ -2617,8 +2627,9 @@ async function runTests() {
 
                 // 2) Twitter/X endpoint (x-client-transaction-id, x-csrf-token headers & ui_metrics in body)
                 profile.setTrafficStep('step-14-twitter');
-                const trigTwitter = recorder.recordTriggerAction('page.click', '#x-onboarding-next');
+                const trigTwitter = recorder.recordTriggerAction('page.click', '#x-onboarding-next', {}, page);
                 const reqTwitter = createMockRequest({
+                    frame: page.mainFrame(),
                     method: 'POST',
                     url: 'https://x.com/i/api/1.1/onboarding/task.json',
                     resourceType: 'fetch',
@@ -2648,8 +2659,9 @@ async function runTests() {
 
                 // 3) Meta endpoint (x-ig-app-id, x-asbd-id, x-csrftoken headers & jazoest, lsd in form body)
                 profile.setTrafficStep('step-14-meta');
-                const trigMeta = recorder.recordTriggerAction('page.click', '#ig-signup-submit');
+                const trigMeta = recorder.recordTriggerAction('page.click', '#ig-signup-submit', {}, page);
                 const reqMeta = createMockRequest({
+                    frame: page.mainFrame(),
                     method: 'POST',
                     url: 'https://www.instagram.com/api/v1/web/accounts/web_create_ajax/',
                     resourceType: 'fetch',
@@ -2677,10 +2689,11 @@ async function runTests() {
 
                 // 4) Google BotGuard endpoint (f.req & bgRequest in form body)
                 profile.setTrafficStep('step-14-google');
-                const trigGoogle = recorder.recordTriggerAction('page.click', '#google-next-btn');
+                const trigGoogle = recorder.recordTriggerAction('page.click', '#google-next-btn', {}, page);
                 const reqGoogle = createMockRequest({
+                    frame: page.mainFrame(),
                     method: 'POST',
-                    url: 'https://accounts.google.com/_/signup/validatepersonaldetails',
+                    url: 'https://fixture.test/diagnostics/form-summary',
                     resourceType: 'fetch',
                     headersArray: [
                         { name: 'Host', value: 'accounts.google.com' },
@@ -2703,8 +2716,9 @@ async function runTests() {
 
                 // 5) Arkose FunCaptcha endpoint (public_key in URL path & bda in body)
                 profile.setTrafficStep('step-14-arkose');
-                const trigArkose = recorder.recordTriggerAction('page.click', '#arkose-verify-btn');
+                const trigArkose = recorder.recordTriggerAction('page.click', '#arkose-verify-btn', {}, page);
                 const reqArkose = createMockRequest({
+                    frame: page.mainFrame(),
                     method: 'POST',
                     url: 'https://client-api.arkoselabs.com/fc/gt2/public_key/2F1CD804',
                     resourceType: 'fetch',
@@ -2776,9 +2790,10 @@ async function runTests() {
                 );
                 assert.ok(metaJazoestSig, 'Expected Meta jazoest signature');
                 assert.equal(metaJazoestSig.location, 'body');
-                assert.equal(metaJazoestSig.valueSha256, sha256Hex('22145'));
+                assert.equal(metaJazoestSig.valueSha256, null);
                 assert.ok(metaLsdSig, 'Expected Meta lsd signature');
-                assert.equal(metaLsdSig.valueSha256, sha256Hex('AVq_lsd_token'));
+                assert.equal(metaLsdSig.valueSha256, null);
+                assert.equal(metaLsdSig.maskedPreview, '[REDACTED]');
                 assert.ok(metaAppIdSig, 'Expected Meta x-ig-app-id signature');
                 assert.equal(metaAppIdSig.location, 'header');
 
@@ -2790,8 +2805,8 @@ async function runTests() {
                 );
                 assert.ok(googleBgSig, 'Expected Google bgRequest signature');
                 assert.equal(googleBgSig.location, 'body');
-                assert.equal(googleBgSig.valueSha256, sha256Hex('botguard_vm_payload_xyz'));
-                assert.equal(googleBgSig.maskedPreview, 'botg***xyz');
+                assert.equal(googleBgSig.valueSha256, null);
+                assert.equal(googleBgSig.maskedPreview, '[REDACTED]');
                 assert.ok(googleFreqSig, 'Expected Google f.req signature');
                 assert.equal(googleFreqSig.location, 'body');
 
@@ -2802,9 +2817,9 @@ async function runTests() {
                 assert.equal(arkoseBdaSig.location, 'body');
                 assert.equal(
                     arkoseBdaSig.valueSha256,
-                    sha256Hex('arkose_encrypted_browser_data_array_12345')
+                    null
                 );
-                assert.equal(arkoseBdaSig.maskedPreview, 'arko***345');
+                assert.equal(arkoseBdaSig.maskedPreview, '[REDACTED]');
 
                 // Verify summary.platformSignatures aggregation and causal linking
                 assert.ok(summary.platformSignatures, 'Expected summary.platformSignatures block');
@@ -3005,29 +3020,11 @@ async function runTests() {
                     );
                 }
 
-                const expectedApiKeyTag = `[REDACTED:${sha256Hex(rawApiKey).slice(0, 8)}]`;
-                const expectedPasswordTag = `[REDACTED:${sha256Hex(rawPassword).slice(0, 8)}]`;
-
-                assert.equal(
-                    ndjsonRaw.includes(expectedApiKeyTag),
-                    true,
-                    `Expected traffic.ndjson to contain ${expectedApiKeyTag}`
-                );
-                assert.equal(
-                    ndjsonRaw.includes(expectedPasswordTag),
-                    true,
-                    `Expected traffic.ndjson to contain ${expectedPasswordTag}`
-                );
-                assert.equal(
-                    wireLogRaw.includes(expectedApiKeyTag),
-                    true,
-                    `Expected pre-tls-wire.log to contain ${expectedApiKeyTag}`
-                );
-                assert.equal(
-                    wireLogRaw.includes(expectedPasswordTag),
-                    true,
-                    `Expected pre-tls-wire.log to contain ${expectedPasswordTag}`
-                );
+                for (const capture of [ndjsonRaw, wireLogRaw]) {
+                    assert.ok(capture.includes('api_key=[REDACTED]'));
+                    assert.ok(capture.includes('password=[REDACTED]'));
+                    assert.doesNotMatch(capture, /\[REDACTED:[a-f\d]{8}\]/i);
+                }
                 assert.equal(
                     wireLogRaw.includes('Authorization: Bearer [REDACTED]'),
                     true,
@@ -3105,6 +3102,7 @@ async function runTests() {
                     'http://10.106.0.1:8080',
                     {
                         profileId: 'traffic-test-16-crash-replay-anomalies',
+                        recordBodies: true,
                         os: 'windows',
                         profilesDir: tempProfilesDir,
                         useSharedBrowser: false,

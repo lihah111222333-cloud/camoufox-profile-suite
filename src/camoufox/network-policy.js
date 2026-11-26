@@ -24,6 +24,12 @@ export function resolveNetworkPolicyMode(...policies) {
     return modes.has('managed-proxy') ? 'managed-proxy' : 'url-only';
 }
 
+export function resolveConfiguredNetworkPolicyMode(...policies) {
+    const mode = process.env.CAMOUFOX_PORT_SCAN_MODE;
+    const configuredRestriction = mode && mode !== 'url-only' ? { mode } : undefined;
+    return resolveNetworkPolicyMode(configuredRestriction, ...policies);
+}
+
 function parseProxyOrigin(value) {
     if (typeof value !== 'string') return null;
     const match = /^(https?|socks5):\/\/(\[[0-9a-f:.]+\]|[a-z0-9.-]+):(\d+)\/?$/i.exec(value);
@@ -46,6 +52,12 @@ function hasProxyPreferenceOverride(preferences) {
 
 function hasProxyEnvironmentOverride(env) {
     return Object.keys(env || {}).some((name) => /^(https?_proxy|all_proxy|no_proxy)$/i.test(name));
+}
+
+export function assertManagedProxyLaunchEnvironment(env) {
+    if (hasProxyEnvironmentOverride(env)) {
+        throw managedEgressError('Camoufox managed-proxy mode requires its original proxy configuration.');
+    }
 }
 
 export function bindManagedProxy(proxy, options) {

@@ -1293,7 +1293,6 @@ export function scaleGpuExecutionDurationMs(hostElapsedMs, scalingWeights, optio
  */
 export function buildGpuPerformanceInitScript(scalingWeights) {
     const configPayload = JSON.stringify({
-        profileId: scalingWeights.profileId || 'default-gpu-profile',
         targetGpuModel: scalingWeights.targetGpuSpec.model,
         computeTimeMultiplier: scalingWeights.computeTimeMultiplier,
         memoryTransferMultiplier: scalingWeights.memoryTransferMultiplier,
@@ -1312,7 +1311,6 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
     try {
         Object.defineProperty(globalThis, '__camoufoxGpuPerformanceState', {
             value: Object.freeze({
-                profileId: CFG.profileId,
                 targetGpuModel: CFG.targetGpuModel,
                 computeTimeMultiplier: CFG.computeTimeMultiplier,
                 memoryTransferMultiplier: CFG.memoryTransferMultiplier,

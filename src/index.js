@@ -6,15 +6,39 @@
  * نقطة البداية الرئيسية للتطبيق
  */
 
-import { appendAccountResult, migrateExistingAccountOutputs, writeRunSummary } from './utils/account-results.js';
+import {
+    appendAccountResult, migrateExistingAccountOutputs, recordAccountCleanup, writeRunSummary
+} from './utils/account-results.js';
+import { parseRunCounts } from './utils/cli-counts.js';
+import { ensureStateDirectory, LEGACY_DIRECTORY, STATE_DIRECTORY } from './utils/state-paths.js';
+import { randomUUID } from 'node:crypto';
+import { setImmediate } from 'node:timers/promises';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const RESULTS_FILE = path.join(STATE_DIRECTORY, 'results.json');
+const SUMMARY_FILE = path.join(STATE_DIRECTORY, 'summary.json');
 
-const RESULTS_FILE = path.join(__dirname, '../results.json');
-const SUMMARY_FILE = path.join(__dirname, '../summary.json');
+function accountOutputDiagnostic(error) {
+    if (error?.code === 'ACCOUNT_OUTPUT_INVALID_DATA' || error?.code === 'ACCOUNT_OUTPUT_LOCK_FAILED') {
+        return ' ' + error.message;
+    }
+    return '';
+}
+
+function prepareAccountOutputs() {
+    try {
+        ensureStateDirectory();
+        migrateExistingAccountOutputs(RESULTS_FILE, SUMMARY_FILE, { legacyDirectory: LEGACY_DIRECTORY });
+    } catch (error) {
+        const details = error instanceof AggregateError
+            ? error.errors.map(accountOutputDiagnostic).join('')
+            : accountOutputDiagnostic(error);
+        throw new AccountOutputWriteError(
+            'Could not prepare results.json or summary.json in the application state directory.' + details, error
+        );
+    }
+}
 
 class AccountOutputWriteError extends Error {
     constructor(message, cause) {
@@ -23,16 +47,17 @@ class AccountOutputWriteError extends Error {
     }
 }
 
-async function loadRuntime() {
-    const { default: config } = await import('./config.js');
+async function loadRuntime(config) {
+    const { default: proxyManager } = await import('./utils/proxy-manager.js');
+    if (config.profileService === 'camoufox' && config.app?.testProxy === false && !proxyManager.proxies.length) {
+        proxyManager.rejectUnselectedLegacyInventory();
+    }
     const [
         { default: logger },
-        { default: proxyManager },
         { default: nameGenerator },
         { createGmailAccount }
     ] = await Promise.all([
         import('./utils/logger.js'),
-        import('./utils/proxy-manager.js'),
         import('./utils/name-generator.js'),
         import('./gmail/creator.js')
     ]);
@@ -51,7 +76,7 @@ function saveResult(result, logger) {
         const message = result.success
             ? 'An account was created and its result could not be saved safely in results.json.'
             : 'A failed account attempt could not be saved safely in results.json.';
-        throw new AccountOutputWriteError(message, error);
+        throw new AccountOutputWriteError(message + accountOutputDiagnostic(error), error);
     }
     logger.info('Result saved', { email: saved.email });
     return saved;
@@ -62,22 +87,48 @@ function saveResult(result, logger) {
  * إنشاء حساب Gmail واحد
  */
 async function createAccount(accountNumber = null) {
-    migrateExistingAccountOutputs(RESULTS_FILE, SUMMARY_FILE);
-    return createAccountWithRuntime(await loadRuntime(), accountNumber);
+    const { default: config } = await import('./config.js');
+    prepareAccountOutputs();
+    const { result, failure } = await createAccountWithRuntime(await loadRuntime(config), accountNumber);
+    if (!result.success) throw failure;
+    return result;
 }
 
-async function createAccountWithRuntime(runtime, accountNumber) {
+async function createAccountWithRuntime(runtime, accountNumber, { signal, activeStops } = {}) {
     const { config, logger, proxyManager, nameGenerator, createGmailAccount } = runtime;
-    let profile = null;
-    let phoneOrder = null;
-    let proxy = null; // Initialize proxy variable
+    const profileService = config.profileService || 'gpm';
+    const serviceName = profileService === 'camoufox'
+        ? 'Camoufox'
+        : (profileService === 'dolphin' ? 'Dolphin Anty' : 'GPM Login');
     const accountLabel = accountNumber ? `[Account ${accountNumber}]` : '';
+    let profile = null;
+    let proxy = null;
+    let savedResult;
+    let failure;
+    let profileCleanup;
+    let stopping;
+    const stop = () => {
+        stopping ??= (async () => {
+            const details = { profileId: profile.profileId, profileType: serviceName };
+            try {
+                if (await profile.stop() === true) {
+                    logger.info(`${accountLabel} Profile stopped`, details);
+                    return 'stopped';
+                }
+            } catch {
+                // A thrown stop failure is also unconfirmed.
+            }
+            logger.warn(`${accountLabel} Profile shutdown unconfirmed`, details);
+            return 'stop-unconfirmed';
+        })();
+        return stopping;
+    };
 
     try {
+        signal?.throwIfAborted();
         logger.info(`${accountLabel} === Starting Gmail Account Creation ===`);
 
         // Step 1: Get proxy
-        const profileService = config.profileService || 'gpm';
         proxy = proxyManager.getNextProxy();
         if (!proxy) {
             if (profileService === 'camoufox' && config.app?.testProxy === false) {
@@ -86,7 +137,7 @@ async function createAccountWithRuntime(runtime, accountNumber) {
                 throw new Error('No proxies available');
             }
         } else {
-            logger.info(`${accountLabel} Proxy selected`, { proxy: proxy.ip });
+            logger.info(`${accountLabel} Proxy selected`);
         }
 
         // Step 2: Generate account data
@@ -97,13 +148,17 @@ async function createAccountWithRuntime(runtime, accountNumber) {
         });
 
         // Step 3: Create profile based on selected service
-        const profileName = `Gmail_${accountData.username}_${Date.now()}`;
+        const profileName = profileService === 'camoufox'
+            ? `Gmail_${randomUUID()}`
+            : `Gmail_${accountData.username}_${Date.now()}`;
         
         logger.info(`${accountLabel} Creating ${profileService.toUpperCase()} profile`, { name: profileName });
         
         // Format proxy according to service
+        signal?.throwIfAborted();
         if (profileService === 'camoufox') {
             const { createAndStartProfile: createAndStartCamoufoxProfile } = await import('./camoufox/profile.js');
+            signal?.throwIfAborted();
             const camoufoxProxy = proxy ? proxyManager.getCamoufoxFormat(proxy) : null;
             profile = await createAndStartCamoufoxProfile(profileName, camoufoxProxy, {
                 os: config.camoufox?.os,
@@ -137,6 +192,7 @@ async function createAccountWithRuntime(runtime, accountNumber) {
         } else if (profileService === 'dolphin') {
             // Lazy-load Dolphin Anty profile module only when selected
             const { createAndStartProfile: createAndStartDolphinProfile } = await import('./dolphin/profile.js');
+            signal?.throwIfAborted();
             const dolphinProxy = proxy ? {
                 ip: proxy.ip,
                 port: proxy.port,
@@ -148,6 +204,7 @@ async function createAccountWithRuntime(runtime, accountNumber) {
         } else {
             // Lazy-load GPM Login profile module only when selected
             const { createAndStartProfile: createAndStartGPMProfile } = await import('./gpmlogin/profile.js');
+            signal?.throwIfAborted();
             const gpmProxy = proxy ? {
                 ip: proxy.ip,
                 port: proxy.port,
@@ -157,7 +214,10 @@ async function createAccountWithRuntime(runtime, accountNumber) {
             } : null;
             profile = await createAndStartGPMProfile(profileName, gpmProxy);
         }
-        
+
+        activeStops?.add(stop);
+        signal?.throwIfAborted();
+
         const camoufoxTelemetry =
             typeof profile?.getTelemetrySummary === 'function' ? profile.getTelemetrySummary() : null;
         logger.info(`${accountLabel} Profile created and started`, {
@@ -174,11 +234,9 @@ async function createAccountWithRuntime(runtime, accountNumber) {
 
         // Step 4: Get browser and page
         const browser = await profile.getBrowser();
+        signal?.throwIfAborted();
         const page = await profile.getPage();
-
-        const serviceName = profileService === 'camoufox'
-            ? 'Camoufox'
-            : (profileService === 'dolphin' ? 'Dolphin Anty' : 'GPM Login');
+        signal?.throwIfAborted();
 
         if (!browser || !page) {
             throw new Error(`Failed to get browser instance from ${serviceName} profile`);
@@ -187,7 +245,7 @@ async function createAccountWithRuntime(runtime, accountNumber) {
         // Step 5: Create Gmail account
         logger.info(`${accountLabel} Starting Gmail account creation process`);
         if (typeof profile.setTrafficStep === 'function') {
-            profile.setTrafficStep('signup-flow', { email: accountData.email });
+            profile.setTrafficStep('signup-flow');
         }
         const result = await createGmailAccount(page, accountData, { profile });
         if (result?.email && typeof profile.updateTrafficAttribution === 'function') {
@@ -197,11 +255,10 @@ async function createAccountWithRuntime(runtime, accountNumber) {
         // Step 6: Get profile IP (if available)
         let profileIP = null;
         try {
-            if (typeof profile.setTrafficStep === 'function') {
-                profile.setTrafficStep('ip-check');
-            }
-            const page = await profile.getPage();
-            if (page) {
+            if (!signal?.aborted) {
+                if (typeof profile.setTrafficStep === 'function') {
+                    profile.setTrafficStep('ip-check');
+                }
                 profileIP = await page.evaluate(() => {
                     return new Promise((resolve) => {
                         fetch('https://api.ipify.org?format=json')
@@ -219,80 +276,83 @@ async function createAccountWithRuntime(runtime, accountNumber) {
             typeof profile?.getTelemetrySummary === 'function' ? profile.getTelemetrySummary() : null;
 
         // Step 7: Save account outcome
-        const accountResult = saveResult({
+        savedResult = saveResult({
             ...result,
             success: true,
             profileId: profile.profileId,
             profileType: serviceName,
+            profileCleanup: 'pending',
             proxyIP: proxy ? proxy.ip : null,
             profileIP: profileIP,
             trafficAttribution: profile.trafficPaths || null,
             ...(finalCamoufoxTelemetry ? { camoufoxTelemetry: finalCamoufoxTelemetry } : {}),
             timestamp: new Date().toISOString()
         }, logger);
-
-        logger.info(`${accountLabel} === Account Creation Completed Successfully ===`, {
-            email: result.email
-        });
-
-        return accountResult;
     } catch (error) {
-        if (error instanceof AccountOutputWriteError) {
-            throw error;
-        }
+        if (error instanceof AccountOutputWriteError) throw error;
+        failure = error;
         logger.error(`${accountLabel} === Account Creation Failed ===`, {
-            error: error.message,
-            stack: error.stack
+            error: error?.message,
+            stack: error?.stack
         });
 
-        // Save failure result
-        saveResult({
+        const profileId = profile?.profileId ?? error?.profileId ?? null;
+        savedResult = saveResult({
             success: false,
-            errorCode: error.code,
-            errorStage: error.stage,
-            profileId: profile?.profileId || null,
+            errorCode: error?.code,
+            errorStage: error?.stage,
+            profileId,
+            ...(profileId !== null ? { profileType: serviceName } : {}),
             trafficAttribution: profile?.trafficPaths || null,
+            profileCleanup: profile ? 'pending' : error?.profileCleanup,
             timestamp: new Date().toISOString()
         }, logger);
-
-        throw error;
     } finally {
-        // Cleanup: Stop profile
-        if (profile) {
-            try {
-                await profile.stop();
-                logger.info(`${accountLabel} Profile stopped`);
-            } catch (error) {
-                logger.warn(`${accountLabel} Error stopping profile`, { error: error.message });
-            }
-        }
+        activeStops?.delete(stop);
+        if (profile) profileCleanup = await stop();
+    }
 
-        // Release proxy on failure
-        if (profile && proxy) {
-            // Only release if we failed
-            // proxyManager.releaseProxy(proxy);
+    let result = savedResult;
+    if (profile) {
+        try {
+            result = recordAccountCleanup(RESULTS_FILE, savedResult.resultId, profileCleanup);
+        } catch (error) {
+            throw new AccountOutputWriteError(
+                'Could not save profile cleanup in results.json.' + accountOutputDiagnostic(error), error
+            );
         }
     }
+    if (result.success) {
+        logger.info(`${accountLabel} === Account Creation Completed Successfully ===`, { email: result.email });
+    }
+    return { result, failure };
 }
 
 /**
  * Process queue with concurrency control
  * معالجة قائمة الانتظار مع التحكم في التزامن
  */
-async function processQueue(queue, concurrency, logger) {
+async function processQueue(total, concurrency, createTask, logger, signal) {
     const results = [];
     const executing = [];
     let completed = 0;
     let failed = 0;
     let outputWriteError;
 
-    const executeTask = async (task, index) => {
+    const executeTask = async (index) => {
         try {
-            logger.info(`[Thread ${index + 1}] Starting account creation ${completed + failed + 1}/${queue.length}`);
-            const result = await task();
-            completed++;
+            logger.info(`[Thread ${index + 1}] Starting account creation ${completed + failed + 1}/${total}`);
+            const { result, failure } = await createTask(index + 1);
             results.push(result);
-            logger.info(`[Thread ${index + 1}] Account created successfully (${completed} success, ${failed} failed)`);
+            if (result.success) {
+                completed++;
+                logger.info(`[Thread ${index + 1}] Account created successfully (${completed} success, ${failed} failed)`);
+            } else {
+                failed++;
+                logger.error(`[Thread ${index + 1}] Account creation failed (${completed} success, ${failed} failed)`, {
+                    error: failure?.message
+                });
+            }
         } catch (error) {
             if (error instanceof AccountOutputWriteError) {
                 outputWriteError ??= error;
@@ -310,22 +370,24 @@ async function processQueue(queue, concurrency, logger) {
         }
     };
 
-    for (let i = 0; i < queue.length; i++) {
-        const task = queue[i];
-        
+    for (let i = 0; i < total; i++) {
         // Wait if we've reached concurrency limit
         while (executing.length >= concurrency) {
             await Promise.race(executing);
         }
-        if (outputWriteError) {
+        if (outputWriteError || signal?.aborted) {
             break;
         }
 
-        const promise = executeTask(task, i).then(() => {
+        const promise = executeTask(i).then(() => {
             executing.splice(executing.indexOf(promise), 1);
         });
 
         executing.push(promise);
+        if (executing.length < concurrency && i + 1 < total) {
+            // Give signals and completions a turn even when the requested concurrency is very large.
+            await setImmediate();
+        }
     }
 
     // Wait for all remaining tasks
@@ -337,10 +399,11 @@ async function processQueue(queue, concurrency, logger) {
     return {
         results,
         stats: {
-            total: queue.length,
+            total,
             completed,
             failed,
-            successRate: ((completed / queue.length) * 100).toFixed(2) + '%'
+            ...(signal?.aborted ? { skipped: total - completed - failed } : {}),
+            successRate: ((completed / total) * 100).toFixed(2) + '%'
         }
     };
 }
@@ -349,30 +412,23 @@ async function processQueue(queue, concurrency, logger) {
  * Main function
  * الدالة الرئيسية
  */
-async function main() {
-    migrateExistingAccountOutputs(RESULTS_FILE, SUMMARY_FILE);
-    const runtime = await loadRuntime();
-    const { config, logger, proxyManager } = runtime;
+async function main({ signal } = {}) {
+    signal?.throwIfAborted();
+    const { default: config } = await import('./config.js');
+    const { accountsCount, threadsCount: requestedThreads } = parseRunCounts(process.argv.slice(2));
+    const threadsCount = Math.min(requestedThreads, accountsCount);
+    signal?.throwIfAborted();
+    prepareAccountOutputs();
+    const runtime = await loadRuntime(config);
+    const { logger, proxyManager } = runtime;
+    const activeStops = new Set();
+    const stopActiveProfiles = () => {
+        for (const stop of activeStops) void stop();
+    };
+    signal?.addEventListener('abort', stopActiveProfiles, { once: true });
 
     try {
-        // Parse command line arguments
-        const args = process.argv.slice(2);
-        let accountsCount = parseInt(process.env.ACCOUNTS_COUNT || '1');
-        let threadsCount = parseInt(process.env.THREADS_COUNT || '1');
-
-        // Parse arguments: --accounts=5 --threads=2
-        for (const arg of args) {
-            if (arg.startsWith('--accounts=')) {
-                accountsCount = parseInt(arg.split('=')[1]) || accountsCount;
-            } else if (arg.startsWith('--threads=')) {
-                threadsCount = parseInt(arg.split('=')[1]) || threadsCount;
-            } else if (arg.startsWith('-a=')) {
-                accountsCount = parseInt(arg.split('=')[1]) || accountsCount;
-            } else if (arg.startsWith('-t=')) {
-                threadsCount = parseInt(arg.split('=')[1]) || threadsCount;
-            }
-        }
-
+        signal?.throwIfAborted();
         logger.info('=== Gmail Account Creator Bot Started ===');
         logger.info('Configuration:', {
             accountsCount,
@@ -384,28 +440,12 @@ async function main() {
             availableProxies: proxyManager.getAvailableCount()
         });
 
-        // Validate configuration
-        if (accountsCount < 1) {
-            throw new Error('Accounts count must be at least 1');
-        }
-
-        if (threadsCount < 1) {
-            throw new Error('Threads count must be at least 1');
-        }
-
-        if (threadsCount > accountsCount) {
+        if (threadsCount < requestedThreads) {
             logger.warn('Threads count is greater than accounts count, setting threads to accounts count');
-            threadsCount = accountsCount;
         }
 
         if (proxyManager.proxies.length < threadsCount) {
             logger.warn(`Only ${proxyManager.proxies.length} proxies available, but ${threadsCount} threads requested`);
-        }
-
-        // Create queue of tasks
-        const queue = [];
-        for (let i = 0; i < accountsCount; i++) {
-            queue.push(() => createAccountWithRuntime(runtime, i + 1));
         }
 
         logger.info(`Starting creation of ${accountsCount} accounts with ${threadsCount} concurrent threads`);
@@ -413,7 +453,13 @@ async function main() {
         const startTime = Date.now();
         
         // Process queue with concurrency control
-        const { results, stats } = await processQueue(queue, threadsCount, logger);
+        const { results, stats } = await processQueue(
+            accountsCount,
+            threadsCount,
+            (accountNumber) => createAccountWithRuntime(runtime, accountNumber, { signal, activeStops }),
+            logger,
+            signal
+        );
 
         const endTime = Date.now();
         const duration = ((endTime - startTime) / 1000).toFixed(2);
@@ -443,18 +489,53 @@ async function main() {
         try {
             writeRunSummary(SUMMARY_FILE, summary);
         } catch (error) {
-            throw new AccountOutputWriteError('Run summary could not be saved safely in summary.json.', error);
+            throw new AccountOutputWriteError(
+                'Run summary could not be saved safely in summary.json.' + accountOutputDiagnostic(error), error
+            );
         }
         logger.info('Summary saved to summary.json');
 
-        logger.info('=== Bot execution completed ===');
-    } catch (error) {
-        if (error instanceof AccountOutputWriteError) {
-            logger.error(error.message);
-        } else {
-            logger.error('Fatal error in main', { error: error.message, stack: error.stack });
+        if (results.some(({ profileCleanup }) =>
+            profileCleanup === 'stop-unconfirmed' || profileCleanup === 'delete-unconfirmed'
+        )) {
+            const error = new Error('Managed profile cleanup is unconfirmed. See summary.json for profile IDs.');
+            error.code = 'PROFILE_CLEANUP_UNCONFIRMED';
+            throw error;
         }
-        process.exit(1);
+        logger.info(signal?.aborted ? '=== Bot execution interrupted ===' : '=== Bot execution completed ===');
+    } catch (error) {
+        if (error !== signal?.reason) logger.error('Fatal error in main', { error });
+        throw error;
+    } finally {
+        signal?.removeEventListener('abort', stopActiveProfiles);
+    }
+}
+
+export async function runCli() {
+    const controller = new AbortController();
+    const interrupt = (signal, exitCode) => {
+        if (controller.signal.aborted) return;
+        process.exitCode = exitCode;
+        controller.abort(new Error(`Interrupted by ${signal}`));
+    };
+    const onSigint = () => interrupt('SIGINT', 130);
+    const onSigterm = () => interrupt('SIGTERM', 143);
+    process.on('SIGINT', onSigint);
+    process.on('SIGTERM', onSigterm);
+
+    try {
+        await main({ signal: controller.signal });
+    } catch (error) {
+        if (error !== controller.signal.reason) {
+            const safeMessage = error instanceof AccountOutputWriteError ||
+                error?.code === 'INVALID_CLI_COUNT' || error?.code === 'PROFILE_CLEANUP_UNCONFIRMED' ||
+                error?.code === 'PROXY_CONFIGURATION_ERROR' || error?.code === 'PRIVATE_ENV_CONFIGURATION_ERROR';
+            console.error(safeMessage ? error.message : 'The run could not be completed.');
+        }
+        if (!controller.signal.aborted) process.exitCode = 1;
+    } finally {
+        process.off('SIGINT', onSigint);
+        process.off('SIGTERM', onSigterm);
     }
 }
 
@@ -474,12 +555,7 @@ const isMainModule = (() => {
     }
 })();
 
-if (isMainModule) {
-    main().catch(error => {
-        console.error(error.message);
-        process.exit(1);
-    });
-}
+if (isMainModule) runCli();
 
 export default {
     createAccount,

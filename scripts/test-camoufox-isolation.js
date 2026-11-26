@@ -101,22 +101,17 @@ function createMockCamoufoxEngine() {
         const originStorage = new Map();
 
         // Hydrate from persisted storage-state.json if provided
-        if (contextOptions.storageState && typeof contextOptions.storageState === 'string') {
-            if (fs.existsSync(contextOptions.storageState)) {
-                const raw = fs.readFileSync(contextOptions.storageState, 'utf8');
-                const parsed = JSON.parse(raw);
-                if (Array.isArray(parsed.cookies)) {
-                    cookieJar = parsed.cookies.map((c) => ({ ...c }));
+        const parsed = contextOptions.storageState;
+        if (Array.isArray(parsed?.cookies)) {
+            cookieJar = parsed.cookies.map((c) => ({ ...c }));
+        }
+        if (Array.isArray(parsed?.origins)) {
+            for (const entry of parsed.origins) {
+                const map = new Map();
+                for (const item of entry.localStorage || []) {
+                    map.set(item.name, item.value);
                 }
-                if (Array.isArray(parsed.origins)) {
-                    for (const entry of parsed.origins) {
-                        const map = new Map();
-                        for (const item of entry.localStorage || []) {
-                            map.set(item.name, item.value);
-                        }
-                        originStorage.set(entry.origin, map);
-                    }
-                }
+                originStorage.set(entry.origin, map);
             }
         }
 
@@ -784,7 +779,11 @@ async function runTests() {
 
                 // Verify idempotent registration and unregistration of process cleanup hooks
                 unregisterProcessCleanupHooks();
+                const beforeSigint = process.listeners('SIGINT');
+                const beforeSigterm = process.listeners('SIGTERM');
                 assert.equal(registerProcessCleanupHooks(), true);
+                assert.deepEqual(process.listeners('SIGINT'), beforeSigint);
+                assert.deepEqual(process.listeners('SIGTERM'), beforeSigterm);
                 assert.equal(registerProcessCleanupHooks(), false);
                 assert.equal(unregisterProcessCleanupHooks(), true);
                 assert.equal(unregisterProcessCleanupHooks(), false);
@@ -811,8 +810,11 @@ async function runTests() {
                     })
                 ]);
 
-                // Starting a profile automatically ensures process cleanup hooks are registered
-                assert.equal(registerProcessCleanupHooks(), false);
+                assert.deepEqual(process.listeners('SIGINT'), beforeSigint);
+                assert.deepEqual(process.listeners('SIGTERM'), beforeSigterm);
+                assert.equal(registerProcessCleanupHooks(), true);
+                assert.equal(process.listenerCount('SIGINT'), beforeSigint.length + 1);
+                assert.equal(process.listenerCount('SIGTERM'), beforeSigterm.length + 1);
 
                 const activeIds = getActiveProfileIds();
                 assert.equal(activeIds.length, 3);
@@ -887,6 +889,7 @@ async function runTests() {
                 const shutdownSummary = await stopAllActiveProfiles('test-emergency-shutdown');
                 assert.equal(shutdownSummary.reason, 'test-emergency-shutdown');
                 assert.equal(shutdownSummary.stoppedCount, 3);
+                assert.equal(shutdownSummary.sharedBrowsersClosed, true);
                 assert.deepEqual(
                     [...shutdownSummary.profileIds].sort(),
                     ['Shutdown_Lin', 'Shutdown_Mac', 'Shutdown_Win']
@@ -894,6 +897,8 @@ async function runTests() {
 
                 // Verify getActiveProfileIds() is now empty
                 assert.deepEqual(getActiveProfileIds(), []);
+                assert.deepEqual(process.listeners('SIGINT'), beforeSigint);
+                assert.deepEqual(process.listeners('SIGTERM'), beforeSigterm);
 
                 // Verify all underlying mock contexts and browsers were closed
                 for (const { profile } of activeProfilesList) {
@@ -950,25 +955,18 @@ async function runTests() {
                         profileId: 'Restart_Chain_Win',
                         os: 'windows',
                         profilesDir: tempProfilesDir,
-                        useSharedBrowser: false
+                        useSharedBrowser: false,
+                        recordBodies: true
                     }
                 );
 
-                profileSession1.setTrafficStep('session-1-signup-init');
-                const session1ReqBody = JSON.stringify({
-                    session: 1,
-                    step: 'init',
-                    user: 'alice_s1'
-                });
-                const session1ResBody = JSON.stringify({
-                    ok: true,
-                    session: 1,
-                    token: 'tok_s1'
-                });
+                profileSession1.setTrafficStep('fixture-phase-one');
+                const session1ReqBody = JSON.stringify({ count: 1 });
+                const session1ResBody = JSON.stringify({ ok: true, count: 1 });
 
                 const mockReq1 = {
                     method: () => 'POST',
-                    url: () => 'https://accounts.google.com/_/signup/session1',
+                    url: () => 'https://diagnostic.example.test/request-1',
                     resourceType: () => 'fetch',
                     isNavigationRequest: () => false,
                     headers: () => ({ 'content-type': 'application/json' }),
@@ -977,7 +975,7 @@ async function runTests() {
                 };
                 const mockRes1 = {
                     request: () => mockReq1,
-                    url: () => 'https://accounts.google.com/_/signup/session1',
+                    url: () => 'https://diagnostic.example.test/request-1',
                     status: () => 200,
                     statusText: () => 'OK',
                     headers: () => ({ 'content-type': 'application/json' }),
@@ -986,7 +984,7 @@ async function runTests() {
                         responseBodyReads += 1;
                         return Buffer.from(session1ResBody, 'utf8');
                     },
-                    serverAddr: async () => ({ ipAddress: '142.250.80.109', port: 443 }),
+                    serverAddr: async () => ({ ipAddress: '192.0.2.10', port: 443 }),
                     securityDetails: async () => ({ protocol: 'TLS 1.3' })
                 };
 
@@ -998,7 +996,15 @@ async function runTests() {
                 await new Promise((resolve) => setImmediate(resolve));
 
                 const trafficDir = profileSession1.trafficPaths.trafficDir;
-                await profileSession1.stop();
+                const beforeSigint = process.listeners('SIGINT');
+                const beforeSigterm = process.listeners('SIGTERM');
+                assert.equal(registerProcessCleanupHooks(), true);
+                assert.equal(process.listenerCount('SIGINT'), beforeSigint.length + 1);
+                assert.equal(process.listenerCount('SIGTERM'), beforeSigterm.length + 1);
+                assert.equal(await profileSession1.stop(), true);
+                assert.deepEqual(process.listeners('SIGINT'), beforeSigint);
+                assert.deepEqual(process.listeners('SIGTERM'), beforeSigterm);
+                assert.equal(unregisterProcessCleanupHooks(), true);
 
                 const integrityAfterSession1 = verifyTrafficIntegrity(trafficDir);
                 assert.equal(
@@ -1014,25 +1020,18 @@ async function runTests() {
                 // Restart the exact same profileId in a new CamoufoxProfile instance
                 const profileSession2 = new CamoufoxProfile('Restart_Chain_Win', {
                     profilesDir: tempProfilesDir,
-                    useSharedBrowser: false
+                    useSharedBrowser: false,
+                    recordBodies: true
                 });
                 await profileSession2.start();
-                profileSession2.setTrafficStep('session-2-resume-verify');
+                profileSession2.setTrafficStep('fixture-phase-two');
 
-                const session2ReqBody = JSON.stringify({
-                    session: 2,
-                    step: 'verify',
-                    code: '998877'
-                });
-                const session2ResBody = JSON.stringify({
-                    ok: true,
-                    session: 2,
-                    verified: true
-                });
+                const session2ReqBody = JSON.stringify({ count: 2 });
+                const session2ResBody = JSON.stringify({ ok: true, count: 2 });
 
                 const mockReq2 = {
                     method: () => 'POST',
-                    url: () => 'https://accounts.google.com/_/signup/session2',
+                    url: () => 'https://diagnostic.example.test/request-2',
                     resourceType: () => 'fetch',
                     isNavigationRequest: () => false,
                     headers: () => ({ 'content-type': 'application/json' }),
@@ -1041,7 +1040,7 @@ async function runTests() {
                 };
                 const mockRes2 = {
                     request: () => mockReq2,
-                    url: () => 'https://accounts.google.com/_/signup/session2',
+                    url: () => 'https://diagnostic.example.test/request-2',
                     status: () => 200,
                     statusText: () => 'OK',
                     headers: () => ({ 'content-type': 'application/json' }),
@@ -1050,7 +1049,7 @@ async function runTests() {
                         responseBodyReads += 1;
                         return Buffer.from(session2ResBody, 'utf8');
                     },
-                    serverAddr: async () => ({ ipAddress: '142.250.80.109', port: 443 }),
+                    serverAddr: async () => ({ ipAddress: '192.0.2.10', port: 443 }),
                     securityDetails: async () => ({ protocol: 'TLS 1.3' })
                 };
 
@@ -1061,7 +1060,7 @@ async function runTests() {
                 profileSession2.context.emit('requestfinished', mockReq2);
                 await new Promise((resolve) => setImmediate(resolve));
 
-                await profileSession2.stop();
+                assert.equal(await profileSession2.stop(), true);
 
                 const integrityAfterSession2 = verifyTrafficIntegrity(trafficDir);
                 assert.equal(

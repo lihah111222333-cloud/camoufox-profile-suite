@@ -15,11 +15,8 @@
 بعد إنشاء الـ repository، قم بتنفيذ الأوامر التالية:
 
 ```bash
-# إضافة جميع الملفات
-git add .
-
-# عمل commit
-git commit -m "Initial commit: Gmail Account Creator with GPM Login"
+# فحص الملفات ومراجعة ما تم تجهيزه ثم إنشاء الالتزام
+bash PUSH_TO_GITHUB.sh
 
 # إضافة remote repository (استبدل YOUR_USERNAME و REPO_NAME)
 git remote add origin https://github.com/YOUR_USERNAME/REPO_NAME.git
@@ -36,12 +33,15 @@ git push -u origin main
 
 تأكد من أن الملفات التالية **غير موجودة** في الـ repository:
 - `.env`
+- `.npmrc` إذا احتوى على بيانات اعتماد
 - `config/proxies.txt`
 - `email.txt`
 - `gmlogin.txt`
 - `results.json`
 - `summary.json`
 - `logs/`
+- ملفات تعريف المتصفح، بما فيها مجلد `CAMOUFOX_STORAGE_DIR` المخصص
+- ملفات التقاط الحركة مثل `traffic.har`
 
 ### 4. إنشاء ملف .env.example
 
@@ -81,17 +81,17 @@ TEST_PROXY=true
   - Proxies
   - Passwords
   - Personal data
-- استخدم `.env` للمتغيرات الحساسة
-- أضف `.env` إلى `.gitignore`
+- احتفظ بـ `.env` وملفات الاعتماد في [مجلد حالة التطبيق](ENV_VARIABLES.md#configuration-and-local-state).
+- احتفظ بقواعد تجاهل الملفات الحساسة في `.gitignore`.
 
-## إذا نسيت إضافة ملف حساس:
+## إذا رفعت ملفًا حساسًا بالخطأ
 
-إذا رفعت ملف حساس بالخطأ:
+1. ألغِ بيانات الاعتماد المكشوفة أو دوّرها فورًا، بما فيها كلمات مرور الوكلاء والرموز المميزة. أبطل جلسات المتصفح المكشوفة أيضًا.
+2. أزل الملف من النسخة الحالية وأبقِه ضمن قواعد التجاهل. على سبيل المثال، أبقِ `config/proxies.txt` محليًا وأخرجه من الفهرس:
 
-```bash
-# إزالة الملف من git history
-git rm --cached config/proxies.txt
-git commit -m "Remove sensitive file"
-git push
-```
+   ```bash
+   git rm --cached -- config/proxies.txt
+   git commit -m "Remove exposed proxy configuration"
+   ```
 
+3. انشر الالتزام وفق إجراءات المستودع. تظل القيم القديمة في الالتزامات السابقة. نسّق مع مسؤولي المستودع لتنظيف الفروع والوسوم المتأثرة وإزالة مواد الإصدار والنسخ المتاحة. نسّق مع أصحاب النسخ المستنسخة والمتفرعة لاستبدال النسخ القديمة. قد تبقى للبيانات المنشورة نسخ محفوظة أو مُنزَّلة، لذا أبقِ بيانات الاعتماد القديمة مُلغاة.

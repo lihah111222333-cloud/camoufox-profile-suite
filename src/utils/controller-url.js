@@ -19,8 +19,11 @@ let WebSocket;
 export class ControllerUrlError extends Error {}
 
 function isLoopback(hostname) {
-    return hostname === 'localhost' || hostname === '[::1]'
-        || (hostname.startsWith('127.') && isIPv4(hostname));
+    return hostname === 'localhost' || isLoopbackAddress(hostname);
+}
+
+function isLoopbackAddress(hostname) {
+    return hostname === '[::1]' || (hostname.startsWith('127.') && isIPv4(hostname));
 }
 
 export function parseControllerUrl(address, defaultProtocol) {
@@ -43,12 +46,24 @@ export function parseControllerUrl(address, defaultProtocol) {
     return url;
 }
 
-export function controllerApiUrl(address, path) {
+export function controllerApiUrl(address, path, trustedHttpSetting) {
     const url = parseControllerUrl(address);
-    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.search) {
+    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || /[?#]/.test(url.href)) {
         throw new ControllerUrlError('Invalid browser controller API URL');
     }
-    return `${url.href.replace(/\/$/, '')}${path}`;
+    const base = url.href.replace(/\/$/, '');
+    if (url.protocol === 'http:') {
+        let approved;
+        try {
+            approved = new URL(process.env[trustedHttpSetting]).href.replace(/\/$/, '');
+        } catch {
+            // A missing or malformed opt-in cannot approve a plaintext endpoint.
+        }
+        if (!isLoopbackAddress(url.hostname) || approved !== base) {
+            throw new ControllerUrlError(`Browser controller API requires HTTPS or an explicit numeric loopback API URL in ${trustedHttpSetting}`);
+        }
+    }
+    return `${base}${path}`;
 }
 
 export function validateControllerEndpoint(endpoint, controller, requireSameOrigin = false) {

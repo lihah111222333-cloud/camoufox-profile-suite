@@ -5,27 +5,33 @@
 
 import dotenv from 'dotenv';
 import axios from 'axios';
-import http from 'http';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import net from 'node:net';
 import logger from '../utils/logger.js';
+import { profileIdPathComponent } from '../utils/controller-id.js';
+import { controllerRequestOptions } from '../utils/controller-url.js';
+import { loadPrivateEnvironment } from '../utils/private-env.js';
 import { requireProxyProtocol } from '../utils/proxy-protocol.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+loadPrivateEnvironment('.emv', '.env', () => !process.env.GOLOGIN_API_KEY, dotenv.parse, dotenv.decrypt);
 
-// Load .emv file if exists, otherwise fallback to .env
-// تحميل ملف .emv إن وجد، وإلا استخدام .env
-dotenv.config({ path: path.resolve(__dirname, '../../.emv') });
-if (!process.env.GOLOGIN_API_KEY) {
-    dotenv.config({ path: path.resolve(__dirname, '../../.env') });
+const GOLOGIN_API_ORIGIN = 'https://api.gologin.com';
+
+export function getGoLoginApiKey() {
+    const apiKey = process.env.GOLOGIN_API_KEY;
+    if (!apiKey) throw new Error('GOLOGIN_API_KEY is not set');
+    return apiKey;
 }
 
-const GOLOGIN_API_URL = 'https://api.gologin.com';
-const GOLOGIN_API_KEY = process.env.GOLOGIN_API_KEY;
-
-if (!GOLOGIN_API_KEY) {
-    logger.error('GOLOGIN_API_KEY is not set in environment variables');
+function goLoginApiUrl(endpoint) {
+    if (typeof endpoint !== 'string' || !endpoint.startsWith('/') || endpoint.startsWith('//')
+        || /[\\#\u0000-\u001f\u007f]/.test(endpoint)) {
+        throw new Error('GoLogin API endpoint must be a root-relative path');
+    }
+    const url = new URL(endpoint, GOLOGIN_API_ORIGIN);
+    if (url.origin !== GOLOGIN_API_ORIGIN) {
+        throw new Error('GoLogin API endpoint must match the GoLogin API origin');
+    }
+    return url;
 }
 
 // The profile API's supported modes do not include HTTPS proxies.
@@ -51,14 +57,14 @@ function formatGoLoginProxy(proxy) {
 /**
  * GoLogin API Client Class
  */
-class GoLoginClient {
-    constructor() {
-        this.apiKey = GOLOGIN_API_KEY;
-        this.baseURL = GOLOGIN_API_URL;
-        this.headers = {
-            'Authorization': `Bearer ${this.apiKey}`,
-            'Content-Type': 'application/json'
-        };
+export class GoLoginClient {
+    #apiKey;
+
+    constructor(apiKey) {
+        if (apiKey !== undefined && (typeof apiKey !== 'string' || !apiKey)) {
+            throw new Error('A GoLogin API key is required');
+        }
+        this.#apiKey = apiKey;
     }
 
     /**
@@ -66,30 +72,23 @@ class GoLoginClient {
      * إجراء طلب API
      */
     async request(method, endpoint, data = null, retries = 1) {
-        // Ensure API key is loaded once
-        if (!this.apiKey) {
-            dotenv.config();
-            this.apiKey = process.env.GOLOGIN_API_KEY;
-            if (this.apiKey) {
-                this.headers['Authorization'] = `Bearer ${this.apiKey}`;
-            }
-        }
-
-        if (!this.apiKey) {
-            throw new Error('GOLOGIN_API_KEY is not set');
-        }
+        const url = goLoginApiUrl(endpoint);
+        const apiKey = this.#apiKey ?? getGoLoginApiKey();
+        const config = {
+            ...controllerRequestOptions,
+            method,
+            url: url.href,
+            headers: {
+                Authorization: `Bearer ${apiKey}`,
+                'Content-Type': 'application/json'
+            },
+            timeout: 30000,
+            ...(data && { data })
+        };
 
         let lastError;
         for (let attempt = 1; attempt <= retries; attempt++) {
             try {
-                const config = {
-                    method,
-                    url: `${this.baseURL}${endpoint}`,
-                    headers: this.headers,
-                    timeout: 30000,
-                    ...(data && { data })
-                };
-
                 const response = await axios(config);
                 return response.data;
             } catch (error) {
@@ -392,13 +391,15 @@ class GoLoginClient {
     async createProfile(profileData, testProxyConnection = false) {
         try {
             const proxy = formatGoLoginProxy(profileData.proxy);
+            // Creation and the optional proxy update use the same credential.
+            const client = this.#apiKey === undefined ? new GoLoginClient(getGoLoginApiKey()) : this;
             if (testProxyConnection && proxy?.mode === 'http') {
                 const address = `${proxy.host}:${proxy.port}`;
-                logger.info('Testing proxy connection before creating profile', { proxy: address });
+                logger.info('Checking proxy TCP reachability before creating profile', { proxy: address });
                 try {
                     const result = await this.testProxy(proxy);
                     if (!result.valid) {
-                        logger.warn('Proxy test failed, but continuing with profile creation', {
+                        logger.warn('Proxy preflight unsuccessful, continuing with profile creation', {
                             proxy: address,
                             error: result.error
                         });
@@ -465,7 +466,7 @@ class GoLoginClient {
             // استخدام /browser/custom مع بصمة فريدة لمصداقية أفضل
             // Create profile using /browser/custom with unique Android fingerprint
             // Retry up to 2 times for server errors
-            const response = await this.request('POST', '/browser/custom', defaultProfile, 2);
+            const response = await client.request('POST', '/browser/custom', defaultProfile, 2);
             logger.info('Profile created using /browser/custom with unique Android fingerprint', { 
                 profileId: response.id,
                 userAgent: uniqueFingerprint.navigator.userAgent.substring(0, 60) + '...'
@@ -485,7 +486,7 @@ class GoLoginClient {
                             hasPassword: !!defaultProfile.proxy.password
                         }
                     });
-                    await this.updateProfileProxy(response.id, defaultProfile.proxy);
+                    await client.updateProfileProxy(response.id, defaultProfile.proxy);
                     logger.info('Proxy updated successfully', { profileId: response.id });
                     // Update response with proxy info for later use
                     response.proxy = defaultProfile.proxy;
@@ -518,7 +519,7 @@ class GoLoginClient {
     async updateProfile(profileId, updates) {
         // Retry up to 2 times for server errors
         const data = updates?.proxy ? { ...updates, proxy: formatGoLoginProxy(updates.proxy) } : updates;
-        const response = await this.request('PUT', `/browser/${profileId}`, data, 2);
+        const response = await this.request('PUT', `/browser/${profileIdPathComponent(profileId)}`, data, 2);
         logger.info('Profile updated', { profileId });
         return response;
     }
@@ -531,7 +532,7 @@ class GoLoginClient {
         // Use dedicated proxy endpoint (PATCH /browser/:id/proxy)
         // This only requires proxy data, not full profile update
         // Retry up to 2 times for server errors
-        await this.request('PATCH', `/browser/${profileId}/proxy`, formatGoLoginProxy(proxyData), 2);
+        await this.request('PATCH', `/browser/${profileIdPathComponent(profileId)}/proxy`, formatGoLoginProxy(proxyData), 2);
         logger.info('Profile proxy updated', { profileId });
         return true;
     }
@@ -542,7 +543,7 @@ class GoLoginClient {
      */
     async deleteProfile(profileId) {
         try {
-            await this.request('DELETE', `/browser/${profileId}`);
+            await this.request('DELETE', `/browser/${profileIdPathComponent(profileId)}`);
             logger.info('Profile deleted', { profileId });
             return true;
         } catch (error) {
@@ -556,7 +557,7 @@ class GoLoginClient {
      */
     async getProfile(profileId) {
         try {
-            const response = await this.request('GET', `/browser/${profileId}`);
+            const response = await this.request('GET', `/browser/${profileIdPathComponent(profileId)}`);
             return response;
         } catch (error) {
             throw new Error(`Failed to get profile: ${error.message}`);
@@ -569,7 +570,7 @@ class GoLoginClient {
      */
     async startProfile(profileId) {
         try {
-            const response = await this.request('GET', `/browser/${profileId}`);
+            const response = await this.request('GET', `/browser/${profileIdPathComponent(profileId)}`);
             return response;
         } catch (error) {
             throw new Error(`Failed to start profile: ${error.message}`);
@@ -581,127 +582,47 @@ class GoLoginClient {
      * إيقاف البروفايل
      */
     async stopProfile(profileId) {
-        try {
-            await this.request('DELETE', `/browser/stop/${profileId}`);
-            logger.info('Profile stopped', { profileId });
-            return true;
-        } catch (error) {
-            logger.warn('Failed to stop profile', { profileId, error: error.message });
-            return false;
-        }
+        const id = profileIdPathComponent(profileId);
+        logger.warn('Stopping a GoLogin profile by ID is unsupported. Use the running session to stop it.', {
+            profileId: id
+        });
+        return false;
     }
 
     /**
-     * Test proxy connection using HTTP CONNECT method
-     * اختبار اتصال البروكسي باستخدام HTTP CONNECT
+     * Check if an HTTP proxy endpoint accepts a TCP connection.
      */
     async testProxy(proxy) {
-        const host = proxy?.host || proxy?.ip;
-        if (!host || !proxy.port) {
+        const address = proxy?.host || proxy?.ip;
+        const hostname = typeof address === 'string' ? address.trim() : '';
+        if (!hostname || !proxy.port) {
             return { valid: false, error: 'Proxy data is missing' };
         }
 
         try {
             requireProxyProtocol(proxy, ['http'], 'GoLogin proxy preflight');
-            const port = parseInt(proxy.port, 10);
-            if (isNaN(port) || port < 1 || port > 65535) {
-                return { valid: false, error: `Invalid proxy port: ${proxy.port}` };
+            if (proxy.username || proxy.password) {
+                return { valid: false, error: 'Authenticated GoLogin proxy preflight requires HTTPS' };
             }
 
-            // Test proxy connection by attempting to connect
-            // اختبار اتصال البروكسي عن طريق محاولة الاتصال
-            return new Promise((resolve) => {
-                const testHost = 'httpbin.org';
-                const testPort = 443;
-                const timeout = 5000; // 5 seconds timeout (reduced for faster response)
-                let resolved = false;
-                let req = null;
-                
-                // Create timeout wrapper to ensure we always resolve
-                const timeoutId = setTimeout(() => {
-                    if (resolved) return;
-                    resolved = true;
-                    if (req) req.destroy(); // Destroy request if still active
-                    logger.warn('Proxy test failed - timeout', { 
-                        proxy: `${host}:${port}`
-                    });
-                    resolve({ valid: false, error: 'Connection timeout' });
-                }, timeout + 1000); // Add 1 second buffer
-                
-                // Create HTTP CONNECT request to proxy
-                const connectPath = `${testHost}:${testPort}`;
-                const headers = {
-                    'Host': connectPath,
-                    'Proxy-Connection': 'keep-alive'
+            const host = hostname.replace(/^\[([^\]]+)\]$/, '$1');
+            const port = Number(proxy.port);
+            if (!Number.isInteger(port) || port < 1 || port > 65535) {
+                return { valid: false, error: 'Invalid proxy port' };
+            }
+
+            return await new Promise(resolve => {
+                const socket = net.createConnection({ host, port, timeout: 5000 });
+                const finish = result => {
+                    socket.destroy();
+                    resolve(result);
                 };
-                
-                // Add proxy auth header if credentials provided
-                if (proxy.username && proxy.password) {
-                    headers['Proxy-Authorization'] = `Basic ${Buffer.from(`${proxy.username}:${proxy.password}`).toString('base64')}`;
-                }
-                
-                const requestOptions = {
-                    hostname: host,
-                    port: port,
-                    method: 'CONNECT',
-                    path: connectPath,
-                    timeout: timeout,
-                    headers
-                };
-
-                req = http.request(requestOptions, (res) => {
-                    if (resolved) return;
-                    clearTimeout(timeoutId);
-                    resolved = true;
-                    
-                    if (res.statusCode === 200) {
-                        logger.info('Proxy test successful', { 
-                            proxy: `${host}:${port}`,
-                            statusCode: res.statusCode
-                        });
-                        resolve({ valid: true, ip: host });
-                    } else {
-                        logger.warn('Proxy test failed - invalid status', { 
-                            proxy: `${host}:${port}`,
-                            statusCode: res.statusCode 
-                        });
-                        resolve({ valid: false, error: `Proxy returned status ${res.statusCode}` });
-                    }
-                    res.destroy();
-                });
-
-                req.on('error', (error) => {
-                    if (resolved) return;
-                    clearTimeout(timeoutId);
-                    resolved = true;
-                    logger.warn('Proxy test failed - connection error', { 
-                        proxy: `${host}:${port}`,
-                        error: error.message 
-                    });
-                    resolve({ valid: false, error: error.message });
-                });
-
-                req.on('timeout', () => {
-                    if (resolved) return;
-                    clearTimeout(timeoutId);
-                    resolved = true;
-                    req.destroy();
-                    logger.warn('Proxy test failed - request timeout', { 
-                        proxy: `${host}:${port}`
-                    });
-                    resolve({ valid: false, error: 'Request timeout' });
-                });
-
-                req.setTimeout(timeout);
-                req.end();
+                socket.once('connect', () => finish({ valid: true, ip: hostname }));
+                socket.once('error', error => finish({ valid: false, error: error.message }));
+                socket.once('timeout', () => finish({ valid: false, error: 'Connection timeout' }));
             });
         } catch (error) {
-            const errorMsg = error.message || 'Unknown proxy error';
-            logger.warn('Proxy test failed', { 
-                proxy: `${host}:${proxy.port}`,
-                error: errorMsg 
-            });
-            return { valid: false, error: errorMsg };
+            return { valid: false, error: error.message };
         }
     }
 

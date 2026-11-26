@@ -1,4 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import { isIP } from 'node:net';
+import path from 'node:path';
+import { withAccountOutputLock } from './account-output-lock.js';
 import { readPrivateFile, writePrivateFile } from './private-storage.js';
 
 const SUMMARY_FIELDS = [
@@ -23,6 +26,8 @@ const TELEMETRY_GROUPS = {
     ],
     fingerprintLedger: ['profileId', 'maxHammingDistance', 'totalEntries', 'driftAlertCount']
 };
+const PROFILE_CLEANUP = new Set(['pending', 'stopped', 'stop-unconfirmed', 'deleted', 'delete-unconfirmed']);
+const RESULT_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const MANUAL_STAGES = new Set(['password', 'verification', 'recovery-email', 'untrusted-page', 'completion']);
 
 function pickScalars(source, fields) {
@@ -61,9 +66,13 @@ function failureDetails(record) {
     return { error: 'Account creation failed' };
 }
 
+function invalidOutput(message) {
+    return Object.assign(new Error(message), { code: 'ACCOUNT_OUTPUT_INVALID_DATA' });
+}
+
 function assertAccountRecord(record, label) {
     if (!record || typeof record !== 'object' || Array.isArray(record) || typeof record.success !== 'boolean') {
-        throw new Error(`Invalid account record in ${label}`);
+        throw invalidOutput(`Invalid account record in ${label}`);
     }
 }
 
@@ -71,6 +80,8 @@ function savedAccountRecord(record) {
     assertAccountRecord(record, 'results.json');
 
     const selected = accountFields(record, RESULT_FIELDS);
+    if (typeof record.resultId === 'string' && RESULT_ID.test(record.resultId)) selected.resultId = record.resultId;
+    if (PROFILE_CLEANUP.has(record.profileCleanup)) selected.profileCleanup = record.profileCleanup;
     if (selected.success === false) {
         Object.assign(selected, failureDetails(record));
     }
@@ -91,10 +102,10 @@ function savedAccountRecord(record) {
     return selected;
 }
 
-function readExistingOutput(filePath, label) {
+function readExistingOutput(filePath, label, { restrict = true } = {}) {
     let content;
     try {
-        content = readPrivateFile(filePath);
+        content = readPrivateFile(filePath, 'utf8', { requireOwner: true, restrict });
     } catch (error) {
         if (error.code === 'ENOENT') {
             return undefined;
@@ -105,42 +116,50 @@ function readExistingOutput(filePath, label) {
     try {
         return { content, data: JSON.parse(content) };
     } catch {
-        throw new Error(`${label} contains invalid JSON`);
+        throw invalidOutput(`${label} contains invalid JSON`);
     }
 }
 
 function projectResults(data) {
     if (!Array.isArray(data)) {
-        throw new Error('Account results file must contain an array');
+        throw invalidOutput('Account results file must contain an array');
     }
     return data.map(savedAccountRecord);
 }
 
 function projectSummary(summary) {
     if (!summary || typeof summary !== 'object' || !Array.isArray(summary.results)) {
-        throw new Error('Run summary file must contain a results array');
+        throw invalidOutput('Run summary file must contain a results array');
     }
     return {
         ...pickScalars(summary, ['timestamp']),
         configuration: pickScalars(summary.configuration, ['accountsCount', 'threadsCount', 'profileService', 'smsProvider']),
-        stats: pickScalars(summary.stats, ['total', 'completed', 'failed', 'successRate']),
+        stats: pickScalars(summary.stats, ['total', 'completed', 'failed', 'successRate', 'skipped']),
         ...pickScalars(summary, ['duration']),
         results: summary.results.map((entry) => {
             assertAccountRecord(entry, 'summary.json');
+            const cleanup = PROFILE_CLEANUP.has(entry.profileCleanup) ? { profileCleanup: entry.profileCleanup } : {};
             if (entry.success) {
                 const record = accountFields(entry, SUMMARY_FIELDS);
                 return {
                     success: true,
                     ...Object.fromEntries(SUMMARY_FIELDS.map((field) => [field, record[field] ?? null])),
+                    ...cleanup,
                     error: null
                 };
             }
-            return { success: false, email: null, ...failureDetails(entry) };
+            return {
+                success: false,
+                email: null,
+                ...pickScalars(entry, ['profileId', 'profileType']),
+                ...cleanup,
+                ...failureDetails(entry)
+            };
         })
     };
 }
 
-export function migrateExistingAccountOutputs(resultsFile, summaryFile) {
+export function migrateExistingAccountOutputs(resultsFile, summaryFile, { legacyDirectory } = {}) {
     const outputs = [
         { filePath: resultsFile, label: 'Account results file', project: projectResults },
         { filePath: summaryFile, label: 'Run summary file', project: projectSummary }
@@ -148,13 +167,19 @@ export function migrateExistingAccountOutputs(resultsFile, summaryFile) {
     const errors = [];
     for (const { filePath, label, project } of outputs) {
         try {
-            const existing = readExistingOutput(filePath, label);
-            if (existing) {
-                const updated = JSON.stringify(project(existing.data), null, 2);
-                if (existing.content !== updated) {
-                    writePrivateFile(filePath, updated);
+            withAccountOutputLock(filePath, () => {
+                const existing = readExistingOutput(filePath, label);
+                const legacy = !existing && legacyDirectory
+                    ? readExistingOutput(path.join(legacyDirectory, path.basename(filePath)), label, { restrict: false })
+                    : undefined;
+                const source = existing || legacy;
+                if (!source) return;
+
+                const updated = JSON.stringify(project(source.data), null, 2);
+                if (!existing || existing.content !== updated) {
+                    writePrivateFile(filePath, updated, { requireOwner: true });
                 }
-            }
+            });
         } catch (error) {
             errors.push(error);
         }
@@ -164,15 +189,41 @@ export function migrateExistingAccountOutputs(resultsFile, summaryFile) {
     }
 }
 
+function updateResults(filePath, update) {
+    return withAccountOutputLock(filePath, () => {
+        const existing = readExistingOutput(filePath, 'Account results file');
+        const results = existing ? projectResults(existing.data) : [];
+        const updated = update(results);
+        writePrivateFile(filePath, JSON.stringify(results, null, 2), { requireOwner: true });
+        return updated;
+    });
+}
+
 export function appendAccountResult(filePath, record) {
-    const existing = readExistingOutput(filePath, 'Account results file');
-    const results = existing ? projectResults(existing.data) : [];
-    const added = savedAccountRecord({ ...record, createdAt: new Date().toISOString() });
-    results.push(added);
-    writePrivateFile(filePath, JSON.stringify(results, null, 2));
-    return added;
+    const added = savedAccountRecord({ ...record, createdAt: new Date().toISOString(), resultId: randomUUID() });
+    return updateResults(filePath, (results) => {
+        results.push(added);
+        return added;
+    });
+}
+
+export function recordAccountCleanup(filePath, resultId, profileCleanup) {
+    if (typeof resultId !== 'string' || !RESULT_ID.test(resultId)) {
+        throw invalidOutput('Invalid result ID for profile cleanup.');
+    }
+    if (!PROFILE_CLEANUP.has(profileCleanup) || profileCleanup === 'pending') {
+        throw invalidOutput('Invalid profile cleanup outcome.');
+    }
+    return updateResults(filePath, (results) => {
+        const record = results.find((entry) => entry.resultId === resultId);
+        if (!record) throw invalidOutput('The result to update is missing from results.json.');
+        record.profileCleanup = profileCleanup;
+        return record;
+    });
 }
 
 export function writeRunSummary(filePath, summary) {
-    writePrivateFile(filePath, JSON.stringify(projectSummary(summary), null, 2));
+    withAccountOutputLock(filePath, () => {
+        writePrivateFile(filePath, JSON.stringify(projectSummary(summary), null, 2), { requireOwner: true });
+    });
 }

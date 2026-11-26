@@ -6,8 +6,8 @@
  * inspected by Google BotGuard, Arkose BDA, Meta Device Graph, and ByteDance JSVMP.
  */
 
-import fs from 'fs';
 import logger from '../utils/logger.js';
+import { readCaptureFile } from './capture-io.js';
 import {
     APPLE_SILICON_SKU_CATALOG,
     INTEL_MAC_SKU_CATALOG,
@@ -2189,6 +2189,38 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
     };
 }
 
+function isEgressRequestEvent(event) {
+    if (!event || typeof event !== 'object') return false;
+    const type = event.type || event.eventType || event.direction || null;
+    if (!type) {
+        return Boolean(event.headers || event.headersArray || event.requestHeaders || event.egressWireBlock);
+    }
+    return type === 'egress' || type === 'request' || event.direction === 'egress';
+}
+
+/** Read the ledger in a capture directory selected by the caller. */
+export function readCoherenceCaptureEvents(trafficDir, { trustedLocal = false } = {}) {
+    const raw = readCaptureFile(trafficDir, 'traffic.ndjson', {
+        optional: true,
+        trustedLocal,
+        maxBytes: 128 * 1024 * 1024
+    });
+    if (!raw) return [];
+
+    const events = [];
+    for (const line of raw.toString('utf8').split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+            const event = JSON.parse(trimmed);
+            if (isEgressRequestEvent(event)) events.push(event);
+        } catch {
+            // A partially written line does not contribute an observation.
+        }
+    }
+    return events;
+}
+
 /**
  * Extract pre-TLS egress HTTP request events from an array of events, a summary object
  * (`{ egressEvents }`), or a live/stopped `CamoufoxTrafficRecorder` instance.
@@ -2201,17 +2233,8 @@ function extractEgressRequestEvents(trafficEventsOrSummary) {
         return [];
     }
 
-    const isEgressEvent = (ev) => {
-        if (!ev || typeof ev !== 'object') return false;
-        const type = ev.type || ev.eventType || ev.direction || null;
-        if (!type) {
-            return Boolean(ev.headers || ev.headersArray || ev.requestHeaders || ev.egressWireBlock);
-        }
-        return type === 'egress' || type === 'request' || ev.direction === 'egress';
-    };
-
     if (Array.isArray(trafficEventsOrSummary)) {
-        return trafficEventsOrSummary.filter(isEgressEvent);
+        return trafficEventsOrSummary.filter(isEgressRequestEvent);
     }
 
     if (typeof trafficEventsOrSummary === 'object') {
@@ -2219,41 +2242,10 @@ function extractEgressRequestEvents(trafficEventsOrSummary) {
             return trafficEventsOrSummary.egressEvents.filter((ev) => ev && typeof ev === 'object');
         }
         if (Array.isArray(trafficEventsOrSummary.events)) {
-            return trafficEventsOrSummary.events.filter(isEgressEvent);
+            return trafficEventsOrSummary.events.filter(isEgressRequestEvent);
         }
         if (Array.isArray(trafficEventsOrSummary.requests)) {
             return trafficEventsOrSummary.requests.filter((ev) => ev && typeof ev === 'object');
-        }
-
-        const ndjsonPath =
-            trafficEventsOrSummary.paths?.trafficNdjsonPath ||
-            trafficEventsOrSummary.trafficNdjsonPath ||
-            null;
-
-        if (typeof ndjsonPath === 'string' && ndjsonPath.length > 0) {
-            try {
-                if (fs.existsSync(ndjsonPath)) {
-                    const content = fs.readFileSync(ndjsonPath, 'utf8');
-                    const parsedEvents = [];
-                    for (const line of content.split(/\r?\n/)) {
-                        const trimmed = line.trim();
-                        if (!trimmed) continue;
-                        try {
-                            const ev = JSON.parse(trimmed);
-                            if (isEgressEvent(ev)) {
-                                parsedEvents.push(ev);
-                            }
-                        } catch {
-                            // Ignore malformed NDJSON line
-                        }
-                    }
-                    if (parsedEvents.length > 0) {
-                        return parsedEvents;
-                    }
-                }
-            } catch {
-                // Fall back to in-memory transactions if reading traffic.ndjson fails
-            }
         }
 
         if (trafficEventsOrSummary.transactions) {
@@ -2354,7 +2346,7 @@ function normalizeEgressHeaders(event) {
 
 /**
  * Cross-check in-browser DOM telemetry (`domTelemetry.navigator`) against recorded pre-TLS
- * egress HTTP request events (`traffic.ndjson` / `CamoufoxTrafficRecorder` / array of egress events).
+ * egress HTTP request events supplied as data. Use readCoherenceCaptureEvents for a local ledger.
  *
  * @param {object} domTelemetry Output of `collectBrowserFingerprint(page)` (or object containing `.navigator`)
  * @param {Array<object> | object} trafficEventsOrSummary Array of egress events, `{ egressEvents }`, or `CamoufoxTrafficRecorder`

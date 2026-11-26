@@ -23,7 +23,7 @@
 **المخططات (داخل القسم)**
 
 - [السياق العام للنظام](#السياق-العام-للنظام)
-- [تسلسل زمني — حساب واحد (المسار الناجح المبسّط)](#تسلسل-زمني--حساب-واحد-المسار-الناجح-المبسّط)
+- [تسلسل محاولة واحدة حتى التسليم](#تسلسل-محاولة-واحدة-حتى-التسليم)
 - [مسار التسجيل داخل Gmail (منطقي)](#مسار-التسجيل-داخل-gmail-منطقي)
 - [جدول — نموذج التزامن](#جدول--نموذج-التزامن)
 
@@ -42,7 +42,7 @@
 
 ## حول المشروع (About)
 
-**منشئ حسابات Gmail** أداة أتمتة بـ **Node.js** لتشغيل تدفق **إنشاء حساب Google / Gmail** داخل **بروفايل متصفح مضاد للبصمة** ([GPM Login](https://gpmlogin.com/) أو [Dolphin Anty](https://dolphin-anty.com/))، مع الربط عبر **Puppeteer**، وحل **reCAPTCHA** عبر إضافة **OMO Captcha**، وإكمال **التحقق بالهاتف** عبر واجهات **SMS** (SMS Verification). يدعم **البروكسيات**، **إدخالاً شبيهاً بالإنسان**، وتشغيلاً **متوازياً** مع حفظ النتائج في JSON وسجلات.
+**منشئ حسابات Gmail** أداة **Node.js** تفتح مسار إنشاء حساب Google في بروفايل متصفح وتسجّل نتيجة المحاولة. تعالج الواجهة الحقول الأولية التي يمكن التحقق منها وتسلّم إدخال كلمة المرور والتحقق والموافقة وتأكيد الحساب إلى صاحبه. تُسجّل حالة `MANUAL_SIGNUP_REQUIRED` عند التسليم ويحاول التطبيق إيقاف البروفايل المُدار. أكمل الخطوات المتبقية وتحقق من هوية الحساب في متصفح موثوق.
 
 | | |
 |--|--|
@@ -73,21 +73,16 @@
 - **GPM Login** (الافتراضي)، أو  
 - **Dolphin Anty**
 
-ثم يستخدم **Puppeteer** للاتصال بنفس المتصفح وملء نماذج إنشاء حساب Google، مع:
-
-- **إضافة OMO Captcha** لمعالجة اختبارات مثل reCAPTCHA  
-- **مزود SMS** لتأكيد رقم الهاتف (SMS Verification)
+ثم يستخدم **Puppeteer** للاتصال بالمتصفح ومعالجة الخطوات الأولية المدعومة. يراجع صاحب الحساب طلبات التحقق والموافقة بنفسه. مكتبة **SMS Verification** منفصلة عن مسار التسجيل وتستخدم مفتاحها الخاص.
 
 ---
 
 ## المتطلبات قبل البدء
 
 1. **Node.js 18 أو أحدث** (مستحسن).  
-2. **GPM Login** يعمل محلياً وواجهة الـ API متاحة (العنوان الافتراضي في المشروع `http://127.0.0.1:14517`) **أو** **Dolphin Anty** مع مفتاح API وعنوان الخادم.  
-3. **مفتاح OMO Captcha** وإعداد الإضافة داخل قوالب البروفايل.  
-4. **مفتاح مزود SMS** حسب [`ENV_VARIABLES.md`](ENV_VARIABLES.md).  
-5. ملف **بروكسيات** `config/proxies.txt` بصيغة صحيحة.  
-6. ملف **أسماء** `config/names.json` (يُستخدم لتوليد بيانات الحساب).
+2. **GPM Login** أو **Dolphin Anty** أو محرك **Camoufox** مثبّت محلياً. اضبط عنوان HTTPS الموثوق لوحدة التحكم أو اسمح صراحة بعنوان HTTP الرقمي المحلي المطابق على مضيف موثوق. راجع [إعداد الاتصال](ENV_VARIABLES.md#browser-controller-connection).
+3. ملف `config/proxies.txt` بصيغة صحيحة في مجلد الحالة عندما يتطلب وضع البروفايل بروكسي.
+4. ملف `config/names.json` المُرفق بالمشروع لتوليد بيانات الحساب.
 
 ---
 
@@ -103,22 +98,33 @@ npm install
 
 **ماذا يحدث؟** يتم تنزيل الاعتماديات من `package.json`، أهمها: `puppeteer-core`, `axios`, `dotenv`, `gologin`.
 
-### 2) إنشاء ملف البيئة `.env`
+### 2) إنشاء ملفات الإعدادات الخاصة
+
+على أنظمة POSIX، أنشئ مجلد الحالة والملفات التالية بحساب تشغيل التطبيق قبل إضافة المفاتيح وبيانات اعتماد البروكسي.
 
 ```bash
-cp .env.example .env
+export GMAIL_CREATOR_STATE_DIR="$HOME/.local/state/gmail-account-creator"
+(
+  umask 077
+  mkdir -p "$GMAIL_CREATOR_STATE_DIR/config" &&
+    set -C &&
+    cat .env.example > "$GMAIL_CREATOR_STATE_DIR/.env" &&
+    : > "$GMAIL_CREATOR_STATE_DIR/config/proxies.txt"
+)
 ```
 
-افتح `.env` واملأ القيم الحقيقية (لا ترفع الملف إلى Git — عادةً مُدرج في `.gitignore`).
+امنح المالك وحده صلاحية الوصول إلى الملفات العادية الموجودة بتعيين الوضع `0600` لكل من `.env` و`.emv` الاختياري و`config/proxies.txt` قبل تحريرها. على Windows، اضبط قائمة التحكم بالوصول لمجلد الحالة على NTFS وتحقق من أن صلاحيات الملفات الموجودة والجديدة تقتصر على حساب التشغيل وحسابات النظام المصرح لها.
 
 **أهم المتغيرات:**
 
 | المتغير | الوظيفة |
 |---------|---------|
-| `PROFILE_SERVICE` | `gpm` (افتراضي) أو `dolphin` لاختيار منصة البروفايلات |
-| `GPM_API_URL` | عنوان API لـ GPM Login محلياً |
+| `PROFILE_SERVICE` | `gpm` (افتراضي) أو `dolphin` أو `camoufox` لاختيار منصة البروفايلات |
+| `GMAIL_CREATOR_STATE_DIR`, `GMAIL_CREATOR_LEGACY_DIR` | مسارات مطلقة لمجلدي الحالة والتهيئة السابقة، تُضبط في بيئة التشغيل |
+| `GPM_API_URL` | عنوان API لـ GPM Login |
 | `DOLPHIN_API_KEY`, `DOLPHIN_API_URL`, `DOLPHIN_FOLDER_ID` | إعدادات Dolphin عند اختيار `dolphin` |
-| `SMS_VERIFY_API_KEY` | مفتاح SMS Verification (عند استخدام المزود الافتراضي) |
+| `GPM_TRUSTED_HTTP_API_URL`, `DOLPHIN_TRUSTED_HTTP_API_URL` | الموافقة الصريحة على عنوان HTTP الرقمي المحلي المطابق |
+| `SMS_VERIFY_API_KEY` | مفتاح اختياري لاستخدام مكتبة SMS Verification بصورة مستقلة |
 | `SMS_PROVIDER` | `sms-verification` — التفاصيل في [`ENV_VARIABLES.md`](ENV_VARIABLES.md) |
 | `ACCOUNTS_COUNT` | عدد الحسابات المطلوب إنشاؤها في التشغيلة |
 | `THREADS_COUNT` | عدد المهام المتزامنة (الخيوط) |
@@ -127,24 +133,17 @@ cp .env.example .env
 
 ### 3) إعداد البروكسيات
 
-الملف: `config/proxies.txt`
+الملف هو `config/proxies.txt` داخل مجلد الحالة.
 
 - سطر لكل بروكسي.  
 - الصيغة: `ip:port` أو `ip:port:username:password`  
 - الأسطر التي تبدأ بـ `#` تُعتبر تعليقاً.
 
-إن لم يوجد الملف، قد يُنشئ النظام ملفاً فارغاً أو يتحذّر — يجب توفير بروكسيات كافية خاصةً عند زيادة `THREADS_COUNT`.
+يتوقف التشغيل إذا كان أي سطر من غير التعليقات غير صالح.
 
 ### 4) إعداد الأسماء
 
 الملف: `config/names.json` — يُستخدم لتوليد أسماء ومقترحات بريد منطقية ضمن `src/utils/name-generator.js`.
-
-### 5) إضافة OMO Captcha إلى البروفايل
-
-يجب أن تكون **إضافة OMO Captcha** مثبّتة/مهيأة في بروفايلات GPM أو Dolphin التي يستخدمها السكربت.
-
-- **معرّف الإضافة (Extension ID):** `dfjghhjachoacpgpkmbpdlpppeagojhe`  
-- الإعداد البرمجي للإضافة يمر عبر `src/captcha/omo-handler.js` ويمكن تعطيل جزء الإعداد عبر `SETUP_OMO_CAPTCHA=false` عند الحاجة.
 
 ---
 
@@ -200,11 +199,10 @@ npm run list-folders
 2. **توليد بيانات الحساب** (اسم، اسم مستخدم، إلخ) عبر `name-generator`.  
 3. **إنشاء بروفايل** باسم يتضمن بادئة `Gmail_` والوقت، ثم **تشغيله** عبر GPM أو Dolphin.  
 4. **ربط Puppeteer** بعنوان التصحيح البعيد (remote debugging) للمتصفح داخل البروفايل.  
-5. **تشغيل مسار التسجيل** في `createGmailAccount` داخل `src/gmail/creator.js`: فتح صفحات Google، ملء الحقول، سلوك بشري محاكى، كشف الصفحات (`page-detector.js`).  
-6. إذا طُلبت كلمة مرور أو رمز تحقق، تتوقف المحاولة الآلية ويُطلب الإكمال اليدوي.
-7. عند النجاح تُحفظ حالة المحاولة في `results.json`. تُستبعد كلمات المرور ورموز التحقق وبيانات اعتماد البروكسي.
-8. **عند الفشل:** تسجيل الخطأ في `results.json` أيضاً.  
-9. **في جميع الأحوال:** إيقاف البروفايل في كتلة `finally` لتفريغ الموارد.
+5. **فتح مسار التسجيل** في `src/gmail/creator.js` ومعالجة الحقول الأولية المدعومة بعد التحقق من الصفحة.
+6. تسليم إدخال كلمة المرور والتحقق والموافقة وتأكيد الحساب والصفحات غير المعروفة إلى صاحب الحساب.
+7. حفظ حالة المحاولة في `results.json` دون تخزين كلمات المرور أو رموز التحقق أو بيانات اعتماد البروكسي.
+8. محاولة إيقاف البروفايل وتسجيل أي حالة إيقاف أو حذف تعذّر تأكيدها في `summary.json`.
 
 بعد انتهاء كل المهام، يُكتب **ملخص التشغيلة** في `summary.json` (إحصائيات نجاح/فشل، المدة، إعدادات مختصرة).
 
@@ -228,10 +226,8 @@ flowchart TB
   end
   subgraph Browser["Chrome حقيقي داخل البروفايل"]
     PU[Puppeteer عبر CDP]
-    EXT[إضافة OMO Captcha]
     WEB[تسجيل accounts.google.com]
   end
-  SMS[مزود SMS]
   CFG[(إعدادات .env وnames.json وproxies.txt)]
   OUT[(results.json وsummary.json وlogs)]
 
@@ -242,12 +238,10 @@ flowchart TB
   GPM --> PU
   DOL --> PU
   PU --> WEB
-  EXT --> WEB
-  CA --> SMS
   CA --> OUT
 ```
 
-### تسلسل زمني — حساب واحد (المسار الناجح المبسّط)
+### تسلسل محاولة واحدة حتى التسليم
 
 ```mermaid
 sequenceDiagram
@@ -263,8 +257,8 @@ sequenceDiagram
   M->>Pr: createAndStartProfile + بروكسي
   Pr->>PP: getBrowser / getPage
   M->>G: createGmailAccount(page, data)
-  G->>PP: تنقّل وملء حقول وكابتشا وهاتف
-  G-->>M: كائن النتيجة
+  G->>PP: الانتقال والتحقق من نموذج التسجيل
+  G-->>M: يتطلب إكمالاً يدوياً
   M->>M: saveResult إلى results.json
   M->>Pr: stop
 ```
@@ -274,17 +268,10 @@ sequenceDiagram
 ```mermaid
 flowchart TD
   A[createGmailAccount] --> B[الانتقال لصفحة التسجيل]
-  B --> C[ملء الاسم والبيانات الأولى]
-  C --> D{حالة الصفحة}
-  D -->|اقتراحات بريد| E[اختيار مقترح أو مخصص]
-  D -->|كلمة المرور| F[تحتاج إلى إكمال يدوي]
-  D -->|تاريخ الميلاد والجنس| G[fillBirthdayAndGenderForm]
-  E --> D
-  G --> H[انتظار reCAPTCHA وOMO]
-  H --> I[handlePhoneVerification]
-  I -->|خطوة اختيارية| J[completeAccountCreation]
-  I -->|يلزم رمز| F
-  J --> K[إرجاع حالة المحاولة]
+  B --> C{نموذج تسجيل تم التحقق منه}
+  C -->|خطوة أولية مدعومة| D[ملء الاسم أو اسم المستخدم]
+  D --> C
+  C -->|تحقق أو موافقة أو حالة غير معروفة| E[تسجيل الحاجة إلى إكمال يدوي]
 ```
 
 ### جدول — نموذج التزامن
@@ -348,24 +335,7 @@ flowchart TD
 
 | الدالة | الوظيفة |
 |--------|---------|
-| `createGmailAccount(page, accountData)` | **التصدير الرئيسي.** يقود كامل حوار إنشاء الحساب على صفحة Puppeteer. |
-
-**دوال مساعدة داخلية (ترتيب منطقي تقريبي):**
-
-| الدالة | الدور |
-|--------|--------|
-| `humanLikeType` | كتابة شبيهة بالإنسان في حقل إدخال. |
-| `ensurePageOpen` | التأكد أن الصفحة جاهزة قبل العمليات. |
-| `navigateToSignUp` | فتح مسار التسجيل. |
-| `fillSignUpForm` | حقول الاسم والبداية. |
-| `selectRandomSuggestedEmail` | اختيار من اقتراحات Gmail. |
-| `clickCreateOwnGmailAddress` | مسار «إنشاء عنوان Gmail خاص بك». |
-| `fillUsernameAndPassword` | اسم المستخدم وكلمة المرور والخطوات المرتبطة. |
-| `fillBirthdayAndGenderForm` | تاريخ الميلاد والجنس. |
-| `waitForRecaptcha` | انتظار/التعامل مع reCAPTCHA مع OMO. |
-| `handlePhoneVerification` | يتخطى الخطوة الاختيارية ويطلب الإكمال اليدوي إذا كان الرمز مطلوباً. |
-| `completeAccountCreation` | خطوات الإنهاء والمراجعة. |
-| `clickNextButton` | الضغط على «التالي» مع بدائل للمحSelectors. |
+| `createGmailAccount(page, accountData, options)` | يعالج الخطوات الأولية المدعومة ويُرجع خطأ `MANUAL_SIGNUP_REQUIRED` مع المرحلة التي يتولى فيها صاحب الحساب المتابعة. |
 
 ### `src/gmail/page-detector.js`
 
@@ -517,6 +487,8 @@ flowchart TD
 
 ## المخرجات والسجلات
 
+تُحفظ هذه الملفات داخل [مجلد حالة التطبيق](ENV_VARIABLES.md#configuration-and-local-state).
+
 | الملف / المجلد | المحتوى |
 |----------------|---------|
 | `results.json` | سجل لكل محاولة (نجاح أو فشل) مع الطابع الزمني |
@@ -556,11 +528,11 @@ flowchart TD
 
 ### التثبيت من GitHub Packages
 
-أضف إلى `.npmrc` (مع [رمز وصول](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-npm-registry) يملك `read:packages`):
+أضف هذه الإعدادات إلى إعداد npm الخاص بالمستخدم (عادةً `~/.npmrc`). حمّل `GITHUB_PACKAGES_TOKEN` من مخزن بيانات الاعتماد إلى بيئة التشغيل قبل تشغيل npm. استخدم [رمز وصول](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-npm-registry) يملك `read:packages`.
 
 ```text
 @code-root:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=YOUR_GITHUB_TOKEN
+//npm.pkg.github.com/:_authToken=${GITHUB_PACKAGES_TOKEN}
 ```
 
 ثم:
@@ -586,11 +558,13 @@ gmail-account-creator
 
 المشروع يستخدم **Node + ESM** بدون اختبارات Jest مدمجة في `package.json`. السيرات المضمّنة:
 
-1. **CI:** `npm ci` + `node --check` — `.github/workflows/ci.yml`  
-2. **Release:** عند دفع وسم `v*` — `.github/workflows/release.yml`  
-3. **نشر الحزمة:** عند نشر إصدار — `.github/workflows/publish-github-packages.yml`  
+1. **CI** يثبّت التبعيات ويفحص الصياغة ويشغّل اختبارات الأمان عند الدفع أو فتح طلب دمج — `.github/workflows/ci.yml`
+2. **Release** يشغّل اختبارات الأمان عند دفع وسم `v*` قبل إرفاق حزمة npm — `.github/workflows/release.yml`
+3. **نشر الحزمة** يشغّل اختبارات الأمان قبل نشر الحزمة عند نشر إصدار — `.github/workflows/publish-github-packages.yml`
 4. **Dependabot (اختياري):** تحديثات أسبوعية لـ `npm`.  
 5. **عدم رفع أسرار:** التأكد أن `.env` غير مرفوع.
+
+شغّل `npm run test:security` من نسخة من الشيفرة المصدرية بعد تثبيت التبعيات. للتحقق من إصدار مثبّت، شغّل الاختبارات من وسم الإصدار المطابق.
 
 ---
 

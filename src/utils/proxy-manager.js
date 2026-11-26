@@ -5,19 +5,77 @@
 
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import logger from './logger.js';
+import { ensurePrivateDirectory, readPrivateFile } from './private-storage.js';
+import { ensureStateDirectory, LEGACY_DIRECTORY, PACKAGE_ROOT, STATE_DIRECTORY } from './state-paths.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const PROXY_INVENTORY = path.join('config', 'proxies.txt');
+const PROXIES_FILE = path.join(STATE_DIRECTORY, PROXY_INVENTORY);
+const PROXY_FILE_OPTIONS = { requireOwner: true };
+const INVALID_INVENTORY = 'Invalid proxy configuration in config/proxies.txt. Check the indicated lines.';
 
-const PROXIES_FILE = path.join(__dirname, '../../config/proxies.txt');
+function proxyConfigurationError(message) {
+    return Object.assign(new Error(message), { code: 'PROXY_CONFIGURATION_ERROR' });
+}
+
+function hasUnselectedLegacyInventory() {
+    if (STATE_DIRECTORY === PACKAGE_ROOT || LEGACY_DIRECTORY === PACKAGE_ROOT) return false;
+    try {
+        fs.lstatSync(path.join(PACKAGE_ROOT, PROXY_INVENTORY));
+        return true;
+    } catch (error) {
+        if (error.code === 'ENOENT') return false;
+        throw proxyConfigurationError('Could not check for an existing installation proxy inventory');
+    }
+}
+
+function readProxyInventory() {
+    for (const directory of [STATE_DIRECTORY, LEGACY_DIRECTORY]) {
+        if (!directory) continue;
+        try {
+            return readPrivateFile(path.join(directory, PROXY_INVENTORY), 'utf8', PROXY_FILE_OPTIONS);
+        } catch (error) {
+            if (error.code !== 'ENOENT') throw error;
+        }
+    }
+
+    if (hasUnselectedLegacyInventory()) {
+        // Leave the state path available for explicit legacy adoption.
+        return '';
+    }
+
+    ensureStateDirectory();
+    ensurePrivateDirectory(path.dirname(PROXIES_FILE), { requireOwner: true });
+    let fd;
+    try {
+        fd = fs.openSync(PROXIES_FILE, 'wx', 0o600);
+    } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        return readPrivateFile(PROXIES_FILE, 'utf8', PROXY_FILE_OPTIONS);
+    }
+
+    try {
+        if (process.platform !== 'win32' && (fs.fstatSync(fd).mode & 0o7777) !== 0o600) {
+            fs.fchmodSync(fd, 0o600);
+        }
+        fs.writeFileSync(fd, '# Proxy format: ip:port:username:password\n', 'utf8');
+    } finally {
+        fs.closeSync(fd);
+    }
+    logger.warn('Created an empty proxy inventory in config/proxies.txt');
+    return '';
+}
 
 class ProxyManager {
+    #proxies;
+
     constructor() {
-        this.proxies = [];
         this.usedProxies = new Set();
-        this.loadProxies();
+    }
+
+    get proxies() {
+        if (!this.#proxies) this.loadProxies();
+        return this.#proxies;
     }
 
     /**
@@ -56,11 +114,11 @@ class ProxyManager {
                 const authPart = rest.slice(0, lastAt);
                 const hostPart = rest.slice(lastAt + 1);
                 const colonIdx = authPart.indexOf(':');
-                if (colonIdx >= 0) {
-                    username = decodeURIComponent(authPart.slice(0, colonIdx));
-                    password = decodeURIComponent(authPart.slice(colonIdx + 1));
-                } else {
-                    username = decodeURIComponent(authPart);
+                try {
+                    username = decodeURIComponent(colonIdx >= 0 ? authPart.slice(0, colonIdx) : authPart);
+                    if (colonIdx >= 0) password = decodeURIComponent(authPart.slice(colonIdx + 1));
+                } catch {
+                    return null;
                 }
                 const parsedHost = this._splitHostAndRemainder(hostPart);
                 if (!parsedHost || parsedHost.extra.length > 0) return null;
@@ -122,43 +180,38 @@ class ProxyManager {
      * تحميل البروكسيات من الملف
      */
     loadProxies() {
+        this.#proxies = undefined;
+        this.usedProxies.clear();
+
+        let content;
         try {
-            if (!fs.existsSync(PROXIES_FILE)) {
-                logger.warn('Proxies file not found, creating empty file');
-                fs.writeFileSync(PROXIES_FILE, '# Proxy format: ip:port:username:password\n', 'utf8');
-                return;
+            content = readProxyInventory();
+        } catch {
+            throw proxyConfigurationError('Could not safely read or create config/proxies.txt');
+        }
+
+        const proxies = [];
+        let invalid = false;
+        for (const [index, rawLine] of content.split(/\r?\n/).entries()) {
+            const line = rawLine.trim();
+            if (!line || line.startsWith('#')) continue;
+            const proxy = this.parseProxyLine(line);
+            if (!proxy) {
+                logger.warn('Invalid proxy format in config/proxies.txt', { lineNumber: index + 1 });
+                invalid = true;
+            } else {
+                proxies.push(proxy);
             }
+        }
+        if (invalid) throw proxyConfigurationError(INVALID_INVENTORY);
 
-            const content = fs.readFileSync(PROXIES_FILE, 'utf8');
-            const lines = content.split(/\r?\n/).map(line => line.trim()).filter(line => {
-                // Skip empty lines and comments
-                return line && !line.startsWith('#');
-            });
+        this.#proxies = proxies;
+        logger.info('Loaded proxies from config/proxies.txt', { proxyCount: proxies.length });
+    }
 
-            this.proxies = lines.map((line, index) => {
-                const proxy = this.parseProxyLine(line);
-                if (proxy) {
-                    if (index === 0) {
-                        logger.info('Example proxy loaded', {
-                            ip: proxy.ip,
-                            port: proxy.port,
-                            type: proxy.type,
-                            hasUsername: !!proxy.username,
-                            hasPassword: !!proxy.password,
-                            usernameLength: proxy.username.length,
-                            passwordLength: proxy.password.length
-                        });
-                    }
-                    return proxy;
-                }
-                logger.warn('Invalid proxy format', { line, lineNumber: index + 1 });
-                return null;
-            }).filter(p => p !== null);
-
-            logger.info(`Loaded ${this.proxies.length} proxies from file`);
-        } catch (error) {
-            logger.error('Error loading proxies', { error: error.message });
-            this.proxies = [];
+    rejectUnselectedLegacyInventory() {
+        if (hasUnselectedLegacyInventory()) {
+            throw proxyConfigurationError('An installation proxy inventory exists. Move it to the state directory or set GMAIL_CREATOR_LEGACY_DIR before connecting directly.');
         }
     }
 
@@ -167,12 +220,14 @@ class ProxyManager {
      * الحصول على بروكسي متاح
      */
     getNextProxy() {
-        const available = this.proxies.filter(p => !this.usedProxies.has(p.raw));
+        const proxies = this.proxies;
+        if (proxies.length === 0) return null;
+        const available = proxies.filter(p => !this.usedProxies.has(p.raw));
         
         if (available.length === 0) {
             logger.warn('No available proxies, resetting used proxies');
             this.usedProxies.clear();
-            return this.proxies[0] || null;
+            return proxies[0];
         }
 
         const proxy = available[Math.floor(Math.random() * available.length)];

@@ -75,7 +75,7 @@ test('credential headers are masked and cookie digests are recoverable from the 
         'Set-Cookie': `Fixture=${cookie}; Path=/store; Secure; HttpOnly; SameSite=Lax`
     }));
     await recorder.flushSummary();
-    context.emit('request', request(url, {
+    context.emit('request', request('https://example.test/store', {
         cookie: `Fixture=${cookie}`,
         Authorization: `Bearer ${authorization}`,
         'X-Api-Key': apiKey
@@ -147,7 +147,7 @@ test('navigation and step metadata use the same URL masking as headers and HTTP 
 });
 
 test('private Necko source keeps its format while the diagnostic index masks credentials and URLs', async (t) => {
-    const { recorder, context } = fixture(t);
+    const { recorder, context } = fixture(t, { neckoMozLog: true });
     const secret = 'native-header-fixture-only';
     const urlKey = 'native-navigation-fixture-only';
     const source = [
@@ -167,7 +167,7 @@ test('private Necko source keeps its format while the diagnostic index masks cre
     context.emit('request', request('https://example.test/'));
     const summary = await recorder.stop();
 
-    assert.equal(path.dirname(recorder.neckoMozLogPath), path.join(recorder.trafficDir, '.private'));
+    assert.equal(path.dirname(recorder.neckoMozLogPath), path.join(path.dirname(recorder.trafficDir), '.native'));
     assert.equal(fs.readFileSync(recorder.neckoMozLogPath, 'utf8'), `${source}\n`);
     if (process.platform !== 'win32') {
         assert.equal(fs.statSync(recorder.neckoMozLogPath).mode & 0o777, 0o600);
@@ -178,12 +178,12 @@ test('private Necko source keeps its format while the diagnostic index masks cre
     assert.equal(parsed.parsedRequests[0].headers.authorization, 'Basic [REDACTED]');
     assert.equal(parsed.parsedRequests[0].requestLine, `GET ${redactUrlSecrets(`relative?token=${urlKey}`)} HTTP/1.1`);
     assert.equal(parsed.parsedResponses[0].headers['set-cookie'], '[REDACTED]');
-    assert.deepEqual(summary.neckoMozLog, parsed);
+    assert.deepEqual(summary.neckoMozLog, { ...parsed, sha256: null });
     assertAbsent(recorder, [secret, urlKey]);
 });
 
-test('metadata-only mode skips request, response and WebSocket accessors', async (t) => {
-    const { recorder, context, page } = fixture(t, { recordBodies: false, neckoMozLog: false });
+test('metadata-only mode skips request, response and WebSocket accessors by default', async (t) => {
+    const { recorder, context, page } = fixture(t, { neckoMozLog: false });
     let reads = 0;
     const marker = 'metadata-only-content-fixture';
     const read = () => {
@@ -225,7 +225,7 @@ test('metadata-only mode skips request, response and WebSocket accessors', async
 });
 
 test('an unbounded browser transport is never asked for decoded response bodies', async (t) => {
-    const { recorder, context } = fixture(t, { maxBodyBytes: 32 });
+    const { recorder, context } = fixture(t, { recordBodies: true, maxBodyBytes: 32 });
     let requestedBodies = 0;
     const readUnbounded = async () => {
         requestedBodies += 1;
@@ -265,7 +265,7 @@ test('an unbounded browser transport is never asked for decoded response bodies'
 });
 
 test('enabled request and WebSocket capture retain bounded payload files and content digests', async (t) => {
-    const { recorder, context, page } = fixture(t, { maxBodyBytes: 24, maxInlinePreviewBytes: 20 });
+    const { recorder, context, page } = fixture(t, { recordBodies: true, maxBodyBytes: 24, maxInlinePreviewBytes: 20 });
     const body = 'fixture-content-'.repeat(10);
     context.emit('request', request('https://example.test/post', {}, { postData: () => body }));
     const ws = new EventEmitter();
@@ -278,10 +278,146 @@ test('enabled request and WebSocket capture retain bounded payload files and con
     for (const event of ledger.filter(({ type }) => type === 'egress' || type === 'ws-egress')) {
         assert.equal(event.recordBodies, true);
         assert.equal(event.postDataSha256 ?? event.payloadSha256, digest(body));
-        assert.equal(event.bodyPreview, body.slice(0, 20));
+        assert.equal(event.bodyPreview, null);
         assert.equal(event.payloadTruncated, true);
         const filePath = path.join(recorder.trafficDir, event.payloadFile);
         assert.equal(fs.readFileSync(filePath, 'utf8'), body.slice(0, 24));
         if (process.platform !== 'win32') assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
     }
+});
+
+test('opted-in requests project complete JSON and forms while authentication and WebSocket stay private', async (t) => {
+    const { recorder, context, page } = fixture(t, { recordBodies: true, neckoMozLog: false });
+    const jsonBody = '{"success":true,"label":"private-json-marker","data":{"count":2,"status":"succeeded"}}';
+    const formBody = 'count=1&count=2&ok=true&label=private-form-marker';
+    const reqs = [
+        request('https://example.test/items', { 'Content-Type': 'application/fixture+json; charset=utf-8' }, {
+            postData: () => jsonBody
+        }),
+        request('https://example.test/items', { 'Content-Type': 'application/x-www-form-urlencoded' }, {
+            postData: () => formBody
+        })
+    ];
+    for (const req of reqs) context.emit('request', req);
+    let sensitiveBodyReads = 0;
+    const readBody = () => {
+        sensitiveBodyReads += 1;
+        return 'private-auth-marker';
+    };
+    context.emit('request', request('https://example.test/v2/sign-in', { 'Content-Type': 'application/json' }, {
+        postData: readBody, postDataBuffer: readBody
+    }));
+
+    const regularSocket = Object.assign(new EventEmitter(), { url: () => 'wss://example.test/events' });
+    const authenticationSocket = Object.assign(new EventEmitter(), { url: () => 'wss://example.test/v2/auth/socket' });
+    page.emit('websocket', regularSocket);
+    page.emit('websocket', authenticationSocket);
+    regularSocket.emit('framesent', { payload: 'private-ws-marker' });
+    authenticationSocket.emit('framereceived', { get payload() { return readBody(); } });
+    await recorder.stop();
+
+    const ledger = events(recorder);
+    const requests = ledger.filter(({ type }) => type === 'egress').sort((a, b) => a.seq - b.seq);
+    const { log } = recorder.exportHar();
+    const projections = ['{"success":true,"data":{"count":2,"status":"succeeded"}}', 'count=1&count=2&ok=true'];
+    for (const [i, body] of [jsonBody, formBody].entries()) {
+        const event = requests[i];
+        assert.equal(event.bodyPreview, projections[i]);
+        assert.ok(recorder.formatTransactionWireDump(event.correlationId).includes(projections[i]));
+        assert.equal(log.entries[i].request.postData?.text, projections[i]);
+        assert.equal(fs.readFileSync(path.join(recorder.trafficDir, event.payloadFile), 'utf8'), body);
+    }
+    const privateFrame = ledger.find(({ type }) => type === 'ws-egress');
+    assert.equal(privateFrame.bodyPreview, null);
+    assert.equal(fs.readFileSync(path.join(recorder.trafficDir, privateFrame.payloadFile), 'utf8'), 'private-ws-marker');
+    assert.equal(ledger.find(({ type }) => type === 'ws-ingress').payloadFile, null);
+    assert.equal(requests[2].payloadFile, null);
+    assert.equal(log.entries[2].request.postData?.text ?? '', '');
+    assert.equal(sensitiveBodyReads, 0);
+    assertAbsent(recorder, ['private-json-marker', 'private-form-marker', 'private-auth-marker', 'private-ws-marker']);
+});
+
+test('reopened wire applies current header, URL, trigger and body rules to accepted legacy events', async (t) => {
+    const traceId = 'legacy-wire-fixture';
+    const { recorder, recorderOptions } = fixture(t, { traceId, recordBodies: true, neckoMozLog: false });
+    const common = {
+        correlationId: 'legacy-transaction',
+        timestamp: '2026-01-01T00:00:00.000Z',
+        url: 'https://example.test/items',
+        recordBodies: true,
+        attribution: { traceId }
+    };
+    const legacy = [
+        {
+            ...common,
+            type: 'egress',
+            method: 'POST',
+            headers: {
+                Authorization: 'Bearer legacy-request-marker',
+                Cookie: 'session=legacy-cookie-marker',
+                'Content-Type': 'application/json'
+            },
+            triggerAction: {
+                actionId: 'legacy-action',
+                actionType: 'goto',
+                target: 'https://example.test/items?token=legacy-target-marker'
+            },
+            bodyPreview: '{"ok":true,"label":"legacy-body-marker"}',
+            platformSignatures: [{
+                signatureName: 'public_key',
+                platform: 'arkose',
+                location: 'body',
+                valueSha256: digest('legacy-signature-marker'),
+                valueLength: 'legacy-signature-marker'.length,
+                maskedPreview: 'legacy-signature-marker'
+            }]
+        },
+        {
+            ...common,
+            type: 'ingress',
+            status: 200,
+            headersArray: [
+                { name: 'Set-Cookie', value: 'session=legacy-response-marker' },
+                { name: 'Content-Type', value: 'application/json' },
+                { name: 'Location', value: '/next?token=legacy-location-marker' }
+            ],
+            bodyPreview: '{"count":3,"label":"legacy-truncation-marker"',
+            bodyPreviewTruncated: true
+        },
+        {
+            ...common,
+            correlationId: 'legacy-socket',
+            type: 'ws-egress',
+            url: 'wss://example.test/events',
+            payloadBytes: 42,
+            bodyPreview: '{"count":5,"label":"legacy-ws-marker"}'
+        }
+    ];
+    let head = '0'.repeat(64);
+    const lines = legacy.map((event, i) => {
+        const record = { ...event, seq: i + 1, prevEventHash: head };
+        head = digest(`${head}|${record.seq}|${JSON.stringify(record)}`);
+        return JSON.stringify({ ...record, eventHash: head });
+    });
+    const archived = `${lines.join('\n')}\n`;
+    fs.writeFileSync(recorder.trafficNdjsonPath, archived);
+    const reopened = new CamoufoxTrafficRecorder(recorderOptions);
+    const summary = await reopened.stop();
+
+    const [signature] = summary.platformSignatures.signatures;
+    assert.equal(signature.maskedPreview, '[REDACTED]');
+    assert.equal(signature.valueSha256, null);
+    assert.equal(signature.valueLength, null);
+    assert.doesNotMatch(fs.readFileSync(recorder.attributionIndexPath, 'utf8'), /legacy-signature-marker/);
+    const wire = reopened.formatTransactionWireDump('legacy-transaction');
+    assert.match(wire, /Authorization: Bearer \[REDACTED\]/);
+    assert.match(wire, /Cookie: \[REDACTED\]/);
+    assert.match(wire, /Set-Cookie: \[REDACTED\]/);
+    assert.match(wire, /"ok":true/);
+    assert.match(wire, /legacy-action/);
+    assert.doesNotMatch(wire, /legacy-(request|cookie|response|target|body|truncation|location)-marker/);
+    const socketWire = reopened.formatTransactionWireDump('legacy-socket');
+    assert.match(socketWire, /WS-EGRESS.*bytes=42/);
+    assert.doesNotMatch(socketWire, /legacy-ws-marker/);
+    assert.equal(fs.readFileSync(recorder.trafficNdjsonPath, 'utf8'), archived);
 });

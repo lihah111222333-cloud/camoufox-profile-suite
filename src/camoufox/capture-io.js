@@ -1,10 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { constants as bufferLimits } from 'node:buffer';
 
 const MAX_CAPTURE_BYTES = 128 * 1024 * 1024;
 const MAX_PAYLOAD_BYTES = 32 * 1024 * 1024;
+const MAX_PAYLOAD_DEPTH = 32;
+const MAX_PAYLOAD_ENTRIES = 100_000;
 const MAX_LOCAL_BYTES = bufferLimits.MAX_STRING_LENGTH;
 const STAT_OPTIONS = { bigint: true };
 const IS_LINUX = process.platform === 'linux';
@@ -190,44 +192,134 @@ function captureFileComponents(fileName) {
     throw captureError('Invalid capture file reference');
 }
 
-/** Read an ordinary file explicitly referenced from the capture's payload directory. */
-export function readCapturePayload(trafficDir, relativePath, { maxBytes = MAX_PAYLOAD_BYTES, trustedLocal = false } = {}) {
+function payloadFileComponents(relativePath) {
     const components = splitFileName(relativePath);
-    if (components.length < 2 || components[0] !== 'payloads') {
+    if (components.length < 2 || components.length > MAX_PAYLOAD_DEPTH + 1 || components[0] !== 'payloads') {
         throw captureError('Capture payload reference must be inside payloads/');
     }
-    return withCaptureFile(trafficDir, components, { trustedLocal, maxBytes, flags: fs.constants.O_RDONLY }, readBytes);
+    return components;
+}
+
+/** Read an ordinary file explicitly referenced from the capture's payload directory. */
+export function readCapturePayload(trafficDir, relativePath, { maxBytes = MAX_PAYLOAD_BYTES, trustedLocal = false } = {}) {
+    return withCaptureFile(trafficDir, payloadFileComponents(relativePath), {
+        trustedLocal, maxBytes, flags: fs.constants.O_RDONLY
+    }, readBytes);
+}
+
+export function hashCapturePayload(trafficDir, relativePath, {
+    trustedLocal = false, maxBytes = trustedLocal ? MAX_LOCAL_BYTES : MAX_CAPTURE_BYTES
+} = {}) {
+    return withCaptureFile(trafficDir, payloadFileComponents(relativePath), {
+        trustedLocal, maxBytes, flags: fs.constants.O_RDONLY
+    }, (fd, size, verifyFile) => hashFileBytes(fd, size, size, verifyFile));
 }
 
 /** Read a fixed capture artifact, optionally allowing an absent file. */
 export function readCaptureFile(trafficDir, fileName, {
     optional = false, trustedLocal = false, maxBytes = trustedLocal ? MAX_LOCAL_BYTES : MAX_CAPTURE_BYTES
 } = {}) {
+    return accessCaptureArtifact(trafficDir, fileName, { optional, trustedLocal, maxBytes }, readBytes);
+}
+
+function accessCaptureArtifact(trafficDir, fileName, { optional, trustedLocal, maxBytes }, useFile) {
     const components = captureFileComponents(fileName);
     if (optional && !SECURE_DIRECTORY_OPEN && !trustedLocal &&
         !fs.lstatSync(path.join(trafficDir, ...components), { throwIfNoEntry: false })) return null;
     try {
-        return withCaptureFile(trafficDir, components, { trustedLocal, maxBytes, flags: fs.constants.O_RDONLY }, readBytes);
+        return withCaptureFile(trafficDir, components, { trustedLocal, maxBytes, flags: fs.constants.O_RDONLY }, useFile);
     } catch (error) {
         if (optional && error.code === 'ENOENT') return null;
         throw error;
     }
 }
 
-export function listCapturePayloads(trafficDir, { trustedLocal = false } = {}) {
-    try {
-        return withCaptureDirectory(trafficDir, ['payloads'], trustedLocal, (directory, verifyDirectories) => {
-            const entries = fs.readdirSync(directory.lookup, { withFileTypes: true });
-            verifyDirectories();
-            if (!sameVersion(directory.stat, directoryStat(directory))) {
-                throw captureError('Capture payload directory changed during listing');
-            }
-            return entries;
-        });
-    } catch (error) {
-        if (error.code === 'ENOENT') return [];
-        throw error;
+/** Hash a bounded capture file or its checkpointed prefix without loading it into memory. */
+export function hashCaptureFile(trafficDir, fileName, {
+    optional = false, trustedLocal = false, maxBytes = MAX_CAPTURE_BYTES, prefixBytes
+} = {}) {
+    return accessCaptureArtifact(trafficDir, fileName, { optional, trustedLocal, maxBytes }, (fd, size, verifyFile) => {
+        const length = prefixBytes ?? size;
+        if (!Number.isSafeInteger(length) || length < 0 || length > size) {
+            throw captureError(`${fileName} byte length mismatch`);
+        }
+
+        return hashFileBytes(fd, size, length, verifyFile);
+    });
+}
+
+function hashFileBytes(fd, size, length, verifyFile) {
+    const hash = createHash('sha256');
+    const buffer = Buffer.allocUnsafe(Math.min(length, 64 * 1024));
+    let offset = 0;
+    while (offset < length) {
+        const count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, length - offset), offset);
+        if (count === 0) throw captureError('Capture file changed during access');
+        hash.update(buffer.subarray(0, count));
+        offset += count;
     }
+    verifyFile();
+    return { sha256: hash.digest('hex'), bytes: size };
+}
+
+function verifyDirectoryListing(directory, verifyDirectories) {
+    verifyDirectories();
+    if (!sameVersion(directory.stat, directoryStat(directory))) {
+        throw captureError('Capture directory changed during listing');
+    }
+}
+
+/** List a caller-selected directory without traversing links. */
+export function listCaptureDirectory(directory, { trustedLocal = false } = {}) {
+    return withCaptureDirectory(directory, [], trustedLocal, (opened, verifyDirectories) => {
+        const entries = fs.readdirSync(opened.lookup, { withFileTypes: true });
+        verifyDirectoryListing(opened, verifyDirectories);
+        return entries;
+    });
+}
+
+export function listCapturePayloads(trafficDir, { trustedLocal = false } = {}) {
+    const files = [];
+    let visited = 0;
+    let opened = false;
+
+    function visit(components) {
+        withCaptureDirectory(trafficDir, components, trustedLocal, (directory, verifyDirectories) => {
+            opened = true;
+            const listing = fs.opendirSync(directory.lookup);
+            try {
+                let entry;
+                while ((entry = listing.readSync()) !== null) {
+                    visited += 1;
+                    if (visited > MAX_PAYLOAD_ENTRIES) {
+                        throw captureError('Capture payload directory exceeds inventory limits', 'ERR_CAPTURE_TOO_LARGE');
+                    }
+                    const relativePath = [...components, entry.name].join('/');
+                    splitFileName(relativePath);
+                    if (entry.isDirectory()) {
+                        if (components.length >= MAX_PAYLOAD_DEPTH) {
+                            throw captureError('Capture payload directory exceeds inventory limits', 'ERR_CAPTURE_TOO_LARGE');
+                        }
+                        visit([...components, entry.name]);
+                    } else if (entry.isFile()) {
+                        files.push(relativePath);
+                    } else {
+                        throw captureError(`Expected regular payload file or directory: ${relativePath}`);
+                    }
+                }
+            } finally {
+                listing.closeSync();
+            }
+            verifyDirectoryListing(directory, verifyDirectories);
+        });
+    }
+
+    try {
+        visit(['payloads']);
+    } catch (error) {
+        if (opened || error.code !== 'ENOENT') throw error;
+    }
+    return files;
 }
 
 /** Trim a validated crash suffix from the same file whose bytes were verified. */
@@ -256,27 +348,34 @@ export function writeCaptureExport(outputPath, content, { replace = true } = {})
     });
     const lookup = directory?.lookup || '.';
     const target = path.join(lookup, path.basename(outputPath));
-    const temporary = path.join(lookup, `.har-${randomUUID()}.tmp`);
+    const temporary = path.join(lookup, `.capture-export-${randomUUID()}.tmp`);
     try {
         if (directory) {
             assertDirectory(directory);
             const existing = fs.lstatSync(target, { ...STAT_OPTIONS, throwIfNoEntry: false });
             if (existing && (!existing.isFile() || existing.nlink !== 1n)) {
-                throw captureError('HAR destination must be an ordinary file');
+                throw captureError('Capture export destination must be an ordinary file');
             }
         }
         const fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT |
             fs.constants.O_EXCL | FILE_FLAGS, 0o600);
         try {
             const created = fs.fstatSync(fd, STAT_OPTIONS);
-            fs.writeFileSync(fd, content, 'utf8');
+            let bytes = 0;
+            const chunks = typeof content === 'string' || ArrayBuffer.isView(content) ? [content] : content;
+            for (const chunk of chunks) {
+                const buffer = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk;
+                fs.writeFileSync(fd, buffer);
+                bytes += buffer.byteLength;
+            }
             fs.fsyncSync(fd);
             if (directory) assertDirectory(directory);
             if (!sameNode(created, fs.lstatSync(temporary, STAT_OPTIONS))) {
-                throw captureError('HAR temporary file changed during writing');
+                throw captureError('Capture export temporary file changed during writing');
             }
             if (replace) fs.renameSync(temporary, target);
             else fs.linkSync(temporary, target);
+            return bytes;
         } finally {
             try {
                 const existing = fs.lstatSync(temporary, { ...STAT_OPTIONS, throwIfNoEntry: false });
@@ -286,6 +385,6 @@ export function writeCaptureExport(outputPath, content, { replace = true } = {})
             }
         }
     } finally {
-        if (directory) fs.closeSync(directory.fd);
+        if (directory) closeDirectory(directory.fd);
     }
 }

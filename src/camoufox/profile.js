@@ -3,9 +3,11 @@
  * Drop-in replacement for Dolphin Anty (`src/dolphin/profile.js`) and GPM Login (`src/gpmlogin/profile.js`)
  */
 
+import path from 'node:path';
 import logger from '../utils/logger.js';
 import camoufoxClient, { validateCamoufoxNetworkPolicy } from './client.js';
-import { auditProfileCoherence, evaluateWireToDomCoherence } from './coherence-auditor.js';
+import { auditProfileCoherence, evaluateWireToDomCoherence, readCoherenceCaptureEvents } from './coherence-auditor.js';
+import { recordedControlKey } from './traffic-redaction.js';
 
 const WAIT_UNTIL_MAP = {
     networkidle0: 'networkidle',
@@ -59,8 +61,44 @@ function normalizeXPathSelector(expression) {
     return raw.startsWith('xpath=') ? raw : `xpath=${raw}`;
 }
 
-function normalizeCookieDomain(domain) {
-    return typeof domain === 'string' ? domain.replace(/^\./, '').toLowerCase() : '';
+function parseCookieUrl(value) {
+    if (typeof value !== 'string') return null;
+    try {
+        const url = new URL(value);
+        return url.protocol === 'http:' || url.protocol === 'https:' ? url : null;
+    } catch {
+        return null;
+    }
+}
+
+function currentCookieUrl(page) {
+    try {
+        return parseCookieUrl(page.url?.());
+    } catch {
+        return null;
+    }
+}
+
+function cookieMatchesScope(cookie, { name, domain, url, path, partitionKey, _crHasCrossSiteAncestor }) {
+    if (cookie.name !== name || (cookie.partitionKey ?? null) !== partitionKey) return false;
+    if (_crHasCrossSiteAncestor !== undefined && cookie._crHasCrossSiteAncestor !== _crHasCrossSiteAncestor) return false;
+    if (typeof cookie.domain !== 'string' || !cookie.domain) return false;
+    if (typeof cookie.path !== 'string' || !cookie.path.startsWith('/')) return false;
+
+    const cookieDomain = cookie.domain.toLowerCase();
+    if (domain) {
+        if (cookieDomain !== domain) return false;
+    } else {
+        const host = url.hostname.toLowerCase();
+        const hostMatches = cookieDomain.startsWith('.')
+            ? `.${host}`.endsWith(cookieDomain)
+            : host === cookieDomain;
+        if (!hostMatches || (cookie.secure && url.protocol !== 'https:')) return false;
+    }
+
+    if (path !== undefined) return cookie.path === path;
+    if (!url || url.pathname === cookie.path) return true;
+    return url.pathname.startsWith(cookie.path.endsWith('/') ? cookie.path : `${cookie.path}/`);
 }
 
 function wrapMultiArgEvaluate(originalEvaluate, decorateResult = null) {
@@ -84,6 +122,7 @@ function wrapMultiArgEvaluate(originalEvaluate, decorateResult = null) {
 }
 
 const contextBindings = new WeakMap();
+const sessionLifecycles = new WeakMap();
 const pageContexts = new WeakMap();
 const framePages = new WeakMap();
 const handleOwners = new WeakMap();
@@ -114,7 +153,12 @@ function isContextUsable(context) {
         return false;
     }
     const binding = contextBindings.get(context);
-    return !binding?.closed && binding?.isBrowserConnected?.() !== false;
+    return !binding?.closed && !binding?.closing && binding?.isBrowserConnected?.() !== false;
+}
+
+export function observeContextClosure(context, browser) {
+    const binding = bindContext(context);
+    return () => binding.closed || browser.isConnected?.() === false;
 }
 
 function resolvePageContext(page) {
@@ -251,15 +295,16 @@ export function attachElementHandleCompatibility(handle, owner = null, targetHin
                     const recorder = resolveFrameRecorder(handleOwners.get(handle));
                     const target = handle._camoufoxTargetHint || 'ElementHandle';
                     const meta = {};
-                    if (methodName === 'press' && typeof args[0] === 'string') {
-                        meta.key = args[0];
+                    if (methodName === 'press') {
+                        const key = recordedControlKey(args[0]);
+                        if (key !== undefined) meta.key = key;
                     } else if (
                         (methodName === 'fill' || methodName === 'type') &&
                         typeof args[0] === 'string'
                     ) {
                         meta.valueLength = args[0].length;
                     }
-                    recorder?.recordTriggerAction?.(`elementHandle.${methodName}`, target, meta);
+                    recorder?.recordTriggerAction?.(`elementHandle.${methodName}`, target, meta, handleOwners.get(handle));
                 } catch {
                     // Never allow instrumentation to interfere with ElementHandle actions
                 }
@@ -414,7 +459,7 @@ export function attachPageCompatibility(page, context = null, profile = null) {
     page.setTrafficStep = (stepName, meta = {}) => resolveRecorder()?.setStep(stepName, meta) || null;
     page.setStep = page.setTrafficStep;
     page.recordTrafficTrigger = (actionType, target = null, meta = {}) =>
-        resolveRecorder()?.recordTriggerAction?.(actionType, target, meta) || null;
+        resolveRecorder()?.recordTriggerAction?.(actionType, target, meta, page) || null;
 
     Object.defineProperty(page, '_camoufoxProfile', {
         get() {
@@ -449,7 +494,7 @@ export function attachPageCompatibility(page, context = null, profile = null) {
                     recorder.recordTriggerAction?.('page.goto', targetUrl, {
                         url: targetUrl,
                         pageUrl: typeof page.url === 'function' ? page.url() : null
-                    });
+                    }, page);
                 }
             } catch {
                 // Never allow instrumentation to interfere with navigation
@@ -470,15 +515,16 @@ export function attachPageCompatibility(page, context = null, profile = null) {
                     const meta = {
                         pageUrl: typeof page.url === 'function' ? page.url() : null
                     };
-                    if (methodName === 'press' && typeof rest[0] === 'string') {
-                        meta.key = rest[0];
+                    if (methodName === 'press') {
+                        const key = recordedControlKey(rest[0]);
+                        if (key !== undefined) meta.key = key;
                     } else if (
                         (methodName === 'fill' || methodName === 'type') &&
                         typeof rest[0] === 'string'
                     ) {
                         meta.valueLength = rest[0].length;
                     }
-                    recorder?.recordTriggerAction?.(`page.${methodName}`, targetSelector, meta);
+                    recorder?.recordTriggerAction?.(`page.${methodName}`, targetSelector, meta, page);
                 } catch {
                     // Never allow instrumentation to interfere with page execution
                 }
@@ -487,34 +533,14 @@ export function attachPageCompatibility(page, context = null, profile = null) {
         }
     }
 
-    // Puppeteer page.evaluateOnNewDocument(fn, ...args) -> Playwright context.addInitScript
+    // Puppeteer page.evaluateOnNewDocument(fn, ...args) -> Playwright page.addInitScript
     if (typeof page.evaluateOnNewDocument !== 'function') {
         page.evaluateOnNewDocument = async (pageFunction, ...args) => {
-            const targetContext = resolveContext();
-            const addScript =
-                targetContext && typeof targetContext.addInitScript === 'function'
-                    ? targetContext.addInitScript.bind(targetContext)
-                    : typeof page.addInitScript === 'function'
-                      ? page.addInitScript.bind(page)
-                      : null;
-
-            if (!addScript) {
-                return undefined;
+            if (typeof page.addInitScript !== 'function') {
+                throw new Error('The browser backend does not support page-scoped initializers');
             }
 
-            if (args.length <= 1 || typeof pageFunction !== 'function') {
-                return addScript(pageFunction, args[0]);
-            }
-
-            const fnSource = pageFunction.toString();
-            return addScript(
-                ([serializedFn, serializedArgs]) => {
-                    // eslint-disable-next-line no-new-func
-                    const hydratedFn = new Function(`return (${serializedFn})`)();
-                    return hydratedFn(...serializedArgs);
-                },
-                [fnSource, args]
-            );
+            return wrapMultiArgEvaluate(page.addInitScript.bind(page))(pageFunction, ...args);
         };
     }
 
@@ -614,14 +640,9 @@ export function attachPageCompatibility(page, context = null, profile = null) {
             if (!targetContext || typeof targetContext.cookies !== 'function') {
                 return [];
             }
-            if (urls.length > 0) {
-                return targetContext.cookies(urls);
-            }
-            const currentUrl = typeof page.url === 'function' ? page.url() : '';
-            if (currentUrl && /^https?:\/\//i.test(currentUrl)) {
-                return targetContext.cookies([currentUrl]);
-            }
-            return targetContext.cookies();
+            const scope = urls.length ? urls.map(parseCookieUrl) : [currentCookieUrl(page)];
+            const cookieUrls = scope.filter(Boolean).map((url) => url.href);
+            return cookieUrls.length ? targetContext.cookies(cookieUrls) : [];
         };
     }
 
@@ -676,85 +697,48 @@ export function attachPageCompatibility(page, context = null, profile = null) {
         };
     }
 
-    // Puppeteer page.deleteCookie(...cookies) -> filter & restore on Playwright context
+    // Expire only the matching cookie identities through Playwright's cookie API.
     if (typeof page.deleteCookie !== 'function') {
         page.deleteCookie = async (...cookiesToDelete) => {
             const targetContext = resolveContext();
-            if (!targetContext) {
-                return;
-            }
             const targets = cookiesToDelete
                 .flat()
-                .filter((c) => c && typeof c === 'object' && c.name);
-            if (targets.length === 0) {
-                return;
+                .filter((cookie) => typeof cookie?.name === 'string' && cookie.name);
+            if (targets.length === 0) return;
+
+            const pageUrl = currentCookieUrl(page);
+            const scopes = targets.map(({ name, domain, url, path, partitionKey, _crHasCrossSiteAncestor }) => {
+                if (domain != null && typeof domain !== 'string') return null;
+                const scopedDomain = typeof domain === 'string' && domain ? domain.toLowerCase() : null;
+                return {
+                    name,
+                    domain: scopedDomain,
+                    url: scopedDomain ? null : url == null ? pageUrl : parseCookieUrl(url),
+                    path,
+                    partitionKey: partitionKey ?? null,
+                    _crHasCrossSiteAncestor
+                };
+            }).filter((scope) => scope && (scope.domain || scope.url));
+            if (scopes.length === 0) return;
+
+            if (typeof targetContext?.cookies !== 'function' || typeof targetContext.addCookies !== 'function') {
+                throw new Error('The browser backend does not support scoped cookie deletion');
             }
-
-            const extractCookieHostname = (rawDomain, rawUrl) => {
-                const normDom = normalizeCookieDomain(rawDomain);
-                if (normDom) return normDom;
-                if (typeof rawUrl === 'string' && rawUrl.trim()) {
-                    try {
-                        return normalizeCookieDomain(new URL(rawUrl).hostname);
-                    } catch {
-                        return normalizeCookieDomain(rawUrl);
-                    }
-                }
-                return '';
-            };
-
-            const matchesTarget = (cookie, target) => {
-                if (cookie.name !== target.name) {
-                    return false;
-                }
-                const cookieDomain = extractCookieHostname(cookie.domain, cookie.url);
-                if (target.domain) {
-                    if (cookieDomain !== normalizeCookieDomain(target.domain)) {
-                        return false;
-                    }
-                } else if (target.url) {
-                    const targetHost = extractCookieHostname(null, target.url);
-                    if (
-                        targetHost &&
-                        cookieDomain &&
-                        cookieDomain !== targetHost &&
-                        !targetHost.endsWith(`.${cookieDomain}`)
-                    ) {
-                        return false;
-                    }
-                }
-                if (target.path && cookie.path && cookie.path !== target.path) {
-                    return false;
-                }
-                return true;
-            };
-
-            if (
-                typeof targetContext.cookies === 'function' &&
-                typeof targetContext.clearCookies === 'function'
-            ) {
-                const existing = await targetContext.cookies();
-                const remaining = existing.filter(
-                    (cookie) => !targets.some((target) => matchesTarget(cookie, target))
-                );
-                await targetContext.clearCookies();
-                if (remaining.length > 0 && typeof targetContext.addCookies === 'function') {
-                    await targetContext.addCookies(remaining);
-                }
-                return;
-            }
-
-            if (typeof targetContext.addCookies === 'function') {
-                const currentUrl = typeof page.url === 'function' ? page.url() : '';
-                const expired = targets.map((target) => ({
-                    ...target,
+            const existing = await targetContext.cookies();
+            const expired = existing.filter((cookie) => scopes.some((scope) => cookieMatchesScope(cookie, scope)))
+                .map(({ name, domain, path, secure, httpOnly, sameSite, partitionKey, _crHasCrossSiteAncestor }) => ({
+                    name,
+                    domain,
+                    path,
+                    secure,
+                    httpOnly,
+                    sameSite,
+                    ...(partitionKey != null ? { partitionKey } : {}),
+                    ...(_crHasCrossSiteAncestor !== undefined ? { _crHasCrossSiteAncestor } : {}),
                     value: '',
-                    expires: 0,
-                    ...(!target.url && !target.domain && currentUrl && /^https?:\/\//i.test(currentUrl)
-                        ? { url: currentUrl }
-                        : {}),
-                    ...(target.domain && !target.path ? { path: '/' } : {})
+                    expires: 1
                 }));
+            if (expired.length > 0) {
                 await targetContext.addCookies(expired);
             }
         };
@@ -852,8 +836,15 @@ export function attachBrowserCompatibility(browser, profile = null) {
         if (createPage) context.newPage = newPage;
         if (closeContext) {
             context.close = (...args) => {
-                binding.closed = true;
-                return closeContext(...args);
+                if (!binding.closing) {
+                    binding.closing = (async () => {
+                        await closeContext(...args);
+                        binding.closed = true;
+                    })().finally(() => {
+                        binding.closing = null;
+                    });
+                }
+                return binding.closing;
             };
         }
         context.on?.('page', decoratePage);
@@ -864,22 +855,26 @@ export function attachBrowserCompatibility(browser, profile = null) {
 /**
  * Keep the native browser with the client lifecycle and return the profile-scoped view.
  */
-export function attachSessionCompatibility(session) {
-    const { browser, context, page, profileId, profilesDir, metadata, trafficRecorder } = session;
-    const view = attachBrowserCompatibility(browser, {
-        context,
-        metadata,
-        trafficRecorder: trafficRecorder ?? null,
-        saveStorageState: () => camoufoxClient.saveProfileStorageState(profileId, context, profilesDir)
-    });
-    return {
+export function attachSessionCompatibility(session, lifecycle) {
+    const { browser, context, page, metadata, trafficRecorder } = session;
+    const view = {
         ...session,
-        browser: view,
+        browser: attachBrowserCompatibility(browser, {
+            context,
+            metadata,
+            trafficRecorder: trafficRecorder ?? null,
+            saveStorageState: lifecycle.saveStorageState
+        }),
         page: attachPageCompatibility(page, context)
     };
+    sessionLifecycles.set(view, lifecycle);
+    return view;
 }
 
 export class CamoufoxProfile {
+    #lifecycle = null;
+    #profilesDir;
+
     constructor(profileId, options = {}) {
         this.profileId = profileId;
         this.options = options;
@@ -990,15 +985,7 @@ export class CamoufoxProfile {
      * Flush and return the latest pre-TLS traffic attribution summary report
      */
     async getTrafficAttribution() {
-        if (this.trafficRecorder) {
-            if (typeof this.trafficRecorder.flushSummary === 'function') {
-                return await this.trafficRecorder.flushSummary();
-            }
-            if (typeof this.trafficRecorder.getSummary === 'function') {
-                return this.trafficRecorder.getSummary();
-            }
-        }
-        return this.lastTrafficAttribution || null;
+        return this.#lifecycle?.getTrafficAttribution() ?? null;
     }
 
     /**
@@ -1084,9 +1071,12 @@ export class CamoufoxProfile {
             }
         }
         if (this.trafficRecorder && this.coherenceReport?.telemetry) {
+            const events = this.trafficPaths?.trafficDir
+                ? readCoherenceCaptureEvents(this.trafficPaths.trafficDir, { trustedLocal: true })
+                : [];
             this.coherenceReport.wireToDomCoherence = evaluateWireToDomCoherence(
                 this.coherenceReport.telemetry,
-                this.trafficRecorder,
+                events.length > 0 ? events : this.trafficRecorder,
                 targetOs
             );
         }
@@ -1096,12 +1086,19 @@ export class CamoufoxProfile {
     /**
      * Start profile and initialize Camoufox Browser, BrowserContext, and Page
      */
-    async start() {
+    async start(expectedStorageGeneration) {
         try {
             logger.info('Starting Camoufox profile', { profileId: this.profileId });
 
-            const session = await camoufoxClient.startProfile(this.profileId, this.options);
+            const session = await camoufoxClient.startProfile(
+                this.profileId,
+                { ...this.options, profilesDir: this.#profilesDir ?? this.options?.profilesDir },
+                expectedStorageGeneration
+            );
+            this.#lifecycle = sessionLifecycles.get(session);
+            this.#profilesDir = this.#lifecycle.profilesDir;
             this.context = session.context;
+            this.lastTrafficAttribution = null;
             this.storageStatePath = session.storageStatePath;
             this.metadata = session.metadata;
             this.trafficRecorder = session.trafficRecorder || null;
@@ -1174,14 +1171,8 @@ export class CamoufoxProfile {
      * to `profiles/<profileId>/storage-state.json`
      */
     async saveStorageState() {
-        if (!this.context) {
-            return null;
-        }
-        const savedPath = await camoufoxClient.saveProfileStorageState(
-            this.profileId,
-            this.context,
-            this.options?.profilesDir
-        );
+        if (!this.context || !this.#lifecycle) return null;
+        const savedPath = await this.#lifecycle.saveStorageState();
         if (savedPath) {
             this.storageStatePath = savedPath;
         }
@@ -1192,49 +1183,34 @@ export class CamoufoxProfile {
      * Stop profile (automatically saves storageState and flushes traffic attribution before closing)
      */
     async stop() {
-        try {
-            await this.saveStorageState();
-        } catch (error) {
-            logger.warn('Failed to save Camoufox storageState during stop()', {
-                profileId: this.profileId,
-                error: error.message
-            });
-        }
-
-        if (this.securityGuards && typeof this.securityGuards.getStats === 'function') {
-            try {
-                this.lastSecurityGuardStats = this.securityGuards.getStats();
-            } catch {}
-        }
-        if (this.gpuPerformanceScaler?.scalingWeights || this.metadata?.gpuPerformance) {
-            this.lastGpuPerformanceSummary =
-                this.gpuPerformanceScaler?.scalingWeights || this.metadata?.gpuPerformance;
-        }
+        const lifecycle = this.#lifecycle;
+        if (!lifecycle) return true;
 
         try {
-            const stopped = await camoufoxClient.stopProfile(this.profileId, this.options);
-            if (this.trafficRecorder && typeof this.trafficRecorder.stop === 'function') {
-                try {
-                    this.lastTrafficAttribution = await this.trafficRecorder.stop();
-                } catch {}
+            const { stopped, closed, trafficAttribution } = await lifecycle.stop();
+            if (closed && this.#lifecycle === lifecycle) {
+                if (typeof this.securityGuards?.getStats === 'function') {
+                    try {
+                        this.lastSecurityGuardStats = this.securityGuards.getStats();
+                    } catch {}
+                }
+                if (this.gpuPerformanceScaler?.scalingWeights || this.metadata?.gpuPerformance) {
+                    this.lastGpuPerformanceSummary =
+                        this.gpuPerformanceScaler?.scalingWeights || this.metadata?.gpuPerformance;
+                }
+                this.lastTrafficAttribution = trafficAttribution;
+                this.browser = null;
+                this.context = null;
+                this.page = null;
+                this.securityGuards = null;
+                this.gpuPerformanceScaler = null;
             }
-            this.browser = null;
-            this.context = null;
-            this.page = null;
-            this.securityGuards = null;
-            this.gpuPerformanceScaler = null;
-            logger.info('Camoufox profile stopped', { profileId: this.profileId });
             return stopped;
         } catch (error) {
             logger.warn('Error stopping Camoufox profile', {
                 profileId: this.profileId,
                 error: error.message
             });
-            this.browser = null;
-            this.context = null;
-            this.page = null;
-            this.securityGuards = null;
-            this.gpuPerformanceScaler = null;
             return false;
         }
     }
@@ -1244,8 +1220,10 @@ export class CamoufoxProfile {
      */
     async delete() {
         try {
-            await this.stop();
-            await camoufoxClient.deleteProfile(this.profileId, this.options);
+            const lifecycle = this.#lifecycle;
+            if (!lifecycle) throw new Error('Camoufox manager has no acquired profile session');
+            if (!(await this.stop())) throw new Error('Could not stop Camoufox profile before deletion');
+            await lifecycle.delete();
             logger.info('Camoufox profile deleted', { profileId: this.profileId });
             return true;
         } catch (error) {
@@ -1267,7 +1245,7 @@ export async function createAndStartProfile(profileName, proxy = null, options =
         const isAvailable = await camoufoxClient.checkCamoufoxConnection();
         if (!isAvailable) {
             throw new Error(
-                'Camoufox module is not available. Ensure the camoufox package or /Volumes/hello/wj/camoufox/typescript/dist/index.js is built.'
+                'Camoufox module is not available. Ensure the trusted camoufox package is installed.'
             );
         }
 
@@ -1280,13 +1258,14 @@ export async function createAndStartProfile(profileName, proxy = null, options =
 
         const profileManager = new CamoufoxProfile(profileData.id, {
             ...options,
+            profilesDir: path.dirname(profileData.profileDir),
             proxy: profileData.proxy,
             os: profileData.os,
             geoip: profileData.geoip,
             humanize: profileData.humanize
         });
 
-        await profileManager.start();
+        await profileManager.start(profileData._storageGeneration);
 
         logger.info('Camoufox profile created and started', {
             profileId: profileData.id,

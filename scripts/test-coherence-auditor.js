@@ -4110,7 +4110,7 @@ const tests = [
             });
             assert.ok(pc instanceof rtcSandbox.RTCPeerConnection);
             assert.equal(capturedRtcConfig.iceServers.length, 1);
-            assert.deepEqual(capturedRtcConfig.iceServers[0].urls, ['stun:stun.cloudflare.com:3478']);
+            assert.deepEqual(Array.from(capturedRtcConfig.iceServers[0].urls), ['stun:stun.cloudflare.com:3478']);
 
             // 2. Shared-browser multi-profile isolation in attachBrowserCompatibility
             const pageA = { url: () => 'https://a.example.com' };
@@ -4304,7 +4304,7 @@ const tests = [
                 ]
             });
             assert.equal(cw.capturedIframeRtcCfg.iceServers.length, 1);
-            assert.deepEqual(cw.capturedIframeRtcCfg.iceServers[0].urls, [
+            assert.deepEqual(Array.from(cw.capturedIframeRtcCfg.iceServers[0].urls), [
                 'stun:stun.l.google.com:19302'
             ]);
 

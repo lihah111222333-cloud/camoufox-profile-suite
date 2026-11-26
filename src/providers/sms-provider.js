@@ -11,7 +11,7 @@ import '../config.js';
 import { rejectLegacyOperation } from './fivesim-api-legacy.js';
 
 // Get provider from .env (default: 'sms-verification')
-const SMS_PROVIDER = (process.env.SMS_PROVIDER || 'sms-verification').toLowerCase().trim();
+const SMS_PROVIDER = process.env.SMS_PROVIDER?.trim().toLowerCase() || 'sms-verification';
 
 // Lazy load providers
 let smsProvider = null;
@@ -22,6 +22,9 @@ async function loadProvider() {
 
     if (SMS_PROVIDER === 'fivesim-legacy' || SMS_PROVIDER === '5sim-legacy') {
         return rejectLegacyOperation();
+    }
+    if (SMS_PROVIDER !== 'sms-verification') {
+        throw new Error('Unsupported SMS_PROVIDER. Set SMS_PROVIDER to sms-verification.');
     }
 
     const smsVerifyApi = await import('./sms-verification-api.js');
@@ -34,7 +37,7 @@ async function loadProvider() {
         buyNumberAndGetSMS: smsVerifyApi.buyNumberAndGetSMS,
 
         // Order status
-        getOrderStatus: smsVerifyApi.getSmsVerifyStatus,
+        getOrderStatus: smsVerifyApi.getSmsVerifyOrderStatus,
         waitForSMS: smsVerifyApi.waitForSmsVerifyCode,
 
         // Order management
@@ -101,9 +104,12 @@ export const reportNumberUsed = async (...args) => {
     return provider.reportNumberUsed(...args);
 };
 
-export const setOrderStatus = async (...args) => {
+// Accept only the reconciliation actions exposed by finishOrder and cancelOrder.
+export const setOrderStatus = async (orderId, status) => {
     const provider = await loadProvider();
-    return provider.setOrderStatus(...args);
+    if (status === 6) return provider.finishOrder(orderId);
+    if (status === 8) return provider.cancelOrder(orderId);
+    throw new RangeError('SMS order status must be 6 (finish) or 8 (cancel)');
 };
 
 export const getServiceName = async () => {

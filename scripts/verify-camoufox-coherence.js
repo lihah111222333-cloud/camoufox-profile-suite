@@ -7,23 +7,24 @@
  */
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
-import { fileURLToPath } from 'url';
-import config from '../src/config.js';
-import { createAndStartProfile } from '../src/camoufox/profile.js';
-import { resolveCamoufoxModule } from '../src/camoufox/client.js';
+import { writeCaptureExport } from '../src/camoufox/capture-io.js';
+import { isCamoufoxModuleResolvable } from '../src/camoufox/sdk-resolution.js';
 import {
     auditProfileCoherence,
     evaluatePlatformCoherence,
     computeGpuPerformanceScalingWeights
 } from '../src/camoufox/coherence-auditor.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const ROOT_DIR = path.resolve(__dirname, '..');
-const REPORT_PATH = path.resolve(ROOT_DIR, 'camoufox-audit-report.json');
-
+const REPORT_NAME = 'camoufox-audit-report.json';
 const SUPPORTED_OS_TARGETS = ['windows', 'macos', 'linux'];
+const SYNTHETIC_GPU_BASELINE = {
+    hostChipModel: 'Synthetic fixture',
+    hostFp32Tflops: 10,
+    hostMemoryBandwidthGBps: 100,
+    hostPixelFillRateGPixels: 100
+};
 
 function float64ToHex(val) {
     const buf = new ArrayBuffer(8);
@@ -323,7 +324,8 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
         },
         hardwareProfile: p.hardwareProfile,
         gpuPerformance: computeGpuPerformanceScalingWeights(p.webglRenderer, {
-            profileId: `diag-${targetOs}`
+            profileId: `diag-${targetOs}`,
+            hostBaseline: SYNTHETIC_GPU_BASELINE
         }),
         storageEstimate: {
             quotaBytes: 21474836480,
@@ -368,33 +370,19 @@ async function executeAudit(page, targetOs) {
 /**
  * Inspect local Camoufox SDK and Playwright dependency availability
  */
-async function checkEnvironment() {
-    const localCamoufoxRepo = '/Volumes/hello/wj/camoufox/typescript';
+function checkEnvironment() {
     const envStatus = {
         nodeVersion: process.version,
         hostPlatform: process.platform,
         hostArch: process.arch,
-        profileServiceConfig: config.profileService,
-        camoufoxConfig: config.camoufox,
-        camoufoxSdkInstalled: false,
-        localCamoufoxRepoPresent: fs.existsSync(localCamoufoxRepo),
-        playwrightCoreInstalled: false,
-        notes: []
+        camoufoxSdkInstalled: isCamoufoxModuleResolvable(),
+        playwrightCoreInstalled: false
     };
 
     try {
-        await resolveCamoufoxModule();
-        envStatus.camoufoxSdkInstalled = true;
-    } catch (err) {
-        envStatus.notes.push(`camoufox module not built/installed yet: ${err.message}`);
-    }
-
-    try {
-        await import('playwright-core');
+        import.meta.resolve('playwright-core');
         envStatus.playwrightCoreInstalled = true;
-    } catch (err) {
-        envStatus.notes.push(`playwright-core package not resolvable yet: ${err.message}`);
-    }
+    } catch {}
 
     return envStatus;
 }
@@ -452,12 +440,12 @@ async function runDiagnostic() {
     console.log('🦊 Camoufox Cross-OS Fingerprint Coherence Diagnostic CLI');
     console.log('================================================================================\n');
 
-    const envStatus = await checkEnvironment();
+    if (!forceDryRun) await import('../src/config.js');
+    const envStatus = checkEnvironment();
     console.log(`📦 Node Version         : ${envStatus.nodeVersion}`);
     console.log(`💻 Host Platform        : ${envStatus.hostPlatform} (${envStatus.hostArch})`);
-    console.log(`⚙️  Configured Service   : ${envStatus.profileServiceConfig}`);
-    console.log(`📚 camoufox-js SDK      : ${envStatus.camoufoxSdkInstalled ? 'Installed' : 'Not Installed'}`);
-    console.log(`🎭 playwright-core      : ${envStatus.playwrightCoreInstalled ? 'Installed' : 'Not Installed'}`);
+    console.log(`📚 camoufox-js SDK      : ${envStatus.camoufoxSdkInstalled ? 'Resolvable' : 'Unavailable'}`);
+    console.log(`🎭 playwright-core      : ${envStatus.playwrightCoreInstalled ? 'Resolvable' : 'Unavailable'}`);
     console.log(`🎯 Target OS Profiles   : ${osTargets.join(', ')}\n`);
 
     const results = [];
@@ -474,6 +462,7 @@ async function runDiagnostic() {
 
         if (mode === 'live-browser') {
             try {
+                const { createAndStartProfile } = await import('../src/camoufox/profile.js');
                 session = await createAndStartProfile(`diag-${targetOs}-${Date.now()}`, null, {
                     os: targetOs,
                     headless: true,
@@ -487,10 +476,9 @@ async function runDiagnostic() {
                     throw new Error('Camoufox session started without an active Playwright Page or BrowserContext');
                 }
                 auditReport = await executeAudit(page, targetOs);
-            } catch (err) {
-                fallbackReason = err.message;
-                console.warn(`⚠️  Live Camoufox launch unavailable for ${targetOs} (${err.message}).`);
-                console.warn(`   💡 Hint: Run "npx camoufox fetch" to download the C++ patched browser binary.`);
+            } catch {
+                fallbackReason = 'Live Camoufox audit unavailable';
+                console.warn(`⚠️  Live Camoufox audit unavailable for ${targetOs}.`);
                 console.warn(`   🔄 Falling back to synthetic coherence rule verification for [${targetOs}]...`);
                 mode = 'dry-run-synthetic-fallback';
             } finally {
@@ -559,9 +547,14 @@ async function runDiagnostic() {
         results
     };
 
-    fs.writeFileSync(REPORT_PATH, JSON.stringify(summaryReport, null, 2), 'utf8');
+    const containsLiveAudit = results.some(({ mode }) => mode === 'live-browser');
+    const reportDirectory = containsLiveAudit
+        ? (await import('../src/utils/state-paths.js')).ensureStateDirectory()
+        : fs.mkdtempSync(path.join(os.tmpdir(), 'camoufox-audit-'));
+    const reportPath = path.join(reportDirectory, REPORT_NAME);
+    writeCaptureExport(reportPath, `${JSON.stringify(summaryReport, null, 2)}\n`, { replace: containsLiveAudit });
     console.log(`\n================================================================================`);
-    console.log(`📄 Diagnostic report written to: ${REPORT_PATH}`);
+    console.log(`📄 Diagnostic report written to: ${reportPath}`);
     console.log(`🏁 Overall Coherence Status: ${overallPassed ? '✅ PASSED' : '❌ FAILED'}`);
     console.log(`================================================================================\n`);
 

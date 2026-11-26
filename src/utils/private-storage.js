@@ -15,7 +15,13 @@ function restrictMode(fd, stats, mode) {
     }
 }
 
-function openPrivateFile(filePath, access = fs.constants.O_RDONLY) {
+function assertOwner(stats, filePath) {
+    if (typeof process.geteuid === 'function' && stats.uid !== process.geteuid()) {
+        throw new Error(`Expected the current user to own: ${filePath}`);
+    }
+}
+
+function openPrivateFile(filePath, access = fs.constants.O_RDONLY, { requireOwner = false, restrict = true } = {}) {
     const existing = fs.lstatSync(filePath);
     if (!existing.isFile() || existing.nlink !== 1) {
         throw new Error(`Expected a regular file with one directory entry: ${filePath}`);
@@ -27,7 +33,9 @@ function openPrivateFile(filePath, access = fs.constants.O_RDONLY) {
         if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== existing.dev || opened.ino !== existing.ino) {
             throw new Error(`File changed while opening: ${filePath}`);
         }
-        restrictMode(fd, opened, FILE_MODE);
+        if (requireOwner) assertOwner(opened, filePath);
+        const ownerReadOnly = access === fs.constants.O_RDONLY && (opened.mode & 0o7777) === 0o400;
+        if (restrict && !ownerReadOnly) restrictMode(fd, opened, FILE_MODE);
         return fd;
     } catch (error) {
         fs.closeSync(fd);
@@ -36,12 +44,13 @@ function openPrivateFile(filePath, access = fs.constants.O_RDONLY) {
 }
 
 // Only call this for application-owned directories.
-export function ensurePrivateDirectory(directory) {
+export function ensurePrivateDirectory(directory, { requireOwner = false } = {}) {
     fs.mkdirSync(directory, { recursive: true, mode: DIRECTORY_MODE });
     const existing = fs.lstatSync(directory);
     if (!existing.isDirectory()) {
         throw new Error(`Expected a directory: ${directory}`);
     }
+    if (requireOwner) assertOwner(existing, directory);
     if (!SUPPORTS_OWNER_MODES || (existing.mode & 0o7777) === DIRECTORY_MODE) {
         return;
     }
@@ -52,18 +61,19 @@ export function ensurePrivateDirectory(directory) {
         if (!opened.isDirectory() || opened.dev !== existing.dev || opened.ino !== existing.ino) {
             throw new Error(`Directory changed while opening: ${directory}`);
         }
+        if (requireOwner) assertOwner(opened, directory);
         restrictMode(fd, opened, DIRECTORY_MODE);
     } finally {
         fs.closeSync(fd);
     }
 }
 
-export function restrictPrivateFile(filePath) {
-    fs.closeSync(openPrivateFile(filePath));
+export function restrictPrivateFile(filePath, options) {
+    fs.closeSync(openPrivateFile(filePath, fs.constants.O_RDONLY, options));
 }
 
-export function readPrivateFile(filePath, encoding = 'utf8') {
-    const fd = openPrivateFile(filePath);
+export function readPrivateFile(filePath, encoding = 'utf8', options) {
+    const fd = openPrivateFile(filePath, fs.constants.O_RDONLY, options);
     try {
         return fs.readFileSync(fd, encoding);
     } finally {
@@ -71,9 +81,9 @@ export function readPrivateFile(filePath, encoding = 'utf8') {
     }
 }
 
-export function writePrivateFile(filePath, data) {
+export function writePrivateFile(filePath, data, options) {
     try {
-        restrictPrivateFile(filePath);
+        restrictPrivateFile(filePath, options);
     } catch (error) {
         if (error.code !== 'ENOENT') {
             throw error;
@@ -96,10 +106,10 @@ export function writePrivateFile(filePath, data) {
     }
 }
 
-export function appendPrivateFile(filePath, data) {
+export function appendPrivateFile(filePath, data, options) {
     let fd;
     try {
-        fd = openPrivateFile(filePath, APPEND_EXISTING);
+        fd = openPrivateFile(filePath, APPEND_EXISTING, options);
     } catch (error) {
         if (error.code !== 'ENOENT') {
             throw error;
@@ -114,7 +124,7 @@ export function appendPrivateFile(filePath, data) {
             if (createError.code !== 'EEXIST') {
                 throw createError;
             }
-            fd = openPrivateFile(filePath, APPEND_EXISTING);
+            fd = openPrivateFile(filePath, APPEND_EXISTING, options);
         }
     }
     try {

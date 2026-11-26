@@ -218,9 +218,12 @@ function createMockPlaywrightStack() {
         async addCookies(newCookies) {
             for (const cookie of newCookies) {
                 const idx = state.cookies.findIndex(
-                    (c) => c.name === cookie.name && c.domain === cookie.domain
+                    (c) => c.name === cookie.name && c.domain === cookie.domain &&
+                        c.path === cookie.path && c.partitionKey === cookie.partitionKey
                 );
-                if (idx >= 0) {
+                if (cookie.expires === 1) {
+                    if (idx >= 0) state.cookies.splice(idx, 1);
+                } else if (idx >= 0) {
                     state.cookies[idx] = { ...state.cookies[idx], ...cookie };
                 } else {
                     state.cookies.push({ ...cookie });
@@ -244,6 +247,10 @@ function createMockPlaywrightStack() {
             mouseMoves,
             mouseClicks,
             keyPresses,
+            initScripts: [],
+            async addInitScript(fn, arg) {
+                this.initScripts.push({ fn, arg });
+            },
             context() {
                 return ownerContext;
             },
@@ -374,8 +381,8 @@ async function runTests() {
 
     // 4. Test evaluateOnNewDocument (single and multi-arg)
     await page.evaluateOnNewDocument((a, b) => a + b, 10, 20);
-    assert.equal(state.initScripts.length, 1);
-    assert.deepEqual(state.initScripts[0].arg[1], [10, 20]);
+    assert.equal(state.initScripts.length, 0);
+    assert.deepEqual(page.initScripts[0].arg[1], [10, 20]);
     console.log('  [PASS] page.evaluateOnNewDocument');
 
     // 5. Test setViewport and viewport()

@@ -1,0 +1,386 @@
+import crypto from 'node:crypto';
+import { isIP } from 'node:net';
+import { domainToASCII } from 'node:url';
+import { redactDiagnosticText, redactUrlSecrets } from './traffic-redaction.js';
+
+/**
+ * Known anti-bot, risk-control, and session authentication cookie/token names across
+ * Google, Cloudflare, Meta/Instagram, TikTok, and X/Twitter.
+ */
+export const ANTI_BOT_COOKIE_REGEX =
+    /^(datr|sb|fr|c_user|xs|ig_did|mid|csrftoken|rur|ttwid|msToken|s_v_web_id|verifyFp|odin_tt|passport_csrf_token|guest_id|guest_id_marketing|guest_id_ads|ct0|auth_token|kdt|_twitter_sess|__cf_bm|cf_clearance|_cfuvid|NID|AEC|SOCS|SID|HSID|SSID|APISID|SAPISID|__Secure-[0-9A-Za-z_-]+|__Host-[0-9A-Za-z_-]+)$/i;
+
+const COOKIE_VALUE_MASK = '[REDACTED]';
+
+/**
+ * Parse a `Set-Cookie` response header string into structured metadata with a full
+ * SHA-256 value digest (`valueSha256`) and masked preview (`maskedValue`) for
+ * tamper-evident token rotation and lineage tracking.
+ *
+ * @param {string} rawSetCookieValue
+ * @param {number} [observedAt=Date.now()]
+ * @returns {{
+ *   name: string,
+ *   value: string,
+ *   valueSha256: string,
+ *   maskedValue: string,
+ *   domain: string|null,
+ *   path: string|null,
+ *   secure: boolean,
+ *   httpOnly: boolean,
+ *   sameSite: string|null,
+ *   partitioned: boolean,
+ *   expires: string|null,
+ *   maxAge: number|null,
+ *   isDeleted: boolean,
+ *   isAntiBotToken: boolean
+ * }|null}
+ */
+export function parseSetCookieHeader(rawSetCookieValue, observedAt = Date.now()) {
+    if (typeof rawSetCookieValue !== 'string') {
+        return null;
+    }
+    const trimmedHeader = rawSetCookieValue.trim();
+    if (!trimmedHeader) {
+        return null;
+    }
+
+    const parts = trimmedHeader.split(';');
+    const firstPart = (parts[0] || '').trim();
+    const eqIdx = firstPart.indexOf('=');
+    if (eqIdx <= 0) {
+        return null;
+    }
+
+    const name = firstPart.slice(0, eqIdx).trim();
+    if (!name) {
+        return null;
+    }
+    const value = firstPart.slice(eqIdx + 1).trim();
+    const valueSha256 = crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+    const maskedValue = COOKIE_VALUE_MASK;
+
+    let domain = null;
+    let cookiePath = null;
+    let secure = false;
+    let httpOnly = false;
+    let sameSite = null;
+    let partitioned = false;
+    let expires = null;
+    let maxAge = null;
+
+    for (let i = 1; i < parts.length; i += 1) {
+        const attrSegment = parts[i].trim();
+        if (!attrSegment) continue;
+
+        const attrEqIdx = attrSegment.indexOf('=');
+        const attrName = (attrEqIdx >= 0 ? attrSegment.slice(0, attrEqIdx) : attrSegment)
+            .trim()
+            .toLowerCase();
+        const attrVal = attrEqIdx >= 0 ? attrSegment.slice(attrEqIdx + 1).trim() : null;
+
+        if (attrName === 'domain') {
+            domain = attrVal || null;
+        } else if (attrName === 'path') {
+            cookiePath = attrVal ? redactUrlSecrets(attrVal) : null;
+        } else if (attrName === 'secure') {
+            secure = true;
+        } else if (attrName === 'httponly') {
+            httpOnly = true;
+        } else if (attrName === 'samesite') {
+            sameSite = attrVal || null;
+        } else if (attrName === 'partitioned') {
+            partitioned = true;
+        } else if (attrName === 'expires') {
+            expires = attrVal || null;
+        } else if (attrName === 'max-age') {
+            const parsedMaxAge = attrVal !== null && attrVal !== '' ? Number(attrVal) : NaN;
+            maxAge = Number.isFinite(parsedMaxAge) ? parsedMaxAge : null;
+        }
+    }
+
+    const isDeleted = maxAge !== null ? maxAge <= 0 : Date.parse(expires) <= observedAt;
+
+    const isAntiBotToken = ANTI_BOT_COOKIE_REGEX.test(name);
+
+    return {
+        name,
+        value,
+        valueSha256,
+        maskedValue,
+        domain,
+        path: cookiePath,
+        secure,
+        httpOnly,
+        sameSite,
+        partitioned,
+        expires,
+        maxAge,
+        isDeleted,
+        isAntiBotToken
+    };
+}
+
+/**
+ * Parse an egress `Cookie` request header string (`"k1=v1; k2=v2"`) into an array
+ * of structured cookie descriptors with SHA-256 value digests and masked previews.
+ *
+ * @param {string} rawCookieHeader
+ * @returns {Array<{
+ *   name: string,
+ *   value: string,
+ *   valueSha256: string,
+ *   maskedValue: string,
+ *   isAntiBotToken: boolean
+ * }>}
+ */
+export function parseCookieHeader(rawCookieHeader) {
+    if (typeof rawCookieHeader !== 'string' || !rawCookieHeader.trim()) {
+        return [];
+    }
+
+    const results = [];
+    const segments = rawCookieHeader.split(/[;\r\n]+/);
+
+    for (const seg of segments) {
+        const trimmed = seg.trim();
+        if (!trimmed) continue;
+        const eqIdx = trimmed.indexOf('=');
+        if (eqIdx <= 0) continue;
+
+        const name = trimmed.slice(0, eqIdx).trim();
+        if (!name) continue;
+        const value = trimmed.slice(eqIdx + 1).trim();
+        const valueSha256 = crypto.createHash('sha256').update(value, 'utf8').digest('hex');
+        const maskedValue = COOKIE_VALUE_MASK;
+        const isAntiBotToken = ANTI_BOT_COOKIE_REGEX.test(name);
+
+        results.push({
+            name,
+            value,
+            valueSha256,
+            maskedValue,
+            isAntiBotToken
+        });
+    }
+
+    return results;
+}
+
+export function deriveCookieObservations({ headers = {}, headersArray = [] }, name, observedAt) {
+    const orderedValues = (Array.isArray(headersArray) ? headersArray : [])
+        .filter((header) => String(header?.name).toLowerCase() === name)
+        .map((header) => header?.value);
+    const rawValues = orderedValues.length ? orderedValues : Object.entries(headers || {})
+        .filter(([headerName]) => headerName.toLowerCase() === name)
+        .flatMap(([, value]) => value);
+
+    const parsed = name === 'set-cookie'
+        ? rawValues.flatMap((value) => String(value ?? '').split(/\r?\n/).map((header) => parseSetCookieHeader(header, observedAt)))
+        : rawValues.flatMap(parseCookieHeader);
+    return parsed.filter(Boolean).map(({ value, ...observation }) => observation);
+}
+
+const RETAINED_OBSERVATIONS_PER_SCOPE = 256;
+
+function matchingDomain(host, domain) {
+    return Boolean(host && domain && (
+        host === domain || (!isIP(host) && host.endsWith(`.${domain}`))
+    ));
+}
+
+function matchingPath(requestPath, cookiePath) {
+    return requestPath === cookiePath || (
+        requestPath.startsWith(cookiePath) &&
+        (cookiePath.endsWith('/') || requestPath[cookiePath.length] === '/')
+    );
+}
+
+function requestScope(event) {
+    try {
+        const { hostname, pathname, protocol } = new URL(event.url);
+        return { hostname, pathname, secure: protocol === 'https:' || protocol === 'wss:' };
+    } catch {
+        return { hostname: null, pathname: '/', secure: false };
+    }
+}
+
+function newEntry(observation, scope) {
+    return {
+        name: observation.name,
+        isAntiBotToken: Boolean(observation.isAntiBotToken || ANTI_BOT_COOKIE_REGEX.test(observation.name)),
+        ...scope,
+        secure: null,
+        httpOnly: null,
+        sameSite: null,
+        firstSetAt: null,
+        firstSetByCorrelationId: null,
+        firstSetAtStep: null,
+        firstSetByTrigger: null,
+        firstSetUrl: null,
+        lastSetAt: null,
+        lastSetByCorrelationId: null,
+        lastSetAtStep: null,
+        lastValueSha256: null,
+        lastMaskedValue: COOKIE_VALUE_MASK,
+        mutationsCount: 0,
+        lastSentAt: null,
+        lastSentByCorrelationId: null,
+        lastSentAtStep: null,
+        matchesLatestSetCookie: null
+    };
+}
+
+// Track membership and the chronological tail without scanning previously recorded values.
+function remember(recent, key, value, limit) {
+    if (recent.has(key)) return false;
+    recent.set(key, value);
+    if (recent.size > limit) {
+        recent.delete(recent.keys().next().value);
+    }
+    return true;
+}
+
+function entryFor(entries, observation, scope, key) {
+    if (!entries.has(key)) {
+        entries.set(key, {
+            entry: newEntry(observation, scope),
+            history: new Map(),
+            historyCount: 0,
+            sent: new Map(),
+            sentCount: 0,
+            expiresAt: null,
+            lastSetClock: null,
+            deleted: false
+        });
+    }
+    return entries.get(key);
+}
+
+/** One projection for live capture, ledger replay, and offline queries. */
+export class CookieLineage {
+    constructor({ limit = RETAINED_OBSERVATIONS_PER_SCOPE } = {}) {
+        this.limit = limit;
+        this.byName = new Map();
+    }
+
+    observe(event) {
+        const incoming = event?.type === 'ingress';
+        if (!incoming && event?.type !== 'egress') return;
+        const timestamp = event.timestamp || null;
+        const clock = typeof event.epochMs === 'number' ? event.epochMs : Date.parse(timestamp);
+        const observations = Array.isArray(event.cookieObservations)
+            ? event.cookieObservations
+            : deriveCookieObservations(event, incoming ? 'set-cookie' : 'cookie', clock);
+        if (!observations.length) return;
+        const actionStep = redactDiagnosticText(event.attribution?.actionStep || event.actionStep || 'init');
+        const correlationId = event.correlationId || null;
+        const triggerActionId = event.triggerAction?.actionId || event.attribution?.triggerAction?.actionId || null;
+        const { hostname, pathname, secure } = requestScope(event);
+
+        for (const observation of observations) {
+            if (typeof observation?.name !== 'string' || !observation.name) continue;
+            const valueSha256 = typeof observation.valueSha256 === 'string' && /^[0-9a-f]{64}$/i.test(observation.valueSha256)
+                ? observation.valueSha256.toLowerCase() : null;
+            const partitionKey = typeof observation.partitionKey === 'string'
+                ? redactUrlSecrets(observation.partitionKey)
+                : typeof event.cookiePartitionKey === 'string' ? redactUrlSecrets(event.cookiePartitionKey) : null;
+            if (!this.byName.has(observation.name)) {
+                this.byName.set(observation.name, new Map());
+            }
+            const entries = this.byName.get(observation.name);
+
+            if (incoming) {
+                const hostOnly = !observation.domain;
+                const declaredDomain = String(observation.domain || '').replace(/^\./, '');
+                const domain = hostOnly
+                    ? hostname
+                    : /[\s@/#?]/.test(declaredDomain) ? '' : domainToASCII(declaredDomain);
+                const path = typeof observation.path === 'string' && observation.path.startsWith('/')
+                    ? redactUrlSecrets(observation.path)
+                    : pathname.slice(0, pathname.lastIndexOf('/')) || '/';
+                const partitioned = Boolean(observation.partitioned || partitionKey);
+                const scopeStatus = matchingDomain(hostname, domain) ? 'set-cookie' : 'unknown';
+                const scope = { domain: domain || hostname, hostOnly, path, partitioned, partitionKey, scopeStatus };
+                const scopeKey = JSON.stringify([scopeStatus, domain, hostOnly, path, partitioned, partitionKey,
+                    scopeStatus === 'unknown' ? hostname : null]);
+                const state = entryFor(entries, observation, scope, scopeKey);
+                const { entry } = state;
+                const maxAge = observation.maxAge;
+                const expiresAt = Number.isFinite(maxAge) ? clock + maxAge * 1000 : Date.parse(observation.expires);
+                const isDeleted = Boolean(observation.isDeleted || expiresAt <= clock || maxAge === 0);
+                if (!state.historyCount) {
+                    entry.firstSetAt = timestamp;
+                    entry.firstSetByCorrelationId = correlationId;
+                    entry.firstSetAtStep = actionStep;
+                    entry.firstSetByTrigger = triggerActionId;
+                    entry.firstSetUrl = event.url ? redactUrlSecrets(event.url) : null;
+                }
+                if (entry.lastValueSha256 !== valueSha256 || state.deleted !== isDeleted) {
+                    entry.mutationsCount += 1;
+                }
+                entry.secure = Boolean(observation.secure);
+                entry.httpOnly = Boolean(observation.httpOnly);
+                entry.sameSite = observation.sameSite == null ? null : redactDiagnosticText(observation.sameSite);
+                entry.lastSetAt = timestamp;
+                entry.lastSetByCorrelationId = correlationId;
+                entry.lastSetAtStep = actionStep;
+                entry.lastValueSha256 = valueSha256;
+                state.lastSetClock = clock;
+                state.expiresAt = expiresAt;
+                state.deleted = isDeleted;
+                const historyKey = JSON.stringify([correlationId ?? timestamp, valueSha256, isDeleted]);
+                const stored = remember(state.history, historyKey, {
+                    correlationId, actionStep, triggerActionId, timestamp,
+                    status: event.status ?? null, valueSha256, maskedValue: COOKIE_VALUE_MASK, isDeleted
+                }, this.limit);
+                if (stored) state.historyCount += 1;
+                continue;
+            }
+
+            const candidates = [];
+            for (const state of entries.values()) {
+                const { entry } = state;
+                if (entry.scopeStatus !== 'set-cookie' || state.deleted || state.expiresAt <= clock ||
+                    state.lastSetClock > clock || !valueSha256 || valueSha256 !== entry.lastValueSha256 || (entry.secure && !secure) ||
+                    !hostname || !(entry.hostOnly ? hostname === entry.domain : matchingDomain(hostname, entry.domain)) ||
+                    !matchingPath(pathname, entry.path) ||
+                    (entry.partitioned && partitionKey && entry.partitionKey && entry.partitionKey !== partitionKey)) {
+                    continue;
+                }
+                candidates.push(state);
+            }
+            const candidate = candidates.length === 1 ? candidates[0] : null;
+            const matched = candidate && (!candidate.entry.partitioned || (
+                partitionKey && candidate.entry.partitionKey === partitionKey
+            ));
+            const scopeStatus = candidates.length ? 'ambiguous' : 'unmatched';
+            const state = matched ? candidate : entryFor(entries, observation, {
+                domain: hostname, hostOnly: null, path: null, partitioned: null, partitionKey, scopeStatus
+            }, JSON.stringify([scopeStatus, hostname, partitionKey]));
+            if (!correlationId || remember(state.sent, correlationId, correlationId, this.limit)) {
+                state.sentCount += 1;
+            }
+            state.entry.lastSentAt = timestamp;
+            state.entry.lastSentByCorrelationId = correlationId;
+            state.entry.lastSentAtStep = actionStep;
+            state.entry.matchesLatestSetCookie = matched ? true : null;
+        }
+    }
+
+    snapshot() {
+        return Object.fromEntries(Array.from(this.byName, ([name, entries]) => {
+            const instances = Array.from(entries.values(), ({ entry, history, historyCount, sent, sentCount }) => ({
+                ...entry,
+                sentCount,
+                valueHistory: Array.from(history.values(), (value) => ({ ...value })),
+                valueHistoryOmittedCount: historyCount - history.size,
+                sentInCorrelationIds: Array.from(sent.keys())
+            }));
+            const lineage = instances.length === 1
+                ? instances[0]
+                : { name, isAntiBotToken: instances.some((entry) => entry.isAntiBotToken), instances };
+            return [name, lineage];
+        }));
+    }
+}

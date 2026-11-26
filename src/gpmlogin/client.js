@@ -4,6 +4,7 @@
  */
 
 import axios from 'axios';
+import config from '../config.js';
 import logger from '../utils/logger.js';
 import {
     controllerApiUrl,
@@ -11,10 +12,23 @@ import {
     parseControllerUrl,
     validateControllerEndpoint
 } from '../utils/controller-url.js';
+import { profileIdPathComponent, requireControllerProfileId } from '../utils/controller-id.js';
+import { controllerErrorDetails, controllerRejected, sendControllerRequest } from '../utils/controller-request.js';
 import { requireProxyProtocol } from '../utils/proxy-protocol.js';
 
-const GPM_API_URL = process.env.GPM_API_URL || 'http://127.0.0.1:14517';
+const GPM_API_URL = config.gpmlogin.apiUrl;
 const controllerClient = axios.create(controllerRequestOptions);
+
+function gpmApiUrl(path) {
+    return controllerApiUrl(GPM_API_URL, path, 'GPM_TRUSTED_HTTP_API_URL');
+}
+
+function gpmStopCode(data) {
+    const message = data?.message;
+    if (typeof message === 'string' && /^(?:profile (?:is )?)?(?:not found|already stopped|not running)\.?$/i.test(message.trim())) {
+        return 'PROFILE_ALREADY_STOPPED';
+    }
+}
 
 /**
  * Generate realistic Android User-Agent with variations
@@ -226,22 +240,12 @@ export function generateAndroidFingerprint() {
  */
 export async function checkGPMConnection() {
     try {
-        const response = await controllerClient.get(controllerApiUrl(GPM_API_URL, '/api/v3/profiles'), {
-            timeout: 5000
-        });
+        const url = gpmApiUrl('/api/v3/profiles');
+        await sendControllerRequest('GPM API connection check', () => controllerClient.get(url, { timeout: 5000 }));
         logger.info('GPM API is connected and responding');
         return true;
     } catch (error) {
-        if (error.code === 'ECONNREFUSED') {
-            logger.error('GPM API is not running or not accessible', {
-                url: GPM_API_URL,
-                suggestion: 'Please make sure GPM Login is running'
-            });
-        } else if (error.code === 'ETIMEDOUT') {
-            logger.error('GPM API connection timeout', { url: GPM_API_URL });
-        } else {
-            logger.error('GPM API Error', { error: error.message });
-        }
+        logger.error('GPM API connection check failed', controllerErrorDetails(error));
         return false;
     }
 }
@@ -340,74 +344,40 @@ export async function createProfile(profileName, proxy = null) {
             }
             
             requestBody.raw_proxy = rawProxy;
-            logger.info('Creating profile with proxy', {
-                proxy: `${proxy.ip}:${proxy.port}`,
-                type: proxyType
-            });
+            logger.info('Creating profile with proxy', { protocol: proxyType });
         }
         
         logger.info('Creating GPM profile', { name: finalName, userAgent: userAgent.substring(0, 50) + '...' });
         
-        const response = await controllerClient.post(controllerApiUrl(GPM_API_URL, '/api/v3/profiles/create'), requestBody, {
-            headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            },
-            timeout: 10000
-        });
-        
+        const url = gpmApiUrl('/api/v3/profiles/create');
+        const response = await sendControllerRequest('GPM API create profile', () =>
+            controllerClient.post(url, requestBody, {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                },
+                timeout: 10000
+            })
+        );
+
         let responseData = response.data;
         if (typeof responseData === 'string') {
             try {
                 responseData = JSON.parse(responseData);
-            } catch (e) {
-                throw new Error(`Failed to parse response: ${responseData}`);
+            } catch {
+                throw new Error('GPM API returned invalid JSON while creating a profile');
             }
         }
-        
-        if (responseData && responseData.success === false) {
-            const errorMsg = responseData.message || 'Unknown error';
-            throw new Error(`GPM API Error: ${errorMsg}`);
+
+        if (responseData?.success === false) {
+            throw new Error('GPM API rejected profile creation');
         }
-        
-        if (responseData && responseData.success === true) {
-            if (responseData.data) {
-                return { ...responseData.data, userAgent };
-            }
-            return { ...responseData, userAgent };
-        }
-        
-        if (responseData) {
-            if (responseData.data) {
-                return { ...responseData.data, userAgent };
-            }
-            if (responseData.id) {
-                return { ...responseData, userAgent };
-            }
-        }
-        
-        throw new Error(`Invalid response from GPM API: ${JSON.stringify(responseData)}`);
+
+        const profile = responseData?.data || responseData;
+        const id = requireControllerProfileId(profile?.id);
+        return { ...profile, id, userAgent };
     } catch (error) {
-        if (error.response) {
-            logger.error('GPM API Error Response', {
-                status: error.response.status,
-                data: error.response.data
-            });
-            let errorMsg = 'Unknown error';
-            const errorData = error.response.data;
-            if (typeof errorData === 'string') {
-                try {
-                    const parsed = JSON.parse(errorData);
-                    errorMsg = parsed.message || errorData;
-                } catch (e) {
-                    errorMsg = errorData;
-                }
-            } else if (errorData && errorData.message) {
-                errorMsg = errorData.message;
-            }
-            throw new Error(`GPM API Error: ${error.response.status} - ${errorMsg}`);
-        }
-        logger.error('Error creating profile', { error: error.message });
+        logger.error('GPM API create profile failed', controllerErrorDetails(error));
         throw error;
     }
 }
@@ -436,12 +406,14 @@ export async function startProfile(profileId, options = {}) {
             params.append('addination_args', options.addination_args);
         }
         
-        let url = controllerApiUrl(GPM_API_URL, `/api/v3/profiles/start/${profileId}`);
+        let url = gpmApiUrl(`/api/v3/profiles/start/${profileIdPathComponent(profileId)}`);
         if (params.toString()) {
             url += `?${params.toString()}`;
         }
         
-        const response = await controllerClient.get(url, { timeout: 30000 });
+        const response = await sendControllerRequest('GPM API start profile', () =>
+            controllerClient.get(url, { timeout: 30000 })
+        );
         
         if (response.data) {
             const data = response.data.data || response.data;
@@ -456,16 +428,9 @@ export async function startProfile(profileId, options = {}) {
             }
         }
         
-        throw new Error(`Invalid response from GPM API: ${JSON.stringify(response.data)}`);
+        throw new Error('GPM API returned an invalid profile startup response');
     } catch (error) {
-        if (error.response) {
-            logger.error('GPM API Error Response', {
-                status: error.response.status,
-                data: error.response.data
-            });
-            throw new Error(`GPM API Error: ${error.response.status} - ${JSON.stringify(error.response.data)}`);
-        }
-        logger.error('Error starting profile', { error: error.message });
+        logger.error('GPM API start profile failed', controllerErrorDetails(error));
         throw error;
     }
 }
@@ -475,64 +440,38 @@ export async function startProfile(profileId, options = {}) {
  * إيقاف بروفايل بالمعرف
  */
 export async function stopProfile(profileId, maxRetries = 3) {
-    if (!profileId) {
-        logger.warn('No profile ID provided, skipping stopProfile');
+    let url;
+    try {
+        url = gpmApiUrl(`/api/v3/profiles/stop/${profileIdPathComponent(profileId)}`);
+    } catch (error) {
+        logger.warn('GPM API stop profile failed', controllerErrorDetails(error));
         return false;
     }
-    
-    let lastError = null;
-    
+
+    let lastError;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            const response = await controllerClient.get(controllerApiUrl(GPM_API_URL, `/api/v3/profiles/stop/${profileId}`), {
-                timeout: 10000
-            });
-            
-            if (response.status === 200) {
-                if (attempt > 1) {
-                    logger.info(`Profile stopped (attempt ${attempt}/${maxRetries})`, { profileId });
-                }
-                return true;
-            }
+            const response = await sendControllerRequest('GPM API stop profile', () =>
+                controllerClient.get(url, { timeout: 10000 }), gpmStopCode
+            );
+            if ((response.status === 200 || response.status === 204) && !controllerRejected(response.data)) return true;
+            break;
         } catch (error) {
+            if (error.status === 404) return true;
+            if ((error.status === 400 || error.status === 409) && error.providerCode === 'PROFILE_ALREADY_STOPPED') return true;
             lastError = error;
-            
-            if (error.response) {
-                const status = error.response.status;
-                const message = error.response.data?.message || error.message || '';
-                
-                if (status === 404 || 
-                    message.toLowerCase().includes('not found') ||
-                    message.toLowerCase().includes('already stopped') ||
-                    message.toLowerCase().includes('not running')) {
-                    logger.info('Profile is already stopped', { profileId, status });
-                    return true;
-                }
-            }
-            
-            if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT' || error.code === 'ECONNRESET') {
-                if (attempt < maxRetries) {
-                    const delay = attempt * 1000;
-                    logger.warn(`Error stopping profile (attempt ${attempt}/${maxRetries}), retrying...`, {
-                        profileId,
-                        error: error.message,
-                        delay: `${delay}ms`
-                    });
-                    await new Promise(resolve => setTimeout(resolve, delay));
-                    continue;
-                }
-            }
-            
-            if (attempt === 1) {
-                logger.warn('Error stopping profile', { profileId, error: error.message });
-            }
+
+            const retryable = ['ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET', 'ECONNABORTED'].includes(error.transportCode);
+            if (!retryable || attempt === maxRetries) break;
+            const delay = attempt * 1000;
+            logger.warn('GPM API stop profile failed, retrying', {
+                ...controllerErrorDetails(error), attempt, delay
+            });
+            await new Promise(resolve => setTimeout(resolve, delay));
         }
     }
-    
-    logger.error(`Failed to stop profile after ${maxRetries} attempts`, {
-        profileId,
-        error: lastError?.message || 'Unknown error'
-    });
+
+    logger.error('GPM API stop profile failed', controllerErrorDetails(lastError));
     return false;
 }
 
@@ -542,42 +481,24 @@ export async function stopProfile(profileId, maxRetries = 3) {
  */
 export async function deleteProfile(profileId, mode = 2) {
     try {
-        if (!profileId) {
-            throw new Error('Profile ID is required');
-        }
-        
-        logger.info('Deleting profile', { profileId, mode });
-        
-        const deleteUrl = controllerApiUrl(GPM_API_URL, `/api/v3/profiles/delete/${profileId}?mode=${mode}`);
-        const response = await controllerClient.delete(deleteUrl, {
-            headers: {
-                'Accept': 'application/json'
-            },
-            timeout: 15000
-        });
-        
-        if (response.status === 200 || response.status === 204) {
-            const responseData = response.data || {};
-            if (responseData.success !== false) {
-                logger.info('Profile deleted successfully', { profileId, mode });
-                return true;
-            } else {
-                throw new Error(responseData.message || 'Delete failed');
-            }
-        }
-    } catch (error) {
-        if (error.response && error.response.status === 404) {
-            logger.info('Profile not found (may already be deleted)', { profileId });
+        const id = profileIdPathComponent(profileId);
+        const query = new URLSearchParams({ mode });
+        const url = gpmApiUrl(`/api/v3/profiles/delete/${id}?${query}`);
+        const response = await sendControllerRequest('GPM API delete profile', () =>
+            controllerClient.delete(url, {
+                headers: { 'Accept': 'application/json' },
+                timeout: 15000
+            })
+        );
+
+        if ((response.status === 200 || response.status === 204) && !controllerRejected(response.data)) {
+            logger.info('GPM API profile deleted successfully', { profileId: id });
             return true;
         }
-        if (error.response) {
-            logger.error('GPM API Error Response', {
-                status: error.response.status,
-                data: error.response.data
-            });
-            throw new Error(`GPM API Error: ${error.response.status} - ${JSON.stringify(error.response.data)}`);
-        }
-        logger.error('Error deleting profile', { error: error.message });
+        throw new Error('GPM API did not confirm profile deletion');
+    } catch (error) {
+        if (error.status === 404) return true;
+        logger.error('GPM API delete profile failed', controllerErrorDetails(error));
         throw error;
     }
 }
@@ -588,21 +509,14 @@ export async function deleteProfile(profileId, mode = 2) {
  */
 export async function getProfile(profileId) {
     try {
-        const response = await controllerClient.get(controllerApiUrl(GPM_API_URL, `/api/v3/profiles/${profileId}`), {
-            timeout: 10000
-        });
-        
-        const profileData = response.data?.data || response.data;
-        return profileData;
+        const url = gpmApiUrl(`/api/v3/profiles/${profileIdPathComponent(profileId)}`);
+        const response = await sendControllerRequest('GPM API get profile', () =>
+            controllerClient.get(url, { timeout: 10000 })
+        );
+        if (controllerRejected(response.data)) throw new Error('GPM API rejected the profile lookup');
+        return response.data?.data || response.data;
     } catch (error) {
-        if (error.response) {
-            logger.error('GPM API Error Response', {
-                status: error.response.status,
-                data: error.response.data
-            });
-            throw new Error(`GPM API Error: ${error.response.status} - ${JSON.stringify(error.response.data)}`);
-        }
-        logger.error('Error getting profile', { error: error.message });
+        logger.error('GPM API get profile failed', controllerErrorDetails(error));
         throw error;
     }
 }

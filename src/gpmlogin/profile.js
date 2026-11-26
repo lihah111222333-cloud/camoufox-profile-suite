@@ -7,6 +7,7 @@ import puppeteer from 'puppeteer-core';
 import axios from 'axios';
 import logger from '../utils/logger.js';
 import gpmClient from './client.js';
+import ManagedProfile, { rollbackNewManagedProfile } from '../utils/managed-profile.js';
 import {
     ControllerUrlError,
     connectBrowser,
@@ -55,19 +56,16 @@ async function discoverBrowserEndpoint(controller, paths, timeout) {
     return null;
 }
 
-class GPMLoginProfile {
+class GPMLoginProfile extends ManagedProfile {
     constructor(profileId, remoteDebuggingAddress = null) {
-        this.profileId = profileId;
-        this.browser = null;
-        this.page = null;
-        this.remoteDebuggingAddress = remoteDebuggingAddress;
+        super(profileId, gpmClient, 'remoteDebuggingAddress', remoteDebuggingAddress, () => this.#startBrowser());
     }
 
     /**
      * Start profile and get browser instance
      * بدء البروفايل والحصول على متصفح
      */
-    async start() {
+    async #startBrowser() {
         try {
             logger.info('Starting GPM profile', { profileId: this.profileId });
 
@@ -317,77 +315,6 @@ class GPMLoginProfile {
             logger.warn('Failed to inject anti-detection scripts', { error: error.message });
         }
     }
-
-    /**
-     * Get browser instance (creates new if needed)
-     * الحصول على متصفح (إنشاء جديد إذا لزم الأمر)
-     */
-    async getBrowser() {
-        if (!this.browser) {
-            await this.start();
-        }
-        return this.browser;
-    }
-
-    /**
-     * Get page instance
-     * الحصول على صفحة
-     */
-    async getPage() {
-        if (!this.page) {
-            const browser = await this.getBrowser();
-            const pages = await browser.pages();
-            this.page = pages[0] || await browser.newPage();
-        }
-        return this.page;
-    }
-
-    /**
-     * Stop profile
-     * إيقاف البروفايل
-     */
-    async stop() {
-        try {
-            if (this.browser) {
-                try {
-                    await this.browser.disconnect();
-                } catch (e) {
-                    // Ignore disconnect errors
-                }
-                this.browser = null;
-                this.page = null;
-            }
-
-            await gpmClient.stopProfile(this.profileId);
-            logger.info('Profile stopped', { profileId: this.profileId });
-            return true;
-        } catch (error) {
-            logger.warn('Error stopping profile', { 
-                profileId: this.profileId, 
-                error: error.message 
-            });
-            return false;
-        }
-    }
-
-    /**
-     * Delete profile
-     * حذف البروفايل
-     */
-    async delete() {
-        try {
-            await this.stop();
-            await gpmClient.deleteProfile(this.profileId);
-            logger.info('Profile deleted', { profileId: this.profileId });
-            return true;
-        } catch (error) {
-            logger.error('Failed to delete profile', { 
-                profileId: this.profileId, 
-                error: error.message 
-            });
-            throw error;
-        }
-    }
 }
 
 /**
@@ -395,6 +322,7 @@ class GPMLoginProfile {
  * إنشاء وبدء بروفايل جديد
  */
 export async function createAndStartProfile(name, proxy = null) {
+    let profileManager;
     try {
         // Check GPM connection first
         const isConnected = await gpmClient.checkGPMConnection();
@@ -406,39 +334,21 @@ export async function createAndStartProfile(name, proxy = null) {
         logger.info('Creating GPM profile...');
         const profile = await gpmClient.createProfile(name, proxy);
         
-        if (!profile.id) {
-            throw new Error('Failed to create profile: No profile ID returned');
-        }
+        profileManager = new GPMLoginProfile(profile?.id);
 
-        logger.info('Profile created', { 
-            profileId: profile.id, 
-            name: profile.profile_name || name,
-            userAgent: profile.userAgent?.substring(0, 50) + '...' || 'N/A'
-        });
+        logger.info('Profile created', { profileId: profile.id });
 
         // Wait a bit for profile to be ready
         logger.info('Waiting for profile initialization...');
         await new Promise(resolve => setTimeout(resolve, 3000));
 
-        // Start profile
-        logger.info('Starting GPM profile...');
-        const startData = await gpmClient.startProfile(profile.id);
-        
-        if (!startData.remote_debugging_address) {
-            throw new Error('Failed to start profile: No remote debugging address returned');
-        }
-
-        // Connect to browser
-        const profileManager = new GPMLoginProfile(profile.id, startData.remote_debugging_address);
         await profileManager.start();
 
-        logger.info('Profile created and started', { 
-            profileId: profile.id, 
-            name: profile.profile_name || name 
-        });
+        logger.info('Profile created and started', { profileId: profile.id });
         
         return profileManager;
     } catch (error) {
+        if (profileManager) throw await rollbackNewManagedProfile(profileManager, error);
         logger.error('Failed to create and start profile', { error: error.message });
         throw error;
     }

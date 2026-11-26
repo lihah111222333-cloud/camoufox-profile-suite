@@ -309,22 +309,34 @@ test('Win32 compatibility uses existing filesystem permissions for ordinary file
 });
 
 const npmScript = /[/\\]npm-cli\.js$/.test(process.env.npm_execpath || '') ? process.env.npm_execpath : null;
+const publicFiles = JSON.parse(fs.readFileSync(path.join(PROJECT, 'package.json'), 'utf8')).files;
 
-test('npm package includes public config but excludes operator files', {
+test('npm tarball contains exactly the public files from a checkout with local state', {
     skip: process.platform === 'win32' && !npmScript
 }, (t) => {
     const directory = temporaryDirectory(t);
     const packageRoot = path.join(directory, 'package');
-    for (const file of [
-        'package.json', '.gitignore', '.env.example', 'config/names.json', 'docs/openapi-default.json',
-        'src/index.js', 'src/utils/account-results.js', 'src/utils/private-storage.js'
-    ]) {
+    const expected = ['package.json', ...publicFiles];
+    for (const file of [...expected, '.gitignore', 'tests/security/distribution.test.js']) {
         copyProjectFile(packageRoot, file);
     }
-    const privateFiles = ['config/proxies.txt', 'config/operator-local.json', '.env', '.emv'];
+    const privateFiles = [
+        'config/proxies.txt', 'config/operator-local.json', '.env', '.emv', 'traffic.har',
+        'bin/operator-copy.txt', 'src/custom store/profile/profile.json',
+        'src/custom store/profile/storage-state.json', 'src/custom store/profile/traffic/payloads/part.bin',
+        'src/custom store/profile/.native/sslkeylog.txt', 'scripts/archived-capture.har',
+        'docs/local-export.json', 'assets/operator-copy.jpeg'
+    ];
     for (const file of privateFiles) {
-        fs.writeFileSync(path.join(packageRoot, file), FAKE_PASSWORD);
+        const destination = path.join(packageRoot, file);
+        fs.mkdirSync(path.dirname(destination), { recursive: true });
+        fs.writeFileSync(destination, FAKE_PASSWORD);
     }
+    const stateDirectory = path.join(directory, 'state');
+    fs.mkdirSync(stateDirectory, { mode: 0o700 });
+    const envFile = path.join(stateDirectory, '.env');
+    const customStore = 'CAMOUFOX_STORAGE_DIR="./src/custom store"\n';
+    fs.writeFileSync(envFile, customStore, { mode: 0o600 });
     const userConfig = path.join(directory, 'empty-user-npmrc');
     const globalConfig = path.join(directory, 'empty-global-npmrc');
     fs.writeFileSync(userConfig, '');
@@ -332,31 +344,59 @@ test('npm package includes public config but excludes operator files', {
 
     const npm = npmScript ? process.execPath : 'npm';
     const argv = npmScript ? [npmScript] : [];
-    const packed = spawnSync(npm, [
-        ...argv, 'pack', '--dry-run', '--ignore-scripts', '--offline', '--json',
+    const pack = () => spawnSync(npm, [
+        ...argv, 'pack', '--offline', '--json',
         '--cache', path.join(directory, 'cache'), '--userconfig', userConfig, '--globalconfig', globalConfig
     ], {
         cwd: packageRoot,
-        env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot },
+        env: {
+            PATH: process.env.PATH,
+            SystemRoot: process.env.SystemRoot,
+            NODE_OPTIONS: process.env.NODE_OPTIONS,
+            GMAIL_CREATOR_STATE_DIR: stateDirectory
+        },
         encoding: 'utf8'
     });
+    const packed = pack();
     assert.equal(packed.status, 0, packed.error?.message || packed.stderr);
-    const [{ files }] = JSON.parse(packed.stdout);
-    const packaged = new Set(files.map((file) => file.path));
-    assert.ok(packaged.has('config/names.json'));
-    assert.ok(packaged.has('.env.example'));
-    assert.ok(packaged.has('docs/openapi-default.json'));
-    assert.ok(packaged.has('src/utils/account-results.js'));
-    assert.ok(packaged.has('src/utils/private-storage.js'));
-    for (const file of privateFiles) {
-        assert.ok(!packaged.has(file), file);
+    const [{ files: packedFiles, filename }] = JSON.parse(packed.stdout);
+    assert.deepEqual(packedFiles.map((file) => file.path).sort(), expected.sort());
+    for (const file of ['bin/gmail-account-creator.js', 'src/index.js', 'config/names.json', '.env.example',
+        'docs/openapi-default.json', 'src/utils/account-results.js', 'src/utils/private-storage.js']) {
+        assert.ok(expected.includes(file), file);
     }
+
+    if (process.platform !== 'win32') {
+        const archive = spawnSync('tar', ['-tzf', path.join(packageRoot, filename)], {
+            env: { PATH: process.env.PATH }, encoding: 'utf8'
+        });
+        assert.equal(archive.status, 0, archive.error?.message || archive.stderr);
+        assert.deepEqual(archive.stdout.trim().split('\n').sort(), expected.map((file) => `package/${file}`).sort());
+    }
+
+    fs.writeFileSync(envFile, 'CAMOUFOX_STORAGE_DIR=./src\n');
+    const overlappingStore = pack();
+    assert.notEqual(overlappingStore.status, 0);
+    assert.match(overlappingStore.stderr, /Expected an allowed public file for packaging/);
+    fs.writeFileSync(envFile, customStore);
+
+    // npm implicitly includes root README variants even with an explicit files list.
+    fs.writeFileSync(path.join(packageRoot, 'README.local-copy'), FAKE_PASSWORD);
+    const blocked = pack();
+    assert.notEqual(blocked.status, 0);
+    assert.match(blocked.stderr, /additional file that npm would include/);
+    assert.ok(!blocked.stderr.includes(FAKE_PASSWORD));
 });
+
+const commitFixtureFiles = ['PUSH_TO_GITHUB.sh', 'scripts/check-distribution.mjs', 'package.json',
+    ...publicFiles.filter((file) => file.startsWith('src/'))];
 
 function temporaryRepository(t, includeIgnore = true) {
     const directory = temporaryDirectory(t);
     const root = path.join(directory, 'repository');
-    copyProjectFile(root, 'PUSH_TO_GITHUB.sh');
+    for (const file of commitFixtureFiles) {
+        copyProjectFile(root, file);
+    }
     if (includeIgnore) {
         copyProjectFile(root, '.gitignore');
     }
@@ -364,6 +404,8 @@ function temporaryRepository(t, includeIgnore = true) {
     fs.writeFileSync(globalConfig, '');
     const env = {
         PATH: process.env.PATH,
+        NODE_OPTIONS: process.env.NODE_OPTIONS,
+        GMAIL_CREATOR_STATE_DIR: path.join(directory, 'state'),
         GIT_CONFIG_GLOBAL: globalConfig,
         GIT_CONFIG_NOSYSTEM: '1',
         GIT_TERMINAL_PROMPT: '0'
@@ -371,15 +413,18 @@ function temporaryRepository(t, includeIgnore = true) {
     const git = (...args) => spawnSync('git', args, { cwd: root, env, encoding: 'utf8' });
     const initialize = git('init', '-q');
     assert.equal(initialize.status, 0, initialize.error?.message || initialize.stderr);
-    const prepareCommit = (input) => spawnSync('bash', ['PUSH_TO_GITHUB.sh'], {
-        cwd: root, env, input, encoding: 'utf8'
+    const prepareCommit = (input, stateDirectory = env.GMAIL_CREATOR_STATE_DIR) => spawnSync('bash', ['PUSH_TO_GITHUB.sh'], {
+        cwd: root, env: { ...env, GMAIL_CREATOR_STATE_DIR: stateDirectory }, input, encoding: 'utf8'
     });
     return { root, git, prepareCommit };
 }
 
 test('commit helper rejects credential files already in its index', { skip: process.platform === 'win32' }, (t) => {
     const { root, git, prepareCommit } = temporaryRepository(t);
-    for (const file of ['.env.production', '.emv', 'config/proxies.txt', 'results.json']) {
+    for (const file of [
+        '.env.production', '.emv', 'config/proxies.txt', 'results.json', 'traffic.har',
+        'custom/profile/profile.json', 'custom/profile/storage-state.json', 'custom/profile/.native/sslkeylog.txt'
+    ]) {
         const fullPath = path.join(root, file);
         fs.mkdirSync(path.dirname(fullPath), { recursive: true });
         fs.writeFileSync(fullPath, FAKE_PASSWORD);
@@ -403,22 +448,90 @@ test('commit helper rejects an unignored secret before staging', { skip: process
     assert.equal(git('ls-files').stdout, '');
 });
 
+test('commit helper excludes resolved storage roots and rejects existing index entries there', {
+    skip: process.platform === 'win32'
+}, (t) => {
+    const { root, git, prepareCommit } = temporaryRepository(t);
+    const store = 'src/runtime [store]';
+    const privateFile = `${store}/unrecognized-output.bin`;
+    const sourceFile = `${store}-helper.js`;
+    const stateDir = 'operator state';
+    const stateFile = `${stateDir}/unrecognized-output.bin`;
+    fs.mkdirSync(path.join(root, store));
+    fs.mkdirSync(path.join(root, stateDir));
+    const link = spawnSync('ln', ['-s', store, 'active-store'], {
+        cwd: root, env: { PATH: process.env.PATH }, encoding: 'utf8'
+    });
+    assert.equal(link.status, 0, link.error?.message || link.stderr);
+    fs.writeFileSync(path.join(root, '.env'), 'CAMOUFOX_STORAGE_DIR=./active-store\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(root, privateFile), FAKE_PASSWORD);
+    fs.writeFileSync(path.join(root, stateFile), FAKE_PASSWORD);
+    fs.writeFileSync(path.join(root, sourceFile), '// public source fixture\n');
+    const stateDirectory = path.join(root, stateDir);
+    const cancelled = prepareCommit('n\n', stateDirectory);
+    assert.match(cancelled.stdout, /Cancelled/);
+    const staged = git('ls-files', '-z').stdout.split('\0');
+    assert.ok(staged.includes(sourceFile));
+    assert.ok(!staged.includes(privateFile));
+    assert.ok(!staged.includes(stateFile));
+    assert.ok(!staged.includes('active-store'));
+
+    for (const file of [privateFile, stateFile]) {
+        assert.equal(git('add', '--', file).status, 0);
+        const blocked = prepareCommit('y\n', stateDirectory);
+        assert.equal(blocked.status, 1);
+        assert.match(blocked.stderr, /Sensitive file would be included in the commit/);
+        assert.ok(blocked.stderr.includes(file));
+        assert.equal(git('rm', '--cached', '--', file).status, 0);
+    }
+});
+
+test('commit helper checks .npmrc in both the worktree and index and accepts environment references', {
+    skip: process.platform === 'win32'
+}, (t) => {
+    const { root, git, prepareCommit } = temporaryRepository(t, false);
+    const config = path.join(root, '.npmrc');
+    const inline = `//registry.example.test/:_authToken = "${FAKE_PASSWORD}"\n`;
+    const environment = '//registry.example.test/:_authToken=${GITHUB_PACKAGES_TOKEN}\n';
+    fs.writeFileSync(config, inline);
+    const unstaged = prepareCommit('y\n');
+    assert.equal(unstaged.status, 1);
+    assert.match(unstaged.stderr, /Sensitive file would be included in the commit.*\.npmrc/);
+    assert.ok(!unstaged.stderr.includes(FAKE_PASSWORD));
+    assert.equal(git('ls-files').stdout, '');
+
+    assert.equal(git('add', '--', '.npmrc').status, 0);
+    fs.writeFileSync(config, environment);
+    const staged = prepareCommit('y\n');
+    assert.equal(staged.status, 1);
+    assert.match(staged.stderr, /Sensitive file would be included in the commit.*\.npmrc/);
+    assert.ok(!staged.stderr.includes(FAKE_PASSWORD));
+
+    assert.equal(git('add', '--', '.npmrc').status, 0);
+    const cancelled = prepareCommit('n\n');
+    assert.match(cancelled.stdout, /Cancelled/);
+});
+
 test('environment template can be staged while local variants are ignored', { skip: process.platform === 'win32' }, (t) => {
     const { root, git, prepareCommit } = temporaryRepository(t);
     copyProjectFile(root, '.env.example');
-    for (const file of ['.env', '.env.production', '.emv', '.emv.local']) {
-        fs.writeFileSync(path.join(root, file), FAKE_PASSWORD);
+    for (const file of ['.env', '.env.production', '.emv', '.emv.local', 'traffic.har', '.npmrc']) {
+        fs.writeFileSync(path.join(root, file), `FIXTURE=${FAKE_PASSWORD}\n`, { mode: 0o600 });
     }
     const cancelled = prepareCommit('n\n');
     assert.equal(cancelled.status, 1);
     assert.ok(cancelled.stdout.includes('Cancelled'));
     const staged = git('ls-files');
     assert.equal(staged.status, 0, staged.stderr);
-    assert.deepEqual(staged.stdout.trim().split('\n'), ['.env.example', '.gitignore', 'PUSH_TO_GITHUB.sh']);
+    assert.deepEqual(staged.stdout.trim().split('\n'), ['.env.example', '.gitignore', ...commitFixtureFiles].sort());
 });
 
 test('OpenAPI includes placeholders in profile, proxy and token examples', () => {
     const specification = JSON.parse(fs.readFileSync(path.join(PROJECT, 'docs/openapi-default.json'), 'utf8'));
+    assert.match(specification.info.description, /generate -i docs\/openapi-default\.json/);
+    assert.match(specification.info.description, /readFileSync\('docs\/openapi-default\.json'/);
+    assert.match(specification.info.description, /verify the exact API origin/);
+    assert.doesNotMatch(specification.info.description, /http:\/\/[^\s]+\/openapi/);
     const profile = specification.paths['/api/profile/detail'].post.responses['200'].content['application/json'].example;
     assert.ok(profile.sk === 'REPLACE_WITH_SECRET_KEY');
     for (const cookie of JSON.parse(profile.cookie)) {

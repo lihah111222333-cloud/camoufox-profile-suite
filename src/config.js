@@ -3,45 +3,18 @@
  * إعدادات التطبيق
  */
 
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import { parseAccountCount, parseThreadCount } from './utils/cli-counts.js';
+import { loadPrivateEnvironment } from './utils/private-env.js';
+import { getDefaultProfilesDirectory } from './utils/state-paths.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-function loadEnvFileSafe(filePath) {
-    try {
-        if (!fs.existsSync(filePath)) return;
-        if (typeof process.loadEnvFile === 'function') {
-            process.loadEnvFile(filePath);
-            return;
-        }
-        const lines = fs.readFileSync(filePath, 'utf8').split(/\r?\n/);
-        for (const rawLine of lines) {
-            const line = rawLine.trim();
-            if (!line || line.startsWith('#')) continue;
-            const eqIdx = line.indexOf('=');
-            if (eqIdx <= 0) continue;
-            const key = line.slice(0, eqIdx).trim();
-            const val = line.slice(eqIdx + 1).trim().replace(/^['"]|['"]$/g, '');
-            if (!(key in process.env)) {
-                process.env[key] = val;
-            }
-        }
-    } catch {
-        // Ignore missing/unreadable .env file
-    }
+try {
+    loadPrivateEnvironment('.env', '.emv', () => !process.env.PROFILE_SERVICE && !process.env.DOLPHIN_API_KEY);
+} catch (error) {
+    throw Object.assign(error, { code: 'PRIVATE_ENV_CONFIGURATION_ERROR' });
 }
 
-// Load .env file first, then try .emv if .env doesn't exist
-// تحميل ملف .env أولاً، ثم تجربة .emv إذا لم يوجد .env
-loadEnvFileSafe(path.resolve(__dirname, '../.env'));
-// Also try loading .emv if .env doesn't have required variables
-// أيضاً جرب تحميل .emv إذا لم يكن .env يحتوي على المتغيرات المطلوبة
-if (!process.env.PROFILE_SERVICE && !process.env.DOLPHIN_API_KEY) {
-    loadEnvFileSafe(path.resolve(__dirname, '../.emv'));
-}
+const configuredAccountsCount = process.env.ACCOUNTS_COUNT ?? '1';
+const configuredThreadsCount = process.env.THREADS_COUNT ?? '1';
 
 export const config = {
     profileService: process.env.PROFILE_SERVICE || 'gpm', // 'gpm', 'dolphin', or 'camoufox'
@@ -75,9 +48,9 @@ export const config = {
                   .filter(Boolean)
             : undefined,
         maxHammingDistance: parseInt(process.env.CAMOUFOX_CANVAS_MAX_HAMMING_DISTANCE || '0', 10),
-        storageDir: process.env.CAMOUFOX_STORAGE_DIR || path.resolve(__dirname, '../profiles'),
+        storageDir: getDefaultProfilesDirectory(),
         recordTraffic: process.env.CAMOUFOX_RECORD_TRAFFIC !== 'false', // Default: true (pre-TLS Necko egress/ingress NDJSON + attribution)
-        recordBodies: process.env.CAMOUFOX_RECORD_BODIES !== 'false', // Default: true (capture plaintext request/response payloads)
+        recordBodies: process.env.CAMOUFOX_RECORD_BODIES === 'true', // Opt in to private request and WebSocket attachments
         recordWireLog: process.env.CAMOUFOX_RECORD_WIRE_LOG !== 'false', // Default: true (writes canonical pre-TLS HTTP/1.1 & HTTP/2 wire stream to pre-tls-wire.log)
         sslKeyLog: process.env.CAMOUFOX_SSLKEYLOG === 'true', // Private diagnostic for a dedicated browser process
         neckoMozLog: process.env.CAMOUFOX_NECKO_MOZ_LOG === 'true', // Default: false (enables Firefox C++ Necko kernel MOZ_LOG to necko-pre-tls.moz_log)
@@ -110,8 +83,8 @@ export const config = {
         logLevel: process.env.LOG_LEVEL || 'info',
         maxRetries: parseInt(process.env.MAX_RETRIES || '3'),
         retryDelay: 5000,
-        accountsCount: parseInt(process.env.ACCOUNTS_COUNT || '1'),
-        threadsCount: parseInt(process.env.THREADS_COUNT || '1'),
+        get accountsCount() { return parseAccountCount(configuredAccountsCount); },
+        get threadsCount() { return parseThreadCount(configuredThreadsCount); },
         testProxy: process.env.TEST_PROXY !== 'false' // Default: true, set TEST_PROXY=false to disable
     }
 };
@@ -134,13 +107,13 @@ if (config.profileService === 'gpm') {
 } else if (config.profileService === 'camoufox') {
     const validOs = ['windows', 'macos', 'linux'];
     if (!validOs.includes(String(config.camoufox.os).toLowerCase())) {
-        console.warn(`⚠ Unknown CAMOUFOX_OS: ${config.camoufox.os}. Using default: windows`);
+        console.warn('⚠ Unknown CAMOUFOX_OS. Using default: windows');
         config.camoufox.os = 'windows';
     } else {
         config.camoufox.os = String(config.camoufox.os).toLowerCase();
     }
 } else {
-    console.warn(`⚠ Unknown PROFILE_SERVICE: ${config.profileService}. Using default: gpm`);
+    console.warn('⚠ Unknown PROFILE_SERVICE. Using default: gpm');
     config.profileService = 'gpm';
 }
 

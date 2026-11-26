@@ -4,6 +4,7 @@
 # Dependencies
 node_modules/
 package-lock.json
+.npmrc
 
 # Environment files and common alternate spelling
 *.env
@@ -19,6 +20,8 @@ logs/
 # Results and data files
 results.json
 summary.json
+results.json.lock/
+summary.json.lock/
 data/
 profiles.json
 
@@ -64,5 +67,15 @@ gpm-data/
 # Camoufox persistent profile storage & audit output
 profiles/
 camoufox-audit-report.json
-
+profile.json
+storage-state.json
+traffic.ndjson
+attribution-index.json
+traffic/payloads/
+traffic/.private/
+.native/
+sslkeylog.txt
+_shared_sslkeylog.txt
+*.moz_log*
+*.har
 

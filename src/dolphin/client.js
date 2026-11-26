@@ -15,30 +15,51 @@ import {
     toWebSocketUrl,
     validateControllerEndpoint
 } from '../utils/controller-url.js';
+import { requireControllerProfileId } from '../utils/controller-id.js';
+import { controllerErrorDetails, controllerRejected, sendControllerRequest } from '../utils/controller-request.js';
 import { requireProxyProtocol } from '../utils/proxy-protocol.js';
 
 const DOLPHIN_API_URL = config.dolphin.apiUrl;
 const DOLPHIN_API_KEY = config.dolphin.apiKey;
 const controllerClient = axios.create(controllerRequestOptions);
 
-// Helper function to format Authorization header
-// دالة مساعدة لتنسيق رأس Authorization
 function getAuthHeader() {
-    // Check if API key is empty
-    // التحقق من أن API key ليس فارغاً
-    if (!DOLPHIN_API_KEY || DOLPHIN_API_KEY.trim() === '') {
-        throw new Error('DOLPHIN_API_KEY is not set. Please set it in .env file');
+    if (!DOLPHIN_API_KEY.trim()) {
+        throw new Error('DOLPHIN_API_KEY is required in .env');
     }
-    
-    // Check if API key already has Bearer prefix
-    // التحقق من أن API key يحتوي على Bearer prefix
-    if (DOLPHIN_API_KEY.startsWith('Bearer ')) {
-        return DOLPHIN_API_KEY;
-    }
-    
-    // For Local API, try without Bearer first (as it worked in list-dolphin-folders.js)
-    // لـ Local API، جرب بدون Bearer أولاً (كما عمل في list-dolphin-folders.js)
     return DOLPHIN_API_KEY;
+}
+
+function dolphinErrorCode(data) {
+    if (typeof data === 'string') {
+        try {
+            data = JSON.parse(data);
+        } catch {
+            return undefined;
+        }
+    }
+    // 12001 denotes a duplicate folder name. 50200 denotes insufficient permissions.
+    const code = data?.code;
+    if (code === 12001 || code === '12001') return '12001';
+    if (code === 50200 || code === '50200') return '50200';
+}
+
+function dolphinPost(operation, path, body, timeout, authorization) {
+    const url = controllerApiUrl(DOLPHIN_API_URL, path, 'DOLPHIN_TRUSTED_HTTP_API_URL');
+    const auth = authorization ?? getAuthHeader();
+    return sendControllerRequest(operation, () => controllerClient.post(url, body, {
+        headers: { Authorization: auth, 'Content-Type': 'application/json' },
+        timeout
+    }), dolphinErrorCode);
+}
+
+function readJsonResponse(data, operation) {
+    if (typeof data !== 'string') return data;
+    try {
+        return JSON.parse(data);
+    } catch {
+        throw new Error(`${operation} returned invalid JSON`);
+    }
 }
 
 /**
@@ -47,33 +68,11 @@ function getAuthHeader() {
  */
 export async function checkDolphinConnection() {
     try {
-        const response = await controllerClient.post(controllerApiUrl(DOLPHIN_API_URL, '/api/profile/getProfiles'),
-            { page: 1, pageSize: 1 },
-            {
-                headers: {
-                    'Authorization': getAuthHeader(),
-                    'Content-Type': 'application/json'
-                },
-                timeout: 5000
-            }
-        );
+        await dolphinPost('Dolphin Anty API connection check', '/api/profile/getProfiles', { page: 1, pageSize: 1 }, 5000);
         logger.info('Dolphin Anty API is connected and responding');
         return true;
     } catch (error) {
-        if (error.code === 'ECONNREFUSED') {
-            logger.error('Dolphin Anty API is not running or not accessible', {
-                url: DOLPHIN_API_URL,
-                suggestion: 'Please make sure Dolphin Anty is running or check DOLPHIN_API_URL'
-            });
-        } else if (error.code === 'ETIMEDOUT') {
-            logger.error('Dolphin Anty API connection timeout', { url: DOLPHIN_API_URL });
-        } else if (error.response?.status === 401) {
-            logger.error('Dolphin Anty API authentication failed', {
-                hint: 'Please check your DOLPHIN_API_KEY in .env file'
-            });
-        } else {
-            logger.error('Dolphin Anty API Error', { error: error.message });
-        }
+        logger.error('Dolphin Anty API connection check failed', controllerErrorDetails(error));
         return false;
     }
 }
@@ -282,134 +281,25 @@ export async function createProfile(profileName, proxy = null) {
             cores: hardwareConcurrency
         });
         
-        // Get or create folder
-        // الحصول على مجلد أو إنشاؤه
-        let folderId = config.dolphin.folderId;
-        
-        // If folder ID is set, validate it exists
-        // إذا تم تحديد folder ID، تحقق من وجوده
-        if (folderId && folderId.toString().trim() !== '') {
-            logger.info('Folder ID provided in config, will use it', { folderId: folderId.toString() });
-        } else {
-            // If folder ID is not set or is empty, get or create default folder
-            // إذا لم يتم تحديد folder ID أو كان فارغاً، احصل على مجلد افتراضي أو أنشئه
-            const defaultFolderName = 'gmail-accounts'; // Default folder name in English
-            logger.info('Folder ID not set, getting or creating default folder', { folderName: defaultFolderName });
-            try {
-                folderId = await getOrCreateFolder(defaultFolderName, '#3370FF');
-            } catch (folderError) {
-                logger.warn('Failed to get or create folder, trying to use first available folder', { 
-                    error: folderError.message 
-                });
-                // Fallback: use first available folder
-                try {
-                    folderId = await getFirstAvailableFolder();
-                    if (!folderId) {
-                        throw new Error('No folders available');
-                    }
-                } catch (fallbackError) {
-                    throw new Error('No folders available. Please create a folder manually in Dolphin Anty or set a valid DOLPHIN_FOLDER_ID in .emv file.');
-                }
-            }
-        }
-        
-        // Validate folder ID
-        if (!folderId || folderId.toString().trim() === '') {
-            throw new Error('Folder ID is required but not set. Please set DOLPHIN_FOLDER_ID in .emv file or create a folder in Dolphin Anty.');
-        }
-        
-        logger.info('Using folder ID for profile creation', { folderId: folderId.toString() });
-        
-        // Build request body
+        const folderId = config.dolphin.folderId.trim() || await getOrCreateFolder('gmail-accounts');
         const requestBody = {
             title: finalName,
-            folderId: folderId.toString(), // Ensure it's a string
+            folderId: String(folderId),
             fingerprint: fingerprintObj
         };
-        
-        if (proxyObj) {
-            requestBody.proxy = proxyObj;
-        }
-        
-        logger.info('Creating Dolphin Anty profile', { 
-            name: finalName, 
-            userAgent: userAgent.substring(0, 50) + '...',
-            folderId: folderId.toString(),
-            hasProxy: !!proxyObj,
-            apiUrl: DOLPHIN_API_URL
-        });
-        
-        const authHeader = getAuthHeader();
-        logger.debug('API Request details', {
-            url: `${DOLPHIN_API_URL}/api/profile/advancedCreateProfile`,
-            hasAuthHeader: !!authHeader,
-            authHeaderLength: authHeader ? authHeader.length : 0
-        });
-        
-        const response = await controllerClient.post(controllerApiUrl(DOLPHIN_API_URL, '/api/profile/advancedCreateProfile'), requestBody, {
-            headers: {
-                'Authorization': authHeader,
-                'Content-Type': 'application/json'
-            },
-            timeout: 30000
-        });
-        
-        let responseData = response.data;
-        if (typeof responseData === 'string') {
-            try {
-                responseData = JSON.parse(responseData);
-            } catch (e) {
-                throw new Error(`Failed to parse response: ${responseData}`);
-            }
-        }
-        
-        if (responseData && responseData.id) {
-            logger.info('Dolphin Anty profile created successfully', { 
-                profileId: responseData.id,
-                name: responseData.title || finalName
-            });
-            return { 
-                id: responseData.id,
-                profileId: responseData.id,
-                title: responseData.title || finalName,
-                userAgent: userAgent
-            };
-        }
-        
-        throw new Error(`Invalid response from Dolphin API: ${JSON.stringify(responseData)}`);
+        if (proxyObj) requestBody.proxy = proxyObj;
+
+        const operation = 'Dolphin Anty API create profile';
+        logger.info('Creating Dolphin Anty profile', { name: finalName, hasProxy: !!proxyObj });
+        const response = await dolphinPost(operation, '/api/profile/advancedCreateProfile', requestBody, 30000);
+        const data = readJsonResponse(response.data, operation);
+        if (data?.success === false) throw new Error('Dolphin Anty API rejected profile creation');
+
+        const id = requireControllerProfileId(data?.id);
+        logger.info('Dolphin Anty profile created successfully', { name: finalName });
+        return { id, profileId: id, title: data.title || finalName, userAgent };
     } catch (error) {
-        if (error.response) {
-            logger.error('Dolphin Anty API Error Response', {
-                status: error.response.status,
-                data: error.response.data
-            });
-            let errorMsg = 'Unknown error';
-            const errorData = error.response.data;
-            if (typeof errorData === 'string') {
-                try {
-                    const parsed = JSON.parse(errorData);
-                    errorMsg = parsed.message || errorData;
-                } catch (e) {
-                    errorMsg = errorData;
-                }
-            } else if (errorData && errorData.message) {
-                errorMsg = errorData.message;
-            }
-            
-            // Provide helpful error messages for common issues
-            // تقديم رسائل خطأ مفيدة للمشاكل الشائعة
-            if (error.response.status === 400 && (errorMsg.includes('permission') || errorMsg.includes('50200'))) {
-                const helpfulMsg = `Insufficient permissions. Possible solutions:
-1. Check if your API key has the required permissions in Dolphin Anty settings
-2. Verify that Dolphin Anty is running and accessible at ${DOLPHIN_API_URL}
-3. Make sure the folder ID exists and you have access to it
-4. Try generating a new API key from Dolphin Anty panel with full permissions`;
-                throw new Error(`Dolphin Anty API Error: ${error.response.status} - ${errorMsg}\n\n${helpfulMsg}`);
-            }
-            
-            throw new Error(`Dolphin Anty API Error: ${error.response.status} - ${errorMsg}`);
-        }
-        logger.error('Error creating Dolphin Anty profile', { error: error.message });
+        logger.error('Dolphin Anty API create profile failed', controllerErrorDetails(error));
         throw error;
     }
 }
@@ -420,67 +310,21 @@ export async function createProfile(profileName, proxy = null) {
  */
 export async function startProfile(profileId) {
     try {
-        logger.info('Starting Dolphin Anty profile', { profileId });
-        
-        const response = await controllerClient.post(controllerApiUrl(DOLPHIN_API_URL, '/api/browser/openBrowser'),
-            { profileId },
-            {
-                headers: {
-                    'Authorization': getAuthHeader(),
-                    'Content-Type': 'application/json'
-                },
-                timeout: 60000 // 60 seconds timeout for browser launch
-            }
-        );
-        
-        let responseData = response.data;
-        if (typeof responseData === 'string') {
-            try {
-                responseData = JSON.parse(responseData);
-            } catch (e) {
-                throw new Error(`Failed to parse response: ${responseData}`);
-            }
-        }
-        
-        const address = responseData?.ws || responseData?.webSocketDebuggerUrl;
-        if (address) {
+        const operation = 'Dolphin Anty API start profile';
+        const id = requireControllerProfileId(profileId);
+        const response = await dolphinPost(operation, '/api/browser/openBrowser', { profileId: id }, 60000);
+        const data = readJsonResponse(response.data, operation);
+        const address = data?.ws || data?.webSocketDebuggerUrl;
+        if (address && data.success !== false) {
             const endpoint = toWebSocketUrl(parseControllerUrl(address, 'ws:'));
             validateControllerEndpoint(endpoint, parseControllerUrl(DOLPHIN_API_URL));
-            logger.info('Dolphin Anty profile started successfully', {
-                profileId,
-                controller: endpoint.origin,
-                port: responseData.port
-            });
-            return {
-                ws: endpoint.href,
-                webSocketDebuggerUrl: endpoint.href,
-                port: responseData.port,
-                pid: responseData.pid
-            };
+            logger.info('Dolphin Anty profile started successfully');
+            return { ws: endpoint.href, webSocketDebuggerUrl: endpoint.href, port: data.port, pid: data.pid };
         }
 
-        throw new Error(`Invalid response from Dolphin API: ${JSON.stringify(responseData)}`);
+        throw new Error('Dolphin Anty API returned an invalid profile startup response');
     } catch (error) {
-        if (error.response) {
-            logger.error('Dolphin Anty API Error Response', {
-                status: error.response.status,
-                data: error.response.data
-            });
-            let errorMsg = 'Unknown error';
-            const errorData = error.response.data;
-            if (typeof errorData === 'string') {
-                try {
-                    const parsed = JSON.parse(errorData);
-                    errorMsg = parsed.message || errorData;
-                } catch (e) {
-                    errorMsg = errorData;
-                }
-            } else if (errorData && errorData.message) {
-                errorMsg = errorData.message;
-            }
-            throw new Error(`Dolphin Anty API Error: ${error.response.status} - ${errorMsg}`);
-        }
-        logger.error('Error starting Dolphin Anty profile', { error: error.message });
+        logger.error('Dolphin Anty API start profile failed', controllerErrorDetails(error));
         throw error;
     }
 }
@@ -491,26 +335,16 @@ export async function startProfile(profileId) {
  */
 export async function stopProfile(profileId) {
     try {
-        logger.info('Stopping Dolphin Anty profile', { profileId });
-        
-        const response = await controllerClient.post(controllerApiUrl(DOLPHIN_API_URL, '/api/browser/closeProfiles'),
-            { profileIds: [profileId] },
-            {
-                headers: {
-                    'Authorization': getAuthHeader(),
-                    'Content-Type': 'application/json'
-                },
-                timeout: 10000
-            }
-        );
-        
-        logger.info('Dolphin Anty profile stopped successfully', { profileId });
+        const response = await dolphinPost('Dolphin Anty API stop profile', '/api/browser/closeProfiles',
+            { profileIds: [requireControllerProfileId(profileId)] }, 10000);
+        if ((response.status !== 200 && response.status !== 204) || controllerRejected(response.data)) {
+            logger.warn('Dolphin Anty API did not confirm profile closure');
+            return false;
+        }
+        logger.info('Dolphin Anty profile stopped successfully');
         return true;
     } catch (error) {
-        logger.warn('Error stopping Dolphin Anty profile', { 
-            profileId,
-            error: error.message 
-        });
+        logger.warn('Dolphin Anty API stop profile failed', controllerErrorDetails(error));
         return false;
     }
 }
@@ -521,26 +355,15 @@ export async function stopProfile(profileId) {
  */
 export async function deleteProfile(profileId) {
     try {
-        logger.info('Deleting Dolphin Anty profile', { profileId });
-        
-        const response = await controllerClient.post(controllerApiUrl(DOLPHIN_API_URL, '/api/profile/delete'),
-            { profileIds: [profileId] },
-            {
-                headers: {
-                    'Authorization': getAuthHeader(),
-                    'Content-Type': 'application/json'
-                },
-                timeout: 10000
-            }
-        );
-        
-        logger.info('Dolphin Anty profile deleted successfully', { profileId });
+        const response = await dolphinPost('Dolphin Anty API delete profile', '/api/profile/delete',
+            { profileIds: [requireControllerProfileId(profileId)] }, 10000);
+        if ((response.status !== 200 && response.status !== 204) || controllerRejected(response.data)) {
+            throw new Error('Dolphin Anty API did not confirm profile deletion');
+        }
+        logger.info('Dolphin Anty profile deleted successfully');
         return true;
     } catch (error) {
-        logger.error('Error deleting Dolphin Anty profile', { 
-            profileId,
-            error: error.message 
-        });
+        logger.error('Dolphin Anty API delete profile failed', controllerErrorDetails(error));
         throw error;
     }
 }
@@ -551,23 +374,12 @@ export async function deleteProfile(profileId) {
  */
 export async function getProfile(profileId) {
     try {
-        const response = await controllerClient.post(controllerApiUrl(DOLPHIN_API_URL, '/api/profile/detail'),
-            { profileId },
-            {
-                headers: {
-                    'Authorization': getAuthHeader(),
-                    'Content-Type': 'application/json'
-                },
-                timeout: 10000
-            }
-        );
-        
+        const id = requireControllerProfileId(profileId);
+        const response = await dolphinPost('Dolphin Anty API get profile', '/api/profile/detail', { profileId: id }, 10000);
+        if (controllerRejected(response.data)) throw new Error('Dolphin Anty API rejected the profile lookup');
         return response.data;
     } catch (error) {
-        logger.error('Error getting Dolphin Anty profile', { 
-            profileId,
-            error: error.message 
-        });
+        logger.error('Dolphin Anty API get profile failed', controllerErrorDetails(error));
         throw error;
     }
 }
@@ -585,42 +397,14 @@ export async function getProfile(profileId) {
  */
 export async function updateProfileProxy(profileIds, proxy) {
     try {
-        // Ensure profileIds is an array
-        const ids = Array.isArray(profileIds) ? profileIds : [profileIds];
-        
+        const ids = Array.from(Array.isArray(profileIds) ? profileIds : [profileIds], requireControllerProfileId);
+        if (ids.length === 0) throw new Error('At least one Dolphin Anty profile ID is required');
         const requestBody = { ...formatBaseProxy(proxy), ids };
 
-        logger.info('Updating profile proxy', {
-            profileIds: ids,
-            proxy: `${requestBody.host}:${requestBody.port}`,
-            protocol: requestBody.protocol
-        });
-        
-        const response = await controllerClient.post(controllerApiUrl(DOLPHIN_API_URL, '/api/profile/updateProfileBaseProxy'),
-            requestBody,
-            {
-                headers: {
-                    'Authorization': getAuthHeader(),
-                    'Content-Type': 'application/json'
-                },
-                timeout: 15000
-            }
-        );
-        
-        let responseData = response.data;
-        if (typeof responseData === 'string') {
-            try {
-                responseData = JSON.parse(responseData);
-            } catch (e) {
-                // Response might be empty or non-JSON on success
-            }
-        }
-        
-        logger.info('Profile proxy updated successfully', {
-            profileIds: ids,
-            proxy: `${requestBody.host}:${requestBody.port}`
-        });
-        
+        const response = await dolphinPost('Dolphin Anty API update profile proxy', '/api/profile/updateProfileBaseProxy',
+            requestBody, 15000);
+        if (controllerRejected(response.data)) throw new Error('Dolphin Anty API rejected the proxy update');
+        logger.info('Dolphin Anty profile proxy updated successfully');
         return {
             success: true,
             profileIds: ids,
@@ -631,28 +415,7 @@ export async function updateProfileProxy(profileIds, proxy) {
             }
         };
     } catch (error) {
-        if (error.response) {
-            logger.error('Dolphin Anty API Error updating proxy', {
-                status: error.response.status,
-                data: error.response.data
-            });
-            
-            let errorMsg = 'Unknown error';
-            const errorData = error.response.data;
-            if (typeof errorData === 'string') {
-                try {
-                    const parsed = JSON.parse(errorData);
-                    errorMsg = parsed.message || errorData;
-                } catch (e) {
-                    errorMsg = errorData;
-                }
-            } else if (errorData && errorData.message) {
-                errorMsg = errorData.message;
-            }
-            
-            throw new Error(`Dolphin Anty API Error: ${error.response.status} - ${errorMsg}`);
-        }
-        logger.error('Error updating profile proxy', { error: error.message });
+        logger.error('Dolphin Anty API update profile proxy failed', controllerErrorDetails(error));
         throw error;
     }
 }
@@ -662,146 +425,70 @@ export async function updateProfileProxy(profileIds, proxy) {
  * الحصول على قائمة المجلدات
  */
 export async function getFolderList(page = 1, pageSize = 100) {
+    const operation = 'Dolphin Anty API list folders';
+    const auth = getAuthHeader();
+    const request = authorization => dolphinPost(operation, '/api/folder/list', { page, pageSize }, 10000, authorization);
+    let response;
     try {
-        // Try different authorization formats
-        // جرب تنسيقات مختلفة للتفويض
-        const authFormats = [
-            DOLPHIN_API_KEY, // Without Bearer
-            `Bearer ${DOLPHIN_API_KEY}`, // With Bearer
-        ];
-
-        let lastError = null;
-        for (const authFormat of authFormats) {
-            try {
-                const response = await controllerClient.post(controllerApiUrl(DOLPHIN_API_URL, '/api/folder/list'),
-                    { page, pageSize },
-                    {
-                        headers: {
-                            'Authorization': authFormat,
-                            'Content-Type': 'application/json'
-                        },
-                        timeout: 10000
-                    }
-                );
-                
-                let responseData = response.data;
-                if (typeof responseData === 'string') {
-                    try {
-                        responseData = JSON.parse(responseData);
-                    } catch (e) {
-                        throw new Error(`Failed to parse response: ${responseData}`);
-                    }
-                }
-                
-                return responseData;
-            } catch (error) {
-                lastError = error;
-                // If 401, try next format; otherwise throw
-                if (error.response && error.response.status === 401) {
-                    continue;
-                }
-                throw error;
-            }
-        }
-        
-        // If all formats failed with 401
-        throw lastError || new Error('Failed to authenticate with Dolphin API');
+        response = await request(auth);
     } catch (error) {
-        logger.error('Error getting folder list', { error: error.message });
-        throw error;
+        if (error.status !== 401 || auth.startsWith('Bearer ')) throw error;
+        response = await request(`Bearer ${auth}`);
     }
+    const data = readJsonResponse(response.data, operation);
+    if (controllerRejected(data)) throw new Error('Dolphin Anty API rejected the folder lookup');
+    return data;
+}
+
+function folderListItems(data) {
+    if (Array.isArray(data)) return data;
+    const folders = [data?.list, data?.data, data?.folders].find(Array.isArray);
+    if (!folders) {
+        throw new Error('Dolphin Anty API returned an invalid folder list');
+    }
+    return folders;
+}
+
+function readFolderId(folder) {
+    const id = folder?.id ?? folder?.folderId;
+    if (Number.isSafeInteger(id) && id >= 0) return id;
+    return typeof id === 'string' && id.trim() ? id : null;
 }
 
 /**
  * Get all folders (across all pages)
- * الحصول على جميع المجلدات (من جميع الصفحات)
+ * الحصول على جميع المجلدات (عبر جميع الصفحات)
  */
 export async function getAllFolders() {
-    try {
-        const allFolders = [];
-        let page = 1;
-        const pageSize = 100;
-        let hasMore = true;
-
-        while (hasMore) {
-            const responseData = await getFolderList(page, pageSize);
-            
-            // Handle different response formats
-            let folders = [];
-            if (responseData && responseData.list && Array.isArray(responseData.list)) {
-                folders = responseData.list;
-            } else if (responseData && responseData.data && Array.isArray(responseData.data)) {
-                folders = responseData.data;
-            } else if (Array.isArray(responseData)) {
-                folders = responseData;
-            } else if (responseData && responseData.folders && Array.isArray(responseData.folders)) {
-                folders = responseData.folders;
-            }
-
-            if (folders.length > 0) {
-                allFolders.push(...folders);
-                
-                const total = responseData.total || folders.length;
-                
-                if (folders.length < pageSize || allFolders.length >= total) {
-                    hasMore = false;
-                } else {
-                    page++;
-                }
-            } else {
-                hasMore = false;
-            }
-        }
-
-        return allFolders;
-    } catch (error) {
-        logger.error('Error getting all folders', { error: error.message });
-        throw error;
+    const pageSize = 100;
+    const allFolders = [];
+    for (let page = 1; ; page++) {
+        const data = await getFolderList(page, pageSize);
+        const folders = folderListItems(data);
+        allFolders.push(...folders);
+        const total = Number(data.total);
+        if (folders.length === 0 || !Number.isSafeInteger(total) || allFolders.length >= total) return allFolders;
     }
 }
 
 /**
- * Find folder by name
+ * Find a uniquely named folder
  * البحث عن مجلد بالاسم
  */
 export async function findFolderByName(folderName) {
-    try {
-        const folders = await getFolderList(1, 100);
-        
-        // Search in all pages if needed
-        // Check both 'folderName' and 'name' fields (API may use either)
-        if (folders && folders.data && Array.isArray(folders.data)) {
-            const found = folders.data.find(folder => 
-                (folder.folderName && folder.folderName === folderName) ||
-                (folder.name && folder.name === folderName)
-            );
-            if (found) {
-                return found.id;
-            }
-        }
-        
-        // Search in additional pages if there are more
-        if (folders && folders.total > 100) {
-            const totalPages = Math.ceil(folders.total / 100);
-            for (let page = 2; page <= totalPages; page++) {
-                const pageFolders = await getFolderList(page, 100);
-                if (pageFolders && pageFolders.data && Array.isArray(pageFolders.data)) {
-                    const found = pageFolders.data.find(folder => 
-                        (folder.folderName && folder.folderName === folderName) ||
-                        (folder.name && folder.name === folderName)
-                    );
-                    if (found) {
-                        return found.id;
-                    }
-                }
-            }
-        }
-        
-        return null;
-    } catch (error) {
-        logger.error('Error finding folder by name', { error: error.message });
-        throw error;
+    if (typeof folderName !== 'string' || !folderName.trim()) throw new Error('Dolphin Anty folder name is required');
+    const folders = await getAllFolders();
+    const matches = folders.filter(folder => (folder?.folderName ?? folder?.name) === folderName);
+    if (matches.length > 1) {
+        throw new Error('Multiple Dolphin Anty folders match the desired name. Set DOLPHIN_FOLDER_ID explicitly.');
     }
+    if (matches.length === 0) return null;
+
+    const id = readFolderId(matches[0]);
+    if (id === null) {
+        throw new Error('The intended Dolphin Anty folder has no valid ID. Set DOLPHIN_FOLDER_ID explicitly.');
+    }
+    return id;
 }
 
 /**
@@ -809,141 +496,39 @@ export async function findFolderByName(folderName) {
  * إنشاء مجلد جديد
  */
 export async function createFolder(folderName, folderColor = '#3370FF', sortOrder = 0) {
+    const operation = 'Dolphin Anty API create folder';
     try {
-        logger.info('Creating Dolphin folder', { folderName, folderColor });
-        
-        const response = await controllerClient.post(controllerApiUrl(DOLPHIN_API_URL, '/api/folder/add'),
-            { 
-                folderName,
-                folderColor,
-                sortOrder
-            },
-            {
-                headers: {
-                    'Authorization': getAuthHeader(),
-                    'Content-Type': 'application/json'
-                },
-                timeout: 10000
-            }
-        );
-        
-        let responseData = response.data;
-        if (typeof responseData === 'string') {
-            try {
-                responseData = JSON.parse(responseData);
-            } catch (e) {
-                throw new Error(`Failed to parse response: ${responseData}`);
-            }
-        }
-        
-        if (responseData && responseData.id) {
-            logger.info('Dolphin folder created successfully', { 
-                folderId: responseData.id,
-                folderName: responseData.folderName || folderName
-            });
-            return responseData.id;
-        }
-        
-        throw new Error(`Invalid response from Dolphin API: ${JSON.stringify(responseData)}`);
+        const response = await dolphinPost(operation, '/api/folder/add', { folderName, folderColor, sortOrder }, 10000);
+        const data = readJsonResponse(response.data, operation);
+        const id = readFolderId(data);
+        if (id !== null && data.success !== false) return id;
+        throw new Error('Dolphin Anty API returned an invalid folder creation response');
     } catch (error) {
-        if (error.response) {
-            const errorData = error.response.data;
-            let errorMsg = 'Unknown error';
-            
-            if (typeof errorData === 'string') {
-                try {
-                    const parsed = JSON.parse(errorData);
-                    errorMsg = parsed.message || errorData;
-                } catch (e) {
-                    errorMsg = errorData;
-                }
-            } else if (errorData && errorData.message) {
-                errorMsg = errorData.message;
-            }
-            
-            // Check if folder already exists
-            if (errorMsg.includes('already exists') || error.response.status === 400) {
-                logger.warn('Folder might already exist, trying to find it', { folderName });
-                const existingFolderId = await findFolderByName(folderName);
-                if (existingFolderId) {
-                    logger.info('Found existing folder', { folderName, folderId: existingFolderId });
-                    return existingFolderId;
-                }
-            }
-            
-            throw new Error(`Dolphin Anty API Error: ${error.response.status} - ${errorMsg}`);
+        if (error.providerCode === '12001') {
+            // A concurrent creator may have created the same named folder.
+            const existingFolderId = await findFolderByName(folderName).catch(() => null);
+            if (existingFolderId !== null) return existingFolderId;
         }
-        logger.error('Error creating Dolphin folder', { error: error.message });
         throw error;
     }
 }
 
 /**
- * Get first available folder from list
+ * Get the first visible folder on explicit request
  * الحصول على أول مجلد متاح من القائمة
  */
 export async function getFirstAvailableFolder() {
-    try {
-        const folders = await getFolderList(1, 100);
-        
-        if (folders && folders.data && Array.isArray(folders.data) && folders.data.length > 0) {
-            const firstFolder = folders.data[0];
-            const folderId = firstFolder.id || firstFolder.folderId;
-            const folderName = firstFolder.folderName || firstFolder.name;
-            
-            if (folderId) {
-                logger.info('Using first available folder', { 
-                    folderName: folderName,
-                    folderId: folderId 
-                });
-                return folderId;
-            }
-        }
-        
-        return null;
-    } catch (error) {
-        logger.error('Error getting first available folder', { error: error.message });
-        throw error;
-    }
+    const [folder] = folderListItems(await getFolderList(1, 100));
+    return readFolderId(folder);
 }
 
 /**
  * Get or create folder by name
- * الحصول على مجلد بالاسم أو استخدام أول مجلد متاح
+ * الحصول على مجلد بالاسم أو إنشاؤه
  */
 export async function getOrCreateFolder(folderName, folderColor = '#3370FF') {
-    try {
-        // Try to find existing folder
-        const existingFolderId = await findFolderByName(folderName);
-        if (existingFolderId) {
-            logger.info('Found existing folder', { folderName, folderId: existingFolderId });
-            return existingFolderId;
-        }
-        
-        // Try to create new folder
-        try {
-            logger.info('Folder not found, attempting to create new folder', { folderName });
-            const newFolderId = await createFolder(folderName, folderColor);
-            return newFolderId;
-        } catch (createError) {
-            // If creation fails due to permissions, use first available folder
-            if (createError.message && (createError.message.includes('permission') || createError.message.includes('50200'))) {
-                logger.warn('Cannot create folder due to insufficient permissions, using first available folder instead', { 
-                    error: createError.message 
-                });
-                const firstFolderId = await getFirstAvailableFolder();
-                if (firstFolderId) {
-                    logger.info('Using first available folder as fallback', { folderId: firstFolderId });
-                    return firstFolderId;
-                }
-                throw new Error('No folders available and cannot create new folder. Please create a folder manually in Dolphin Anty.');
-            }
-            throw createError;
-        }
-    } catch (error) {
-        logger.error('Error getting or creating folder', { error: error.message });
-        throw error;
-    }
+    const existingFolderId = await findFolderByName(folderName);
+    return existingFolderId ?? createFolder(folderName, folderColor);
 }
 
 export default {

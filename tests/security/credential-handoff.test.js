@@ -6,7 +6,6 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { runInNewContext } from 'node:vm';
 import {
-    clickSignupConfirmation,
     getSignupStage,
     requirePostUsernameStage,
     skipOptionalRecoveryEmail
@@ -37,7 +36,8 @@ function makePageFixture({
 
     const document = {
         querySelectorAll(selector) {
-            if (selector === 'input[type="email"], input[name="recoveryEmail"]') {
+            if (['input[type="email"], input[name="recoveryEmail"]', 'input[type="tel"], input[name="phoneNumberId"]']
+                .includes(selector)) {
                 return [{ value: emailValue }];
             }
             assert.equal(selector, 'button[type="button"]');
@@ -72,7 +72,7 @@ test('Signup stage classification requires an exact HTTPS origin and a pathname 
     assert.equal(getSignupStage(RECOVERY_URL), 'recovery-email');
     assert.equal(getSignupStage(`${GOOGLE_ACCOUNTS_ORIGIN}/?next=addrecoveryemail`), 'unknown');
     assert.equal(getSignupStage(`${GOOGLE_ACCOUNTS_ORIGIN}/addrecoveryemail-notice`), 'unknown');
-    assert.equal(getSignupStage('https://myaccount.google.com/'), 'complete');
+    assert.equal(getSignupStage('https://myaccount.google.com/'), 'account-home');
 
     for (const address of [
         'http://accounts.google.com/v3/signin/addrecoveryemail',
@@ -98,6 +98,7 @@ test('Recovery refuses a replacement document, changed step, subframe, or opaque
     for (const disagreement of [
         { documentUrl: 'https://example.invalid/v3/signin/addrecoveryemail' },
         { documentUrl: PHONE_URL },
+        { documentUrl: RECOVERY_URL + '&changed=1' },
         { topLevel: false },
         { documentOrigin: 'null' }
     ]) {
@@ -127,31 +128,6 @@ test('Recovery hands off when skipping is ambiguous, submits a form, or could in
     assert.deepEqual(clicked, ['Skip']);
 });
 
-test('Final confirmation uses the checked button in its own document', async () => {
-    let clicked = 0;
-    const document = {};
-    const window = { origin: GOOGLE_ACCOUNTS_ORIGIN };
-    window.top = window;
-    const element = {
-        ownerDocument: document,
-        isConnected: true,
-        tagName: 'BUTTON',
-        matches: () => false,
-        getClientRects: () => [{}],
-        click: () => { clicked += 1; }
-    };
-    const makeButton = (address, liveDocument = document) => ({
-        evaluate: async (action, options) => runInNewContext(`(${action})(element, options)`, {
-            element, options, window, location: new URL(address), document: liveDocument
-        })
-    });
-    assert.equal(await clickSignupConfirmation(makeButton(RECOVERY_URL), 'confirmation'), false);
-    assert.equal(await clickSignupConfirmation(makeButton(CONFIRMATION_URL, {}), 'confirmation'), false);
-    assert.equal(clicked, 0);
-    assert.equal(await clickSignupConfirmation(makeButton(CONFIRMATION_URL), 'confirmation'), true);
-    assert.equal(clicked, 1);
-});
-
 test('Password and verification stop without any browser operation; an optional phone step can skip', async () => {
     await assert.rejects(requirePostUsernameStage({
         url: () => `${GOOGLE_ACCOUNTS_ORIGIN}/signup/password`
@@ -167,6 +143,10 @@ test('Password and verification stop without any browser operation; an optional 
     await assert.rejects(requirePostUsernameStage(requiredPhone.page), manualStage('verification'));
     assert.deepEqual(requiredPhone.clicked, []);
 
+    const prefilledPhone = makePageFixture({ initialUrl: PHONE_URL, emailValue: '+1-555-0100' });
+    await assert.rejects(requirePostUsernameStage(prefilledPhone.page), manualStage('verification'));
+    assert.deepEqual(prefilledPhone.clicked, []);
+
     const optionalPhone = makePageFixture({ initialUrl: PHONE_URL });
     await requirePostUsernameStage(optionalPhone.page);
     assert.deepEqual(optionalPhone.clicked, ['Skip']);
@@ -178,6 +158,9 @@ test('App diagnostics omit credentials and preserve private log permissions acro
     const files = [
         'src/utils/logger.js',
         'src/utils/private-storage.js',
+        'src/utils/private-env.js',
+        'src/utils/state-paths.js',
+        'src/utils/cli-counts.js',
         'src/gmail/page-detector.js',
         'src/captcha/omo-handler.js',
         'src/config.js',
@@ -215,7 +198,13 @@ test('App diagnostics omit credentials and preserve private log permissions acro
         ${source}
     `], {
         cwd: scratch,
-        env: { PROFILE_SERVICE: 'gpm', OMOCAPTCHA_KEY: fakeSecret, LOG_LEVEL: 'DEBUG' },
+        env: {
+            NODE_OPTIONS: process.env.NODE_OPTIONS,
+            GMAIL_CREATOR_STATE_DIR: scratch,
+            PROFILE_SERVICE: 'gpm',
+            OMOCAPTCHA_KEY: fakeSecret,
+            LOG_LEVEL: 'DEBUG'
+        },
         encoding: 'utf8'
     });
     const result = runLogger(`

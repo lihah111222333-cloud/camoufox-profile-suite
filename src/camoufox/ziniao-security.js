@@ -29,6 +29,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { readPrivateFile, writePrivateFile } from '../utils/private-storage.js';
 import { assertManagedProxyBinding, resolveNetworkPolicyMode } from './network-policy.js';
+import { redactDiagnosticText, redactUrlSecrets } from './traffic-redaction.js';
 
 /**
  * 1. Sensitive Local Ports Probed by E-Commerce & Anti-Bot Scripts
@@ -1059,14 +1060,17 @@ export function resolveGeoCoordinatesWithDeterministicJitter(profileId = 'defaul
  * Attaches Ziniao-absorbed active network guards to a Playwright/Camoufox `BrowserContext`:
  *   - Blocks localhost / private-LAN port-scanning requests (`127.0.0.1`, `localhost`, `[::1]`, RFC1918)
  *   - Blocks untrusted navigation / subresource requests to internal browser schemes
- *   - Logs every blocked attempt for security auditing and pre-TLS traffic attribution
+ *   - Counts every blocked attempt and keeps a bounded sample for security auditing
  *
  * @param {object} context Playwright BrowserContext
  * @param {{
  *   profileId?: string,
  *   portScanProtection?: { enabled?: boolean, allowedPorts?: number[], allowSameOriginLocalDev?: boolean },
  *   allowedExtensionIds?: string[],
- *   onBlockedAttempt?: (event: object) => void
+ *   onBlockedAttempt?: (event: object) => void,
+ *   blockedHistoryMaxEntries?: number,
+ *   blockedHistoryMaxBytes?: number,
+ *   blockedNotificationsPerSecond?: number
  * }} [options]
  * @returns {Promise<{
  *   blockedPortScans: Array<object>,
@@ -1093,12 +1097,70 @@ export function resolveGeoCoordinatesWithDeterministicJitter(profileId = 'defaul
  * }} [options]
  * @returns {object}
  */
+function createRtcConfigSnapshot() {
+    const { defineProperty, freeze } = Object;
+    const isArray = Array.isArray;
+    const iteratorKey = Symbol.iterator;
+    const isDictionary = (value) => value !== null && (typeof value === 'object' || typeof value === 'function');
+
+    const snapshotSequence = (source, select) => {
+        const values = [];
+        for (const item of source) {
+            const value = select(item);
+            if (value !== undefined) {
+                defineProperty(values, values.length, { __proto__: null, value, enumerable: true });
+            }
+        }
+        // Native dictionary conversion iterates these arrays. Use only the saved entries.
+        defineProperty(values, iteratorKey, {
+            __proto__: null,
+            value() {
+                let index = 0;
+                return {
+                    __proto__: null,
+                    next() {
+                        if (index === values.length) return { __proto__: null, done: true };
+                        return { __proto__: null, done: false, value: values[index++] };
+                    }
+                };
+            }
+        });
+        return freeze(values);
+    };
+
+    return (rtcConfig, allowUrl) => {
+        if (!isDictionary(rtcConfig)) return rtcConfig;
+
+        const { iceServers, ...fields } = rtcConfig;
+        const config = { __proto__: null, ...fields };
+        if (iceServers === undefined) return config;
+        if (!isArray(iceServers)) throw new TypeError('RTC ICE servers must be provided as an array');
+
+        const selectUrl = (url) => typeof url === 'string' && allowUrl(url) ? url : undefined;
+        config.iceServers = snapshotSequence(iceServers, (server) => {
+            if (!isDictionary(server)) return undefined;
+            const { urls, url, ...serverFields } = server;
+            const allowedUrls = isArray(urls) ? snapshotSequence(urls, selectUrl) : selectUrl(urls);
+            const allowedUrl = selectUrl(url);
+            if (!allowedUrls?.length && !allowedUrl) return undefined;
+
+            const entry = { __proto__: null, ...serverFields };
+            if (allowedUrls?.length) entry.urls = allowedUrls;
+            if (allowedUrl) entry.url = allowedUrl;
+            return freeze(entry);
+        });
+        return config;
+    };
+}
+
+const snapshotRtcConfig = createRtcConfigSnapshot();
+
 export function sanitizeRtcConfigurationIceServers(rtcConfig, options = {}) {
-    if (!rtcConfig || typeof rtcConfig !== 'object') {
+    if (!rtcConfig || (typeof rtcConfig !== 'object' && typeof rtcConfig !== 'function')) {
         return rtcConfig;
     }
     const enabled = options.enabled !== undefined ? Boolean(options.enabled) : true;
-    if (!enabled || !Array.isArray(rtcConfig.iceServers)) {
+    if (!enabled) {
         return { ...rtcConfig };
     }
 
@@ -1169,57 +1231,12 @@ export function sanitizeRtcConfigurationIceServers(rtcConfig, options = {}) {
         return true;
     };
 
-    const sanitizedIceServers = [];
-    for (const server of rtcConfig.iceServers) {
-        if (!server || typeof server !== 'object') {
-            continue;
-        }
-        const nextServer = { ...server };
-
-        if (Array.isArray(server.urls)) {
-            const keptUrls = server.urls.filter((u) => typeof u === 'string' && checkIceCandidateUrl(u));
-            if (keptUrls.length > 0) {
-                nextServer.urls = keptUrls;
-            } else {
-                delete nextServer.urls;
-            }
-        } else if (typeof server.urls === 'string') {
-            if (checkIceCandidateUrl(server.urls)) {
-                nextServer.urls = server.urls;
-            } else {
-                delete nextServer.urls;
-            }
-        }
-
-        if (typeof server.url === 'string') {
-            if (checkIceCandidateUrl(server.url)) {
-                nextServer.url = server.url;
-            } else {
-                delete nextServer.url;
-            }
-        }
-
-        const hasValidUrls =
-            Array.isArray(nextServer.urls)
-                ? nextServer.urls.length > 0
-                : typeof nextServer.urls === 'string' && nextServer.urls.length > 0;
-        const hasValidUrl = typeof nextServer.url === 'string' && nextServer.url.length > 0;
-
-        if (hasValidUrls || hasValidUrl) {
-            sanitizedIceServers.push(nextServer);
-        }
-    }
-
-    const sanitizedConfig = {
-        ...rtcConfig,
-        iceServers: sanitizedIceServers
-    };
+    const sanitizedConfig = snapshotRtcConfig(rtcConfig, checkIceCandidateUrl);
     Object.defineProperty(sanitizedConfig, 'blockedProbes', {
         value: blockedProbes,
-        enumerable: false,
-        configurable: true
+        enumerable: false
     });
-    return sanitizedConfig;
+    return Object.freeze(sanitizedConfig);
 }
 
 /**
@@ -1229,7 +1246,6 @@ export function sanitizeRtcConfigurationIceServers(rtcConfig, options = {}) {
  * before Gecko's C++ `nICEr` stack opens local UDP/TCP sockets.
  *
  * @param {{
- *   profileId?: string,
  *   enabled?: boolean,
  *   allowedPorts?: number[],
  *   allowSameOriginLocalDev?: boolean
@@ -1238,7 +1254,6 @@ export function sanitizeRtcConfigurationIceServers(rtcConfig, options = {}) {
  */
 export function buildZiniaoWebRtcSecurityInitScript(options = {}) {
     const cfgPayload = JSON.stringify({
-        profileId: String(options.profileId || 'default-profile'),
         enabled: options.enabled !== undefined ? Boolean(options.enabled) : true,
         allowedPorts: Array.isArray(options.allowedPorts)
             ? options.allowedPorts.map(Number).filter(Number.isFinite)
@@ -1253,6 +1268,9 @@ export function buildZiniaoWebRtcSecurityInitScript(options = {}) {
 
     const allowedPortSet = new Set(CFG.allowedPorts || []);
     const OrigURL = typeof URL === 'function' ? URL : null;
+    const snapshotRtcConfig = (${createRtcConfigSnapshot.toString()})();
+    const freezeRtcConfig = Object.freeze;
+    const { apply: applyNative, construct: constructNative } = Reflect;
     const nativeToString = Function.prototype.toString;
     const cloakedFns = new WeakMap();
 
@@ -1500,31 +1518,10 @@ export function buildZiniaoWebRtcSecurityInitScript(options = {}) {
         return false;
     };
 
-    const sanitizeRtcConfig = (rtcConfig) => {
-        if (!rtcConfig || typeof rtcConfig !== 'object' || !Array.isArray(rtcConfig.iceServers)) {
-            return rtcConfig;
+    const sanitizeRtcArgs = (args) => {
+        if (args.length > 0) {
+            args[0] = freezeRtcConfig(snapshotRtcConfig(args[0], shouldAllowIceUrl));
         }
-        const sanitizedServers = [];
-        for (const server of rtcConfig.iceServers) {
-            if (!server || typeof server !== 'object') continue;
-            const nextServer = { ...server };
-            if (Array.isArray(server.urls)) {
-                const kept = server.urls.filter((u) => typeof u === 'string' && shouldAllowIceUrl(u));
-                if (kept.length > 0) nextServer.urls = kept;
-                else delete nextServer.urls;
-            } else if (typeof server.urls === 'string') {
-                if (shouldAllowIceUrl(server.urls)) nextServer.urls = server.urls;
-                else delete nextServer.urls;
-            }
-            if (typeof server.url === 'string') {
-                if (shouldAllowIceUrl(server.url)) nextServer.url = server.url;
-                else delete nextServer.url;
-            }
-            const hasUrls = Array.isArray(nextServer.urls) ? nextServer.urls.length > 0 : typeof nextServer.urls === 'string' && nextServer.urls.length > 0;
-            const hasUrl = typeof nextServer.url === 'string' && nextServer.url.length > 0;
-            if (hasUrls || hasUrl) sanitizedServers.push(nextServer);
-        }
-        return { ...rtcConfig, iceServers: sanitizedServers };
     };
 
     if (typeof Function !== 'undefined' && Function.prototype && typeof Function.prototype.toString === 'function') {
@@ -1552,12 +1549,8 @@ export function buildZiniaoWebRtcSecurityInitScript(options = {}) {
                 if (typeof OrigRTC.prototype.setConfiguration === 'function') {
                     const origSetConfig = OrigRTC.prototype.setConfiguration;
                     const wrappedSetConfig = createNativeMethodWrapper('setConfiguration', function (...args) {
-                        if (args.length > 0 && args[0] && typeof args[0] === 'object') {
-                            const nextArgs = [...args];
-                            nextArgs[0] = sanitizeRtcConfig(args[0]);
-                            return origSetConfig.apply(this, nextArgs);
-                        }
-                        return origSetConfig.apply(this, args);
+                        sanitizeRtcArgs(args);
+                        return applyNative(origSetConfig, this, args);
                     });
                     defineCloakedMethod(OrigRTC.prototype, 'setConfiguration', wrappedSetConfig, origSetConfig);
                 }
@@ -1568,19 +1561,16 @@ export function buildZiniaoWebRtcSecurityInitScript(options = {}) {
                 ProxiedRTC = new Proxy(OrigRTC, {
                     construct(target, args, newTarget) {
                         try {
-                            if (args.length > 0 && args[0] && typeof args[0] === 'object') {
-                                const nextArgs = [...args];
-                                nextArgs[0] = sanitizeRtcConfig(args[0]);
-                                return Reflect.construct(target, nextArgs, newTarget);
-                            }
-                            return Reflect.construct(target, args, newTarget);
+                            sanitizeRtcArgs(args);
+                            return constructNative(target, args, newTarget);
                         } catch (err) {
                             throw sanitizeThrownError(err);
                         }
                     },
                     apply(target, thisArg, args) {
                         try {
-                            return Reflect.apply(target, thisArg, args);
+                            sanitizeRtcArgs(args);
+                            return applyNative(target, thisArg, args);
                         } catch (err) {
                             throw sanitizeThrownError(err);
                         }
@@ -1660,12 +1650,76 @@ export function assertPrivateNetworkIsolationAvailable(portScanProtection, manag
     return mode;
 }
 
+const MAX_BLOCKED_HISTORY_ENTRIES = 128;
+const MAX_BLOCKED_HISTORY_BYTES = 128 * 1024;
+const MAX_BLOCKED_NOTIFICATIONS_PER_SECOND = 16;
+
+function blockedDiagnosticText(value, redact = redactDiagnosticText) {
+    if (value == null) return null;
+    const text = String(value);
+    return text.length <= 1024 ? redact(text) : '[omitted: diagnostic field too long]';
+}
+
 export async function attachZiniaoSecurityGuardsToContext(context, options = {}) {
     const portProtOpts = options.portScanProtection || {};
     const mode = assertPrivateNetworkIsolationAvailable(portProtOpts, options.managedProxyBinding);
 
-    const blockedPortScans = [];
-    const blockedInternalSchemes = [];
+    const limit = (value, max) => Number.isSafeInteger(value) && value >= 0 ? Math.min(value, max) : max;
+    const maxHistoryEntries = limit(options.blockedHistoryMaxEntries, MAX_BLOCKED_HISTORY_ENTRIES);
+    const maxHistoryBytes = limit(options.blockedHistoryMaxBytes, MAX_BLOCKED_HISTORY_BYTES);
+    const maxNotifications = limit(options.blockedNotificationsPerSecond, MAX_BLOCKED_NOTIFICATIONS_PER_SECOND);
+    const history = [];
+    let historyBytes = 0;
+    let blockedPortScanCount = 0;
+    let blockedInternalSchemeCount = 0;
+    let suppressedBlockedAttemptNotifications = 0;
+    let notificationWindowStart = -Infinity;
+    let notificationsThisWindow = 0;
+    let detached = false;
+
+    const samples = (type) => history
+        .filter(({ event }) => event.type === type)
+        .map(({ event }) => ({ ...event }));
+
+    const recordBlockedAttempt = (event) => {
+        if (event.type === 'internal-scheme-probe') {
+            blockedInternalSchemeCount += 1;
+        } else {
+            blockedPortScanCount += 1;
+        }
+        if (detached) return;
+
+        const sample = Object.fromEntries(Object.entries(event).map(([key, value]) => [
+            key,
+            typeof value === 'string'
+                ? blockedDiagnosticText(value, key.endsWith('Url') ? redactUrlSecrets : redactDiagnosticText)
+                : value
+        ]));
+        const bytes = Buffer.byteLength(JSON.stringify(sample), 'utf8');
+        if (maxHistoryEntries > 0 && bytes <= maxHistoryBytes) {
+            while (history.length >= maxHistoryEntries || historyBytes + bytes > maxHistoryBytes) {
+                historyBytes -= history.shift().bytes;
+            }
+            history.push({ event: sample, bytes });
+            historyBytes += bytes;
+        }
+
+        if (typeof options.onBlockedAttempt === 'function') {
+            const now = performance.now();
+            if (now - notificationWindowStart >= 1_000) {
+                notificationWindowStart = now;
+                notificationsThisWindow = 0;
+            }
+            if (notificationsThisWindow < maxNotifications) {
+                notificationsThisWindow += 1;
+                try {
+                    options.onBlockedAttempt({ ...sample });
+                } catch {}
+            } else {
+                suppressedBlockedAttemptNotifications += 1;
+            }
+        }
+    };
     const profileId = String(options.profileId || 'default-profile');
     const portScanProtectionEnabled =
         portProtOpts.enabled !== undefined ? Boolean(portProtOpts.enabled) : true;
@@ -1673,7 +1727,6 @@ export async function attachZiniaoSecurityGuardsToContext(context, options = {})
 
     if (context && typeof context.addInitScript === 'function' && portProtOpts.enabled !== false) {
         const webrtcInitScript = buildZiniaoWebRtcSecurityInitScript({
-            profileId,
             enabled: true,
             allowedPorts: portProtOpts.allowedPorts || [],
             allowSameOriginLocalDev: portProtOpts.allowSameOriginLocalDev ?? false
@@ -1688,20 +1741,12 @@ export async function attachZiniaoSecurityGuardsToContext(context, options = {})
         portScanProtectionMode: portScanProtectionEnabled ? mode : 'disabled',
         ...(mode === 'managed-proxy' ? { destinationIpPolicy: 'managed-proxy-unverified' } : {}),
         webrtcInitScriptAttached,
-        blockedPortScanCount: blockedPortScans.length,
-        blockedInternalSchemeCount: blockedInternalSchemes.length,
-        blockedPortScans: [...blockedPortScans],
-        blockedInternalSchemes: [...blockedInternalSchemes]
+        blockedPortScanCount,
+        blockedInternalSchemeCount,
+        suppressedBlockedAttemptNotifications,
+        blockedPortScans: samples('local-port-scan-probe'),
+        blockedInternalSchemes: samples('internal-scheme-probe')
     });
-
-    if (!context || typeof context.route !== 'function') {
-        return {
-            blockedPortScans,
-            blockedInternalSchemes,
-            getStats,
-            detach: async () => {}
-        };
-    }
 
     const routeHandler = async (route, request) => {
         const req =
@@ -1738,14 +1783,9 @@ export async function attachZiniaoSecurityGuardsToContext(context, options = {})
                 method,
                 resourceType,
                 matchedScheme: schemeEval.matchedScheme,
-                reason: schemeEval.reason
+                reason: `Blocked untrusted access to internal browser/extension resource "${blockedDiagnosticText(reqUrl.trim(), redactUrlSecrets)}"`
             };
-            blockedInternalSchemes.push(ev);
-            if (typeof options.onBlockedAttempt === 'function') {
-                try {
-                    options.onBlockedAttempt(ev);
-                } catch {}
-            }
+            recordBlockedAttempt(ev);
             await route.abort('accessdenied');
             return;
         }
@@ -1774,12 +1814,7 @@ export async function attachZiniaoSecurityGuardsToContext(context, options = {})
                 severity: portEval.severity,
                 reason: portEval.reason
             };
-            blockedPortScans.push(ev);
-            if (typeof options.onBlockedAttempt === 'function') {
-                try {
-                    options.onBlockedAttempt(ev);
-                } catch {}
-            }
+            recordBlockedAttempt(ev);
             await route.abort('connectionrefused');
             return;
         }
@@ -1787,16 +1822,21 @@ export async function attachZiniaoSecurityGuardsToContext(context, options = {})
         await route.continue();
     };
 
-    await context.route('**/*', routeHandler);
+    const hasRoute = typeof context?.route === 'function';
+    if (hasRoute) await context.route('**/*', routeHandler);
 
     return {
-        blockedPortScans,
-        blockedInternalSchemes,
+        get blockedPortScans() { return samples('local-port-scan-probe'); },
+        get blockedInternalSchemes() { return samples('internal-scheme-probe'); },
         getStats,
         detach: async () => {
-            if (typeof context.unroute === 'function') {
+            if (detached) return;
+            if (hasRoute && typeof context.unroute === 'function') {
                 await context.unroute('**/*', routeHandler);
             }
+            detached = true;
+            history.length = 0;
+            historyBytes = 0;
         }
     };
 }

@@ -6,6 +6,7 @@
 import puppeteer from 'puppeteer-core';
 import logger from '../utils/logger.js';
 import dolphinClient from './client.js';
+import ManagedProfile, { rollbackNewManagedProfile } from '../utils/managed-profile.js';
 import {
     ControllerUrlError,
     connectBrowser,
@@ -14,19 +15,16 @@ import {
     validateControllerEndpoint
 } from '../utils/controller-url.js';
 
-class DolphinProfile {
+class DolphinProfile extends ManagedProfile {
     constructor(profileId, webSocketUrl = null) {
-        this.profileId = profileId;
-        this.browser = null;
-        this.page = null;
-        this.webSocketUrl = webSocketUrl;
+        super(profileId, dolphinClient, 'webSocketUrl', webSocketUrl, () => this.#startBrowser());
     }
 
     /**
      * Start profile and get browser instance
      * بدء البروفايل والحصول على متصفح
      */
-    async start() {
+    async #startBrowser() {
         try {
             logger.info('Starting Dolphin Anty profile', { profileId: this.profileId });
 
@@ -128,77 +126,6 @@ class DolphinProfile {
             throw error;
         }
     }
-
-    /**
-     * Get browser instance (creates new if needed)
-     * الحصول على متصفح (إنشاء جديد إذا لزم الأمر)
-     */
-    async getBrowser() {
-        if (!this.browser) {
-            await this.start();
-        }
-        return this.browser;
-    }
-
-    /**
-     * Get page instance
-     * الحصول على صفحة
-     */
-    async getPage() {
-        if (!this.page) {
-            const browser = await this.getBrowser();
-            const pages = await browser.pages();
-            this.page = pages[0] || await browser.newPage();
-        }
-        return this.page;
-    }
-
-    /**
-     * Stop profile
-     * إيقاف البروفايل
-     */
-    async stop() {
-        try {
-            if (this.browser) {
-                try {
-                    await this.browser.disconnect();
-                } catch (e) {
-                    // Ignore disconnect errors
-                }
-                this.browser = null;
-                this.page = null;
-            }
-
-            await dolphinClient.stopProfile(this.profileId);
-            logger.info('Dolphin Anty profile stopped', { profileId: this.profileId });
-            return true;
-        } catch (error) {
-            logger.warn('Error stopping Dolphin Anty profile', { 
-                profileId: this.profileId, 
-                error: error.message 
-            });
-            return false;
-        }
-    }
-
-    /**
-     * Delete profile
-     * حذف البروفايل
-     */
-    async delete() {
-        try {
-            await this.stop();
-            await dolphinClient.deleteProfile(this.profileId);
-            logger.info('Dolphin Anty profile deleted', { profileId: this.profileId });
-            return true;
-        } catch (error) {
-            logger.error('Failed to delete Dolphin Anty profile', { 
-                profileId: this.profileId, 
-                error: error.message 
-            });
-            throw error;
-        }
-    }
 }
 
 /**
@@ -206,6 +133,7 @@ class DolphinProfile {
  * إنشاء وبدء بروفايل جديد
  */
 export async function createAndStartProfile(name, proxy = null) {
+    let profileManager;
     try {
         // Check Dolphin connection first
         const isConnected = await dolphinClient.checkDolphinConnection();
@@ -217,38 +145,21 @@ export async function createAndStartProfile(name, proxy = null) {
         logger.info('Creating Dolphin Anty profile...');
         const profile = await dolphinClient.createProfile(name, proxy);
         
-        if (!profile.id) {
-            throw new Error('Failed to create profile: No profile ID returned');
-        }
+        profileManager = new DolphinProfile(profile?.id);
 
-        logger.info('Dolphin Anty profile created', { 
-            profileId: profile.id, 
-            name: profile.title || name
-        });
+        logger.info('Dolphin Anty profile created', { profileId: profile.id });
 
         // Wait a bit for profile to be ready
         logger.info('Waiting for profile initialization...');
         await new Promise(resolve => setTimeout(resolve, 2000));
 
-        // Start profile
-        logger.info('Starting Dolphin Anty profile...');
-        const startData = await dolphinClient.startProfile(profile.id);
-        
-        if (!startData.ws && !startData.webSocketDebuggerUrl) {
-            throw new Error('Failed to start profile: No WebSocket URL returned');
-        }
-
-        // Create profile manager
-        const profileManager = new DolphinProfile(profile.id, startData.ws || startData.webSocketDebuggerUrl);
         await profileManager.start();
 
-        logger.info('Dolphin Anty profile created and started', { 
-            profileId: profile.id, 
-            name: profile.title || name 
-        });
+        logger.info('Dolphin Anty profile created and started', { profileId: profile.id });
         
         return profileManager;
     } catch (error) {
+        if (profileManager) throw await rollbackNewManagedProfile(profileManager, error);
         logger.error('Failed to create and start Dolphin Anty profile', { error: error.message });
         throw error;
     }

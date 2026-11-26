@@ -13,38 +13,24 @@ if ! command -v git &> /dev/null; then
     exit 1
 fi
 
-# Check the paths before staging and again before committing.
-check_git_paths() (
-    set -o pipefail
-    shopt -s nocasematch
-    git ls-files -z "$@" | while IFS= read -r -d '' git_path; do
-        case "$git_path" in
-            .env.example) ;;
-            *.env|*.env.*|*.emv|*.emv.*|\
-            config/proxies.txt|*/config/proxies.txt|email.txt|*/email.txt|gmlogin.txt|*/gmlogin.txt|\
-            results.json|*/results.json|summary.json|*/summary.json|profiles.json|*/profiles.json|\
-            camoufox-audit-report.json|logs/*|data/*|profiles/*|.gpm/*|gpm-data/*)
-                printf 'Sensitive file would be included in the commit: %q\n' "$git_path" >&2
-                exit 1
-                ;;
-        esac
-    done
-)
+if ! command -v node &> /dev/null; then
+    echo "❌ Node.js is required to check the distribution files." >&2
+    exit 1
+fi
 
 repository_root=$(git rev-parse --show-toplevel) || exit 1
 cd "$repository_root" || exit 1
-check_git_paths --cached --others --exclude-standard || exit 1
 
 # إضافة جميع الملفات
 echo "📦 إضافة الملفات..."
 echo "📦 Adding files..."
-git add . || exit 1
+node scripts/check-distribution.mjs stage || exit 1
 
 # عرض حالة الملفات
 echo ""
 echo "📋 حالة الملفات:"
 echo "📋 File status:"
-git status --short
+git diff --cached --name-status || exit 1
 
 echo ""
 echo "⚠️  تأكد من أن الملفات الحساسة غير موجودة في القائمة أعلاه!"
@@ -59,7 +45,7 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     exit 1
 fi
 
-check_git_paths --cached || exit 1
+node scripts/check-distribution.mjs index || exit 1
 
 # عمل commit
 echo "💾 عمل commit..."
