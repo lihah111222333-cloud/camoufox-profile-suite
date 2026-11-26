@@ -356,10 +356,13 @@ export async function collectBrowserFingerprint(page) {
         ].filter((prop) => Object.prototype.hasOwnProperty.call(navigator, prop));
 
         const toStringSelfSource = fnToString.call(fnToString);
-        const toStringIntact = nativeCodeRegex.test(toStringSelfSource);
+        const functionToString = inspectMethod(Function.prototype, 'toString', 0);
+        const toStringIntact =
+            nativeCodeRegex.test(toStringSelfSource) && Boolean(functionToString.isNative);
 
         const prototypeIntegrity = {
             toStringIntact,
+            functionToString,
             ownNavigatorOverrides,
             userAgentGetter: inspectGetter(navProto, 'userAgent'),
             webdriverGetter: inspectGetter(navProto, 'webdriver'),
@@ -1041,7 +1044,7 @@ export async function collectBrowserFingerprint(page) {
             webgpu,
             stackAndMediaHygiene,
             storageEstimate,
-            ...(gpuPerformance ? { gpuPerformance } : {})
+            ...(gpuPerformance ? { gpuPerformance, gpuPerformanceState: gpuPerformance } : {})
         };
     });
 }
@@ -1106,8 +1109,19 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
             proto.webglDrawArrays && proto.webglDrawArrays.exists !== false
                 ? Boolean(proto.webglDrawArrays.isNative)
                 : true;
+        const functionToStringOk =
+            proto.functionToString !== undefined && proto.functionToString !== null
+                ? typeof proto.functionToString === 'string'
+                    ? /^function\s+toString\(\)\s*\{\s*\[native code\]\s*\}$/s.test(
+                          proto.functionToString.trim()
+                      )
+                    : proto.functionToString.exists !== false
+                      ? Boolean(proto.functionToString.isNative)
+                      : true
+                : true;
+        const toStringOk = proto.toStringIntact !== false && functionToStringOk;
         const gettersNative =
-            Boolean(proto.toStringIntact) &&
+            toStringOk &&
             Boolean(proto.userAgentGetter?.isNative) &&
             Boolean(proto.webdriverGetter?.isNative) &&
             platformGetterOk &&
@@ -1125,7 +1139,7 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
                 `navigator own-property overrides detected: [${(proto.ownNavigatorOverrides || []).join(', ')}]`
             );
         }
-        if (!proto.toStringIntact) issues.push('Function.prototype.toString tampered');
+        if (!toStringOk) issues.push('Function.prototype.toString tampered');
         if (!proto.userAgentGetter?.isNative) issues.push('Navigator.prototype.userAgent getter is not [native code]');
         if (!proto.webdriverGetter?.isNative) issues.push('Navigator.prototype.webdriver getter is not [native code]');
         if (!platformGetterOk) issues.push('Navigator.prototype.platform getter is not [native code]');
@@ -2439,7 +2453,14 @@ export async function auditProfileCoherence(page, expectedOs, options = {}) {
     if (!telemetry.hardwareProfile && opts.hardwareProfile && typeof opts.hardwareProfile === 'object') {
         telemetry.hardwareProfile = { ...opts.hardwareProfile };
     }
-    if (!telemetry.gpuPerformance && opts.gpuPerformance && typeof opts.gpuPerformance === 'object') {
+    if (
+        collectedTelemetry?.gpuPerformance &&
+        typeof collectedTelemetry.gpuPerformance === 'object' &&
+        !telemetry.gpuPerformanceState
+    ) {
+        telemetry.gpuPerformanceState = { ...collectedTelemetry.gpuPerformance };
+    }
+    if (opts.gpuPerformance && typeof opts.gpuPerformance === 'object') {
         telemetry.gpuPerformance = { ...opts.gpuPerformance };
     }
 

@@ -2745,6 +2745,14 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
         const isIMac = !isIMacPro && /\biMac\b/i.test(macProductLabel);
         const isMacPro = /\bMac[\s_-]+Pro\b/i.test(macProductLabel);
 
+        const isAnyMacProduct =
+            isMacStudio || isMacBookAir || isMacBookPro || isMacMini || isIMacPro || isIMac || isMacPro;
+        if (isAnyMacProduct && /NVIDIA|GeForce|RTX|GTX|Qualcomm|Adreno/i.test(renderer)) {
+            issues.push(
+                `Mac product line violation: "${macProductLabel}" cannot ship with non-Apple/non-AMD/non-Intel GPU "${renderer}"`
+            );
+        }
+
         if (isMacStudio) {
             if (cpuArchClaim === 'x86' || (!activeAppleSkuName && /Intel|AMD|Radeon/i.test(renderer))) {
                 issues.push(
@@ -2758,11 +2766,17 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
                     );
                 }
             }
-        } else if (isMacBookAir && activeAppleSkuName) {
-            const sku = APPLE_SILICON_SKU_CATALOG[activeAppleSkuName];
-            if (sku.tier !== 'base') {
+        } else if (isMacBookAir) {
+            if (activeAppleSkuName) {
+                const sku = APPLE_SILICON_SKU_CATALOG[activeAppleSkuName];
+                if (sku.tier !== 'base') {
+                    issues.push(
+                        `Mac product line violation: "${macProductLabel}" (MacBook Air) only ships with base Apple M-series SoCs (M1/M2/M3/M4/M5), never with ${sku.tier}-tier "${sku.chip}"`
+                    );
+                }
+            } else if (/AMD|Radeon/i.test(renderer)) {
                 issues.push(
-                    `Mac product line violation: "${macProductLabel}" (MacBook Air) only ships with base Apple M-series SoCs (M1/M2/M3/M4/M5), never with ${sku.tier}-tier "${sku.chip}"`
+                    `Mac product line violation: "${macProductLabel}" (MacBook Air) never shipped with discrete AMD Radeon GPU "${renderer}"`
                 );
             }
         } else if (isMacBookPro && activeAppleSkuName) {
@@ -2772,11 +2786,17 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
                     `Mac product line violation: "${macProductLabel}" (MacBook Pro) never ships with desktop-only Ultra-tier SoC "${sku.chip}"`
                 );
             }
-        } else if (isMacMini && activeAppleSkuName) {
-            const sku = APPLE_SILICON_SKU_CATALOG[activeAppleSkuName];
-            if (sku.tier === 'max' || sku.tier === 'ultra') {
+        } else if (isMacMini) {
+            if (activeAppleSkuName) {
+                const sku = APPLE_SILICON_SKU_CATALOG[activeAppleSkuName];
+                if (sku.tier === 'max' || sku.tier === 'ultra') {
+                    issues.push(
+                        `Mac product line violation: "${macProductLabel}" (Mac mini) only ships with base or Pro Apple Silicon SoCs, never with ${sku.tier}-tier "${sku.chip}"`
+                    );
+                }
+            } else if (/AMD|Radeon/i.test(renderer)) {
                 issues.push(
-                    `Mac product line violation: "${macProductLabel}" (Mac mini) only ships with base or Pro Apple Silicon SoCs, never with ${sku.tier}-tier "${sku.chip}"`
+                    `Mac product line violation: "${macProductLabel}" (2018 Intel Mac mini) only ships with Intel UHD Graphics 630, never discrete AMD Radeon GPU "${renderer}"`
                 );
             }
         } else if (isIMacPro && activeAppleSkuName) {
@@ -2897,9 +2917,9 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
             issues.push(
                 `Cross-OS DeviceName violation: Windows hostname pattern "${rawHostName}" (DESKTOP-/LAPTOP-/WIN-) cannot appear on macOS targetOs="mac"`
             );
-        } else if (targetOs === 'lin' && /^(?:DESKTOP|WIN)-[A-Z0-9]+$/i.test(rawHostName)) {
+        } else if (targetOs === 'lin' && /^(?:DESKTOP|LAPTOP|WIN)-[A-Z0-9]+$/i.test(rawHostName)) {
             issues.push(
-                `Cross-OS DeviceName violation: Windows hostname pattern "${rawHostName}" (DESKTOP-/WIN-) cannot appear on Linux targetOs="lin"`
+                `Cross-OS DeviceName violation: Windows hostname pattern "${rawHostName}" (DESKTOP-/LAPTOP-/WIN-) cannot appear on Linux targetOs="lin"`
             );
         } else if (
             (targetOs === 'win' || targetOs === 'lin') &&

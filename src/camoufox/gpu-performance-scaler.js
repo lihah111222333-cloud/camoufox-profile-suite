@@ -807,6 +807,58 @@ export const GPU_PERFORMANCE_SPEC_CATALOG = Object.freeze({
         webgpuMaxBufferSize: 2147483648,
         webgpuMaxComputeWorkgroupSizeX: 1024
     }),
+    'NVIDIA GeForce RTX 3060 Laptop GPU': Object.freeze({
+        model: 'NVIDIA GeForce RTX 3060 Laptop GPU',
+        vendor: 'nvidia',
+        architecture: 'ampere',
+        tier: 'performance-laptop',
+        gpuCores: 30,
+        fp32Tflops: 10.94,
+        memoryBandwidthGBps: 336.0,
+        pixelFillRateGPixels: 81.6,
+        textureFillRateGTexels: 171.0,
+        webgpuMaxBufferSize: 2147483648,
+        webgpuMaxComputeWorkgroupSizeX: 1024
+    }),
+    'NVIDIA GeForce RTX 3050': Object.freeze({
+        model: 'NVIDIA GeForce RTX 3050',
+        vendor: 'nvidia',
+        architecture: 'ampere',
+        tier: 'mainstream-desktop',
+        gpuCores: 20,
+        fp32Tflops: 9.1,
+        memoryBandwidthGBps: 224.0,
+        pixelFillRateGPixels: 76.0,
+        textureFillRateGTexels: 142.2,
+        webgpuMaxBufferSize: 2147483648,
+        webgpuMaxComputeWorkgroupSizeX: 1024
+    }),
+    'NVIDIA GeForce RTX 2060': Object.freeze({
+        model: 'NVIDIA GeForce RTX 2060',
+        vendor: 'nvidia',
+        architecture: 'turing',
+        tier: 'mainstream-desktop',
+        gpuCores: 30,
+        fp32Tflops: 6.45,
+        memoryBandwidthGBps: 336.0,
+        pixelFillRateGPixels: 107.5,
+        textureFillRateGTexels: 201.6,
+        webgpuMaxBufferSize: 2147483648,
+        webgpuMaxComputeWorkgroupSizeX: 1024
+    }),
+    'NVIDIA GeForce GTX 1660': Object.freeze({
+        model: 'NVIDIA GeForce GTX 1660',
+        vendor: 'nvidia',
+        architecture: 'turing',
+        tier: 'mainstream-desktop',
+        gpuCores: 22,
+        fp32Tflops: 5.03,
+        memoryBandwidthGBps: 192.1,
+        pixelFillRateGPixels: 85.7,
+        textureFillRateGTexels: 157.1,
+        webgpuMaxBufferSize: 2147483648,
+        webgpuMaxComputeWorkgroupSizeX: 1024
+    }),
     'NVIDIA GeForce GTX 1650': Object.freeze({
         model: 'NVIDIA GeForce GTX 1650',
         vendor: 'nvidia',
@@ -887,12 +939,13 @@ export function lookupGpuPerformanceSpec(rendererOrModel) {
         }
     }
 
-    // Heuristic pattern matchers for variant renderer strings
+    // Heuristic pattern matchers for variant renderer strings & PC_GPU_SKU_CATALOG category IDs
     if (/RTX\s*4090\s*Laptop/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4090 Laptop GPU'];
     if (/RTX\s*4080\s*Laptop/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4080 Laptop GPU'];
     if (/RTX\s*4070\s*Laptop/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4070 Laptop GPU'];
     if (/RTX\s*4060\s*Laptop/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4060 Laptop GPU'];
     if (/RTX\s*4050\s*Laptop/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4050 Laptop GPU'];
+    if (/RTX\s*3060\s*Laptop/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 3060 Laptop GPU'];
     if (/RTX\s*4090/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4090'];
     if (/RTX\s*4080\s*SUPER/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4080 SUPER'];
     if (/RTX\s*(?:4080|5000\s*Ada)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4080'];
@@ -904,24 +957,27 @@ export function lookupGpuPerformanceSpec(rendererOrModel) {
     if (/RTX\s*3090/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 3090'];
     if (/RTX\s*3080/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 3080'];
     if (/RTX\s*3070/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 3070'];
-    if (/RTX\s*(?:3060|3050|2060|A1000)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 3060'];
-    if (/GTX\s*1660/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce GTX 1660 SUPER'];
+    if (/RTX\s*3050/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 3050'];
+    if (/RTX\s*2060/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 2060'];
+    if (/RTX\s*(?:3060|A1000)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 3060'];
+    if (/GTX\s*1660\s*(?:SUPER|Ti)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce GTX 1660 SUPER'];
+    if (/GTX\s*1660/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce GTX 1660'];
     if (/GTX\s*1650/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce GTX 1650'];
     if (/RX\s*7900\s*XTX/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 7900 XTX'];
     if (/RX\s*7800\s*XT/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 7800 XT'];
-    if (/RX\s*6800\s*XT/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 6800 XT'];
+    if (/RX\s*6800\s*XT|RX\s*6000\/7000/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 6800 XT'];
     if (/RX\s*6700\s*XT/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 6700 XT'];
     if (/RX\s*6600/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 6600'];
     if (/W6[89]00X|Vega\s*II/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon Pro W6800X'];
-    if (/5700(?:\s*XT)?|W5[57]00X|W6600X|Vega\s*(?:48|56|64)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon Pro 5700 XT'];
-    if (/5500(?:\s*XT|M)?|5600M|5300M?|580X|575X|570X|560X|555X|Vega\s*(?:16|20)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon Pro 5500M'];
+    if (/5700(?:\s*XT)?|W5[57]00X|W6600X|Vega\s*(?:48|56|64)|Radeon\s+Pro\s+Desktop/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon Pro 5700 XT'];
+    if (/5500(?:\s*XT|M)?|5600M|5300M?|580X|575X|570X|560X|555X|Vega\s*(?:16|20)|Radeon\s+Pro\s+Mobile/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon Pro 5500M'];
     if (/8[89]0M/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon 890M'];
     if (/7[68]0M/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon 780M'];
-    if (/(?:6[68]0M|740M|610M|Radeon(?:\(TM\))?\s+(?:Vega|Graphics))/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon 680M'];
-    if (/Arc\(TM\)\s+A7[57]0/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['Intel(R) Arc(TM) A770 Graphics'];
+    if (/(?:6[68]0M|740M|610M|Radeon(?:\(TM\))?\s+(?:Vega|Graphics|Integrated\s+APU))/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon 680M'];
+    if (/Arc(?:\(TM\))?.*A7[57]0/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['Intel(R) Arc(TM) A770 Graphics'];
     if (/140V|130V/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['Intel(R) Arc(TM) 140V Graphics'];
-    if (/Arc\(TM\)\s+(?:A380\s+)?Graphics/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['Intel(R) Arc(TM) Graphics'];
-    if (/Iris\(R\)\s+Xe|Intel\(R\)\s+Graphics/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['Intel(R) Iris(R) Xe Graphics'];
+    if (/Arc(?:\(TM\))?\s+(?:A380\s+)?Graphics/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['Intel(R) Arc(TM) Graphics'];
+    if (/Iris(?:\(R\))?\s*Xe|Intel(?:\(R\))?\s+Graphics|Intel\s+Integrated\s+UHD/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['Intel(R) Iris(R) Xe Graphics'];
     if (/UHD\s+Graphics\s+7[37]0/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['Intel(R) UHD Graphics 770'];
     if (/Iris.*(?:655|650|645|640|550|540|6100|G7|Pro|Plus|OpenGL)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['Intel(R) Iris(TM) Plus Graphics 655'];
     if (/UHD\s+Graphics(?:\s+630)?/i.test(raw) && !/6[12]\d/.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['Intel(R) UHD Graphics 630'];
@@ -1223,6 +1279,7 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
     });
 
     return `(() => {
+    'use strict';
     const CFG = ${configPayload};
     try {
         Object.defineProperty(globalThis, '__camoufoxGpuPerformanceState', {
@@ -1243,6 +1300,15 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
     } catch {}
     const nativeToString = Function.prototype.toString;
     const cloakedFns = new WeakMap();
+
+    // Concise method syntax produces non-constructor functions with no own .prototype property
+    // ('prototype' in fn === false, new fn() throws TypeError), matching native C++ WebIDL methods.
+    const createNativeMethodWrapper = (methodName, impl) =>
+        ({
+            [methodName](...args) {
+                return impl.apply(this, args);
+            }
+        })[methodName];
 
     const cloak = (wrappedFn, origFn) => {
         try {
@@ -1268,23 +1334,18 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
         Object.defineProperty(targetObj, propName, {
             value: wrappedFn,
             writable: origDesc ? Boolean(origDesc.writable) : true,
-            enumerable: origDesc ? Boolean(origDesc.enumerable) : true,
+            enumerable: origDesc ? Boolean(origDesc.enumerable) : false,
             configurable: origDesc ? Boolean(origDesc.configurable) : true
         });
     };
 
-    const patchedToString = function toString() {
-        if (cloakedFns.has(this)) {
+    const patchedToString = createNativeMethodWrapper('toString', function () {
+        if (typeof this === 'function' && cloakedFns.has(this)) {
             return cloakedFns.get(this);
         }
         return nativeToString.call(this);
-    };
-    cloak(patchedToString, nativeToString);
-    Object.defineProperty(Function.prototype, 'toString', {
-        value: patchedToString,
-        writable: true,
-        configurable: true
     });
+    defineCloakedMethod(Function.prototype, 'toString', patchedToString, nativeToString);
 
     let sampleCounter = 0;
     const nextJitter = () => {
@@ -1319,8 +1380,9 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
         return base * CFG.profileVarianceFactor * nextJitter();
     };
 
-    const advanceVirtualClock = () => {
-        const realNow = origPerfNow.call(performance);
+    const advanceVirtualClock = (explicitRealNow) => {
+        const realNow =
+            typeof explicitRealNow === 'number' ? explicitRealNow : origPerfNow.call(performance);
         const realDelta = Math.max(0, realNow - lastRealPerfNow);
         lastRealPerfNow = realNow;
 
@@ -1344,65 +1406,111 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
         return virtualPerfNow;
     };
 
-    const patchedPerfNow = function now() {
-        return advanceVirtualClock();
-    };
-    cloak(patchedPerfNow, origPerfNow);
-    Object.defineProperty(Performance.prototype, 'now', {
-        value: patchedPerfNow,
-        writable: true,
-        configurable: true
+    const patchedPerfNow = createNativeMethodWrapper('now', function () {
+        const realNow = origPerfNow.call(this);
+        return advanceVirtualClock(realNow);
     });
+    defineCloakedMethod(Performance.prototype, 'now', patchedPerfNow, origPerfNow);
 
-    const patchedDateNow = function now() {
+    const patchedDateNow = createNativeMethodWrapper('now', function () {
         const vNow = advanceVirtualClock();
         return Math.round(baseDateOrigin + (vNow - basePerfOrigin));
-    };
-    cloak(patchedDateNow, origDateNow);
-    Object.defineProperty(Date, 'now', {
-        value: patchedDateNow,
-        writable: true,
-        configurable: true
     });
+    defineCloakedMethod(Date, 'now', patchedDateNow, origDateNow);
+
+    // Keep window.requestAnimationFrame callback timestamp monotonically synchronized with virtual performance.now()
+    let lastVirtualRafTs = basePerfOrigin;
+    if (typeof globalThis.requestAnimationFrame === 'function') {
+        const origRaf = globalThis.requestAnimationFrame;
+        const wrappedRaf = createNativeMethodWrapper('requestAnimationFrame', function (callback) {
+            if (typeof callback !== 'function') {
+                return origRaf.call(this, callback);
+            }
+            const wrappedRafCb = function (rawRafTs) {
+                const realNow = origPerfNow.call(performance);
+                const vNow = advanceVirtualClock(realNow);
+                const rawFrameLag = Number.isFinite(rawRafTs)
+                    ? Math.max(0, Math.min(50, realNow - rawRafTs))
+                    : 0;
+                const minRafStep = lastVirtualRafTs > basePerfOrigin ? 0.001 : 0;
+                const virtualRafTs = Math.min(
+                    vNow,
+                    Math.max(lastVirtualRafTs + minRafStep, vNow - rawFrameLag)
+                );
+                lastVirtualRafTs = virtualRafTs;
+                return callback.call(this, virtualRafTs);
+            };
+            return origRaf.call(this, wrappedRafCb);
+        });
+        defineCloakedMethod(globalThis, 'requestAnimationFrame', wrappedRaf, origRaf);
+    }
 
     const hookedProtos = new WeakSet();
     const timerQueries = new WeakSet();
     const nonTimerQueries = new WeakSet();
+    const timestampQueries = new WeakSet();
     const scaledQueryResults = new WeakMap();
     const scaledExtObjects = new WeakSet();
+
+    let lastRawGpuTimestampNs = null;
+    let virtualGpuTimestampNs = null;
+    const scaleGpuTimestampNs = (rawNs) => {
+        if (lastRawGpuTimestampNs === null) {
+            lastRawGpuTimestampNs = rawNs;
+            virtualGpuTimestampNs = rawNs;
+            return rawNs;
+        }
+        const deltaNs = Math.max(0, rawNs - lastRawGpuTimestampNs);
+        lastRawGpuTimestampNs = rawNs;
+        const scaledDeltaNs = Math.max(
+            deltaNs > 0 ? 100 : 0,
+            Math.round(deltaNs * CFG.computeTimeMultiplier * CFG.profileVarianceFactor * nextJitter())
+        );
+        virtualGpuTimestampNs += scaledDeltaNs;
+        return virtualGpuTimestampNs;
+    };
+
+    const resolveExtTarget = (obj, prop) =>
+        Object.prototype.hasOwnProperty.call(obj, prop) ? obj : Object.getPrototypeOf(obj) || obj;
 
     const hookWebGLPrototype = (proto) => {
         if (!proto || hookedProtos.has(proto)) return;
         hookedProtos.add(proto);
 
-        for (const drawMethod of ['drawArrays', 'drawElements', 'drawArraysInstanced', 'drawElementsInstanced']) {
+        for (const drawMethod of [
+            'drawArrays',
+            'drawElements',
+            'drawArraysInstanced',
+            'drawElementsInstanced',
+            'drawRangeElements'
+        ]) {
             if (typeof proto[drawMethod] === 'function') {
                 const origDraw = proto[drawMethod];
-                const wrappedDraw = function (...args) {
+                const wrappedDraw = createNativeMethodWrapper(drawMethod, function (...args) {
                     advanceVirtualClock();
                     activeGpuBurstMode = 'shader';
                     gpuBurstPendingDrawCalls += 1;
                     return origDraw.apply(this, args);
-                };
+                });
                 defineCloakedMethod(proto, drawMethod, wrappedDraw, origDraw);
             }
         }
 
         if (typeof proto.flush === 'function') {
             const origFlush = proto.flush;
-            const wrappedFlush = function (...args) {
+            const wrappedFlush = createNativeMethodWrapper('flush', function (...args) {
                 advanceVirtualClock();
                 if (gpuBurstPendingDrawCalls > 0) {
                     activeGpuBurstMode = 'shader';
                 }
                 return origFlush.apply(this, args);
-            };
+            });
             defineCloakedMethod(proto, 'flush', wrappedFlush, origFlush);
         }
 
         if (typeof proto.finish === 'function') {
             const origFinish = proto.finish;
-            const wrappedFinish = function (...args) {
+            const wrappedFinish = createNativeMethodWrapper('finish', function (...args) {
                 advanceVirtualClock();
                 activeGpuBurstMode = 'shader';
                 const res = origFinish.apply(this, args);
@@ -1410,13 +1518,13 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                 gpuBurstPendingDrawCalls = 0;
                 activeGpuBurstMode = null;
                 return res;
-            };
+            });
             defineCloakedMethod(proto, 'finish', wrappedFinish, origFinish);
         }
 
         if (typeof proto.clientWaitSync === 'function') {
             const origWaitSync = proto.clientWaitSync;
-            const wrappedWaitSync = function (...args) {
+            const wrappedWaitSync = createNativeMethodWrapper('clientWaitSync', function (...args) {
                 advanceVirtualClock();
                 activeGpuBurstMode = 'shader';
                 const res = origWaitSync.apply(this, args);
@@ -1424,13 +1532,13 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                 gpuBurstPendingDrawCalls = 0;
                 activeGpuBurstMode = null;
                 return res;
-            };
+            });
             defineCloakedMethod(proto, 'clientWaitSync', wrappedWaitSync, origWaitSync);
         }
 
         if (typeof proto.readPixels === 'function') {
             const origReadPixels = proto.readPixels;
-            const wrappedReadPixels = function (...args) {
+            const wrappedReadPixels = createNativeMethodWrapper('readPixels', function (...args) {
                 advanceVirtualClock();
                 activeGpuBurstMode = gpuBurstPendingDrawCalls > 0 ? 'shader' : 'readPixels';
                 const res = origReadPixels.apply(this, args);
@@ -1438,16 +1546,17 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                 gpuBurstPendingDrawCalls = 0;
                 activeGpuBurstMode = null;
                 return res;
-            };
+            });
             defineCloakedMethod(proto, 'readPixels', wrappedReadPixels, origReadPixels);
         }
 
         // Track WebGL2 TIME_ELAPSED_EXT (0x88BF) queries via beginQuery
         if (typeof proto.beginQuery === 'function') {
             const origBeginQuery = proto.beginQuery;
-            const wrappedBeginQuery = function (target, query) {
+            const wrappedBeginQuery = createNativeMethodWrapper('beginQuery', function (target, query) {
                 if (query && typeof query === 'object') {
                     scaledQueryResults.delete(query);
+                    timestampQueries.delete(query);
                     if (target === 0x88BF) {
                         timerQueries.add(query);
                         nonTimerQueries.delete(query);
@@ -1457,27 +1566,33 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                     }
                 }
                 return origBeginQuery.call(this, target, query);
-            };
+            });
             defineCloakedMethod(proto, 'beginQuery', wrappedBeginQuery, origBeginQuery);
         }
 
         // Hook WebGL2 hardware timer queries (TIME_ELAPSED_EXT = 0x88BF, QUERY_RESULT = 0x8866)
         if (typeof proto.getQueryParameter === 'function') {
             const origGetQueryParam = proto.getQueryParameter;
-            const wrappedGetQueryParam = function (query, pname) {
+            const wrappedGetQueryParam = createNativeMethodWrapper('getQueryParameter', function (query, pname) {
                 const val = origGetQueryParam.call(this, query, pname);
                 if (pname === 0x8866 && typeof val === 'number' && val > 0) {
                     const isKnownNonTimer =
                         (query && typeof query === 'object' && nonTimerQueries.has(query)) ||
-                        (query && typeof query === 'object' && query.target && query.target !== 0x88BF);
+                        (query && typeof query === 'object' && query.target && query.target !== 0x88BF && query.target !== 0x8E28);
                     if (!isKnownNonTimer) {
                         if (query && typeof query === 'object' && scaledQueryResults.has(query)) {
                             return scaledQueryResults.get(query);
                         }
-                        const scaled = Math.max(
-                            100,
-                            Math.round(val * CFG.computeTimeMultiplier * CFG.profileVarianceFactor * nextJitter())
-                        );
+                        const isTimestamp =
+                            query &&
+                            typeof query === 'object' &&
+                            (timestampQueries.has(query) || query.target === 0x8E28);
+                        const scaled = isTimestamp
+                            ? scaleGpuTimestampNs(val)
+                            : Math.max(
+                                  100,
+                                  Math.round(val * CFG.computeTimeMultiplier * CFG.profileVarianceFactor * nextJitter())
+                              );
                         if (query && typeof query === 'object') {
                             scaledQueryResults.set(query, scaled);
                         }
@@ -1485,23 +1600,28 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                     }
                 }
                 return val;
-            };
+            });
             defineCloakedMethod(proto, 'getQueryParameter', wrappedGetQueryParam, origGetQueryParam);
         }
 
-        // Hook getExtension('EXT_disjoint_timer_query')
+        // Hook getExtension('EXT_disjoint_timer_query', 'ANGLE_instanced_arrays', 'WEBGL_multi_draw')
         if (typeof proto.getExtension === 'function') {
             const origGetExt = proto.getExtension;
-            const wrappedGetExt = function (name) {
+            const wrappedGetExt = createNativeMethodWrapper('getExtension', function (name) {
                 const ext = origGetExt.call(this, name);
-                if (ext && typeof name === 'string' && /disjoint_timer_query/i.test(name) && !scaledExtObjects.has(ext)) {
+                if (!ext || typeof name !== 'string' || scaledExtObjects.has(ext)) {
+                    return ext;
+                }
+                if (/disjoint_timer_query/i.test(name)) {
                     scaledExtObjects.add(ext);
                     if (typeof ext.beginQueryEXT === 'function') {
-                        const origBeginExt = ext.beginQueryEXT;
-                        const wrappedBeginExt = function (target, query) {
+                        const target = resolveExtTarget(ext, 'beginQueryEXT');
+                        const origBeginExt = target.beginQueryEXT;
+                        const wrappedBeginExt = createNativeMethodWrapper('beginQueryEXT', function (qTarget, query) {
                             if (query && typeof query === 'object') {
                                 scaledQueryResults.delete(query);
-                                if (target === 0x88BF) {
+                                timestampQueries.delete(query);
+                                if (qTarget === 0x88BF) {
                                     timerQueries.add(query);
                                     nonTimerQueries.delete(query);
                                 } else {
@@ -1509,34 +1629,83 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                                     nonTimerQueries.add(query);
                                 }
                             }
-                            return origBeginExt.call(this, target, query);
-                        };
-                        defineCloakedMethod(ext, 'beginQueryEXT', wrappedBeginExt, origBeginExt);
+                            return origBeginExt.call(this, qTarget, query);
+                        });
+                        defineCloakedMethod(target, 'beginQueryEXT', wrappedBeginExt, origBeginExt);
+                    }
+                    if (typeof ext.queryCounterEXT === 'function') {
+                        const target = resolveExtTarget(ext, 'queryCounterEXT');
+                        const origQueryCounter = target.queryCounterEXT;
+                        const wrappedQueryCounter = createNativeMethodWrapper('queryCounterEXT', function (query, qTarget) {
+                            if (query && typeof query === 'object') {
+                                scaledQueryResults.delete(query);
+                                if (qTarget === 0x8E28) {
+                                    timestampQueries.add(query);
+                                    nonTimerQueries.delete(query);
+                                }
+                            }
+                            return origQueryCounter.call(this, query, qTarget);
+                        });
+                        defineCloakedMethod(target, 'queryCounterEXT', wrappedQueryCounter, origQueryCounter);
                     }
                     if (typeof ext.getQueryObjectEXT === 'function') {
-                        const origGetQueryObj = ext.getQueryObjectEXT;
-                        const wrappedGetQueryObj = function (query, pname) {
+                        const target = resolveExtTarget(ext, 'getQueryObjectEXT');
+                        const origGetQueryObj = target.getQueryObjectEXT;
+                        const wrappedGetQueryObj = createNativeMethodWrapper('getQueryObjectEXT', function (query, pname) {
                             const val = origGetQueryObj.call(this, query, pname);
                             if (pname === 0x8866 && typeof val === 'number' && val > 0) {
-                                if (query && typeof query === 'object' && scaledQueryResults.has(query)) {
-                                    return scaledQueryResults.get(query);
+                                const isKnownNonTimer =
+                                    (query && typeof query === 'object' && nonTimerQueries.has(query)) ||
+                                    (query && typeof query === 'object' && query.target && query.target !== 0x88BF && query.target !== 0x8E28);
+                                if (!isKnownNonTimer) {
+                                    if (query && typeof query === 'object' && scaledQueryResults.has(query)) {
+                                        return scaledQueryResults.get(query);
+                                    }
+                                    const isTimestamp =
+                                        query &&
+                                        typeof query === 'object' &&
+                                        (timestampQueries.has(query) || query.target === 0x8E28);
+                                    const scaled = isTimestamp
+                                        ? scaleGpuTimestampNs(val)
+                                        : Math.max(
+                                              100,
+                                              Math.round(val * CFG.computeTimeMultiplier * CFG.profileVarianceFactor * nextJitter())
+                                          );
+                                    if (query && typeof query === 'object') {
+                                        scaledQueryResults.set(query, scaled);
+                                    }
+                                    return scaled;
                                 }
-                                const scaled = Math.max(
-                                    100,
-                                    Math.round(val * CFG.computeTimeMultiplier * CFG.profileVarianceFactor * nextJitter())
-                                );
-                                if (query && typeof query === 'object') {
-                                    scaledQueryResults.set(query, scaled);
-                                }
-                                return scaled;
                             }
                             return val;
-                        };
-                        defineCloakedMethod(ext, 'getQueryObjectEXT', wrappedGetQueryObj, origGetQueryObj);
+                        });
+                        defineCloakedMethod(target, 'getQueryObjectEXT', wrappedGetQueryObj, origGetQueryObj);
+                    }
+                } else if (/ANGLE_instanced_arrays|WEBGL_multi_draw/i.test(name)) {
+                    scaledExtObjects.add(ext);
+                    for (const extDraw of [
+                        'drawArraysInstancedANGLE',
+                        'drawElementsInstancedANGLE',
+                        'multiDrawArraysWEBGL',
+                        'multiDrawElementsWEBGL',
+                        'multiDrawArraysInstancedWEBGL',
+                        'multiDrawElementsInstancedWEBGL'
+                    ]) {
+                        if (typeof ext[extDraw] === 'function') {
+                            const target = resolveExtTarget(ext, extDraw);
+                            const origExtDraw = target[extDraw];
+                            const wrappedExtDraw = createNativeMethodWrapper(extDraw, function (...args) {
+                                advanceVirtualClock();
+                                activeGpuBurstMode = 'shader';
+                                gpuBurstPendingDrawCalls += 1;
+                                return origExtDraw.apply(this, args);
+                            });
+                            defineCloakedMethod(target, extDraw, wrappedExtDraw, origExtDraw);
+                        }
                     }
                 }
                 return ext;
-            };
+            });
             defineCloakedMethod(proto, 'getExtension', wrappedGetExt, origGetExt);
         }
     };
@@ -1552,7 +1721,7 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
     if (typeof HTMLCanvasElement !== 'undefined' && HTMLCanvasElement.prototype) {
         if (typeof HTMLCanvasElement.prototype.toDataURL === 'function') {
             const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-            const wrappedToDataURL = function (...args) {
+            const wrappedToDataURL = createNativeMethodWrapper('toDataURL', function (...args) {
                 if (gpuBurstPendingDrawCalls > 0) {
                     advanceVirtualClock();
                     activeGpuBurstMode = 'fill';
@@ -1563,12 +1732,12 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                     return res;
                 }
                 return origToDataURL.apply(this, args);
-            };
+            });
             defineCloakedMethod(HTMLCanvasElement.prototype, 'toDataURL', wrappedToDataURL, origToDataURL);
         }
         if (typeof HTMLCanvasElement.prototype.toBlob === 'function') {
             const origToBlob = HTMLCanvasElement.prototype.toBlob;
-            const wrappedToBlob = function (callback, ...rest) {
+            const wrappedToBlob = createNativeMethodWrapper('toBlob', function (callback, ...rest) {
                 if (gpuBurstPendingDrawCalls > 0 && typeof callback === 'function') {
                     advanceVirtualClock();
                     activeGpuBurstMode = 'fill';
@@ -1581,14 +1750,14 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                     return origToBlob.call(this, wrappedCb, ...rest);
                 }
                 return origToBlob.call(this, callback, ...rest);
-            };
+            });
             defineCloakedMethod(HTMLCanvasElement.prototype, 'toBlob', wrappedToBlob, origToBlob);
         }
     }
 
     if (typeof OffscreenCanvas !== 'undefined' && OffscreenCanvas.prototype && typeof OffscreenCanvas.prototype.convertToBlob === 'function') {
         const origConvertToBlob = OffscreenCanvas.prototype.convertToBlob;
-        const wrappedConvertToBlob = function (...args) {
+        const wrappedConvertToBlob = createNativeMethodWrapper('convertToBlob', function (...args) {
             if (gpuBurstPendingDrawCalls > 0) {
                 advanceVirtualClock();
                 activeGpuBurstMode = 'fill';
@@ -1599,34 +1768,34 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                 });
             }
             return origConvertToBlob.apply(this, args);
-        };
+        });
         defineCloakedMethod(OffscreenCanvas.prototype, 'convertToBlob', wrappedConvertToBlob, origConvertToBlob);
     }
 
     // Hook WebGPU GPUQueue.prototype.onSubmittedWorkDone & GPUBuffer.prototype.mapAsync
     if (typeof GPUQueue !== 'undefined' && GPUQueue.prototype && typeof GPUQueue.prototype.onSubmittedWorkDone === 'function') {
         const origWorkDone = GPUQueue.prototype.onSubmittedWorkDone;
-        const wrappedWorkDone = function () {
+        const wrappedWorkDone = createNativeMethodWrapper('onSubmittedWorkDone', function () {
             advanceVirtualClock();
             activeGpuBurstMode = 'compute';
             return origWorkDone.call(this).finally(() => {
                 advanceVirtualClock();
                 activeGpuBurstMode = null;
             });
-        };
+        });
         defineCloakedMethod(GPUQueue.prototype, 'onSubmittedWorkDone', wrappedWorkDone, origWorkDone);
     }
 
     if (typeof GPUBuffer !== 'undefined' && GPUBuffer.prototype && typeof GPUBuffer.prototype.mapAsync === 'function') {
         const origMapAsync = GPUBuffer.prototype.mapAsync;
-        const wrappedMapAsync = function (...args) {
+        const wrappedMapAsync = createNativeMethodWrapper('mapAsync', function (...args) {
             advanceVirtualClock();
             activeGpuBurstMode = 'readPixels';
             return origMapAsync.apply(this, args).finally(() => {
                 advanceVirtualClock();
                 activeGpuBurstMode = null;
             });
-        };
+        });
         defineCloakedMethod(GPUBuffer.prototype, 'mapAsync', wrappedMapAsync, origMapAsync);
     }
 })();`;
@@ -1684,28 +1853,69 @@ export function validateGpuPerformanceScalingCoherence(telemetry) {
         return { passed: true, issues };
     }
 
-    const gpuPerf = telemetry.gpuPerformance || telemetry.hardwareProfile?.gpuPerformance || null;
-    if (!gpuPerf) {
+    const rawGpuPerf = telemetry.gpuPerformance || telemetry.hardwareProfile?.gpuPerformance || null;
+    const gpuPerf = rawGpuPerf?.weights || rawGpuPerf?.scalingWeights || rawGpuPerf || null;
+    const inBrowserState =
+        telemetry.gpuPerformanceState && typeof telemetry.gpuPerformanceState === 'object'
+            ? telemetry.gpuPerformanceState
+            : null;
+    if (!gpuPerf && !inBrowserState) {
         return { passed: true, issues };
     }
+    const activePerf = gpuPerf || inBrowserState;
 
     const renderer =
         telemetry.webgl?.unmaskedRenderer ||
         telemetry.hardwareProfile?.gpuModel ||
-        gpuPerf.targetGpuModel ||
+        activePerf.targetGpuModel ||
         '';
     const expectedWeights = computeGpuPerformanceScalingWeights(renderer, {
-        profileId: telemetry.profileId || gpuPerf.profileId || 'audit-profile',
-        hostBaseline: gpuPerf.hostBaseline || undefined
+        profileId: telemetry.profileId || activePerf.profileId || 'audit-profile',
+        hostBaseline: activePerf.hostBaseline || undefined
     });
     const targetSpec = expectedWeights.targetGpuSpec;
     const hostBase = expectedWeights.hostBaseline;
 
-    const claimedGpuModel = gpuPerf.targetGpuSpec?.model || gpuPerf.targetGpuModel || null;
+    // Cross-verify in-browser __camoufoxGpuPerformanceState against expected gpuPerformance weights when both exist
+    if (gpuPerf && inBrowserState) {
+        if (inBrowserState.antiPenetrationActive === false) {
+            issues.push(
+                `In-browser __camoufoxGpuPerformanceState has antiPenetrationActive=false for "${targetSpec.model}"`
+            );
+        }
+        const expectedModel = gpuPerf.targetGpuSpec?.model || gpuPerf.targetGpuModel || targetSpec.model;
+        if (
+            inBrowserState.targetGpuModel &&
+            expectedModel &&
+            lookupGpuPerformanceSpec(inBrowserState.targetGpuModel).model !==
+                lookupGpuPerformanceSpec(expectedModel).model
+        ) {
+            issues.push(
+                `In-browser GPU performance state model "${inBrowserState.targetGpuModel}" contradicts expected profile GPU "${expectedModel}"`
+            );
+        }
+        if (
+            inBrowserState.computeTimeMultiplier !== undefined &&
+            gpuPerf.computeTimeMultiplier !== undefined
+        ) {
+            const browserMult = Number(inBrowserState.computeTimeMultiplier);
+            const expectedMult = Number(gpuPerf.computeTimeMultiplier);
+            if (
+                !Number.isFinite(browserMult) ||
+                Math.abs(browserMult - expectedMult) > Math.max(0.02, expectedMult * 0.05)
+            ) {
+                issues.push(
+                    `In-browser GPU computeTimeMultiplier (${browserMult}) diverges from expected profile weight (${expectedMult})`
+                );
+            }
+        }
+    }
+
+    const claimedGpuModel = activePerf.targetGpuSpec?.model || activePerf.targetGpuModel || null;
     if (
         claimedGpuModel &&
         telemetry.webgl?.unmaskedRenderer &&
-        claimedGpuModel !== targetSpec.model
+        lookupGpuPerformanceSpec(claimedGpuModel).model !== targetSpec.model
     ) {
         issues.push(
             `GPU performance scaler model mismatch: gpuPerformance targets "${claimedGpuModel}" but WebGL renderer resolves to "${targetSpec.model}"`
@@ -1713,7 +1923,7 @@ export function validateGpuPerformanceScalingCoherence(telemetry) {
     }
 
     // 1. Check anti-penetration guard flag
-    if (gpuPerf.antiPenetrationActive === false) {
+    if (activePerf.antiPenetrationActive === false) {
         issues.push(
             `GPU performance anti-penetration guard is disabled (antiPenetrationActive=false) for "${targetSpec.model}"; raw host Mac ("${hostBase.hostChipModel}") performance will leak`
         );
@@ -1723,27 +1933,27 @@ export function validateGpuPerformanceScalingCoherence(telemetry) {
     const tflopsDiffRatio = Math.abs(targetSpec.fp32Tflops - hostBase.hostFp32Tflops) / hostBase.hostFp32Tflops;
     if (tflopsDiffRatio > 0.25) {
         if (
-            gpuPerf.computeTimeMultiplier !== undefined &&
-            Math.abs(Number(gpuPerf.computeTimeMultiplier) - 1.0) < 0.03
+            activePerf.computeTimeMultiplier !== undefined &&
+            Math.abs(Number(activePerf.computeTimeMultiplier) - 1.0) < 0.03
         ) {
             issues.push(
-                `Host Mac GPU performance penetration detected: target GPU "${targetSpec.model}" (${targetSpec.fp32Tflops} TFLOPS) differs from host Mac "${hostBase.hostChipModel}" (${hostBase.hostFp32Tflops} TFLOPS), but computeTimeMultiplier=${gpuPerf.computeTimeMultiplier} (~1.0 unscaled) exposes raw host Mac performance`
+                `Host Mac GPU performance penetration detected: target GPU "${targetSpec.model}" (${targetSpec.fp32Tflops} TFLOPS) differs from host Mac "${hostBase.hostChipModel}" (${hostBase.hostFp32Tflops} TFLOPS), but computeTimeMultiplier=${activePerf.computeTimeMultiplier} (~1.0 unscaled) exposes raw host Mac performance`
             );
         }
 
         if (
-            gpuPerf.measured10msHostShaderMs !== undefined &&
-            Math.abs(Number(gpuPerf.measured10msHostShaderMs) - 10.0) < 0.3
+            activePerf.measured10msHostShaderMs !== undefined &&
+            Math.abs(Number(activePerf.measured10msHostShaderMs) - 10.0) < 0.3
         ) {
             issues.push(
-                `Host Mac GPU timing leak detected: 10ms host shader benchmark returned unscaled ${gpuPerf.measured10msHostShaderMs}ms for "${targetSpec.model}" (expected weighted ~${expectedWeights.expected10msHostShaderMs}ms)`
+                `Host Mac GPU timing leak detected: 10ms host shader benchmark returned unscaled ${activePerf.measured10msHostShaderMs}ms for "${targetSpec.model}" (expected weighted ~${expectedWeights.expected10msHostShaderMs}ms)`
             );
         }
     }
 
     // 3. Verify measured/reported shader benchmark duration aligns with target GPU's weighted performance tier
-    if (gpuPerf.measured10msHostShaderMs !== undefined) {
-        const measuredMs = Number(gpuPerf.measured10msHostShaderMs);
+    if (activePerf.measured10msHostShaderMs !== undefined) {
+        const measuredMs = Number(activePerf.measured10msHostShaderMs);
         const expectedMs = expectedWeights.expected10msHostShaderMs;
         // Allow ±25% thermal/workload variance around the target GPU's weighted duration
         if (!Number.isFinite(measuredMs) || measuredMs <= 0 || measuredMs < expectedMs * 0.5 || measuredMs > expectedMs * 1.8) {
@@ -1754,8 +1964,8 @@ export function validateGpuPerformanceScalingCoherence(telemetry) {
     }
 
     // 4. Verify computeTimeMultiplier matches hostFp32Tflops / targetFp32Tflops
-    if (gpuPerf.computeTimeMultiplier !== undefined) {
-        const reportedMult = Number(gpuPerf.computeTimeMultiplier);
+    if (activePerf.computeTimeMultiplier !== undefined) {
+        const reportedMult = Number(activePerf.computeTimeMultiplier);
         const expectedMult = expectedWeights.computeTimeMultiplier;
         if (!Number.isFinite(reportedMult) || reportedMult <= 0 || Math.abs(reportedMult - expectedMult) > Math.max(0.05, expectedMult * 0.2)) {
             issues.push(

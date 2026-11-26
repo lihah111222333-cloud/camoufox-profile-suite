@@ -250,13 +250,36 @@ function ensurePageOpen(page, operation = 'operation') {
     }
 }
 
+function setRegistrationStep(page, profile, stepName, metadata = {}) {
+    try {
+        const targetProfile = profile || page?._camoufoxProfile || null;
+        if (typeof targetProfile?.setStep === 'function') {
+            return targetProfile.setStep(stepName, metadata);
+        }
+        if (typeof targetProfile?.setTrafficStep === 'function') {
+            return targetProfile.setTrafficStep(stepName, metadata);
+        }
+        if (typeof page?.setStep === 'function') {
+            return page.setStep(stepName, metadata);
+        }
+        if (typeof page?.setTrafficStep === 'function') {
+            return page.setTrafficStep(stepName, metadata);
+        }
+    } catch {
+        // Never interrupt registration flow
+    }
+    return null;
+}
+
 /**
  * Create Gmail account
  * إنشاء حساب Gmail
  */
-export async function createGmailAccount(page, accountData) {
+export async function createGmailAccount(page, accountData, options = {}) {
+    const profile = options?.profile || page?._camoufoxProfile || null;
     try {
         logger.info('Starting Gmail account creation', { email: accountData.email });
+        setRegistrationStep(page, profile, 'gmail:init', { email: accountData.email });
 
         // Human behavior: Initial page exploration before starting
         // سلوك بشري: استكشاف أولي للصفحة قبل البدء
@@ -266,6 +289,7 @@ export async function createGmailAccount(page, accountData) {
 
         // Step 1: Navigate to Gmail page and click "Create account" from dropdown
         // الخطوة 1: الانتقال إلى صفحة Gmail والنقر على "إنشاء حساب" من القائمة المنسدلة
+        setRegistrationStep(page, profile, 'gmail:navigate-signup', { email: accountData.email });
         await navigateToSignUp(page);
 
         await page.waitForTimeout(1000);
@@ -360,12 +384,17 @@ export async function createGmailAccount(page, accountData) {
         await performRandomAction(page);
 
         // Step 2: Setup OMO Captcha extension
+        setRegistrationStep(page, profile, 'gmail:setup-captcha');
         await setupOMOCaptchaExtension(page);
 
         // Note: We now navigate directly to signup page from gmail.com dropdown,
         // so we skip the "Create account" button and "Select account type" steps
 
         // Step 4: Fill sign up form (first name, last name)
+        setRegistrationStep(page, profile, 'gmail:fill-name-form', {
+            firstName: accountData.firstName,
+            lastName: accountData.lastName
+        });
         await fillSignUpForm(page, accountData);
 
         // Step 4.5: Detect current page and handle accordingly

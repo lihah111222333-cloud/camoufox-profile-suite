@@ -3532,7 +3532,203 @@ const tests = [
                     correlationId: secRec.correlationId
                 });
                 assert.equal(wireDumpRes.found, true);
+                assert.ok(wireDumpRes.securityBlock);
                 assert.match(wireDumpRes.wireDump, /SECURITY BLOCK \[ZINIAO ACTIVE GUARD\]/);
+            } finally {
+                fs.rmSync(tmpDir, { recursive: true, force: true });
+            }
+        }
+    },
+    {
+        name: '91. Round-2 Adversarial Audit (Part 1): Non-Constructor GPU Wrapper Stealth ("prototype" in fn === false, WebIDL Receiver Brand Check, requestAnimationFrame Synchronization, ANGLE_instanced_arrays & 100% PC_GPU_SKU_CATALOG Coverage)',
+        fn: async () => {
+            const vm = await import('node:vm');
+            const baseline = collectHostMacPerformanceBaseline();
+            const rtx4090Weights = computeGpuPerformanceScalingWeights('NVIDIA GeForce RTX 4090', {
+                profileId: 'round2-rtx4090',
+                hostBaseline: baseline
+            });
+
+            let realClock = 1000;
+            const sandbox = {
+                performance: {
+                    now() {
+                        return realClock;
+                    }
+                },
+                Performance: function Performance() {},
+                Date: {
+                    now() {
+                        return 1700000000000 + Math.round(realClock);
+                    }
+                },
+                requestAnimationFrame(cb) {
+                    return cb(realClock);
+                },
+                WebGLRenderingContext: function WebGLRenderingContext() {},
+                WebGL2RenderingContext: function WebGL2RenderingContext() {}
+            };
+            // Ensure native-like non-constructor methods on mock prototypes
+            sandbox.Performance.prototype = {
+                now() {
+                    if (this !== sandbox.performance) {
+                        throw new TypeError("'now' called on an object that does not implement interface Performance.");
+                    }
+                    return realClock;
+                }
+            };
+            const extObj = {
+                drawArraysInstancedANGLE() {}
+            };
+            sandbox.WebGLRenderingContext.prototype = {
+                drawArrays() {},
+                finish() {},
+                readPixels() {},
+                getExtension(name) {
+                    return /ANGLE_instanced_arrays/i.test(name) ? extObj : null;
+                }
+            };
+            sandbox.WebGL2RenderingContext.prototype = {
+                drawRangeElements() {}
+            };
+            sandbox.globalThis = sandbox;
+
+            const script = buildGpuPerformanceInitScript(rtx4090Weights);
+            vm.runInNewContext(script, sandbox);
+
+            // 1. Every hooked method must have 'prototype' in fn === false and throw on `new fn()`
+            for (const fn of [
+                sandbox.Performance.prototype.now,
+                sandbox.Date.now,
+                sandbox.requestAnimationFrame,
+                sandbox.WebGLRenderingContext.prototype.drawArrays,
+                sandbox.WebGLRenderingContext.prototype.finish,
+                sandbox.WebGL2RenderingContext.prototype.drawRangeElements
+            ]) {
+                assert.equal('prototype' in fn, false, `Expected no .prototype on ${fn.name}`);
+                assert.equal(Object.getOwnPropertyDescriptor(fn, 'prototype'), undefined);
+                assert.throws(() => new fn());
+            }
+
+            // 2. WebIDL receiver brand check on Performance.prototype.now.call({})
+            assert.throws(() => sandbox.Performance.prototype.now.call({}));
+
+            // 3. requestAnimationFrame callback timestamp stays synchronized <= performance.now() after RTX 4090 burst
+            const gl = Object.create(sandbox.WebGLRenderingContext.prototype);
+            const angleExt = gl.getExtension('ANGLE_instanced_arrays');
+            angleExt.drawArraysInstancedANGLE(4, 0, 6, 100);
+            realClock += 50; // 50ms real host Mac burst compressed to ~7ms virtual RTX 4090 time
+            gl.finish();
+            let rafTs = 0;
+            sandbox.requestAnimationFrame((ts) => {
+                rafTs = ts;
+            });
+            const currentVirtualNow = sandbox.Performance.prototype.now.call(sandbox.performance);
+            assert.ok(
+                rafTs <= currentVirtualNow,
+                `Expected requestAnimationFrame ts (${rafTs}) <= virtual performance.now() (${currentVirtualNow})`
+            );
+
+            // 4. Every PC_GPU_SKU_CATALOG entry resolves to its own vendor (never falls through to Apple M5 Pro)
+            for (const gpuSku of Object.values(PC_GPU_SKU_CATALOG)) {
+                const gpuId = gpuSku.id || gpuSku.model;
+                const perfSpec = lookupGpuPerformanceSpec(gpuId);
+                assert.equal(
+                    perfSpec.vendor,
+                    gpuSku.vendor,
+                    `PC_GPU_SKU_CATALOG["${gpuId}"] resolved to wrong vendor "${perfSpec.vendor}" (${perfSpec.model})`
+                );
+            }
+            assert.equal(
+                lookupGpuPerformanceSpec('NVIDIA GeForce RTX 3060 Laptop GPU').model,
+                'NVIDIA GeForce RTX 3060 Laptop GPU'
+            );
+            assert.equal(lookupGpuPerformanceSpec('NVIDIA GeForce RTX 3050').model, 'NVIDIA GeForce RTX 3050');
+            assert.equal(lookupGpuPerformanceSpec('NVIDIA GeForce RTX 2060').model, 'NVIDIA GeForce RTX 2060');
+            assert.equal(lookupGpuPerformanceSpec('NVIDIA GeForce GTX 1660').model, 'NVIDIA GeForce GTX 1660');
+
+            // 5. Desktop vs Laptop RTX 4090 / 4070 auto-healing distinction
+            const desktop4090Healed = sanitizeAdsPowerProfileToCoherentPreset({
+                ProfileId: 'test-desktop-4090',
+                Platform: 'Win32',
+                WebGLRenderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 4090 Direct3D11 vs_5_0 ps_5_0, D3D11)'
+            });
+            assert.equal(desktop4090Healed.healedPresetId, 'win-desktop-i9-14900k-rtx4090-64g');
+
+            const laptop4090Healed = sanitizeAdsPowerProfileToCoherentPreset({
+                ProfileId: 'test-laptop-4090',
+                Platform: 'Win32',
+                WebGLRenderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 4090 Laptop GPU Direct3D11 vs_5_0 ps_5_0, D3D11)'
+            });
+            assert.equal(laptop4090Healed.healedPresetId, 'win-razer-blade16-i9-rtx4090');
+        }
+    },
+    {
+        name: '92. Round-2 Adversarial Audit (Part 2): IPv4-Compatible IPv6 (::127.0.0.1), NAT64 (64:ff9b::), Gecko jar:http:// Unwrapping, Check 16 In-Browser GPU State Cross-Verification & Resumed Security-Block Anomaly Recovery',
+        fn: async () => {
+            const fs = await import('node:fs');
+            const os = await import('node:os');
+            const path = await import('node:path');
+            const { CamoufoxTrafficRecorder } = await import('../src/camoufox/traffic-recorder.js');
+
+            // 1. IPv4-compatible IPv6, NAT64, Fake-IP 198.18.0.0/15, userinfo@ confusion & jar:http:// port scan protection
+            assert.equal(isLocalOrPrivateTarget('::127.0.0.1').scope, 'loopback');
+            assert.equal(isLocalOrPrivateTarget('::7f00:1').scope, 'loopback');
+            assert.equal(isLocalOrPrivateTarget('64:ff9b::127.0.0.1').scope, 'loopback');
+            assert.equal(isLocalOrPrivateTarget('198.18.0.1').scope, 'private-lan');
+            assert.equal(isLocalOrPrivateTarget('http://www.google.com@127.0.0.1:9222/json').scope, 'loopback');
+            assert.equal(isLocalOrPrivateTarget('kubernetes.default.svc').scope, 'private-lan');
+
+            const jarProbe = evaluatePortScanRequest('jar:http://127.0.0.1:9222/probe.jar!/entry');
+            assert.equal(jarProbe.shouldBlock, true);
+            assert.equal(jarProbe.port, 9222);
+
+            // 2. Check 1 detects tampered functionToString & Check 16 detects in-browser gpuPerformanceState divergence
+            const baseProfile = resolveDeterministicDeviceProfile('round2-check16', {
+                os: 'windows',
+                presetId: 'win-desktop-i9-14900k-rtx4090-64g'
+            });
+            const tamperedStateTelemetry = structuredClone(baseProfile.telemetry);
+            tamperedStateTelemetry.gpuPerformanceState = {
+                targetGpuModel: 'Apple M5 Pro',
+                computeTimeMultiplier: 1.0,
+                antiPenetrationActive: true
+            };
+            const evalRes = evaluatePlatformCoherence(tamperedStateTelemetry, 'windows');
+            assert.equal(evalRes.passed, false);
+            const check16 = findCheck(evalRes, 'exact-hardware-sku-model-coherence');
+            assert.equal(check16.passed, false);
+            assert.match(check16.details, /In-browser GPU/);
+
+            // 3. Resuming CamoufoxTrafficRecorder from unflushed traffic.ndjson preserves stepIndex & security-block anomaly
+            const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'camoufox-resume-sec-'));
+            try {
+                const rec1 = new CamoufoxTrafficRecorder({
+                    profileId: 'resume-sec-profile',
+                    trafficDir: tmpDir
+                });
+                rec1.setStep('step-1-login');
+                rec1.setStep('step-2-probe');
+                const secEv = rec1.recordSecurityBlock({
+                    type: 'local-port-scan-probe',
+                    targetUrl: 'http://127.0.0.1:3389/',
+                    host: '127.0.0.1',
+                    port: 3389,
+                    reason: 'Blocked RDP probe'
+                });
+                // Simulate process crash before flushSummary() by opening rec2 directly on traffic.ndjson
+                const rec2 = new CamoufoxTrafficRecorder({
+                    profileId: 'resume-sec-profile',
+                    trafficDir: tmpDir
+                });
+                assert.equal(rec2.attribution.stepIndex, 2);
+                assert.equal(rec2.anomaliesAndRiskSignals.length, 1);
+                assert.equal(rec2.anomaliesAndRiskSignals[0].correlationId, secEv.correlationId);
+                assert.match(
+                    rec2.formatTransactionWireDump(secEv.correlationId),
+                    /SECURITY-BLOCK \[ZINIAO ACTIVE GUARD\]/
+                );
+                await rec2.stop();
             } finally {
                 fs.rmSync(tmpDir, { recursive: true, force: true });
             }

@@ -72,8 +72,34 @@ export function isLocalOrPrivateTarget(rawHost) {
         return { isLocalOrPrivate: false, scope: 'public' };
     }
     let host = rawHost
-        .trim()
-        .toLowerCase()
+        .replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, '')
+        .replace(/[\t\r\n]/g, '')
+        .toLowerCase();
+
+    if (!host) {
+        return { isLocalOrPrivate: false, scope: 'public' };
+    }
+
+    // If a full URL, protocol-relative URL, userinfo@host, [ipv6]:port, or host:port was passed directly, extract the hostname
+    if (host.includes('://') || host.startsWith('//')) {
+        try {
+            host = new URL(host.startsWith('//') ? `http:${host}` : host).hostname.toLowerCase();
+        } catch {
+            // Fall through to manual stripping
+        }
+    } else {
+        host = host.split(/[/?#]/)[0];
+        if (host.includes('@')) {
+            host = host.slice(host.lastIndexOf('@') + 1);
+        }
+        if (host.startsWith('[') && host.includes(']')) {
+            host = host.slice(1, host.indexOf(']'));
+        } else if (host.indexOf(':') !== -1 && host.indexOf(':') === host.lastIndexOf(':')) {
+            host = host.slice(0, host.indexOf(':'));
+        }
+    }
+
+    host = host
         .replace(/^\[|\]$/g, '')
         .replace(/%.*$/, '')
         .replace(/\.+$/, '');
@@ -90,7 +116,7 @@ export function isLocalOrPrivateTarget(rawHost) {
             // Keep original host
         }
     } else if (host.includes(':')) {
-        // Canonicalize compressed/expanded IPv6 literals via WHATWG URL parser (e.g. "0::1" -> "::1", "::0001" -> "::1")
+        // Canonicalize compressed/expanded IPv6 literals via WHATWG URL parser (e.g. "0::1" -> "::1", "::0001" -> "::1", "::127.0.0.1" -> "::7f00:1")
         try {
             host = new URL(`http://[${host}]`).hostname.toLowerCase().replace(/^\[|\]$/g, '');
         } catch {
@@ -98,34 +124,7 @@ export function isLocalOrPrivateTarget(rawHost) {
         }
     }
 
-    // Unwrap IPv4-mapped IPv6 addresses:
-    // 1. Dotted-quad form: "::ffff:127.0.0.1", "0:0:0:0:0:ffff:192.168.1.1"
-    const mappedDottedMatch = host.match(
-        /^(?:(?:0+:){0,5}0*:|::)(?:ffff:(?:0+:)?|0+:)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i
-    );
-    if (mappedDottedMatch) {
-        host = mappedDottedMatch[1];
-    } else {
-        // 2. WHATWG URL canonical hex-pair form: "::ffff:7f00:1", "0:0:0:0:0:ffff:c0a8:101"
-        const mappedHexMatch = host.match(
-            /^(?:(?:0+:){0,5}0*:|::)ffff:(?:0+:)?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i
-        );
-        if (mappedHexMatch) {
-            const hi = parseInt(mappedHexMatch[1], 16);
-            const lo = parseInt(mappedHexMatch[2], 16);
-            host = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
-        }
-    }
-
-    // Hostname / mDNS / local domain checks
-    if (host === 'localhost' || host.endsWith('.localhost')) {
-        return { isLocalOrPrivate: true, scope: 'loopback' };
-    }
-    if (host.endsWith('.local') || host.endsWith('.lan') || host.endsWith('.internal') || host.endsWith('.home.arpa')) {
-        return { isLocalOrPrivate: true, scope: 'private-lan' };
-    }
-
-    // IPv6 loopback (::1), unspecified (::), link-local (fe80::/10), and ULA (fc00::/7)
+    // Check pure IPv6 loopback (::1) and unspecified (::) before IPv4-compatible unwrapping
     if (
         host === '::1' ||
         host === '::' ||
@@ -134,6 +133,61 @@ export function isLocalOrPrivateTarget(rawHost) {
     ) {
         return { isLocalOrPrivate: true, scope: 'loopback' };
     }
+
+    // Unwrap IPv4-mapped (::ffff:w.x.y.z), SIIT (::ffff:0:w.x.y.z), IPv4-compatible (::w.x.y.z), and RFC 6052 NAT64 (64:ff9b::w.x.y.z) IPv6 addresses:
+    // 1. Dotted-quad form: "::ffff:127.0.0.1", "::127.0.0.1", "64:ff9b::127.0.0.1"
+    const mappedDottedMatch = host.match(
+        /^(?:64:ff9b:(?:(?:0+:){0,3}0*:|:)|(?:(?:0+:){0,5}0*:|::)(?:ffff:(?:0+:)?|0+:)?)+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i
+    );
+    if (mappedDottedMatch) {
+        host = mappedDottedMatch[1];
+    } else {
+        // 2. WHATWG URL canonical hex-pair form: "::ffff:7f00:1", "::7f00:1", "0:0:0:0:0:0:7f00:1", "64:ff9b::7f00:1"
+        const mappedHexMatch = host.match(
+            /^(?:64:ff9b:(?:(?:0+:){0,3}0*:|:)|(?:(?:0+:){0,5}0*:|::)(?:ffff:(?:0+:)?|0+:)?)+([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i
+        );
+        if (mappedHexMatch) {
+            const hi = parseInt(mappedHexMatch[1], 16);
+            const lo = parseInt(mappedHexMatch[2], 16);
+            host = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+        }
+    }
+
+    // Hostname / mDNS / local / DNS-rebinding domain checks
+    if (
+        host === 'localhost' ||
+        host.endsWith('.localhost') ||
+        host === 'localdomain' ||
+        host.endsWith('.localdomain') ||
+        host === 'localtest.me' ||
+        host.endsWith('.localtest.me') ||
+        host === 'lvh.me' ||
+        host.endsWith('.lvh.me') ||
+        host === 'vcap.me' ||
+        host.endsWith('.vcap.me')
+    ) {
+        return { isLocalOrPrivate: true, scope: 'loopback' };
+    }
+    if (
+        host === 'local' ||
+        host === 'lan' ||
+        host === 'internal' ||
+        host === 'intranet' ||
+        host === 'home.arpa' ||
+        host.endsWith('.local') ||
+        host.endsWith('.lan') ||
+        host.endsWith('.internal') ||
+        host.endsWith('.home.arpa') ||
+        host.endsWith('.intranet') ||
+        host.endsWith('.svc') ||
+        host.endsWith('.nip.io') ||
+        host.endsWith('.sslip.io') ||
+        host.endsWith('.xip.io')
+    ) {
+        return { isLocalOrPrivate: true, scope: 'private-lan' };
+    }
+
+    // IPv6 link-local (fe80::/10) and ULA (fc00::/7)
     if (/^fe[89ab][0-9a-f]:/i.test(host)) {
         return { isLocalOrPrivate: true, scope: 'link-local' };
     }
@@ -159,7 +213,9 @@ export function isLocalOrPrivateTarget(rawHost) {
                 a === 10 ||
                 (a === 192 && b === 168) ||
                 (a === 172 && b >= 16 && b <= 31) ||
-                (a === 100 && b >= 64 && b <= 127)
+                (a === 100 && b >= 64 && b <= 127) ||
+                (a === 198 && (b === 18 || b === 19)) ||
+                (a === 192 && b === 0 && c === 0)
             ) {
                 return { isLocalOrPrivate: true, scope: 'private-lan' };
             }
@@ -225,9 +281,17 @@ export function evaluatePortScanRequest(targetUrl, options = {}) {
     const allowSameOriginLocalDev =
         options.allowSameOriginLocalDev !== undefined ? Boolean(options.allowSameOriginLocalDev) : false;
 
-    let normalizedTarget = typeof targetUrl === 'string' ? targetUrl.trim() : '';
-    while (/^(?:blob|view-source|filesystem):/i.test(normalizedTarget)) {
-        normalizedTarget = normalizedTarget.replace(/^(?:blob|view-source|filesystem):/i, '').trim();
+    let normalizedTarget =
+        typeof targetUrl === 'string'
+            ? targetUrl.replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, '').replace(/[\t\r\n]/g, '')
+            : '';
+    while (
+        /^(?:blob|view-source|filesystem):/i.test(normalizedTarget) ||
+        (/^jar:/i.test(normalizedTarget) && !/^jar:file:/i.test(normalizedTarget))
+    ) {
+        normalizedTarget = normalizedTarget
+            .replace(/^(?:blob|view-source|filesystem|jar):/i, '')
+            .replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, '');
     }
     if (normalizedTarget.startsWith('//')) {
         normalizedTarget = `http:${normalizedTarget}`;
@@ -286,7 +350,7 @@ export function evaluatePortScanRequest(targetUrl, options = {}) {
     const port = parsed.port ? Number(parsed.port) : defaultPort;
     const risk = classifyScannedPortRisk(port);
 
-    if (allowSameOriginLocalDev && options.initiatorUrl) {
+    if (allowSameOriginLocalDev && options.initiatorUrl && !parsed.username && !parsed.password) {
         try {
             const initParsed = new URL(options.initiatorUrl);
             const initDefaultPort = getDefaultPortForProtocol(initParsed.protocol.toLowerCase());

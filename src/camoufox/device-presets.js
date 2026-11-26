@@ -2098,6 +2098,8 @@ export function sanitizeAdsPowerProfileToCoherentPreset(rawAdsPowerProfile = {})
     const normOs = normalizePresetOs(rawPlatform);
     const renderer = String(
         rawAdsPowerProfile.UNMASKED_RENDERER_WEBGL ||
+            rawAdsPowerProfile.WebGLRenderer ||
+            rawAdsPowerProfile.webglRenderer ||
             rawAdsPowerProfile.renderer ||
             rawAdsPowerProfile.webgl?.unmaskedRenderer ||
             'Apple M2 Pro'
@@ -2129,15 +2131,22 @@ export function sanitizeAdsPowerProfileToCoherentPreset(rawAdsPowerProfile = {})
     );
 
     if (normOs !== 'macos') {
-        // Resolve matching Windows or Linux preset
+        // Resolve matching Windows or Linux preset (preserving Laptop vs Desktop GPU distinction)
         const osPresets = listUsableDevicePresets({ os: normOs });
         const lowerRenderer = renderer.toLowerCase();
-        let candidatePreset = osPresets.find(
-            (p) =>
-                renderer &&
-                (p.webgl.unmaskedRenderer.toLowerCase().includes(lowerRenderer) ||
-                    lowerRenderer.includes(p.gpuModel.toLowerCase()))
-        );
+        const isLaptopGpuInput = /laptop|\b\d{3}m\b/i.test(renderer);
+        const sortedOsPresets = [...osPresets].sort((a, b) => b.gpuModel.length - a.gpuModel.length);
+        let candidatePreset = sortedOsPresets.find((p) => {
+            if (!renderer) return false;
+            const presetIsLaptop = /laptop|\b\d{3}m\b/i.test(p.gpuModel);
+            if (presetIsLaptop !== isLaptopGpuInput && /RTX|GTX|RX\s*\d/i.test(renderer)) {
+                return false;
+            }
+            return (
+                p.webgl.unmaskedRenderer.toLowerCase().includes(lowerRenderer) ||
+                lowerRenderer.includes(p.gpuModel.toLowerCase())
+            );
+        });
         if (!candidatePreset && normOs === 'windows') {
             if (/RTX\s*4090\s*Laptop/i.test(renderer)) {
                 candidatePreset = osPresets.find((p) => p.presetId === 'win-razer-blade16-i9-rtx4090');
@@ -2145,6 +2154,8 @@ export function sanitizeAdsPowerProfileToCoherentPreset(rawAdsPowerProfile = {})
                 candidatePreset = osPresets.find((p) => p.presetId === 'win-desktop-i9-14900k-rtx4090-64g');
             } else if (/RTX\s*4080/i.test(renderer)) {
                 candidatePreset = osPresets.find((p) => p.presetId === 'win-desktop-r7-7800x3d-rtx4080-32g');
+            } else if (/RTX\s*4070\s*Laptop/i.test(renderer)) {
+                candidatePreset = osPresets.find((p) => p.presetId === 'win-dell-xps16-9640-rtx4070-32g');
             } else if (/RTX\s*4070/i.test(renderer)) {
                 candidatePreset = osPresets.find((p) => p.presetId === 'win-desktop-i7-13700k-rtx4070-32g');
             }
@@ -2165,7 +2176,12 @@ export function sanitizeAdsPowerProfileToCoherentPreset(rawAdsPowerProfile = {})
         };
     }
 
-    const appleSkuName = parseAppleSiliconSkuName(renderer);
+    const isSoftwareOrCrossOsOnMac =
+        /SwiftShader|llvmpipe|softpipe|Basic\s+Render|Direct3D|D3D11|NVIDIA|GeForce|RTX|GTX|Qualcomm|Adreno/i.test(
+            renderer
+        );
+    const appleSkuName =
+        parseAppleSiliconSkuName(renderer) || (isSoftwareOrCrossOsOnMac ? 'Apple M3 Pro' : null);
 
     if (appleSkuName) {
         const sku = APPLE_SILICON_SKU_CATALOG[appleSkuName];
@@ -2309,6 +2325,17 @@ export function sanitizeAdsPowerProfileToCoherentPreset(rawAdsPowerProfile = {})
             webgpuAdapterInfo: { vendor: 'apple', architecture: healedArch }
         };
         healedProfile.telemetry.hardwareProfile = healedProfile.hardwareProfile;
+        const refreshedMediaDevices = createCoherentMediaDevices(profileId, 'macos', {
+            permissionGranted: false,
+            deviceModel: healedProfile.hardwareProfile.deviceModel
+        });
+        healedProfile.mediaDevices = refreshedMediaDevices;
+        if (healedProfile.telemetry.media) {
+            healedProfile.telemetry.media.devices = refreshedMediaDevices;
+        }
+        if (healedProfile.telemetry.stackAndMediaHygiene) {
+            healedProfile.telemetry.stackAndMediaHygiene.mediaDevices = refreshedMediaDevices;
+        }
         healedProfile.gpuPerformance = computeGpuPerformanceScalingWeights(sku.gpuRenderer, {
             profileId
         });
@@ -2324,10 +2351,13 @@ export function sanitizeAdsPowerProfileToCoherentPreset(rawAdsPowerProfile = {})
     }
 
     // Intel / AMD Mac healing
+    const isAmdRadeonMobile = /5500M|5600M|5300M|560X|555X|Vega\s*(?:16|20)/i.test(renderer);
     const isAmdRadeon = /AMD|Radeon/i.test(renderer);
-    const intelPresetId = isAmdRadeon
-        ? 'mac-imac27-intel-5700xt'
-        : 'mac-mbp13-intel-i5-iris655';
+    const intelPresetId = isAmdRadeonMobile
+        ? 'mac-mbp16-intel-i9-radeon5500m'
+        : isAmdRadeon
+          ? 'mac-imac27-intel-5700xt'
+          : 'mac-mbp13-intel-i5-iris655';
     const healedProfile = resolveDeterministicDeviceProfile(profileId, {
         os: 'macos',
         presetId: intelPresetId

@@ -544,7 +544,9 @@ export function listTrafficProfiles(profilesDir) {
         const totals = indexData?.totals || {
             totalRequests: events.filter((e) => e.type === 'egress').length,
             totalResponses: events.filter((e) => e.type === 'ingress').length,
-            failedRequests: events.filter((e) => e.type === 'request-failed').length,
+            failedRequests: events.filter(
+                (e) => e.type === 'request-failed' || e.type === 'security-block'
+            ).length,
             wsFramesSent: events.filter((e) => e.type === 'ws-egress').length,
             wsFramesReceived: events.filter((e) => e.type === 'ws-ingress').length
         };
@@ -873,6 +875,7 @@ export function reconstructTransactionWireDump({
         ingress,
         finished,
         failed,
+        securityBlock,
         wsEvents,
         requestPayload,
         requestPayloadFile: egress?.payloadFile || null,
@@ -1557,6 +1560,7 @@ export function queryProfileTraffic(options = {}) {
               .filter(
                   (e) =>
                       e.type === 'request-failed' ||
+                      e.type === 'security-block' ||
                       e.type === 'ws-error' ||
                       (e.type === 'ingress' &&
                           (e.status === 401 || e.status === 403 || e.status === 429 || e.status >= 500))
@@ -1569,14 +1573,16 @@ export function queryProfileTraffic(options = {}) {
                   type:
                       e.type === 'request-failed'
                           ? 'network-request-failed'
-                          : e.type === 'ws-error'
-                            ? 'websocket-error'
-                            : `http-${e.status}`,
-                  severity: 'high',
+                          : e.type === 'security-block'
+                            ? `security-block:${e.blockType || 'security-probe'}`
+                            : e.type === 'ws-error'
+                              ? 'websocket-error'
+                              : `http-${e.status}`,
+                  severity: e.type === 'security-block' ? e.severity || 'critical' : 'high',
                   method: e.method || null,
                   url: e.url || null,
                   status: e.status ?? null,
-                  failureText: e.failureText ?? null,
+                  failureText: e.reason ?? e.failureText ?? null,
                   payloadFile: e.payloadFile ?? null
               }));
 
@@ -1647,7 +1653,9 @@ export function queryProfileTraffic(options = {}) {
         totals: indexData?.totals || {
             totalRequests: allEvents.filter((e) => e.type === 'egress').length,
             totalResponses: allEvents.filter((e) => e.type === 'ingress').length,
-            failedRequests: allEvents.filter((e) => e.type === 'request-failed').length
+            failedRequests: allEvents.filter(
+                (e) => e.type === 'request-failed' || e.type === 'security-block'
+            ).length
         },
         byActionStep: indexData?.byActionStep || {},
         byTriggerAction: indexData?.byTriggerAction || {},
@@ -1729,8 +1737,9 @@ export function formatCliReport(result) {
             const trig = a.triggerAction
                 ? ` trigger=${a.triggerAction.actionType}:${a.triggerAction.target || ''}`
                 : '';
+            const reasonPart = a.failureText ? ` | reason=${a.failureText}` : '';
             lines.push(
-                `  - [${a.severity || 'medium'}] ${a.type} | corr=${a.correlationId || 'n/a'} | step=${a.actionStep || 'n/a'}${trig} | status=${a.status ?? 'ERR'} | url=${a.url || ''} | payload=${a.payloadFile || 'none'}`
+                `  - [${a.severity || 'medium'}] ${a.type} | corr=${a.correlationId || 'n/a'} | step=${a.actionStep || 'n/a'}${trig} | status=${a.status ?? 'ERR'}${reasonPart} | url=${a.url || ''} | payload=${a.payloadFile || 'none'}`
             );
         }
         return lines.join('\n');

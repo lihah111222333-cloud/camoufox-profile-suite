@@ -28,8 +28,17 @@ class ProxyManager {
      */
     parseProxyLine(rawLine) {
         if (!rawLine || typeof rawLine !== 'string') return null;
-        const line = rawLine.trim();
+        let line = rawLine.trim();
         if (!line || line.startsWith('#')) return null;
+
+        // Normalize unschemed user:pass@host:port lines by prepending http://
+        if (!line.includes('://') && line.includes('@')) {
+            const atIdx = line.lastIndexOf('@');
+            const afterAt = line.slice(atIdx + 1);
+            if (this._splitHostAndRemainder(afterAt.replace(/\/+$/, ''))) {
+                line = `http://${line}`;
+            }
+        }
 
         let type = 'http';
         let ip = '';
@@ -41,7 +50,7 @@ class ProxyManager {
         const schemeMatch = line.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(.+)$/);
         if (schemeMatch) {
             type = schemeMatch[1].toLowerCase();
-            const rest = schemeMatch[2];
+            const rest = schemeMatch[2].trim().replace(/\/+$/, '');
             if (rest.includes('@')) {
                 const lastAt = rest.lastIndexOf('@');
                 const authPart = rest.slice(0, lastAt);

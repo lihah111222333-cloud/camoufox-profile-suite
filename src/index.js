@@ -135,7 +135,19 @@ async function createAccount(accountNumber = null) {
             profile = await createAndStartGPMProfile(profileName, gpmProxy);
         }
         
-        logger.info(`${accountLabel} Profile created and started`, { profileId: profile.profileId });
+        const camoufoxTelemetry =
+            typeof profile?.getTelemetrySummary === 'function' ? profile.getTelemetrySummary() : null;
+        logger.info(`${accountLabel} Profile created and started`, {
+            profileId: profile.profileId,
+            ...(camoufoxTelemetry
+                ? {
+                      presetId: camoufoxTelemetry.presetId,
+                      deviceModel: camoufoxTelemetry.deviceModel,
+                      os: camoufoxTelemetry.os,
+                      gpuPerformance: camoufoxTelemetry.gpuPerformance
+                  }
+                : {})
+        });
 
         // Step 4: Get browser and page
         const browser = await profile.getBrowser();
@@ -154,7 +166,10 @@ async function createAccount(accountNumber = null) {
         if (typeof profile.setTrafficStep === 'function') {
             profile.setTrafficStep('signup-flow', { email: accountData.email });
         }
-        const result = await createGmailAccount(page, accountData);
+        const result = await createGmailAccount(page, accountData, { profile });
+        if (result?.email && typeof profile.updateTrafficAttribution === 'function') {
+            profile.updateTrafficAttribution({ accountEmail: result.email });
+        }
 
         // Step 6: Get profile IP (if available)
         let profileIP = null;
@@ -177,6 +192,9 @@ async function createAccount(accountNumber = null) {
             logger.debug('Could not get profile IP', { error: ipError.message });
         }
 
+        const finalCamoufoxTelemetry =
+            typeof profile?.getTelemetrySummary === 'function' ? profile.getTelemetrySummary() : null;
+
         // Step 7: Save result with all details
         saveResult({
             success: true,
@@ -187,6 +205,7 @@ async function createAccount(accountNumber = null) {
             proxyIP: proxy ? proxy.ip : null,
             profileIP: profileIP,
             trafficAttribution: profile.trafficPaths || null,
+            ...(finalCamoufoxTelemetry ? { camoufoxTelemetry: finalCamoufoxTelemetry } : {}),
             timestamp: new Date().toISOString()
         });
 

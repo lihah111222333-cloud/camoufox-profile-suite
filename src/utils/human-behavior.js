@@ -121,6 +121,8 @@ export function generateMousePath(startX, startY, endX, endY, steps = 25) {
  * Move mouse naturally to coordinates
  * تحريك الماوس بشكل طبيعي إلى الإحداثيات
  */
+const pageMousePositions = new WeakMap();
+
 export async function humanMouseMove(page, targetX, targetY, options = {}) {
     const {
         steps = 20 + Math.floor(Math.random() * 15),
@@ -129,21 +131,15 @@ export async function humanMouseMove(page, targetX, targetY, options = {}) {
     } = options;
     
     try {
-        // Get current mouse position or use default
+        // Get current mouse position from Node-side WeakMap (never pollute target page window.mouseX/mouseY)
         let startX = 100 + Math.random() * 200;
         let startY = 100 + Math.random() * 200;
         
-        if (startFromCurrent) {
-            try {
-                const currentPos = await page.evaluate(() => {
-                    return { x: window.mouseX || 0, y: window.mouseY || 0 };
-                });
-                if (currentPos.x > 0 || currentPos.y > 0) {
-                    startX = currentPos.x;
-                    startY = currentPos.y;
-                }
-            } catch (e) {
-                // Use default start position
+        if (startFromCurrent && page && typeof page === 'object') {
+            const currentPos = pageMousePositions.get(page);
+            if (currentPos && (currentPos.x > 0 || currentPos.y > 0)) {
+                startX = currentPos.x;
+                startY = currentPos.y;
             }
         }
         
@@ -166,11 +162,10 @@ export async function humanMouseMove(page, targetX, targetY, options = {}) {
             await new Promise(resolve => setTimeout(resolve, delay));
         }
         
-        // Save current position for next move
-        await page.evaluate((x, y) => {
-            window.mouseX = x;
-            window.mouseY = y;
-        }, targetX, targetY);
+        // Save current position for next move in Node-side WeakMap
+        if (page && typeof page === 'object') {
+            pageMousePositions.set(page, { x: targetX, y: targetY });
+        }
         
         logger.debug('Human mouse move completed', { targetX, targetY, steps });
     } catch (error) {

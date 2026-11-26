@@ -1080,6 +1080,52 @@ export async function startProfile(profileId, options = {}) {
             const launchFn = camoufoxMod.AsyncCamoufox || camoufoxMod.Camoufox;
             const newContextFn = camoufoxMod.AsyncNewContext || camoufoxMod.NewContext;
 
+            // Resolve deterministic metropolitan geolocation coordinates (with street-level micro-jitter)
+            const rawGeoSource =
+                mergedOptions.geolocation &&
+                Number.isFinite(Number(mergedOptions.geolocation.latitude)) &&
+                Number.isFinite(Number(mergedOptions.geolocation.longitude))
+                    ? mergedOptions.geolocation
+                    : options.country || mergedOptions.country
+                      ? resolveGeoCoordinatesWithDeterministicJitter(
+                            profileId,
+                            options.country || mergedOptions.country
+                        )
+                      : mergedOptions.resolvedGeolocation || null;
+            const hasExplicitGeolocation = Boolean(
+                options.geolocation ||
+                    options.country ||
+                    (!geoip &&
+                        rawGeoSource &&
+                        Number.isFinite(Number(rawGeoSource.latitude)) &&
+                        Number.isFinite(Number(rawGeoSource.longitude)))
+            );
+            const playwrightGeolocation =
+                rawGeoSource &&
+                Number.isFinite(Number(rawGeoSource.latitude)) &&
+                Number.isFinite(Number(rawGeoSource.longitude))
+                    ? {
+                          latitude: Number(rawGeoSource.latitude),
+                          longitude: Number(rawGeoSource.longitude),
+                          ...(Number.isFinite(Number(rawGeoSource.accuracy))
+                              ? { accuracy: Number(rawGeoSource.accuracy) }
+                              : {})
+                      }
+                    : null;
+            const effectiveLocale =
+                mergedOptions.locale || (!geoip ? mergedOptions.resolvedLocale : null) || null;
+            const effectiveTimezoneId =
+                mergedOptions.timezoneId || (!geoip ? mergedOptions.resolvedTimezoneId : null) || null;
+            const effectiveLaunchConfig =
+                hasExplicitGeolocation && playwrightGeolocation
+                    ? {
+                          'geolocation:latitude': playwrightGeolocation.latitude,
+                          'geolocation:longitude': playwrightGeolocation.longitude,
+                          'geolocation:accuracy': playwrightGeolocation.accuracy ?? 35,
+                          ...(mergedOptions.config || {})
+                      }
+                    : mergedOptions.config || null;
+
             if (useSharedBrowser) {
                 browser = await getOrCreateSharedBrowser({
                     os: targetOs,
@@ -1100,9 +1146,11 @@ export async function startProfile(profileId, options = {}) {
                     storageState: storageStatePath,
                     ...(normalizedProxy ? { proxy: normalizedProxy } : {}),
                     ...(mergedOptions.webrtc_ip ? { webrtc_ip: mergedOptions.webrtc_ip } : {}),
-                    ...(mergedOptions.geolocation ? { geolocation: mergedOptions.geolocation } : {}),
-                    ...(mergedOptions.locale ? { locale: mergedOptions.locale } : {}),
-                    ...(mergedOptions.timezoneId ? { timezoneId: mergedOptions.timezoneId } : {}),
+                    ...(hasExplicitGeolocation && playwrightGeolocation
+                        ? { geolocation: playwrightGeolocation }
+                        : {}),
+                    ...(effectiveLocale ? { locale: effectiveLocale } : {}),
+                    ...(effectiveTimezoneId ? { timezoneId: effectiveTimezoneId } : {}),
                     ...(mergedOptions.ff_version ? { ff_version: mergedOptions.ff_version } : {}),
                     ...(mergedOptions.preset ? { preset: mergedOptions.preset } : {}),
                     ...(recordHar ? { recordHar: { path: storageInfo.harPath, content: 'attach' } } : {}),
@@ -1119,14 +1167,14 @@ export async function startProfile(profileId, options = {}) {
                     humanize,
                     geoip,
                     ...(normalizedProxy ? { proxy: normalizedProxy } : {}),
-                    ...(mergedOptions.locale ? { locale: mergedOptions.locale } : {}),
+                    ...(effectiveLocale ? { locale: effectiveLocale } : {}),
                     ...(mergedOptions.ff_version ? { ff_version: mergedOptions.ff_version } : {}),
                     ...(mergedOptions.preset ? { preset: mergedOptions.preset } : {}),
                     ...(mergedOptions.addons ? { addons: mergedOptions.addons } : {}),
                     ...(mergedOptions.fonts ? { fonts: mergedOptions.fonts } : {}),
                     ...(mergedOptions.screen ? { screen: mergedOptions.screen } : {}),
                     ...(mergedOptions.window ? { window: mergedOptions.window } : {}),
-                    ...(mergedOptions.config ? { config: mergedOptions.config } : {}),
+                    ...(effectiveLaunchConfig ? { config: effectiveLaunchConfig } : {}),
                     ...(mergedOptions.firefox_user_prefs
                         ? { firefox_user_prefs: mergedOptions.firefox_user_prefs }
                         : {}),
@@ -1149,8 +1197,10 @@ export async function startProfile(profileId, options = {}) {
 
                 const contextOpts = {
                     storageState: storageStatePath,
-                    ...(mergedOptions.timezoneId ? { timezoneId: mergedOptions.timezoneId } : {}),
-                    ...(mergedOptions.geolocation ? { geolocation: mergedOptions.geolocation } : {}),
+                    ...(effectiveTimezoneId ? { timezoneId: effectiveTimezoneId } : {}),
+                    ...(hasExplicitGeolocation && playwrightGeolocation
+                        ? { geolocation: playwrightGeolocation }
+                        : {}),
                     ...(recordHar ? { recordHar: { path: storageInfo.harPath, content: 'attach' } } : {}),
                     ...(mergedOptions.contextOptions || {})
                 };

@@ -109,15 +109,18 @@ export async function detectGmailPage(page) {
         }
 
         if (url.includes('/signin/identifier') || url.includes('/ServiceLogin')) {
-            return finalizeDetectedPage(page, await detectSignInPage(page));
+            const signInPage = await detectSignInPage(page);
+            if (signInPage) return finalizeDetectedPage(page, signInPage);
         }
         
         if (url.includes('/signup') || url.includes('/webcreateaccount')) {
-            return finalizeDetectedPage(page, await detectSignUpPage(page));
+            const signUpPage = await detectSignUpPage(page);
+            if (signUpPage) return finalizeDetectedPage(page, signUpPage);
         }
         
         if (url.includes('/challenge') || url.includes('/verification')) {
-            return finalizeDetectedPage(page, await detectVerificationPage(page));
+            const verificationPage = await detectVerificationPage(page);
+            if (verificationPage) return finalizeDetectedPage(page, verificationPage);
         }
 
         // Detect by class names (more reliable for Google pages)

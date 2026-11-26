@@ -454,6 +454,7 @@ export function attachPageCompatibility(page, context = null, profile = null) {
 
     page.setTrafficStep = (stepName, meta = {}) =>
         page.getTrafficRecorder()?.setStep(stepName, meta) || null;
+    page.setStep = page.setTrafficStep;
 
     page.recordTrafficTrigger = (actionType, target = null, meta = {}) =>
         page.getTrafficRecorder()?.recordTriggerAction?.(actionType, target, meta) || null;
@@ -879,6 +880,46 @@ export class CamoufoxProfile {
     }
 
     /**
+     * Alias for setTrafficStep
+     */
+    setStep(stepName, metadata = {}) {
+        return this.setTrafficStep(stepName, metadata);
+    }
+
+    /**
+     * Return a consolidated summary of Camoufox hardware preset, GPU performance scaling,
+     * active security guard statistics, fingerprint consistency ledger, and coherence report.
+     */
+    getTelemetrySummary() {
+        const gpuWeights =
+            this.gpuPerformanceScaler?.scalingWeights ||
+            this.lastGpuPerformanceSummary ||
+            this.metadata?.gpuPerformance ||
+            null;
+        return {
+            profileId: this.profileId,
+            presetId: this.metadata?.presetId || null,
+            deviceModel: this.metadata?.deviceModel || this.metadata?.hardwareProfile?.deviceModel || null,
+            os: this.metadata?.os || null,
+            gpuPerformance: gpuWeights
+                ? {
+                      targetGpuModel: gpuWeights.targetGpuSpec?.model || gpuWeights.targetGpuModel || null,
+                      hostChipModel: gpuWeights.hostBaseline?.hostChipModel || null,
+                      computeTimeMultiplier: gpuWeights.computeTimeMultiplier ?? null,
+                      throughputSpeedupRatio: gpuWeights.throughputSpeedupRatio ?? null,
+                      antiPenetrationActive: gpuWeights.antiPenetrationActive ?? true
+                  }
+                : null,
+            securityGuards:
+                this.securityGuards?.getStats?.() || this.lastSecurityGuardStats || null,
+            fingerprintLedger:
+                this.fingerprintLedger?.getSummary?.() || null,
+            coherenceScore: this.coherenceReport?.score ?? null,
+            coherencePassed: this.coherenceReport?.passed ?? null
+        };
+    }
+
+    /**
      * Update account/profile attribution metadata on the active traffic recorder
      */
     updateTrafficAttribution(partial = {}) {
@@ -915,6 +956,11 @@ export class CamoufoxProfile {
         const targetOs = expectedOs || this.metadata?.os || this.options?.os || 'windows';
         this.coherenceReport = await auditProfileCoherence(page, targetOs, {
             profileId: this.profileId,
+            hardwareProfile: this.metadata?.hardwareProfile || undefined,
+            gpuPerformance:
+                this.gpuPerformanceScaler?.scalingWeights ||
+                this.metadata?.gpuPerformance ||
+                undefined,
             ...options
         });
         if (
@@ -1082,19 +1128,23 @@ export class CamoufoxProfile {
             });
         }
 
-        if (this.trafficRecorder && typeof this.trafficRecorder.stop === 'function') {
+        if (this.securityGuards && typeof this.securityGuards.getStats === 'function') {
             try {
-                this.lastTrafficAttribution = await this.trafficRecorder.stop();
-            } catch (error) {
-                logger.warn('Failed to stop Camoufox trafficRecorder during stop()', {
-                    profileId: this.profileId,
-                    error: error.message
-                });
-            }
+                this.lastSecurityGuardStats = this.securityGuards.getStats();
+            } catch {}
+        }
+        if (this.gpuPerformanceScaler?.scalingWeights || this.metadata?.gpuPerformance) {
+            this.lastGpuPerformanceSummary =
+                this.gpuPerformanceScaler?.scalingWeights || this.metadata?.gpuPerformance;
         }
 
         try {
             const stopped = await camoufoxClient.stopProfile(this.profileId, this.options);
+            if (this.trafficRecorder && typeof this.trafficRecorder.stop === 'function') {
+                try {
+                    this.lastTrafficAttribution = await this.trafficRecorder.stop();
+                } catch {}
+            }
             this.browser = null;
             this.context = null;
             this.page = null;

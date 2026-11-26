@@ -1716,10 +1716,17 @@ export class CamoufoxTrafficRecorder {
 
         const lastValidEvent = validEvents[validEvents.length - 1];
         const maxSeq = validEvents.reduce((max, ev) => Math.max(max, Number(ev.seq) || 0), 0);
+        const maxStepIndex = validEvents.reduce(
+            (max, ev) => Math.max(max, Number(ev.attribution?.stepIndex ?? ev.stepIndex) || 0),
+            0
+        );
 
         this.chainHeadHash = lastValidEvent.eventHash;
         this.seq = maxSeq || validEvents.length;
         this.chainedEventCount = validEvents.length;
+        if (maxStepIndex > this.attribution.stepIndex) {
+            this.attribution.stepIndex = maxStepIndex;
+        }
 
         // Load existing attribution-index.json if present
         let existingIndex = null;
@@ -2050,6 +2057,18 @@ export class CamoufoxTrafficRecorder {
                         triggerBucket.correlationIdsSet.add(ev.correlationId);
                     }
                 }
+                this._recordAnomaly({
+                    timestamp: ev.timestamp,
+                    correlationId: ev.correlationId || null,
+                    actionStep: effectiveStepName,
+                    triggerAction: effectiveTrigger,
+                    type: 'network-request-failed',
+                    severity: 'high',
+                    method: ev.method || null,
+                    url: ev.url || null,
+                    status: null,
+                    failureText: ev.failureText || 'UNKNOWN_ERROR'
+                });
             } else if (ev.type === 'security-block') {
                 this.totals.failedRequests += 1;
                 const parsedUrl = parseUrlComponents(ev.url || ev.targetUrl || '');
@@ -2069,6 +2088,18 @@ export class CamoufoxTrafficRecorder {
                         triggerBucket.correlationIdsSet.add(ev.correlationId);
                     }
                 }
+                this._recordAnomaly({
+                    timestamp: ev.timestamp,
+                    correlationId: ev.correlationId || null,
+                    actionStep: stepName,
+                    triggerAction: effectiveTrigger,
+                    type: `security-block:${ev.blockType || 'security-probe'}`,
+                    severity: ev.severity || 'critical',
+                    method: ev.method || 'GET',
+                    url: ev.url || ev.targetUrl || '',
+                    status: null,
+                    failureText: ev.reason || ev.failureText || null
+                });
             } else if (ev.type === 'ws-egress' || ev.type === 'ws-ingress') {
                 const parsedUrl = parseUrlComponents(ev.url || '');
                 const bytes = Number(ev.payloadBytes) || 0;
@@ -3283,6 +3314,16 @@ export class CamoufoxTrafficRecorder {
                                 headersArray: evt.headersArray || [],
                                 bodyPreview: evt.bodyPreview || ''
                             })
+                        );
+                    } else if (evt.type === 'security-block') {
+                        parts.push(
+                            [
+                                '================================================================================',
+                                `!!! SECURITY-BLOCK [ZINIAO ACTIVE GUARD] [seq=${evt.seq}] [corr=${evt.correlationId}] ${evt.timestamp}`,
+                                `[ATTRIBUTION] profile=${evt.attribution?.profileId || this.attribution.profileId} step=${evt.attribution?.actionStep || 'init'}(#${evt.attribution?.stepIndex ?? 0})`,
+                                `[BLOCK-DETAIL] type=${evt.blockType || 'security-probe'} severity=${evt.severity || 'critical'} target="${evt.url || ''}" reason="${evt.reason || evt.failureText || ''}"`,
+                                ''
+                            ].join('\n')
                         );
                     }
                 }
