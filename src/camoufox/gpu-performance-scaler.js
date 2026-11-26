@@ -807,6 +807,32 @@ export const GPU_PERFORMANCE_SPEC_CATALOG = Object.freeze({
         webgpuMaxBufferSize: 2147483648,
         webgpuMaxComputeWorkgroupSizeX: 1024
     }),
+    'NVIDIA GeForce RTX 3080 Laptop GPU': Object.freeze({
+        model: 'NVIDIA GeForce RTX 3080 Laptop GPU',
+        vendor: 'nvidia',
+        architecture: 'ampere',
+        tier: 'high-end-laptop',
+        gpuCores: 48,
+        fp32Tflops: 18.98,
+        memoryBandwidthGBps: 448.0,
+        pixelFillRateGPixels: 148.3,
+        textureFillRateGTexels: 296.6,
+        webgpuMaxBufferSize: 2147483648,
+        webgpuMaxComputeWorkgroupSizeX: 1024
+    }),
+    'NVIDIA GeForce RTX 3070 Laptop GPU': Object.freeze({
+        model: 'NVIDIA GeForce RTX 3070 Laptop GPU',
+        vendor: 'nvidia',
+        architecture: 'ampere',
+        tier: 'performance-laptop',
+        gpuCores: 40,
+        fp32Tflops: 15.97,
+        memoryBandwidthGBps: 448.0,
+        pixelFillRateGPixels: 124.8,
+        textureFillRateGTexels: 249.6,
+        webgpuMaxBufferSize: 2147483648,
+        webgpuMaxComputeWorkgroupSizeX: 1024
+    }),
     'NVIDIA GeForce RTX 3060 Laptop GPU': Object.freeze({
         model: 'NVIDIA GeForce RTX 3060 Laptop GPU',
         vendor: 'nvidia',
@@ -945,13 +971,15 @@ export function lookupGpuPerformanceSpec(rendererOrModel) {
     if (/RTX\s*4070\s*Laptop/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4070 Laptop GPU'];
     if (/RTX\s*4060\s*Laptop/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4060 Laptop GPU'];
     if (/RTX\s*4050\s*Laptop/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4050 Laptop GPU'];
+    if (/RTX\s*3080\s*(?:Ti\s*)?Laptop/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 3080 Laptop GPU'];
+    if (/RTX\s*3070\s*(?:Ti\s*)?Laptop/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 3070 Laptop GPU'];
     if (/RTX\s*3060\s*Laptop/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 3060 Laptop GPU'];
     if (/RTX\s*4090/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4090'];
     if (/RTX\s*4080\s*SUPER/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4080 SUPER'];
     if (/RTX\s*(?:4080|5000\s*Ada)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4080'];
     if (/RTX\s*4070\s*Ti\s*SUPER/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4070 Ti SUPER'];
     if (/RTX\s*4070\s*SUPER/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4070 SUPER'];
-    if (/RTX\s*(?:4070|4000\s*Ada|3500\s*Ada)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4070'];
+    if (/RTX\s*(?:4070|4000\s*Ada|3500\s*Ada|Ada\s+Generation)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4070'];
     if (/RTX\s*4060\s*Ti/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4060 Ti'];
     if (/RTX\s*(?:4060|2000\s*Ada|A2000)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 4060'];
     if (/RTX\s*3090/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce RTX 3090'];
@@ -965,7 +993,7 @@ export function lookupGpuPerformanceSpec(rendererOrModel) {
     if (/GTX\s*1650/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce GTX 1650'];
     if (/RX\s*7900/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 7900 XTX'];
     if (/RX\s*(?:7800|7700|6950|6900)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 7800 XT'];
-    if (/RX\s*6800|RX\s*6000\/7000/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 6800 XT'];
+    if (/RX\s*6800|RX\s*6000M?\/7000M?/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 6800 XT'];
     if (/RX\s*(?:6750|6700|7600)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 6700 XT'];
     if (/RX\s*66\d0/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 6600'];
     if (/W6[89]00X|Vega\s*II/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon Pro W6800X'];
@@ -1310,7 +1338,7 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
             }
             const rawLines = err.stack.split('\\n');
             const internalPattern =
-                /sanitizeThrownError|createNative(?:Method|Getter)Wrapper|defineCloaked(?:Method|Getter)|patched(?:ToString|PerfNow|DateNow)|iframePatched(?:ToString|PerfNow|DateNow)|wrapped(?:Raf|Draw|Flush|Finish|WaitSync|ReadPixels|BeginQuery|GetQueryParam|GetExt|BeginExt|QueryCounter|GetQueryObj|ExtDraw|ToDataURL|ToBlob|ConvertToBlob|WorkDone|MapAsync|Getter)|hookSameOriginIframeRealm|advanceVirtualClock/i;
+                /sanitizeThrownError|createNative(?:Method|Getter)Wrapper|defineCloaked(?:Method|Getter)|patched(?:ToString|PerfNow|DateNow)|iframePatched(?:ToString|PerfNow|DateNow)|wrapped(?:Raf|Draw|Flush|Finish|WaitSync|ReadPixels|BeginQuery|GetQueryParam|GetExt|BeginExt|QueryCounter|GetQueryObj|ExtDraw|ToDataURL|ToBlob|ConvertToBlob|WorkDone|MapAsync|Getter)|hookSameOriginIframeRealm|advanceVirtualClock|ProxiedDate|IframeProxiedDate|\\b(?:construct|apply)\\b/i;
             const cleanedLines = rawLines.filter((line) => !internalPattern.test(line));
             Object.defineProperty(err, 'stack', {
                 value: cleanedLines.join('\\n'),
@@ -1363,9 +1391,14 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
             if (lenDesc) {
                 Object.defineProperty(wrappedFn, 'length', lenDesc);
             }
-            const sourceStr = cloakedFns.has(origFn)
-                ? cloakedFns.get(origFn)
-                : nativeToString.call(origFn);
+            let sourceStr;
+            if (cloakedFns.has(origFn)) {
+                sourceStr = cloakedFns.get(origFn);
+            } else if (origProto && origProto !== Function.prototype && typeof origProto.toString === 'function') {
+                sourceStr = origProto.toString.call(origFn);
+            } else {
+                sourceStr = nativeToString.call(origFn);
+            }
             cloakedFns.set(wrappedFn, sourceStr);
         } catch {}
         return wrappedFn;
@@ -1496,25 +1529,42 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
     ) {
         try {
             const OrigDate = Date;
+            const origDateDesc = Object.getOwnPropertyDescriptor(globalThis, 'Date');
             const ProxiedDate = new Proxy(OrigDate, {
                 construct(target, args, newTarget) {
-                    if (args.length === 0) {
-                        return Reflect.construct(target, [patchedDateNow()], newTarget);
+                    try {
+                        if (args.length === 0) {
+                            return Reflect.construct(target, [patchedDateNow()], newTarget);
+                        }
+                        return Reflect.construct(target, args, newTarget);
+                    } catch (err) {
+                        throw sanitizeThrownError(err);
                     }
-                    return Reflect.construct(target, args, newTarget);
                 },
                 apply(_target, _thisArg, _args) {
-                    return new OrigDate(patchedDateNow()).toString();
+                    try {
+                        return new OrigDate(patchedDateNow()).toString();
+                    } catch (err) {
+                        throw sanitizeThrownError(err);
+                    }
                 }
             });
-            cloakedFns.set(ProxiedDate, nativeToString.call(OrigDate));
+            cloakedFns.set(
+                ProxiedDate,
+                cloakedFns.has(OrigDate) ? cloakedFns.get(OrigDate) : nativeToString.call(OrigDate)
+            );
             Object.defineProperty(OrigDate.prototype, 'constructor', {
                 value: ProxiedDate,
                 writable: true,
                 enumerable: false,
                 configurable: true
             });
-            globalThis.Date = ProxiedDate;
+            Object.defineProperty(globalThis, 'Date', {
+                value: ProxiedDate,
+                writable: origDateDesc ? Boolean(origDateDesc.writable) : true,
+                enumerable: origDateDesc ? Boolean(origDateDesc.enumerable) : false,
+                configurable: origDateDesc ? Boolean(origDateDesc.configurable) : true
+            });
         } catch {}
     }
 
@@ -1937,12 +1987,21 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
             return win;
         }
         try {
+            let iframeOrigToString = nativeToString;
             if (win.Function && win.Function.prototype && typeof win.Function.prototype.toString === 'function') {
                 hookedRealms.add(win);
-                const iframeOrigToString = win.Function.prototype.toString;
+                iframeOrigToString = win.Function.prototype.toString;
                 const iframePatchedToString = createNativeMethodWrapper('toString', function () {
-                    if (typeof this === 'function' && cloakedFns.has(this)) {
-                        return cloakedFns.get(this);
+                    if (typeof this === 'function') {
+                        if (cloakedFns.has(this)) {
+                            return cloakedFns.get(this);
+                        }
+                        if (
+                            Function.prototype !== win.Function.prototype &&
+                            Function.prototype.isPrototypeOf(this)
+                        ) {
+                            return Function.prototype.toString.call(this);
+                        }
                     }
                     return iframeOrigToString.call(this);
                 });
@@ -1957,11 +2016,57 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                 defineCloakedMethod(win.Performance.prototype, 'now', iframePatchedPerfNow, iframeOrigPerfNow);
             }
             if (win.Date && typeof win.Date.now === 'function') {
-                const iframeOrigDateNow = win.Date.now;
+                const iframeOrigDate = win.Date;
+                const iframeOrigDateNow = iframeOrigDate.now;
                 const iframePatchedDateNow = createNativeMethodWrapper('now', function () {
                     return patchedDateNow();
                 });
-                defineCloakedMethod(win.Date, 'now', iframePatchedDateNow, iframeOrigDateNow);
+                defineCloakedMethod(iframeOrigDate, 'now', iframePatchedDateNow, iframeOrigDateNow);
+                if (
+                    typeof iframeOrigDate === 'function' &&
+                    iframeOrigDate.prototype &&
+                    typeof Proxy === 'function' &&
+                    typeof Reflect === 'object'
+                ) {
+                    const iframeDateDesc = Object.getOwnPropertyDescriptor(win, 'Date');
+                    const IframeProxiedDate = new Proxy(iframeOrigDate, {
+                        construct(target, args, newTarget) {
+                            try {
+                                if (args.length === 0) {
+                                    return Reflect.construct(target, [patchedDateNow()], newTarget);
+                                }
+                                return Reflect.construct(target, args, newTarget);
+                            } catch (err) {
+                                throw sanitizeThrownError(err);
+                            }
+                        },
+                        apply(_target, _thisArg, _args) {
+                            try {
+                                return new iframeOrigDate(patchedDateNow()).toString();
+                            } catch (err) {
+                                throw sanitizeThrownError(err);
+                            }
+                        }
+                    });
+                    cloakedFns.set(
+                        IframeProxiedDate,
+                        cloakedFns.has(iframeOrigDate)
+                            ? cloakedFns.get(iframeOrigDate)
+                            : iframeOrigToString.call(iframeOrigDate)
+                    );
+                    Object.defineProperty(iframeOrigDate.prototype, 'constructor', {
+                        value: IframeProxiedDate,
+                        writable: true,
+                        enumerable: false,
+                        configurable: true
+                    });
+                    Object.defineProperty(win, 'Date', {
+                        value: IframeProxiedDate,
+                        writable: iframeDateDesc ? Boolean(iframeDateDesc.writable) : true,
+                        enumerable: iframeDateDesc ? Boolean(iframeDateDesc.enumerable) : false,
+                        configurable: iframeDateDesc ? Boolean(iframeDateDesc.configurable) : true
+                    });
+                }
             }
             if (win.GPUSupportedLimits && win.GPUSupportedLimits.prototype) {
                 defineCloakedGetter(

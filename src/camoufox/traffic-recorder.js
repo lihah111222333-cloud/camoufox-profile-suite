@@ -1783,6 +1783,7 @@ export class CamoufoxTrafficRecorder {
         const txIngressCounted = new Map();
         const txStepByCorr = new Map();
         const txTriggerByCorr = new Map();
+        const txReqPayloadByCorr = new Map();
 
         for (const ev of validEvents) {
             if (ev.correlationId) {
@@ -1931,6 +1932,60 @@ export class CamoufoxTrafficRecorder {
                         maskedPreview: sig.maskedPreview
                     });
                 }
+
+                if (ev.correlationId && ev.payloadFile) {
+                    txReqPayloadByCorr.set(ev.correlationId, ev.payloadFile);
+                }
+
+                const egressBodyPreview = ev.bodyPreview ?? ev.postData ?? null;
+                const egressRiskSignals = detectRiskSignals({
+                    url: ev.url || '',
+                    bodyPreview: egressBodyPreview,
+                    headers: ev.headers || {}
+                });
+                if (egressRiskSignals.length > 0) {
+                    const highestSeverity = egressRiskSignals.some((s) => s.severity === 'critical')
+                        ? 'critical'
+                        : egressRiskSignals.some((s) => s.severity === 'high')
+                          ? 'high'
+                          : 'medium';
+                    this._recordAnomaly({
+                        timestamp: ev.timestamp,
+                        correlationId: ev.correlationId || null,
+                        actionStep: stepName,
+                        triggerAction: ev.triggerAction || null,
+                        type: `risk-signal:${egressRiskSignals.map((s) => s.name).join('+')}`,
+                        severity: highestSeverity,
+                        method: ev.method || 'GET',
+                        url: ev.url || null,
+                        status: null,
+                        failureText: null,
+                        payloadFile: ev.payloadFile || null,
+                        matchedSignals: egressRiskSignals
+                    });
+                }
+
+                const egressWireAnomalies = detectWireHeaderAnomalies({
+                    headers: ev.headers || {},
+                    headersArray: headersArr,
+                    expectedOs: ev.attribution?.os || this.attribution.os,
+                    direction: 'egress'
+                });
+                for (const wa of egressWireAnomalies) {
+                    this._recordAnomaly({
+                        timestamp: ev.timestamp,
+                        correlationId: ev.correlationId || null,
+                        actionStep: stepName,
+                        triggerAction: ev.triggerAction || null,
+                        type: wa.type,
+                        severity: wa.severity,
+                        method: ev.method || 'GET',
+                        url: ev.url || null,
+                        status: null,
+                        failureText: wa.reason,
+                        payloadFile: ev.payloadFile || null
+                    });
+                }
             } else if (ev.type === 'ingress') {
                 const headersArr = Array.isArray(ev.headersArray) ? ev.headersArray : [];
                 const parsedUrl = parseUrlComponents(ev.url || '');
@@ -1990,6 +2045,10 @@ export class CamoufoxTrafficRecorder {
                     status
                 });
 
+                const effectivePayloadFile =
+                    ev.payloadFile ||
+                    (ev.correlationId ? txReqPayloadByCorr.get(ev.correlationId) || null : null);
+
                 if (status === 401 || status === 403 || status === 429 || status >= 500) {
                     const severity =
                         status === 429 || status === 403 || status >= 500 ? 'high' : 'medium';
@@ -2012,7 +2071,56 @@ export class CamoufoxTrafficRecorder {
                         url: ev.url || null,
                         status,
                         failureText: statusText || `HTTP ${status}`,
-                        payloadFile: ev.payloadFile || null
+                        payloadFile: effectivePayloadFile
+                    });
+                }
+
+                const ingressRiskSignals = detectRiskSignals({
+                    url: ev.url || '',
+                    bodyPreview: ev.bodyPreview ?? null,
+                    headers: ev.headers || {}
+                });
+                if (ingressRiskSignals.length > 0) {
+                    const highestSeverity = ingressRiskSignals.some((s) => s.severity === 'critical')
+                        ? 'critical'
+                        : ingressRiskSignals.some((s) => s.severity === 'high')
+                          ? 'high'
+                          : 'medium';
+                    this._recordAnomaly({
+                        timestamp: ev.timestamp,
+                        correlationId: ev.correlationId || null,
+                        actionStep: effectiveStepName,
+                        triggerAction: effectiveTrigger,
+                        type: `risk-signal:${ingressRiskSignals.map((s) => s.name).join('+')}`,
+                        severity: highestSeverity,
+                        method: ev.method || 'GET',
+                        url: ev.url || null,
+                        status,
+                        failureText: null,
+                        payloadFile: effectivePayloadFile,
+                        matchedSignals: ingressRiskSignals
+                    });
+                }
+
+                const ingressWireAnomalies = detectWireHeaderAnomalies({
+                    headers: ev.headers || {},
+                    headersArray: headersArr,
+                    expectedOs: ev.attribution?.os || this.attribution.os,
+                    direction: 'ingress'
+                });
+                for (const wa of ingressWireAnomalies) {
+                    this._recordAnomaly({
+                        timestamp: ev.timestamp,
+                        correlationId: ev.correlationId || null,
+                        actionStep: effectiveStepName,
+                        triggerAction: effectiveTrigger,
+                        type: wa.type,
+                        severity: wa.severity,
+                        method: ev.method || 'GET',
+                        url: ev.url || null,
+                        status,
+                        failureText: wa.reason,
+                        payloadFile: effectivePayloadFile
                     });
                 }
             } else if (ev.type === 'request-finished') {
@@ -2164,6 +2272,31 @@ export class CamoufoxTrafficRecorder {
                         if (ev.correlationId) triggerBucket.correlationIdsSet.add(ev.correlationId);
                     }
                 }
+            } else if (ev.type === 'ws-error') {
+                const parsedUrl = parseUrlComponents(ev.url || '');
+                const stepBucket = this._ensureStepRecord(stepName, stepIndex);
+                stepBucket.domainsSet.add(parsedUrl.host);
+                this._ensureDomainRecord(parsedUrl.host);
+                const triggerBucket = this._ensureTriggerActionRecord(ev.triggerAction || null);
+                if (triggerBucket) {
+                    triggerBucket.domainsSet.add(parsedUrl.host);
+                    if (ev.correlationId) {
+                        triggerBucket.correlationIdsSet.add(ev.correlationId);
+                    }
+                }
+                this._recordAnomaly({
+                    timestamp: ev.timestamp,
+                    correlationId: ev.correlationId || null,
+                    actionStep: stepName,
+                    triggerAction: ev.triggerAction || null,
+                    type: 'websocket-error',
+                    severity: 'medium',
+                    method: 'WEBSOCKET',
+                    url: ev.url || null,
+                    status: null,
+                    failureText: ev.failureText || 'WEBSOCKET_ERROR',
+                    payloadFile: null
+                });
             }
         }
 

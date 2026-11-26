@@ -316,15 +316,22 @@ export function attachElementHandleCompatibility(handle, owner = null, targetHin
  * (`$x`, `waitForXPath`, `waitForTimeout`, multi-arg `evaluate`, `networkidle2`).
  */
 export function attachFrameCompatibility(frame) {
-    if (!frame || typeof frame !== 'object' || frame._camoufoxCompatAttached) {
+    if (!frame || typeof frame !== 'object' || frame._camoufoxFrameCompatAttached) {
         return frame;
     }
 
-    Object.defineProperty(frame, '_camoufoxCompatAttached', {
+    Object.defineProperty(frame, '_camoufoxFrameCompatAttached', {
         value: true,
         enumerable: false,
         configurable: true
     });
+    if (!frame._camoufoxCompatAttached) {
+        Object.defineProperty(frame, '_camoufoxCompatAttached', {
+            value: true,
+            enumerable: false,
+            configurable: true
+        });
+    }
 
     if (typeof frame.$ === 'function') {
         const originalQuery = frame.$.bind(frame);
@@ -459,9 +466,20 @@ export function attachPageCompatibility(page, context = null, profile = null) {
     page.recordTrafficTrigger = (actionType, target = null, meta = {}) =>
         page.getTrafficRecorder()?.recordTriggerAction?.(actionType, target, meta) || null;
 
-    if (page._camoufoxCompatAttached) {
+    if (page._camoufoxPageCompatAttached) {
         return page;
     }
+
+    Object.defineProperty(page, '_camoufoxPageCompatAttached', {
+        value: true,
+        enumerable: false,
+        configurable: true
+    });
+    Object.defineProperty(page, '_camoufoxCompatAttached', {
+        value: true,
+        enumerable: false,
+        configurable: true
+    });
 
     // Apply all Frame-level shims ($x, waitForXPath, waitForSelector, goto, waitForNavigation, evaluate, evaluateHandle, waitForTimeout)
     attachFrameCompatibility(page);
@@ -608,6 +626,47 @@ export function attachPageCompatibility(page, context = null, profile = null) {
         };
     }
 
+    // Puppeteer page.userAgent() -> return active browser/profile Firefox User-Agent
+    if (typeof page.userAgent !== 'function') {
+        page.userAgent = async () => {
+            if (typeof page.evaluate === 'function') {
+                try {
+                    const domUa = await page.evaluate(() =>
+                        typeof window !== 'undefined' && window.navigator?.userAgent
+                            ? window.navigator.userAgent
+                            : typeof navigator !== 'undefined' &&
+                                navigator.userAgent &&
+                                !/^Node\.js\//i.test(navigator.userAgent)
+                              ? navigator.userAgent
+                              : null
+                    );
+                    if (typeof domUa === 'string' && domUa.trim().length > 0) {
+                        return domUa;
+                    }
+                } catch {
+                    // Fallback to profile metadata or OS-coherent Firefox User-Agent
+                }
+            }
+            const p = page._camoufoxProfile || profile;
+            const metaUa =
+                p?.metadata?.userAgent ||
+                p?.metadata?.hardwareProfile?.userAgent ||
+                p?.options?.userAgent ||
+                null;
+            if (typeof metaUa === 'string' && metaUa.trim().length > 0) {
+                return metaUa;
+            }
+            const os = String(p?.metadata?.os || p?.options?.os || 'windows').toLowerCase();
+            if (os === 'macos' || os === 'mac' || os === 'darwin') {
+                return 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0';
+            }
+            if (os === 'linux') {
+                return 'Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0';
+            }
+            return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0';
+        };
+    }
+
     // Puppeteer page.cookies(...urls) -> Playwright context.cookies(urls)
     if (typeof page.cookies !== 'function') {
         page.cookies = async (...urls) => {
@@ -639,10 +698,34 @@ export function attachPageCompatibility(page, context = null, profile = null) {
                 .filter((c) => c && typeof c === 'object' && c.name)
                 .map((cookie) => {
                     const copy = { ...cookie };
-                    if (!copy.url && !copy.domain && currentUrl && /^https?:\/\//i.test(currentUrl)) {
-                        copy.url = currentUrl;
-                    } else if (copy.domain && !copy.path) {
-                        copy.path = '/';
+                    if (typeof copy.sameSite === 'string') {
+                        const lowerSameSite = copy.sameSite.trim().toLowerCase();
+                        if (lowerSameSite === 'lax') {
+                            copy.sameSite = 'Lax';
+                        } else if (lowerSameSite === 'strict') {
+                            copy.sameSite = 'Strict';
+                        } else if (lowerSameSite === 'none' || lowerSameSite === 'no_restriction') {
+                            copy.sameSite = 'None';
+                        } else if (
+                            lowerSameSite === 'unspecified' ||
+                            lowerSameSite === 'default' ||
+                            lowerSameSite === ''
+                        ) {
+                            delete copy.sameSite;
+                        }
+                    }
+                    if (copy.domain) {
+                        delete copy.url;
+                        if (!copy.path) {
+                            copy.path = '/';
+                        }
+                    } else {
+                        if (!copy.url && currentUrl && /^https?:\/\//i.test(currentUrl)) {
+                            copy.url = currentUrl;
+                        }
+                        if (copy.url) {
+                            delete copy.path;
+                        }
                     }
                     return copy;
                 });
@@ -667,15 +750,38 @@ export function attachPageCompatibility(page, context = null, profile = null) {
                 return;
             }
 
+            const extractCookieHostname = (rawDomain, rawUrl) => {
+                const normDom = normalizeCookieDomain(rawDomain);
+                if (normDom) return normDom;
+                if (typeof rawUrl === 'string' && rawUrl.trim()) {
+                    try {
+                        return normalizeCookieDomain(new URL(rawUrl).hostname);
+                    } catch {
+                        return normalizeCookieDomain(rawUrl);
+                    }
+                }
+                return '';
+            };
+
             const matchesTarget = (cookie, target) => {
                 if (cookie.name !== target.name) {
                     return false;
                 }
-                if (
-                    target.domain &&
-                    normalizeCookieDomain(cookie.domain) !== normalizeCookieDomain(target.domain)
-                ) {
-                    return false;
+                const cookieDomain = extractCookieHostname(cookie.domain, cookie.url);
+                if (target.domain) {
+                    if (cookieDomain !== normalizeCookieDomain(target.domain)) {
+                        return false;
+                    }
+                } else if (target.url) {
+                    const targetHost = extractCookieHostname(null, target.url);
+                    if (
+                        targetHost &&
+                        cookieDomain &&
+                        cookieDomain !== targetHost &&
+                        !targetHost.endsWith(`.${cookieDomain}`)
+                    ) {
+                        return false;
+                    }
                 }
                 if (target.path && cookie.path && cookie.path !== target.path) {
                     return false;
@@ -831,6 +937,39 @@ export function attachBrowserCompatibility(browser, profile = null) {
                 if (prof && typeof prof.saveStorageState === 'function') {
                     await prof.saveStorageState();
                 }
+            },
+            userAgent: async () => {
+                const prof = boundProfile || rawBrowser._camoufoxBoundProfile || null;
+                const primaryContext = resolvePrimaryContext();
+                if (primaryContext && typeof primaryContext.pages === 'function') {
+                    const pages = primaryContext.pages();
+                    if (Array.isArray(pages) && pages.length > 0) {
+                        const firstPage = attachPageCompatibility(
+                            pages[0],
+                            primaryContext,
+                            prof || rawBrowser
+                        );
+                        if (typeof firstPage?.userAgent === 'function') {
+                            return firstPage.userAgent();
+                        }
+                    }
+                }
+                const metaUa =
+                    prof?.metadata?.userAgent ||
+                    prof?.metadata?.hardwareProfile?.userAgent ||
+                    prof?.options?.userAgent ||
+                    null;
+                if (typeof metaUa === 'string' && metaUa.trim().length > 0) {
+                    return metaUa;
+                }
+                const os = String(prof?.metadata?.os || prof?.options?.os || 'windows').toLowerCase();
+                if (os === 'macos' || os === 'mac' || os === 'darwin') {
+                    return 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0';
+                }
+                if (os === 'linux') {
+                    return 'Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0';
+                }
+                return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0';
             }
         };
     };
@@ -872,6 +1011,9 @@ export function attachBrowserCompatibility(browser, profile = null) {
         if (typeof rawBrowser.disconnect !== 'function') {
             rawBrowser.disconnect = rootMethods.disconnect;
         }
+        if (typeof rawBrowser.userAgent !== 'function') {
+            rawBrowser.userAgent = rootMethods.userAgent;
+        }
         if (typeof rawBrowser.isConnected !== 'function') {
             rawBrowser.isConnected = () => true;
         }
@@ -906,6 +1048,7 @@ export function attachBrowserCompatibility(browser, profile = null) {
             if (prop === 'pages') return scopedMethods.pages;
             if (prop === 'newPage') return scopedMethods.newPage;
             if (prop === 'disconnect') return scopedMethods.disconnect;
+            if (prop === 'userAgent') return scopedMethods.userAgent;
             if (prop === '_camoufoxBoundProfile') return effectiveProfile;
             if (prop === '_camoufoxRawBrowser') return rawBrowser;
             const val = Reflect.get(target, prop, receiver);

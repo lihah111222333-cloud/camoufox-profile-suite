@@ -4159,6 +4159,268 @@ const tests = [
                 fs.rmSync(tmpDir, { recursive: true, force: true });
             }
         }
+    },
+    {
+        name: '97. Round-5 Deep Audit (Part 1): Dual Init-Script Cross-Realm Composition (buildZiniaoWebRtcSecurityInitScript + buildGpuPerformanceInitScript), Iframe Date Constructor Sync & Alias-Safe RTCPeerConnection Hooking',
+        fn: async () => {
+            const vm = await import('node:vm');
+            const { computeGpuPerformanceScalingWeights, buildGpuPerformanceInitScript } =
+                await import('../src/camoufox/gpu-performance-scaler.js');
+            const { buildZiniaoWebRtcSecurityInitScript } =
+                await import('../src/camoufox/ziniao-security.js');
+
+            let realClock = 1000;
+            function MockPerformance() {}
+            MockPerformance.prototype.now = function now() {
+                if (!(this instanceof MockPerformance)) {
+                    throw new TypeError("'now' called on an object that does not implement interface Performance.");
+                }
+                return realClock;
+            };
+            function MockWebGLRenderingContext() {}
+            MockWebGLRenderingContext.prototype.drawArrays = function drawArrays() {};
+            MockWebGLRenderingContext.prototype.finish = function finish() {
+                realClock += 10;
+            };
+            let capturedTopRtcCfg = null;
+            function MockRTCPeerConnection(cfg) {
+                if (!new.target) {
+                    throw new TypeError("Constructor RTCPeerConnection requires 'new'");
+                }
+                capturedTopRtcCfg = cfg;
+            }
+            MockRTCPeerConnection.prototype.setConfiguration = function setConfiguration(cfg) {
+                if (!(this instanceof MockRTCPeerConnection)) {
+                    throw new TypeError("'setConfiguration' called on an object that does not implement interface RTCPeerConnection.");
+                }
+                capturedTopRtcCfg = cfg;
+            };
+
+            // Child iframe realm with its own Function, Performance, Date, and RTCPeerConnection
+            const iframeCtx = vm.createContext({
+                URL,
+                realClockRef: () => realClock
+            });
+            vm.runInContext(
+                `
+                globalThis.Function = Function;
+                globalThis.Date = Date;
+                globalThis.Performance = function Performance() {};
+                globalThis.Performance.prototype.now = function now() { return realClockRef(); };
+                globalThis.performance = Object.create(globalThis.Performance.prototype);
+                globalThis.capturedIframeRtcCfg = null;
+                globalThis.RTCPeerConnection = function RTCPeerConnection(cfg) {
+                    if (!new.target) throw new TypeError("Constructor RTCPeerConnection requires 'new'");
+                    globalThis.capturedIframeRtcCfg = cfg;
+                };
+                globalThis.RTCPeerConnection.prototype.setConfiguration = function setConfiguration(cfg) {
+                    globalThis.capturedIframeRtcCfg = cfg;
+                };
+                globalThis.mozRTCPeerConnection = globalThis.RTCPeerConnection;
+                `,
+                iframeCtx
+            );
+
+            function MockHTMLIFrameElement() {}
+            Object.defineProperty(MockHTMLIFrameElement.prototype, 'contentWindow', {
+                get: function contentWindow() {
+                    return iframeCtx;
+                },
+                enumerable: true,
+                configurable: true
+            });
+
+            const topSandbox = {
+                URL,
+                Performance: MockPerformance,
+                WebGLRenderingContext: MockWebGLRenderingContext,
+                RTCPeerConnection: MockRTCPeerConnection,
+                mozRTCPeerConnection: MockRTCPeerConnection,
+                HTMLIFrameElement: MockHTMLIFrameElement
+            };
+            topSandbox.performance = Object.create(MockPerformance.prototype);
+            topSandbox.globalThis = topSandbox;
+            const topCtx = vm.createContext(topSandbox);
+            vm.runInContext('globalThis.Function = Function; globalThis.Date = Date;', topCtx);
+
+            // Inject BOTH init scripts in the exact production order used by client.js
+            const webrtcScript = buildZiniaoWebRtcSecurityInitScript({
+                profileId: 'round5-dual-test'
+            });
+            const gpuWeights = computeGpuPerformanceScalingWeights('Intel(R) UHD Graphics 620', {
+                profileId: 'round5-dual-test'
+            });
+            const gpuScript = buildGpuPerformanceInitScript(gpuWeights);
+
+            vm.runInContext(webrtcScript, topCtx);
+            vm.runInContext(gpuScript, topCtx);
+
+            // 1. Vendor alias deduplication: RTCPeerConnection === mozRTCPeerConnection and prototype.constructor === RTCPeerConnection
+            assert.equal(topCtx.RTCPeerConnection, topCtx.mozRTCPeerConnection);
+            assert.equal(topCtx.RTCPeerConnection.prototype.constructor, topCtx.RTCPeerConnection);
+
+            // 2. Access iframe.contentWindow so both chained contentWindow getters run hookSameOriginIframeRealm
+            const ifr = Object.create(MockHTMLIFrameElement.prototype);
+            const cw = ifr.contentWindow;
+
+            // 3. Cross-realm Function.prototype.toString from iframe works for BOTH scripts' hooked functions
+            const ifrToString = cw.Function.prototype.toString;
+            for (const targetFn of [
+                topCtx.Function.prototype.toString,
+                topCtx.Performance.prototype.now,
+                topCtx.Date.now,
+                topCtx.Date,
+                topCtx.RTCPeerConnection,
+                topCtx.RTCPeerConnection.prototype.setConfiguration,
+                cw.Performance.prototype.now,
+                cw.Date.now,
+                cw.Date,
+                cw.RTCPeerConnection,
+                cw.RTCPeerConnection.prototype.setConfiguration
+            ]) {
+                const str = ifrToString.call(targetFn);
+                assert.equal(
+                    /\[native code\]|function (?:now|toString|Date|MockRTCPeerConnection|RTCPeerConnection|setConfiguration)/.test(str) &&
+                        !str.includes('sanitizeRtcConfig') &&
+                        !str.includes('advanceVirtualClock'),
+                    true,
+                    `Cross-realm toString leaked wrapper source: ${str}`
+                );
+            }
+
+            // 4. Same-origin iframe RTCPeerConnection strips obfuscated hex/integer IPv4 and IPv4-compatible IPv6 ([::127.0.0.1])
+            // eslint-disable-next-line no-new
+            new cw.RTCPeerConnection({
+                iceServers: [
+                    {
+                        urls: [
+                            'stun:[::127.0.0.1]:9222',
+                            'stun:[::7f00:1]:9222',
+                            'stun:0x7f000001:9222',
+                            'stun:2130706433:9222',
+                            'stun:stun.l.google.com:19302'
+                        ]
+                    }
+                ]
+            });
+            assert.equal(cw.capturedIframeRtcCfg.iceServers.length, 1);
+            assert.deepEqual(cw.capturedIframeRtcCfg.iceServers[0].urls, [
+                'stun:stun.l.google.com:19302'
+            ]);
+
+            // 5. After a GPU burst, iframe cw.Date.now() and new cw.Date().getTime() remain 100% synchronized (0ms drift)
+            const gl = Object.create(MockWebGLRenderingContext.prototype);
+            gl.drawArrays(4, 0, 3000);
+            gl.finish();
+            const ifrDateNow = cw.Date.now();
+            const ifrNewDateMs = new cw.Date().getTime();
+            assert.equal(
+                Math.abs(ifrDateNow - ifrNewDateMs),
+                0,
+                `Expected cw.Date.now() (${ifrDateNow}) === new cw.Date().getTime() (${ifrNewDateMs})`
+            );
+
+            // 6. Error stack hygiene on RTCPeerConnection.prototype.setConfiguration.call({})
+            let thrownRtcErr = null;
+            try {
+                topCtx.RTCPeerConnection.prototype.setConfiguration.call({});
+            } catch (err) {
+                thrownRtcErr = err;
+            }
+            assert.ok(thrownRtcErr);
+            assert.equal(
+                /wrappedSetConfig|createNativeMethodWrapper|sanitizeThrownError/.test(
+                    thrownRtcErr.stack || ''
+                ),
+                false,
+                `Expected clean stack trace on setConfiguration throw, got: ${thrownRtcErr.stack}`
+            );
+            assert.equal(capturedTopRtcCfg, null);
+        }
+    },
+    {
+        name: '98. Round-5 Deep Audit (Part 2): Rule H Direct WebGPU Limits Validation in validateHardwareModelSpec, 12th–14th Gen Intel OEM Laptop Legacy UHD 620/630 Rejection & RTX 3070/3080 Laptop / Radeon RX Mobile SKU Coverage',
+        fn: async () => {
+            const { lookupGpuPerformanceSpec } = await import(
+                '../src/camoufox/gpu-performance-scaler.js'
+            );
+
+            // 1. Direct validateHardwareModelSpec (Rule H) catches WebGPU limits mismatch even without gpuPerformance telemetry
+            const m1Base = buildCoherentTelemetry('macos');
+            m1Base.navigator.hardwareConcurrency = 8;
+            m1Base.worker.hardwareConcurrency = 8;
+            m1Base.iframeParity.hardwareConcurrency = 8;
+            m1Base.webgl.unmaskedVendor = 'Apple Inc.';
+            m1Base.webgl.unmaskedRenderer = 'Apple M1';
+            m1Base.hardwareProfile = {
+                cpuModel: 'Apple M1',
+                gpuModel: 'Apple M1',
+                ramGb: 16,
+                storageGb: 512
+            };
+            m1Base.webgpu = {
+                limits: {
+                    maxBufferSize: 4294967296, // 4 GiB Pro/Max/Ultra limit instead of 2 GiB base M1 limit
+                    maxComputeWorkgroupSizeX: 1024
+                }
+            };
+            const resM1Lim = validateHardwareModelSpec(m1Base, 'macos');
+            assert.equal(resM1Lim.passed, false);
+            assert.ok(
+                resM1Lim.issues.some((i) => /WebGPU maxBufferSize mismatch/.test(i)),
+                `Expected Rule H to reject 4GiB maxBufferSize on base Apple M1, got: ${resM1Lim.issues.join('; ')}`
+            );
+
+            // 2. 12th–14th Gen Intel OEM Laptops (ThinkPad X1 Carbon Gen 11, ASUS ROG Strix SCAR 16) reject legacy UHD Graphics 620 / 630
+            const x1Gen11WithUhd620 = buildCoherentTelemetry('windows');
+            x1Gen11WithUhd620.navigator.hardwareConcurrency = 12;
+            x1Gen11WithUhd620.worker.hardwareConcurrency = 12;
+            x1Gen11WithUhd620.iframeParity.hardwareConcurrency = 12;
+            x1Gen11WithUhd620.webgl.unmaskedVendor = 'Google Inc. (Intel)';
+            x1Gen11WithUhd620.webgl.unmaskedRenderer =
+                'ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            x1Gen11WithUhd620.hardwareProfile = {
+                deviceModel: 'Lenovo ThinkPad X1 Carbon Gen 11',
+                ramGb: 16,
+                storageGb: 512
+            };
+            const resX1Uhd620 = validateHardwareModelSpec(x1Gen11WithUhd620, 'windows');
+            assert.equal(resX1Uhd620.passed, false);
+            assert.ok(
+                resX1Uhd620.issues.some((i) =>
+                    /OEM device model "Lenovo ThinkPad X1 Carbon Gen 11" GPU mismatch/.test(i)
+                )
+            );
+
+            // 3. RTX 3070 Laptop GPU and AMD Radeon RX 6800M are recognized as laptop discrete GPUs (valid on mobile-h CPUs, rejected on igpuOnly ultrabooks & desktop CPUs)
+            const rtx3070LapSpec = lookupGpuPerformanceSpec(
+                'ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 Laptop GPU Direct3D11 vs_5_0 ps_5_0, D3D11)'
+            );
+            assert.equal(rtx3070LapSpec.model, 'NVIDIA GeForce RTX 3070 Laptop GPU');
+            assert.equal(rtx3070LapSpec.tier, 'performance-laptop');
+
+            const rx6800mLaptop = buildCoherentTelemetry('windows');
+            rx6800mLaptop.navigator.hardwareConcurrency = 16;
+            rx6800mLaptop.worker.hardwareConcurrency = 16;
+            rx6800mLaptop.iframeParity.hardwareConcurrency = 16;
+            rx6800mLaptop.webgl.unmaskedVendor = 'Google Inc. (AMD)';
+            rx6800mLaptop.webgl.unmaskedRenderer =
+                'ANGLE (AMD, AMD Radeon RX 6800M Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            rx6800mLaptop.webgl.maxViewportDims = [16384, 16384];
+            rx6800mLaptop.hardwareProfile = {
+                cpuModel: 'AMD Ryzen 9 7940HS',
+                gpuModel: 'AMD Radeon RX 6800M',
+                ramGb: 32,
+                vramGb: 12,
+                storageGb: 1024
+            };
+            const resRx6800m = validateHardwareModelSpec(rx6800mLaptop, 'windows');
+            assert.equal(
+                resRx6800m.passed,
+                true,
+                `Expected Ryzen 9 7940HS + Radeon RX 6800M laptop to pass, got: ${resRx6800m.issues.join('; ')}`
+            );
+        }
     }
 ];
 

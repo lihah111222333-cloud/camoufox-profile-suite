@@ -672,7 +672,7 @@ export const OEM_DEVICE_MODEL_CATALOG = Object.freeze({
         cpuVendor: 'intel',
         allowedCores: Object.freeze([10, 12, 16]),
         igpuOnly: true,
-        gpuPattern: /Intel\(R\)\s+(?:Iris\(R\)\s+Xe|UHD)\s+Graphics/i,
+        gpuPattern: /Intel\(R\)\s+(?:Iris\(R\)\s+Xe\s+Graphics|UHD\s+Graphics(?!\s+\d{3}))/i,
         allowedRamGb: Object.freeze([8, 16, 32]),
         allowedStorageGb: Object.freeze([256, 512, 1024, 2048]),
         allowedOs: Object.freeze(['win', 'lin'])
@@ -683,7 +683,7 @@ export const OEM_DEVICE_MODEL_CATALOG = Object.freeze({
         cpuVendor: 'intel',
         allowedCores: Object.freeze([10, 12, 14, 16, 20]),
         igpuOnly: true,
-        gpuPattern: /Intel\(R\)\s+(?:Iris\(R\)\s+Xe|UHD)\s+Graphics/i,
+        gpuPattern: /Intel\(R\)\s+(?:Iris\(R\)\s+Xe\s+Graphics|UHD\s+Graphics(?!\s+\d{3}))/i,
         allowedRamGb: Object.freeze([16, 32, 64]),
         allowedStorageGb: Object.freeze([256, 512, 1024, 2048]),
         allowedOs: Object.freeze(['win', 'lin'])
@@ -716,7 +716,7 @@ export const OEM_DEVICE_MODEL_CATALOG = Object.freeze({
         cpuVendor: 'intel',
         allowedCores: Object.freeze([16, 20, 24, 28, 32]),
         igpuOnly: false,
-        gpuPattern: /Intel\(R\)\s+UHD\s+Graphics|NVIDIA\s+RTX\s+(?:A1000|A2000|2000|3500|4000|5000)\s+Ada/i,
+        gpuPattern: /Intel\(R\)\s+UHD\s+Graphics(?:\s+770\b|(?!\s+\d{3}))|NVIDIA\s+RTX\s+(?:A1000|A2000|2000|3500|4000|5000)\s+Ada/i,
         allowedRamGb: Object.freeze([16, 32, 48, 64, 96, 128, 192]),
         allowedStorageGb: Object.freeze([512, 1024, 2048, 4096, 8192]),
         allowedOs: Object.freeze(['win', 'lin'])
@@ -749,7 +749,7 @@ export const OEM_DEVICE_MODEL_CATALOG = Object.freeze({
         cpuVendor: 'intel',
         allowedCores: Object.freeze([12, 14, 16, 20]),
         igpuOnly: false,
-        gpuPattern: /Intel\(R\)\s+(?:Iris\(R\)\s+Xe|Arc\(TM\)|UHD)\s+Graphics|NVIDIA\s+GeForce\s+RTX\s+40[567]0\s+Laptop\s+GPU/i,
+        gpuPattern: /Intel\(R\)\s+(?:(?:Iris\(R\)\s+Xe|Arc\(TM\))\s+Graphics|UHD\s+Graphics(?!\s+\d{3}))|NVIDIA\s+GeForce\s+RTX\s+40[567]0\s+Laptop\s+GPU/i,
         allowedRamGb: Object.freeze([16, 32, 64]),
         allowedStorageGb: Object.freeze([512, 1024, 2048, 4096, 8192]),
         allowedOs: Object.freeze(['win', 'lin'])
@@ -853,7 +853,7 @@ export const OEM_DEVICE_MODEL_CATALOG = Object.freeze({
         cpuVendor: 'intel',
         allowedCores: Object.freeze([24, 32]),
         igpuOnly: false,
-        gpuPattern: /Intel\(R\)\s+UHD\s+Graphics|NVIDIA\s+GeForce\s+RTX\s+40[89]0\s+Laptop\s+GPU/i,
+        gpuPattern: /Intel\(R\)\s+UHD\s+Graphics(?:\s+770\b|(?!\s+\d{3}))|NVIDIA\s+GeForce\s+RTX\s+40[89]0\s+Laptop\s+GPU/i,
         allowedRamGb: Object.freeze([16, 32, 64]),
         allowedStorageGb: Object.freeze([1024, 2048, 4096]),
         allowedOs: Object.freeze(['win', 'lin'])
@@ -864,7 +864,7 @@ export const OEM_DEVICE_MODEL_CATALOG = Object.freeze({
         cpuVendor: 'intel',
         allowedCores: Object.freeze([24, 32]),
         igpuOnly: false,
-        gpuPattern: /Intel\(R\)\s+UHD\s+Graphics|NVIDIA\s+GeForce\s+RTX\s+40[6789]0\s+Laptop\s+GPU/i,
+        gpuPattern: /Intel\(R\)\s+UHD\s+Graphics(?:\s+770\b|(?!\s+\d{3}))|NVIDIA\s+GeForce\s+RTX\s+40[6789]0\s+Laptop\s+GPU/i,
         allowedRamGb: Object.freeze([16, 32, 64, 96]),
         allowedStorageGb: Object.freeze([1024, 2048, 4096, 8192]),
         allowedOs: Object.freeze(['win', 'lin'])
@@ -919,7 +919,7 @@ export const OEM_DEVICE_MODEL_CATALOG = Object.freeze({
         cpuVendor: 'intel',
         allowedCores: Object.freeze([10, 12, 14, 16, 20, 22]),
         igpuOnly: true,
-        gpuPattern: /Intel\(R\)\s+(?:Iris\(R\)\s+Xe|Arc\(TM\)|UHD)\s+Graphics/i,
+        gpuPattern: /Intel\(R\)\s+(?:(?:Iris\(R\)\s+Xe|Arc\(TM\))\s+Graphics|UHD\s+Graphics(?!\s+\d{3}))/i,
         allowedRamGb: Object.freeze([8, 16, 24, 32, 40, 48, 56]),
         allowedStorageGb: Object.freeze([256, 512, 1024, 2048, 4096, 8192]),
         allowedOs: Object.freeze(['lin', 'win'])
@@ -2017,6 +2017,40 @@ export const PC_GPU_SKU_CATALOG = Object.freeze([
         })
     }),
     Object.freeze({
+        id: 'NVIDIA GeForce RTX 3080 Laptop GPU',
+        pattern: /RTX\s*3080\s+(?:Ti\s+)?Laptop\s+GPU/i,
+        vendor: 'nvidia',
+        pciVendorId: '0x10de',
+        angleVendor: 'NVIDIA',
+        isIntegrated: false,
+        formFactor: 'laptop',
+        vramGb: Object.freeze([8, 16]),
+        osSupport: Object.freeze(['win', 'lin']),
+        webglLimits: Object.freeze({
+            maxTextureSize: 16384,
+            maxCubeMapTextureSize: 16384,
+            maxRenderbufferSize: 16384,
+            maxViewportDims: Object.freeze([32768, 32768])
+        })
+    }),
+    Object.freeze({
+        id: 'NVIDIA GeForce RTX 3070 Laptop GPU',
+        pattern: /RTX\s*3070\s+(?:Ti\s+)?Laptop\s+GPU/i,
+        vendor: 'nvidia',
+        pciVendorId: '0x10de',
+        angleVendor: 'NVIDIA',
+        isIntegrated: false,
+        formFactor: 'laptop',
+        vramGb: Object.freeze([8]),
+        osSupport: Object.freeze(['win', 'lin']),
+        webglLimits: Object.freeze({
+            maxTextureSize: 16384,
+            maxCubeMapTextureSize: 16384,
+            maxRenderbufferSize: 16384,
+            maxViewportDims: Object.freeze([32768, 32768])
+        })
+    }),
+    Object.freeze({
         id: 'NVIDIA GeForce RTX 3060 Laptop GPU',
         pattern: /RTX\s*3060\s+Laptop\s+GPU/i,
         vendor: 'nvidia',
@@ -2025,6 +2059,23 @@ export const PC_GPU_SKU_CATALOG = Object.freeze([
         isIntegrated: false,
         formFactor: 'laptop',
         vramGb: Object.freeze([6]),
+        osSupport: Object.freeze(['win', 'lin']),
+        webglLimits: Object.freeze({
+            maxTextureSize: 16384,
+            maxCubeMapTextureSize: 16384,
+            maxRenderbufferSize: 16384,
+            maxViewportDims: Object.freeze([32768, 32768])
+        })
+    }),
+    Object.freeze({
+        id: 'NVIDIA RTX Ada Generation Workstation GPU',
+        pattern: /NVIDIA\s+RTX\s+(?:A1000|A2000|2000|3500|4000|5000)\s+Ada/i,
+        vendor: 'nvidia',
+        pciVendorId: '0x10de',
+        angleVendor: 'NVIDIA',
+        isIntegrated: false,
+        formFactor: 'both',
+        vramGb: Object.freeze([4, 6, 8, 12, 16]),
         osSupport: Object.freeze(['win', 'lin']),
         webglLimits: Object.freeze({
             maxTextureSize: 16384,
@@ -2276,8 +2327,25 @@ export const PC_GPU_SKU_CATALOG = Object.freeze([
         })
     }),
     Object.freeze({
+        id: 'AMD Radeon RX 6000M/7000M Mobile Discrete',
+        pattern: /Radeon\s+RX\s+(?:6[6-9]\d0[MS]|7[6-9]\d0[MS])\b|Radeon\s+RX\s+(?:6[6-9]\d0|7[6-9]\d0)\b(?=.*\b(?:Laptop|Mobile)\b)/i,
+        vendor: 'amd',
+        pciVendorId: '0x1002',
+        angleVendor: 'AMD',
+        isIntegrated: false,
+        formFactor: 'laptop',
+        vramGb: Object.freeze([8, 12, 16]),
+        osSupport: Object.freeze(['win', 'lin']),
+        webglLimits: Object.freeze({
+            maxTextureSize: 16384,
+            maxCubeMapTextureSize: 16384,
+            maxRenderbufferSize: 16384,
+            maxViewportDims: Object.freeze([16384, 16384])
+        })
+    }),
+    Object.freeze({
         id: 'AMD Radeon RX 6000/7000 Discrete',
-        pattern: /Radeon\s+RX\s+(6[6-9]\d0|7[6-9]\d0)/i,
+        pattern: /Radeon\s+RX\s+(6[6-9]\d0|7[6-9]\d0)(?!\s*[MS]\b)(?!.*\b(?:Laptop|Mobile)\b)/i,
         vendor: 'amd',
         pciVendorId: '0x1002',
         angleVendor: 'AMD',
@@ -3489,6 +3557,63 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
             issues.push(
                 `WebGL ALIASED_LINE_WIDTH_RANGE=[${minLine}, ${maxLine}] is invalid for ${targetOs === 'win' ? 'Windows ANGLE D3D11' : 'macOS Metal'} (must be [1, 1])`
             );
+        }
+    }
+
+    // Direct WebGPU GPUSupportedLimits (maxBufferSize & maxComputeWorkgroupSizeX) SKU validation in Rule H
+    const webgpuLimits =
+        telemetry.webgpu?.limits ||
+        hw.webgpuLimits ||
+        webgl.webgpuLimits ||
+        null;
+    if (webgpuLimits && typeof webgpuLimits === 'object' && (activeAppleSkuName || renderer)) {
+        let expectedWebgpuLimits = null;
+        if (activeAppleSkuName && APPLE_SILICON_SKU_CATALOG[activeAppleSkuName]) {
+            const appleSku = APPLE_SILICON_SKU_CATALOG[activeAppleSkuName];
+            expectedWebgpuLimits =
+                appleSku.tier === 'base'
+                    ? { maxBufferSize: 2147483648, maxComputeWorkgroupSizeX: 1024 }
+                    : { maxBufferSize: 4294967296, maxComputeWorkgroupSizeX: 1024 };
+        } else if (
+            /(?:HD|UHD)\s+Graphics(?:\s+(?:4\d\d|5\d\d|6\d\d|7[37]0))?\b|Iris(?:\(TM\))?\s+(?:Pro|Plus|Graphics\s+(?:540|550|6100)|OpenGL)/i.test(
+                renderer
+            )
+        ) {
+            expectedWebgpuLimits = { maxBufferSize: 1073741824, maxComputeWorkgroupSizeX: 512 };
+        } else if (
+            /RTX\s*(?:4090|4080|3500\s*Ada|4000\s*Ada|5000\s*Ada)|RTX\s*(?:4070|3090|3080)(?!.*\b(?:Laptop|Mobile|Max-Q)\b)|RTX\s*4060\s*Ti(?!.*\b(?:Laptop|Mobile|Max-Q)\b)|Radeon\s+RX\s+(?:7900|7800|7700|7600|6950|6900|6800|6750|6700)(?!\s*[MS]\b)(?!.*\b(?:Laptop|Mobile)\b)|Radeon\s+Pro\s+(?:W6800X|W6900X|Vega\s+II)|Arc\(TM\)\s+A[57]\d0/i.test(
+                renderer
+            )
+        ) {
+            expectedWebgpuLimits = { maxBufferSize: 4294967296, maxComputeWorkgroupSizeX: 1024 };
+        } else if (pcGpuSku || intelMacSku || snapdragonSku) {
+            expectedWebgpuLimits = { maxBufferSize: 2147483648, maxComputeWorkgroupSizeX: 1024 };
+        }
+
+        if (expectedWebgpuLimits) {
+            const skuLabel = activeAppleSkuName || pcGpuSku?.id || renderer;
+            if (
+                webgpuLimits.maxBufferSize !== undefined &&
+                webgpuLimits.maxBufferSize !== null
+            ) {
+                const maxBuf = Number(webgpuLimits.maxBufferSize);
+                if (maxBuf !== expectedWebgpuLimits.maxBufferSize) {
+                    issues.push(
+                        `WebGPU maxBufferSize mismatch: reported ${maxBuf} contradicts GPU SKU "${skuLabel}" hardware specification (expected ${expectedWebgpuLimits.maxBufferSize})`
+                    );
+                }
+            }
+            if (
+                webgpuLimits.maxComputeWorkgroupSizeX !== undefined &&
+                webgpuLimits.maxComputeWorkgroupSizeX !== null
+            ) {
+                const maxWgX = Number(webgpuLimits.maxComputeWorkgroupSizeX);
+                if (maxWgX !== expectedWebgpuLimits.maxComputeWorkgroupSizeX) {
+                    issues.push(
+                        `WebGPU maxComputeWorkgroupSizeX mismatch: reported ${maxWgX} contradicts GPU SKU "${skuLabel}" hardware specification (expected ${expectedWebgpuLimits.maxComputeWorkgroupSizeX})`
+                    );
+                }
+            }
         }
     }
 

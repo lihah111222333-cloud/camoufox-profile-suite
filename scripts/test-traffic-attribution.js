@@ -2981,6 +2981,113 @@ async function runTests() {
             }
         );
 
+        // =========================================================================
+        // Test 16: Full Crash-Replay Anomaly Reconstruction (Egress/Ingress Risk Signals, Wire Header Anomalies, Proxy Leak & WebSocket Error) Without attribution-index.json
+        // =========================================================================
+        await testSection(
+            'Test 16: Full Crash-Replay Anomaly Reconstruction Without attribution-index.json',
+            async () => {
+                const profile = await createAndStartProfile(
+                    'Traffic_Test_16_CrashReplayFullAnomalies',
+                    'http://10.106.0.1:8080',
+                    {
+                        profileId: 'traffic-test-16-crash-replay-anomalies',
+                        os: 'windows',
+                        profilesDir: tempProfilesDir,
+                        useSharedBrowser: false,
+                        accountId: 'acct-crash-16',
+                        accountEmail: 'crash16@gmail.com'
+                    }
+                );
+
+                const context = await profile.getContext();
+                const page = await profile.getPage();
+                const trafficDir = profile.trafficPaths.trafficDir;
+                const indexPath = profile.trafficPaths.attributionIndexPath;
+
+                profile.setTrafficStep('step-16-challenge-flow');
+                await page.click('#challenge-submit-btn');
+
+                // 1) Egress with risk signal (/recaptcha/api2/reload) AND Chromium Client-Hints wire header anomaly on Gecko
+                // 2) Ingress HTTP 200 with challenge body risk signal (g-recaptcha) AND proxy-anonymity-leak header (Via)
+                const req16 = createMockRequest({
+                    method: 'POST',
+                    url: 'https://www.google.com/recaptcha/api2/reload?k=6Lf123',
+                    resourceType: 'xhr',
+                    headersArray: [
+                        { name: 'Host', value: 'www.google.com' },
+                        {
+                            name: 'User-Agent',
+                            value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0'
+                        },
+                        { name: 'Sec-CH-UA', value: '"Chromium";v="124"' },
+                        { name: 'Content-Type', value: 'application/x-www-form-urlencoded' }
+                    ],
+                    postData: 'v=123&reason=q'
+                });
+                const res16 = createMockResponse({
+                    request: req16,
+                    status: 200,
+                    statusText: 'OK',
+                    headersArray: [
+                        { name: 'Content-Type', value: 'application/json' },
+                        { name: 'Via', value: '1.1 squid-proxy.local' }
+                    ],
+                    body: JSON.stringify({ challenge: 'g-recaptcha', arkose: 'funcaptcha' })
+                });
+                await emitHttpTransaction(context, req16, res16);
+
+                // 3) WebSocket error event
+                const ws16 = createMockWebSocket('wss://accounts.google.com/v3/signin/ws');
+                page.emit('websocket', ws16);
+                ws16.triggerError('NS_ERROR_WEBSOCKET_CONNECTION_REFUSED');
+
+                await profile.stop();
+
+                // Simulate hard process crash before flushSummary() wrote attribution-index.json
+                assert.equal(fs.existsSync(indexPath), true);
+                fs.unlinkSync(indexPath);
+                assert.equal(fs.existsSync(indexPath), false);
+
+                // Resume a new CamoufoxTrafficRecorder on the same trafficDir and verify full anomaly reconstruction from traffic.ndjson alone
+                const resumedRecorder = new CamoufoxTrafficRecorder({
+                    profileId: 'traffic-test-16-crash-replay-anomalies',
+                    trafficDir,
+                    os: 'windows'
+                });
+                const resumedSummary = await resumedRecorder.flushSummary();
+                await resumedRecorder.stop();
+
+                const anomalyTypes = resumedSummary.anomaliesAndRiskSignals.map((a) => a.type);
+                assert.equal(
+                    anomalyTypes.some((t) => t.startsWith('risk-signal:')),
+                    true,
+                    `Expected risk-signal:* anomaly after crash replay, got: ${anomalyTypes.join(', ')}`
+                );
+                assert.equal(
+                    anomalyTypes.includes('wire-header-anomaly:chromium-client-hints-on-gecko'),
+                    true,
+                    `Expected wire-header-anomaly:chromium-client-hints-on-gecko after crash replay, got: ${anomalyTypes.join(', ')}`
+                );
+                assert.equal(
+                    anomalyTypes.includes('proxy-anonymity-leak'),
+                    true,
+                    `Expected proxy-anonymity-leak after crash replay, got: ${anomalyTypes.join(', ')}`
+                );
+                assert.equal(
+                    anomalyTypes.includes('websocket-error'),
+                    true,
+                    `Expected websocket-error after crash replay, got: ${anomalyTypes.join(', ')}`
+                );
+                assert.ok(
+                    resumedSummary.byActionStep['step-16-challenge-flow']?.anomalyCount >= 4,
+                    'Expected step-16-challenge-flow anomalyCount >= 4 after crash replay'
+                );
+
+                await profile.delete();
+            }
+        );
+
         console.log(`\n🎉 All ${passedTests} Camoufox pre-TLS traffic attribution & isolation test suites passed!`);
     } finally {
         setCamoufoxModule(null);

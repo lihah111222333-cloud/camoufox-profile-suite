@@ -1250,23 +1250,72 @@ export function buildZiniaoWebRtcSecurityInitScript(options = {}) {
     if (!CFG.enabled) return;
 
     const allowedPortSet = new Set(CFG.allowedPorts || []);
+    const OrigURL = typeof URL === 'function' ? URL : null;
     const nativeToString = Function.prototype.toString;
     const cloakedFns = new WeakMap();
+
+    const sanitizeThrownError = (err) => {
+        try {
+            if (!err || (typeof err !== 'object' && typeof err !== 'function') || typeof err.stack !== 'string') {
+                return err;
+            }
+            const rawLines = err.stack.split('\\n');
+            const internalPattern =
+                /sanitizeThrownError|createNative(?:Method|Getter)Wrapper|defineCloaked(?:Method|Getter)|patchedToStr|iframePatchedToString|wrappedSetConfig|sanitizeRtcConfig|shouldAllowIceUrl|isLocalOrPrivateHost|hookRtcConstructorsInRealm|hookSameOriginIframeRealm|ProxiedRTC|\\b(?:construct|apply)\\b/i;
+            const cleanedLines = rawLines.filter((line) => !internalPattern.test(line));
+            Object.defineProperty(err, 'stack', {
+                value: cleanedLines.join('\\n'),
+                writable: true,
+                enumerable: false,
+                configurable: true
+            });
+        } catch {}
+        return err;
+    };
 
     const createNativeMethodWrapper = (methodName, impl) =>
         ({
             [methodName](...args) {
-                return impl.apply(this, args);
+                try {
+                    return impl.apply(this, args);
+                } catch (err) {
+                    throw sanitizeThrownError(err);
+                }
             }
         })[methodName];
 
+    const createNativeGetterWrapper = (propName, impl) =>
+        Object.getOwnPropertyDescriptor(
+            {
+                get [propName]() {
+                    try {
+                        return impl.call(this);
+                    } catch (err) {
+                        throw sanitizeThrownError(err);
+                    }
+                }
+            },
+            propName
+        ).get;
+
     const cloak = (wrappedFn, origFn) => {
         try {
+            const origProto = Object.getPrototypeOf(origFn);
+            if (origProto && Object.getPrototypeOf(wrappedFn) !== origProto) {
+                Object.setPrototypeOf(wrappedFn, origProto);
+            }
             const nameDesc = Object.getOwnPropertyDescriptor(origFn, 'name');
             if (nameDesc) Object.defineProperty(wrappedFn, 'name', nameDesc);
             const lenDesc = Object.getOwnPropertyDescriptor(origFn, 'length');
             if (lenDesc) Object.defineProperty(wrappedFn, 'length', lenDesc);
-            const src = cloakedFns.has(origFn) ? cloakedFns.get(origFn) : nativeToString.call(origFn);
+            let src;
+            if (cloakedFns.has(origFn)) {
+                src = cloakedFns.get(origFn);
+            } else if (origProto && origProto !== Function.prototype && typeof origProto.toString === 'function') {
+                src = origProto.toString.call(origFn);
+            } else {
+                src = nativeToString.call(origFn);
+            }
             cloakedFns.set(wrappedFn, src);
         } catch {}
         return wrappedFn;
@@ -1284,6 +1333,24 @@ export function buildZiniaoWebRtcSecurityInitScript(options = {}) {
         });
     };
 
+    const defineCloakedGetter = (targetObj, propName, impl) => {
+        if (!targetObj) return;
+        const origDesc = Object.getOwnPropertyDescriptor(targetObj, propName);
+        if (!origDesc || typeof origDesc.get !== 'function') return;
+        const origGetter = origDesc.get;
+        const wrappedGetter = createNativeGetterWrapper(propName, function () {
+            const nativeVal = origGetter.call(this);
+            return impl.call(this, nativeVal);
+        });
+        cloak(wrappedGetter, origGetter);
+        Object.defineProperty(targetObj, propName, {
+            get: wrappedGetter,
+            set: origDesc.set,
+            enumerable: Boolean(origDesc.enumerable),
+            configurable: Boolean(origDesc.configurable)
+        });
+    };
+
     const isLocalOrPrivateHost = (rawHost) => {
         if (!rawHost || typeof rawHost !== 'string') return false;
         let host = rawHost
@@ -1294,20 +1361,105 @@ export function buildZiniaoWebRtcSecurityInitScript(options = {}) {
             .replace(/%.*$/, '')
             .replace(/\\.+$/, '');
         if (!host) return false;
-        if (host === '::1' || host === '::' || host === 'localhost' || host.endsWith('.localhost') || host === 'ip6-localhost' || host === 'ip6-loopback') {
+        if (OrigURL) {
+            if (/^(?:0x[0-9a-f]+|\\d+)(?:\\.(?:0x[0-9a-f]+|\\d+)){0,3}$/i.test(host)) {
+                try {
+                    const canon = new OrigURL('http://' + host).hostname;
+                    if (canon) host = canon.toLowerCase().replace(/^\\[|\\]$/g, '');
+                } catch {
+                    return true;
+                }
+            } else if (host.includes(':')) {
+                try {
+                    const canon6 = new OrigURL('http://[' + host + ']').hostname;
+                    if (canon6) host = canon6.toLowerCase().replace(/^\\[|\\]$/g, '');
+                } catch {}
+            }
+        }
+        if (
+            host === '::1' ||
+            host === '::' ||
+            /^(?:0+:){7}0*1$/i.test(host) ||
+            /^(?:0+:){7}0+$/i.test(host) ||
+            host === 'localhost' ||
+            host.endsWith('.localhost') ||
+            host === 'ip6-localhost' ||
+            host.endsWith('.ip6-localhost') ||
+            host === 'ip6-loopback' ||
+            host.endsWith('.ip6-loopback')
+        ) {
             return true;
         }
-        if (host === 'local' || host === 'lan' || host === 'internal' || host.endsWith('.local') || host.endsWith('.lan') || host.endsWith('.internal') || host.endsWith('.home.arpa') || host.endsWith('.svc') || host.endsWith('.nip.io') || host.endsWith('.sslip.io') || host === 'localtest.me' || host.endsWith('.localtest.me') || host === 'lvh.me' || host.endsWith('.lvh.me')) {
+        if (
+            host === 'local' ||
+            host === 'localdomain' ||
+            host === 'lan' ||
+            host === 'internal' ||
+            host === 'intranet' ||
+            host === 'home.arpa' ||
+            host.endsWith('.local') ||
+            host.endsWith('.localdomain') ||
+            host.endsWith('.lan') ||
+            host.endsWith('.internal') ||
+            host.endsWith('.intranet') ||
+            host.endsWith('.home.arpa') ||
+            host.endsWith('.svc') ||
+            host.endsWith('.nip.io') ||
+            host.endsWith('.sslip.io') ||
+            host.endsWith('.xip.io') ||
+            host === 'localtest.me' ||
+            host.endsWith('.localtest.me') ||
+            host === 'lvh.me' ||
+            host.endsWith('.lvh.me') ||
+            host === 'vcap.me' ||
+            host.endsWith('.vcap.me')
+        ) {
             return true;
         }
-        if (/^fe[89ab][0-9a-f]:/i.test(host) || /^(?:fc|fd)[0-9a-f]{2}:/i.test(host) || /^2002:/i.test(host) || /^64:ff9b:/i.test(host) || /ffff:/i.test(host)) {
+        if (/^fe[89ab][0-9a-f]:/i.test(host) || /^(?:fc|fd)[0-9a-f]{2}:/i.test(host)) {
             return true;
+        }
+        const mappedDottedMatch = host.match(
+            /^(?:(?:::(?:ffff:(?:0:)?)?)|(?:(?:0+:){5}(?:ffff|0+))|(?:64:ff9b:(?:0+:){4}|64:ff9b::))(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})$/i
+        );
+        const mappedHexMatch = !mappedDottedMatch
+            ? host.match(
+                  /^(?:(?:::(?:ffff:(?:0:)?)?)|(?:(?:0+:){5}(?:ffff|0+):)|(?:64:ff9b:(?:0+:){4}|64:ff9b::))([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i
+              )
+            : null;
+        const sixToFourMatch =
+            !mappedDottedMatch && !mappedHexMatch
+                ? host.match(/^2002:([0-9a-f]{1,4}):([0-9a-f]{1,4})(?::|$)/i)
+                : null;
+        if (mappedDottedMatch) {
+            host = mappedDottedMatch[1];
+        } else if (mappedHexMatch) {
+            const hi = parseInt(mappedHexMatch[1], 16);
+            const lo = parseInt(mappedHexMatch[2], 16);
+            host = ((hi >> 8) & 0xff) + '.' + (hi & 0xff) + '.' + ((lo >> 8) & 0xff) + '.' + (lo & 0xff);
+        } else if (sixToFourMatch) {
+            const hi = parseInt(sixToFourMatch[1], 16);
+            const lo = parseInt(sixToFourMatch[2], 16);
+            host = ((hi >> 8) & 0xff) + '.' + (hi & 0xff) + '.' + ((lo >> 8) & 0xff) + '.' + (lo & 0xff);
         }
         const ipv4 = host.match(/^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$/);
         if (ipv4) {
             const a = Number(ipv4[1]);
             const b = Number(ipv4[2]);
-            if (a === 127 || a === 0 || (a === 169 && b === 254) || a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) || (a === 100 && b >= 64 && b <= 127) || (a === 198 && (b === 18 || b === 19))) {
+            const c = Number(ipv4[3]);
+            const d = Number(ipv4[4]);
+            if (a > 255 || b > 255 || c > 255 || d > 255) return false;
+            if (
+                a === 127 ||
+                a === 0 ||
+                (a === 169 && b === 254) ||
+                a === 10 ||
+                (a === 192 && b === 168) ||
+                (a === 192 && b === 0 && c === 0) ||
+                (a === 172 && b >= 16 && b <= 31) ||
+                (a === 100 && b >= 64 && b <= 127) ||
+                (a === 198 && (b === 18 || b === 19))
+            ) {
                 return true;
             }
         }
@@ -1317,26 +1469,32 @@ export function buildZiniaoWebRtcSecurityInitScript(options = {}) {
     const shouldAllowIceUrl = (rawUrl) => {
         if (typeof rawUrl !== 'string') return false;
         let cleaned = rawUrl.replace(/^[\\u0000-\\u0020]+|[\\u0000-\\u0020]+$/g, '').replace(/[\\t\\r\\n]/g, '');
-        if (!cleaned) return false;
-        let proto = 'stun:';
-        let normalized = cleaned;
-        if (/^(?:stuns?|turns?):/i.test(normalized)) {
-            proto = normalized.split(':')[0].toLowerCase() + ':';
-            normalized = 'http://' + normalized.replace(/^(?:stuns?|turns?):(?:\\/\\/)?/i, '');
-        }
+        if (!cleaned || !/^(?:stuns?|turns?):/i.test(cleaned)) return false;
+        const proto = cleaned.split(':')[0].toLowerCase() + ':';
+        const normalized = 'http://' + cleaned.replace(/^(?:stuns?|turns?):(?:\\/\\/)?/i, '');
         let host = '';
         let port = proto === 'stuns:' || proto === 'turns:' ? 5349 : 3478;
-        if (typeof URL === 'function') {
+        if (OrigURL) {
             try {
-                const parsed = new URL(normalized);
+                const parsed = new OrigURL(normalized);
                 host = parsed.hostname.replace(/^\\[|\\]$/g, '');
                 if (parsed.port) port = Number(parsed.port);
             } catch {
                 return false;
             }
         }
+        if (!host) return false;
         if (!isLocalOrPrivateHost(host)) return true;
         if (allowedPortSet.has(port)) return true;
+        if (CFG.allowSameOriginLocalDev && typeof location === 'object' && location) {
+            try {
+                const locHost = String(location.hostname || '').replace(/^\\[|\\]$/g, '').toLowerCase();
+                const locPort = location.port ? Number(location.port) : location.protocol === 'https:' ? 443 : 80;
+                if (locHost && locHost === host.toLowerCase() && locPort === port) {
+                    return true;
+                }
+            } catch {}
+        }
         return false;
     };
 
@@ -1378,50 +1536,117 @@ export function buildZiniaoWebRtcSecurityInitScript(options = {}) {
         defineCloakedMethod(Function.prototype, 'toString', patchedToStr, origToStr);
     }
 
-    for (const ctorName of ['RTCPeerConnection', 'mozRTCPeerConnection', 'webkitRTCPeerConnection']) {
-        const OrigRTC = globalThis[ctorName];
-        if (typeof OrigRTC !== 'function') continue;
+    const hookedRtcProtos = new WeakSet();
+    const proxiedRtcCtors = new WeakMap();
+    const hookRtcConstructorsInRealm = (realmObj, realmToString) => {
+        if (!realmObj || (typeof realmObj !== 'object' && typeof realmObj !== 'function')) return;
+        const toStr = typeof realmToString === 'function' ? realmToString : nativeToString;
+        for (const ctorName of ['RTCPeerConnection', 'mozRTCPeerConnection', 'webkitRTCPeerConnection']) {
+            const OrigRTC = realmObj[ctorName];
+            if (typeof OrigRTC !== 'function') continue;
 
-        if (OrigRTC.prototype && typeof OrigRTC.prototype.setConfiguration === 'function') {
-            const origSetConfig = OrigRTC.prototype.setConfiguration;
-            const wrappedSetConfig = createNativeMethodWrapper('setConfiguration', function (...args) {
-                if (args.length > 0 && args[0] && typeof args[0] === 'object') {
-                    const nextArgs = [...args];
-                    nextArgs[0] = sanitizeRtcConfig(args[0]);
-                    return origSetConfig.apply(this, nextArgs);
+            if (OrigRTC.prototype && !hookedRtcProtos.has(OrigRTC.prototype)) {
+                hookedRtcProtos.add(OrigRTC.prototype);
+                if (typeof OrigRTC.prototype.setConfiguration === 'function') {
+                    const origSetConfig = OrigRTC.prototype.setConfiguration;
+                    const wrappedSetConfig = createNativeMethodWrapper('setConfiguration', function (...args) {
+                        if (args.length > 0 && args[0] && typeof args[0] === 'object') {
+                            const nextArgs = [...args];
+                            nextArgs[0] = sanitizeRtcConfig(args[0]);
+                            return origSetConfig.apply(this, nextArgs);
+                        }
+                        return origSetConfig.apply(this, args);
+                    });
+                    defineCloakedMethod(OrigRTC.prototype, 'setConfiguration', wrappedSetConfig, origSetConfig);
                 }
-                return origSetConfig.apply(this, args);
-            });
-            defineCloakedMethod(OrigRTC.prototype, 'setConfiguration', wrappedSetConfig, origSetConfig);
-        }
-
-        const ProxiedRTC = new Proxy(OrigRTC, {
-            construct(target, args, newTarget) {
-                if (args.length > 0 && args[0] && typeof args[0] === 'object') {
-                    const nextArgs = [...args];
-                    nextArgs[0] = sanitizeRtcConfig(args[0]);
-                    return Reflect.construct(target, nextArgs, newTarget);
-                }
-                return Reflect.construct(target, args, newTarget);
-            },
-            apply(target, thisArg, args) {
-                return Reflect.apply(target, thisArg, args);
             }
-        });
-        cloakedFns.set(ProxiedRTC, nativeToString.call(OrigRTC));
-        if (OrigRTC.prototype) {
-            Object.defineProperty(OrigRTC.prototype, 'constructor', {
+
+            let ProxiedRTC = proxiedRtcCtors.get(OrigRTC);
+            if (!ProxiedRTC) {
+                ProxiedRTC = new Proxy(OrigRTC, {
+                    construct(target, args, newTarget) {
+                        try {
+                            if (args.length > 0 && args[0] && typeof args[0] === 'object') {
+                                const nextArgs = [...args];
+                                nextArgs[0] = sanitizeRtcConfig(args[0]);
+                                return Reflect.construct(target, nextArgs, newTarget);
+                            }
+                            return Reflect.construct(target, args, newTarget);
+                        } catch (err) {
+                            throw sanitizeThrownError(err);
+                        }
+                    },
+                    apply(target, thisArg, args) {
+                        try {
+                            return Reflect.apply(target, thisArg, args);
+                        } catch (err) {
+                            throw sanitizeThrownError(err);
+                        }
+                    }
+                });
+                cloakedFns.set(ProxiedRTC, cloakedFns.has(OrigRTC) ? cloakedFns.get(OrigRTC) : toStr.call(OrigRTC));
+                proxiedRtcCtors.set(OrigRTC, ProxiedRTC);
+                if (OrigRTC.prototype) {
+                    Object.defineProperty(OrigRTC.prototype, 'constructor', {
+                        value: ProxiedRTC,
+                        writable: true,
+                        enumerable: false,
+                        configurable: true
+                    });
+                }
+            }
+            const origCtorDesc = Object.getOwnPropertyDescriptor(realmObj, ctorName);
+            Object.defineProperty(realmObj, ctorName, {
                 value: ProxiedRTC,
-                writable: true,
-                enumerable: false,
-                configurable: true
+                writable: origCtorDesc ? Boolean(origCtorDesc.writable) : true,
+                enumerable: origCtorDesc ? Boolean(origCtorDesc.enumerable) : false,
+                configurable: origCtorDesc ? Boolean(origCtorDesc.configurable) : true
             });
         }
-        Object.defineProperty(globalThis, ctorName, {
-            value: ProxiedRTC,
-            writable: true,
-            enumerable: false,
-            configurable: true
+    };
+
+    hookRtcConstructorsInRealm(globalThis, nativeToString);
+
+    const hookedRealms = new WeakSet();
+    const hookSameOriginIframeRealm = (win) => {
+        if (!win || (typeof win !== 'object' && typeof win !== 'function') || hookedRealms.has(win)) {
+            return win;
+        }
+        try {
+            let iframeOrigToString = nativeToString;
+            if (win.Function && win.Function.prototype && typeof win.Function.prototype.toString === 'function') {
+                hookedRealms.add(win);
+                iframeOrigToString = win.Function.prototype.toString;
+                const iframePatchedToString = createNativeMethodWrapper('toString', function () {
+                    if (typeof this === 'function') {
+                        if (cloakedFns.has(this)) {
+                            return cloakedFns.get(this);
+                        }
+                        if (
+                            Function.prototype !== win.Function.prototype &&
+                            Function.prototype.isPrototypeOf(this)
+                        ) {
+                            return Function.prototype.toString.call(this);
+                        }
+                    }
+                    return iframeOrigToString.call(this);
+                });
+                defineCloakedMethod(win.Function.prototype, 'toString', iframePatchedToString, iframeOrigToString);
+            }
+            hookRtcConstructorsInRealm(win, iframeOrigToString);
+        } catch {}
+        return win;
+    };
+
+    if (typeof HTMLIFrameElement !== 'undefined' && HTMLIFrameElement.prototype) {
+        defineCloakedGetter(HTMLIFrameElement.prototype, 'contentWindow', function (cw) {
+            return hookSameOriginIframeRealm(cw);
+        });
+        defineCloakedGetter(HTMLIFrameElement.prototype, 'contentDocument', function (cd) {
+            if (cd && cd.defaultView) {
+                hookSameOriginIframeRealm(cd.defaultView);
+            }
+            return cd;
         });
     }
 })();`;

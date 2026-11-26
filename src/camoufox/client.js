@@ -23,6 +23,8 @@ import {
     shouldSkipCanvasNoiseForHost,
     validateOsAndBrowserVersionMatch,
     resolveGeoCoordinatesWithDeterministicJitter,
+    sanitizeRtcConfigurationIceServers,
+    buildZiniaoWebRtcSecurityInitScript,
     GPU_PERFORMANCE_SPEC_CATALOG,
     lookupGpuPerformanceSpec,
     collectHostMacPerformanceBaseline,
@@ -48,6 +50,8 @@ export {
     shouldSkipCanvasNoiseForHost,
     validateOsAndBrowserVersionMatch,
     resolveGeoCoordinatesWithDeterministicJitter,
+    sanitizeRtcConfigurationIceServers,
+    buildZiniaoWebRtcSecurityInitScript,
     GPU_PERFORMANCE_SPEC_CATALOG,
     lookupGpuPerformanceSpec,
     collectHostMacPerformanceBaseline,
@@ -1228,9 +1232,21 @@ export async function startProfile(profileId, options = {}) {
             if (shouldAttachSecurityGuards) {
                 const customOnBlockedAttempt =
                     options.onBlockedAttempt ?? mergedOptions.onBlockedAttempt;
+                const basePortProt = mergedOptions.securityPolicy?.portScanProtection || {};
+                const runtimePortProt = options.portScanProtection || {};
+                const effectivePortScanProtection = {
+                    ...basePortProt,
+                    ...runtimePortProt,
+                    ...(Array.isArray(options.allowedLocalPorts)
+                        ? { allowedPorts: options.allowedLocalPorts }
+                        : {}),
+                    ...(options.allowSameOriginLocalDev !== undefined
+                        ? { allowSameOriginLocalDev: Boolean(options.allowSameOriginLocalDev) }
+                        : {})
+                };
                 securityGuards = await attachZiniaoSecurityGuardsToContext(context, {
                     profileId,
-                    portScanProtection: mergedOptions.securityPolicy?.portScanProtection,
+                    portScanProtection: effectivePortScanProtection,
                     allowedExtensionIds: options.allowedExtensionIds ?? mergedOptions.allowedExtensionIds,
                     onBlockedAttempt: (blockedEvent) => {
                         logger.warn('Ziniao security guard blocked suspicious browser probe', {
@@ -1678,6 +1694,8 @@ export default {
     shouldSkipCanvasNoiseForHost,
     validateOsAndBrowserVersionMatch,
     resolveGeoCoordinatesWithDeterministicJitter,
+    sanitizeRtcConfigurationIceServers,
+    buildZiniaoWebRtcSecurityInitScript,
     GPU_PERFORMANCE_SPEC_CATALOG,
     lookupGpuPerformanceSpec,
     collectHostMacPerformanceBaseline,

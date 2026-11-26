@@ -879,6 +879,11 @@ export async function collectBrowserFingerprint(page) {
                             ? Performance.prototype.now
                             : null,
                         typeof Date !== 'undefined' ? Date.now : null,
+                        typeof Date !== 'undefined' ? Date : null,
+                        typeof RTCPeerConnection !== 'undefined' ? RTCPeerConnection : null,
+                        typeof RTCPeerConnection !== 'undefined' && RTCPeerConnection.prototype
+                            ? RTCPeerConnection.prototype.setConfiguration
+                            : null,
                         typeof WebGLRenderingContext !== 'undefined' && WebGLRenderingContext.prototype
                             ? WebGLRenderingContext.prototype.readPixels
                             : null

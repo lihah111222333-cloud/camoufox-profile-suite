@@ -502,6 +502,62 @@ async function runTests() {
     assert.equal(await elementExists(page, 'input[name="firstName"]'), true);
     console.log('  [PASS] human-behavior.js and page-detector.js integration');
 
+    // 12. Test Round-5 Page/Frame compatibility decoupling, userAgent(), lowercase sameSite, and URL-scoped deleteCookie
+    const { context: ctx12, profile: prof12 } = createMockPlaywrightStack();
+    const rawFrameFirstPage = createMockFrame('raw-frame-first', 'https://accounts.google.com/signup');
+    rawFrameFirstPage.context = () => ctx12;
+    rawFrameFirstPage.frames = () => [rawFrameFirstPage];
+    rawFrameFirstPage.mainFrame = () => rawFrameFirstPage;
+    attachFrameCompatibility(rawFrameFirstPage);
+    assert.equal(rawFrameFirstPage._camoufoxFrameCompatAttached, true);
+    assert.equal(Boolean(rawFrameFirstPage._camoufoxPageCompatAttached), false);
+    attachPageCompatibility(rawFrameFirstPage, ctx12, prof12);
+    assert.equal(rawFrameFirstPage._camoufoxPageCompatAttached, true);
+    assert.equal(typeof rawFrameFirstPage.setViewport, 'function');
+    assert.equal(typeof rawFrameFirstPage.evaluateOnNewDocument, 'function');
+    assert.equal(typeof rawFrameFirstPage.cookies, 'function');
+    assert.equal(typeof rawFrameFirstPage.setCookie, 'function');
+    assert.equal(typeof rawFrameFirstPage.deleteCookie, 'function');
+    assert.equal(typeof rawFrameFirstPage.userAgent, 'function');
+
+    const pageUa = await page.userAgent();
+    const browserUa = await browser.userAgent();
+    assert.match(pageUa, /Firefox\/\d+/);
+    assert.match(browserUa, /Firefox\/\d+/);
+
+    await page.setCookie(
+        { name: 'PREF', value: '1', domain: '.google.com', sameSite: 'lax' },
+        {
+            name: 'NID',
+            value: '2',
+            url: 'https://accounts.google.com/signup',
+            path: '/signup',
+            sameSite: 'none'
+        },
+        { name: 'SHARED', value: 'goog', domain: '.google.com', sameSite: 'strict' },
+        { name: 'SHARED', value: 'example', domain: '.example.com', sameSite: 'unspecified' }
+    );
+    const allStoredCookies = await ctx12.cookies();
+    const storedOnMain = await page.cookies();
+    const prefCookie = storedOnMain.find((c) => c.name === 'PREF');
+    assert.equal(prefCookie.sameSite, 'Lax');
+    assert.equal(prefCookie.path, '/');
+
+    await page.deleteCookie({ name: 'SHARED', url: 'https://accounts.google.com/signup' });
+    const afterUrlScopedDelete = await page.cookies('https://accounts.google.com', 'https://example.com');
+    assert.equal(
+        afterUrlScopedDelete.some((c) => c.name === 'SHARED' && c.domain === '.google.com'),
+        false
+    );
+    assert.equal(
+        afterUrlScopedDelete.some((c) => c.name === 'SHARED' && c.domain === '.example.com'),
+        true
+    );
+    assert.equal(Array.isArray(allStoredCookies), true);
+    console.log(
+        '  [PASS] Round-5 Frame/Page flag decoupling, page/browser.userAgent(), lowercase sameSite normalization, and URL-scoped deleteCookie'
+    );
+
     console.log('\nAll Playwright-Puppeteer compatibility tests passed!');
 }
 
