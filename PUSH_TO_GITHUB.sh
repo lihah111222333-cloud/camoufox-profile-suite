@@ -13,10 +13,32 @@ if ! command -v git &> /dev/null; then
     exit 1
 fi
 
+# Check the paths before staging and again before committing.
+check_git_paths() (
+    set -o pipefail
+    shopt -s nocasematch
+    git ls-files -z "$@" | while IFS= read -r -d '' git_path; do
+        case "$git_path" in
+            .env.example) ;;
+            *.env|*.env.*|*.emv|*.emv.*|\
+            config/proxies.txt|*/config/proxies.txt|email.txt|*/email.txt|gmlogin.txt|*/gmlogin.txt|\
+            results.json|*/results.json|summary.json|*/summary.json|profiles.json|*/profiles.json|\
+            camoufox-audit-report.json|logs/*|data/*|profiles/*|.gpm/*|gpm-data/*)
+                printf 'Sensitive file would be included in the commit: %q\n' "$git_path" >&2
+                exit 1
+                ;;
+        esac
+    done
+)
+
+repository_root=$(git rev-parse --show-toplevel) || exit 1
+cd "$repository_root" || exit 1
+check_git_paths --cached --others --exclude-standard || exit 1
+
 # إضافة جميع الملفات
 echo "📦 إضافة الملفات..."
 echo "📦 Adding files..."
-git add .
+git add . || exit 1
 
 # عرض حالة الملفات
 echo ""
@@ -37,6 +59,8 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     exit 1
 fi
 
+check_git_paths --cached || exit 1
+
 # عمل commit
 echo "💾 عمل commit..."
 echo "💾 Creating commit..."
@@ -45,7 +69,7 @@ git commit -m "Initial commit: Gmail Account Creator with GPM Login
 - Migrated from GoLogin to GPM Login
 - Added realistic Android User-Agent generation
 - Improved proxy handling and validation
-- Added comprehensive error handling"
+- Added comprehensive error handling" || exit 1
 
 echo ""
 echo "✅ تم عمل commit بنجاح!"

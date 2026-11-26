@@ -47,7 +47,7 @@
 
 ## About
 
-**Gmail Account Creator** is a Node.js automation toolkit that runs **Google / Gmail signup** inside a real **antidetect browser profile** ([GPM Login](https://gpmlogin.com/) or [Dolphin Anty](https://dolphin-anty.com/)), connects with **Puppeteer**, solves **reCAPTCHA** via the **OMO Captcha** extension, and completes **phone verification** through pluggable **SMS** APIs (SMS Verification, 5SIM Legacy). It supports **proxies**, **human-like input**, and **parallel account jobs** with summarized output to JSON and logs.
+**Gmail Account Creator** runs a Google signup flow in a browser profile and records the outcome in JSON. When a page requires a password or phone verification, the CLI records a manual-action result and closes its managed session. The account holder completes that step in a trusted browser.
 
 | | |
 |--|--|
@@ -81,17 +81,17 @@ These values are configured on the GitHub **About** sidebar (description, websit
 - **Camoufox C++-Patched Firefox Antidetect Suite (`PROFILE_SERVICE=camoufox`)**:
   - **17-Check In-Browser Fingerprint & Hardware SKU Coherence Auditor (`src/camoufox/coherence-auditor.js`, `src/camoufox/hardware-models.js`)**: Enforces Rules A–P across Apple Silicon (`M1`–`M5` Base/Pro/Max/Ultra), Intel Macs (`2017–2020`), Windows 11 ARM64 (`Snapdragon X Elite/Plus`), 20+ OEM Laptops/Tablets (`ThinkPad`, `Dell XPS`, `Surface`, `ASUS ROG/Zenbook`, `Razer Blade`, `HP Spectre`, `Framework`, `System76`), 65+ Intel/AMD CPUs, and 35+ GPUs with PCI Vendor/Device IDs.
   - **32 SKU-Verified Device Presets & AdsPower / Ziniao Auto-Healers (`src/camoufox/device-presets.js`, `scripts/audit-adspower-profiles.js`)**: Absorbs AdsPower's OS font, 50+ locale fallback, RFC-9110 `Accept-Language`, SpeechSynthesis voice, and MediaDevices catalogs while repairing broken AdsPower/Ziniao profiles to 100/100 SKU coherence (`--list-presets`, `--heal`).
-  - **Ziniao V6 Absorbed Active Security & Consistency Engine (`src/camoufox/ziniao-security.js`)**: Active localhost/RFC1918 LAN port-scan protection (`SENSITIVE_LOCAL_PORT_CATALOG`), per-domain 64-bit Hamming distance Canvas/WebGL consistency ledger (`CanvasWebglConsistencyLedger`), internal browser scheme guard (`BLOCKED_INTERNAL_URL_PATTERNS`), OS/silicon vs browser engine version floor guard, and 40+ country metropolitan geolocation micro-jitter.
+  - **Ziniao V6 Absorbed Active Security & Consistency Engine (`src/camoufox/ziniao-security.js`)**: URL-based localhost/RFC1918 filtering (`SENSITIVE_LOCAL_PORT_CATALOG`), per-domain 64-bit Hamming distance Canvas/WebGL consistency ledger (`CanvasWebglConsistencyLedger`), internal browser scheme guard (`BLOCKED_INTERNAL_URL_PATTERNS`), OS/silicon vs browser engine version floor guard, and 40+ country metropolitan geolocation micro-jitter.
   - **Host-Mac-Calibrated GPU Performance Weighting & Anti-Penetration Engine (`src/camoufox/gpu-performance-scaler.js`)**: Calibrates against the local host Mac baseline (`Apple M5 Pro`, 18C CPU / 20C GPU / 64GB RAM / 11.5 TFLOPS) and weights WebGL/WebGL2 (`drawArrays`, `drawElements`, `finish`, `flush`, `readPixels`, `clientWaitSync`, `EXT_disjoint_timer_query`), Canvas (`toDataURL`, `toBlob`, `OffscreenCanvas.convertToBlob`), and WebGPU (`onSubmittedWorkDone`, `GPUBuffer.mapAsync`) execution timing to match the target GPU SKU (e.g., `RTX 4090` 7.18x faster, `Intel UHD 620` 26.14x slower) with full `.name`, `.length`, and `[native code]` prototype stealth.
-  - **Pre-TLS Egress/Ingress Traffic Recorder & Attribution CLI (`src/camoufox/traffic-recorder.js`, `scripts/query-traffic-attribution.js`)**: Captures NSS `SSLKEYLOGFILE`, Necko `MOZ_LOG`, canonical pre-TLS wire stream (`pre-tls-wire.log`), W3C HAR 1.2 (`trace.har`), causal UI triggers, cookie lineage, anti-bot signatures, Ziniao security blocks, and a SHA-256 tamper-evident hash chain.
+  - **Pre-TLS Egress/Ingress Traffic Recorder & Attribution CLI (`src/camoufox/traffic-recorder.js`, `scripts/query-traffic-attribution.js`)**: Keeps optional native TLS and Necko diagnostics in dedicated profiles’ private storage. Shareable exports include a redacted wire stream (`pre-tls-wire.log`), W3C HAR 1.2 (`trace.har`), causal UI triggers, cookie lineage, anti-bot signatures, Ziniao security blocks, and a SHA-256 tamper-evident hash chain.
 - **Antidetect profiles** — Create/start/stop browser profiles via Camoufox (`PROFILE_SERVICE=camoufox`), GPM Login (default), or Dolphin Anty API.
 - **Puppeteer control** — Attaches to the profile’s Chrome over remote debugging (no bundled Chromium in `puppeteer-core`).
 - **OMO Captcha** — Extension-based reCAPTCHA handling (extension ID configured in code).
-- **SMS providers** — Pluggable SMS layer: default **SMS Verification** API or **5SIM Legacy** (see [`ENV_VARIABLES.md`](ENV_VARIABLES.md)).
+- **SMS provider** — The SMS Verification library uses its own key. The legacy 5SIM adapter rejects requests locally.
 - **Proxies** — Rotating proxies from `config/proxies.txt` (`ip:port` or `ip:port:user:pass`).
 - **Human-like behavior** — Delays, scrolling, and typing patterns to reduce rigid automation signals.
 - **Concurrency** — `--accounts` / `--threads` (or env vars) with a bounded worker pool.
-- **Outputs** — Append-only `results.json`, run summary in `summary.json`, logs under `logs/`.
+- **Outputs** — Per-attempt status in `results.json`, run totals in `summary.json`, and private diagnostic logs under `logs/`. Passwords, codes and proxy credentials are omitted from routine results.
 
 ---
 
@@ -114,8 +114,8 @@ These values are configured on the GitHub **About** sidebar (description, websit
 3. **Generate identity** (names/usernames from `config/names.json` via `src/utils/name-generator.js`).
 4. **Create & start** an antidetect profile (GPM or Dolphin) with that proxy.
 5. **Connect Puppeteer** to the profile’s debugging endpoint and open the signup flow (`src/gmail/creator.js`).
-6. **Solve captchas** via OMO Captcha extension setup (`src/captcha/omo-handler.js`).
-7. **Order/receive SMS** through the configured SMS provider (`src/providers/sms-provider.js`).
+6. Configure extension credentials in the trusted extension UI when required.
+7. A required password or phone verification ends the automated attempt with a manual-action status. Optional recovery email enrollment is skipped.
 8. **Persist results** to `results.json` and aggregate stats to `summary.json`; **stop** the profile in `finally`.
 
 Intelligent page handling lives in `src/gmail/page-detector.js`.
@@ -169,15 +169,13 @@ sequenceDiagram
   participant Pr as GPM or Dolphin profile
   participant PP as Puppeteer page
   participant G as createGmailAccount
-  participant S as sms-provider
 
   M->>P: getNextProxy
   M->>N: generateAccountData
   M->>Pr: createAndStartProfile + proxy
   Pr->>PP: getBrowser / getPage
   M->>G: createGmailAccount(page, data)
-  G->>PP: navigate, fill forms, captcha, phone
-  G->>S: buyNumber / waitForSMS
+  G->>PP: Navigate and determine the required step
   G-->>M: result object
   M->>M: saveResult results.json
   M->>Pr: stop
@@ -191,14 +189,14 @@ flowchart TD
   B --> C[Fill name / basics]
   C --> D{Page state}
   D -->|suggested emails| E[Pick or custom username]
-  D -->|password step| F[Set password]
+  D -->|password required| F[Manual action required]
   D -->|birthday gender| G[fillBirthdayAndGenderForm]
   E --> D
-  F --> D
   G --> H[waitForRecaptcha + OMO]
   H --> I[handlePhoneVerification]
-  I --> J[completeAccountCreation]
-  J --> K[Return credentials + metadata]
+  I -->|optional step skipped| J[completeAccountCreation]
+  I -->|code required| F
+  J --> K[Return status]
 ```
 
 ### Concurrency model
@@ -218,7 +216,7 @@ flowchart TD
 |------|----------------|
 | `src/index.js` | CLI args, task queue, `saveResult`, run summary to `summary.json`. |
 | `src/config.js` | Loads `.env` / `.emv`, exports `config` object and validation warnings. |
-| `src/gmail/creator.js` | Full signup automation; exports `createGmailAccount`. |
+| `src/gmail/creator.js` | Handles signup pages and identifies steps requiring the account holder. |
 | `src/gmail/page-detector.js` | Detects which Google screen is shown; wait helpers. |
 | `src/captcha/omo-handler.js` | OMO Captcha extension checks, key entry, `setupOMOCaptchaExtension`. |
 | `src/gpmlogin/client.js` | REST calls to GPM API (create/start/stop profile, fingerprint). |
@@ -227,9 +225,9 @@ flowchart TD
 | `src/dolphin/profile.js` | `DolphinProfile` + `createAndStartProfile` factory. |
 | `src/gologin/client.js` | GoLogin cloud API client (large; optional integration path). |
 | `src/gologin/profile.js` | `GoLoginProfile` + `createAndStartProfile` factory. |
-| `src/providers/sms-provider.js` | Chooses SMS Verification vs 5SIM Legacy; unified exports. |
+| `src/providers/sms-provider.js` | Selects the SMS adapter and checks that the selected provider is supported. |
 | `src/providers/sms-verification-api.js` | Raw HTTP helpers for SMS Verification API. |
-| `src/providers/fivesim-api-legacy.js` | 5SIM Legacy (`api1.5sim.net`) integration. |
+| `src/providers/fivesim-api-legacy.js` | Rejects operations on the legacy HTTP adapter. |
 | `src/utils/logger.js` | Leveled logs to console + daily file under `logs/`. |
 | `src/utils/proxy-manager.js` | Reads `config/proxies.txt`, rotation / formats. |
 | `src/utils/name-generator.js` | Random identity from `config/names.json`. |
@@ -268,7 +266,6 @@ Below: **every exported function** and **named public methods on exported single
 
 | Function | Role |
 |----------|------|
-| `getCountrySelection()` | Picks SMS country based on `SMS_PROVIDER` and `config.smsVerify.countries`. |
 | `humanLikeType(page, input, text, options)` | Types into an input with variable speed and occasional corrections. |
 | `ensurePageOpen(page, operation)` | Guards against closed/disconnected pages before actions. |
 | `navigateToSignUp(page)` | Opens Gmail / Google signup entry. |
@@ -278,8 +275,7 @@ Below: **every exported function** and **named public methods on exported single
 | `fillUsernameAndPassword(page, accountData)` | Username + password steps and related prompts. |
 | `fillBirthdayAndGenderForm(page, accountData)` | Birthday and gender screens. |
 | `waitForRecaptcha(page)` | Waits for / interacts with reCAPTCHA with OMO support. |
-| `handlePhoneVerification(page, accountData)` | Orders number, enters phone, reads SMS code via provider. |
-| `generateRecoveryEmail()` | Builds a secondary/recovery email string when required. |
+| `handlePhoneVerification` | Skips optional phone verification or reports that the operator must complete it. |
 | `completeAccountCreation(page, accountData)` | Final confirmations, review screens, wrap-up. |
 | `clickNextButton(page)` | Finds and clicks Google’s “Next” / continue buttons with fallbacks. |
 
@@ -299,8 +295,7 @@ Below: **every exported function** and **named public methods on exported single
 |--------|-------------|
 | `checkRecaptchaExtension(browser)` | Verifies extension presence in the browser. |
 | `openOMOCaptchaExtension(page)` | Opens the extension UI / options page. |
-| `setOMOCaptchaKeyViaAPI(page)` | Injects or calls extension APIs to set API key. |
-| `enterOMOCaptchaKey(page)` | UI automation to paste/type the OMO key. |
+| `setOMOCaptchaKeyViaAPI` / `enterOMOCaptchaKey` | Report manual extension key configuration. |
 | `clickRecaptchaRefreshButton(page)` | Clicks refresh on the captcha widget when stuck. |
 | `setupOMOCaptchaExtension(page)` | Orchestrates full OMO setup before signup needs captcha. |
 
@@ -387,11 +382,11 @@ Representative methods (the file is large; these are the usual integration point
 
 | Symbol | Description |
 |--------|-------------|
-| `loadProvider` | **Internal:** lazy `import()` of 5SIM or SMS Verification implementation. |
+| `loadProvider` | Loads the supported SMS provider or reports an unsupported selection. |
 | `getBalance` / `buyNumber` / `buyNumberAndGetSMS` | Unified entry points after provider load. |
 | `getOrderStatus` / `waitForSMS` | Status polling and SMS wait. |
 | `cancelOrder` / `finishOrder` / `requestResend` / `setOrderStatus` | Order management. |
-| `reportNumberUsed` | 5SIM-only hook; may no-op on SMS Verification. |
+| `reportNumberUsed` | Compatibility hook for the provider interface. |
 | `getServiceName` / `getProviderType` | Introspection for logs. |
 | `SMS_PROVIDER_INFO` | `{ current: SMS_PROVIDER }`. |
 | Aliases | `buySmsVerifyNumber`, `waitForSmsVerifyCode`, `cancelSmsVerifyOrder`, `finishSmsVerifyOrder`, `getSmsVerifyStatus`, `resendSmsVerifyCode` map to unified functions. |
@@ -486,9 +481,8 @@ Add proxies (one per line):
 | `PROFILE_SERVICE` | `gpm` (default) or `dolphin` |
 | `GPM_API_URL` | GPM Login local API base URL |
 | `DOLPHIN_API_KEY`, `DOLPHIN_API_URL`, `DOLPHIN_FOLDER_ID` | Dolphin Anty integration |
-| `OMOCAPTCHA_KEY` | OMO Captcha API key |
 | `SMS_VERIFY_API_KEY`, `SMS_VERIFY_LANG`, `SMS_VERIFY_COUNTRIES` | SMS Verification provider |
-| `SMS_PROVIDER` | `sms-verification` or `fivesim-legacy` |
+| `SMS_PROVIDER` | `sms-verification`. The legacy adapter is disabled. |
 | `ACCOUNTS_COUNT`, `THREADS_COUNT` | Batch size and concurrency |
 | `LOG_LEVEL`, `MAX_RETRIES`, `TEST_PROXY`, `SETUP_OMO_CAPTCHA` | Runtime tuning |
 

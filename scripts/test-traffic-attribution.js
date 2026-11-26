@@ -423,10 +423,10 @@ async function runTests() {
 
     try {
         // =========================================================================
-        // Test 1: Pre-TLS Egress & Post-TLS Decrypted Ingress Capture
+        // Test 1: Pre-TLS Egress & Post-TLS Response Metadata
         // =========================================================================
         await testSection(
-            'Test 1: Pre-TLS Egress & Post-TLS Decrypted Ingress Capture (traffic.ndjson & payloads/)',
+            'Test 1: Pre-TLS Egress & Post-TLS Response Metadata (traffic.ndjson & payloads/)',
             async () => {
                 const profile = await createAndStartProfile(
                     'Traffic_Test_1',
@@ -477,20 +477,17 @@ async function runTests() {
                         { name: 'Location', value: 'https://accounts.google.com/v3/signin/identifier?hl=en' },
                         { name: 'Cache-Control', value: 'no-cache, no-store' }
                     ],
+                    body: 'Redirecting to the next page',
                     serverAddr: { ipAddress: '142.250.185.78', port: 443 },
                     securityDetails: { protocol: 'TLS 1.3', subjectName: 'accounts.google.com' }
                 });
 
-                await emitHttpTransaction(context, reqHop1, resHop1);
-
-                // Hop 2: Follow-up redirected GET request -> 200 OK with decrypted JSON body
+                // Hop 2: Follow-up redirected GET request -> 200 OK with a JSON body
                 const decryptedResponseJson = JSON.stringify({
                     status: 'ACCOUNT_READY',
                     sessionId: 'sess_987654321',
                     continuations: ['password_step']
                 });
-                const expectedBodySha256 = sha256Hex(decryptedResponseJson);
-
                 const reqHop2 = createMockRequest({
                     method: 'GET',
                     url: 'https://accounts.google.com/v3/signin/identifier?hl=en',
@@ -519,6 +516,17 @@ async function runTests() {
                     securityDetails: { protocol: 'TLS 1.3', subjectName: 'accounts.google.com' }
                 });
 
+                let responseBodyReads = 0;
+                for (const response of [resHop1, resHop2]) {
+                    for (const method of ['body', 'text']) {
+                        const read = response[method];
+                        response[method] = () => {
+                            responseBodyReads += 1;
+                            return read();
+                        };
+                    }
+                }
+                await emitHttpTransaction(context, reqHop1, resHop1);
                 await emitHttpTransaction(context, reqHop2, resHop2);
 
                 await profile.getTrafficAttribution();
@@ -566,20 +574,25 @@ async function runTests() {
                 assert.equal(fs.existsSync(reqPayloadDiskPath), true);
                 assert.equal(fs.readFileSync(reqPayloadDiskPath, 'utf8'), postPayloadJson);
 
-                // Verify post-TLS decrypted response body SHA-256, serverAddr, securityDetails, and payload file
-                assert.equal(ingress2.bodySha256, expectedBodySha256);
-                assert.equal(ingress2.bodyBytes, Buffer.byteLength(decryptedResponseJson));
-                assert.equal(ingress2.bodyPreview, decryptedResponseJson);
+                // Verify response metadata and the reason each response body was omitted.
+                assert.equal(responseBodyReads, 0);
+                for (const ingress of [ingress1, ingress2]) {
+                    assert.equal(ingress.recordBodies, true);
+                    assert.equal(ingress.bodyOmittedReason, 'unbounded-response-reader');
+                    assert.equal(ingress.bodySha256, null);
+                    assert.equal(ingress.bodyBytes, 0);
+                    assert.equal(ingress.bodyPreview, null);
+                    assert.equal(ingress.payloadFile, null);
+                }
+                assert.deepEqual(ingress1.headersArray, await resHop1.headersArray());
+                assert.equal(ingress2.mimeType, 'application/json');
+                assert.deepEqual(ingress2.headersArray, await resHop2.headersArray());
                 assert.deepEqual(ingress2.serverAddr, { ipAddress: '142.250.185.78', port: 443 });
                 assert.deepEqual(ingress2.securityDetails, {
                     protocol: 'TLS 1.3',
                     subjectName: 'accounts.google.com'
                 });
-                assert.ok(ingress2.payloadFile && ingress2.payloadFile.startsWith('payloads/res-'));
-
-                const resPayloadDiskPath = path.join(profile.trafficPaths.trafficDir, ingress2.payloadFile);
-                assert.equal(fs.existsSync(resPayloadDiskPath), true);
-                assert.equal(fs.readFileSync(resPayloadDiskPath, 'utf8'), decryptedResponseJson);
+                assert.deepEqual(fs.readdirSync(profile.trafficPaths.payloadsDir), [path.basename(egress1.payloadFile)]);
 
                 await profile.delete();
             }
@@ -744,7 +757,10 @@ async function runTests() {
                     request: forbiddenReq,
                     status: 403,
                     statusText: 'Forbidden',
-                    headersArray: [{ name: 'Content-Type', value: 'text/plain' }],
+                    headersArray: [
+                        { name: 'Content-Type', value: 'text/plain' },
+                        { name: 'WWW-Authenticate', value: 'Bearer realm="checkpoint_required"' }
+                    ],
                     body: '403 Forbidden: Unusual traffic detected'
                 });
                 await emitHttpTransaction(context, forbiddenReq, forbiddenRes);
@@ -799,23 +815,39 @@ async function runTests() {
                 assert.equal(rateLimitAnomaly.actionStep, 'step-arkose-challenge');
                 assert.equal(rateLimitAnomaly.status, 429);
                 assert.ok(rateLimitAnomaly.correlationId.startsWith('corr-'));
-                assert.ok(
-                    rateLimitAnomaly.payloadFile && rateLimitAnomaly.payloadFile.startsWith('payloads/res-')
-                );
 
                 const arkoseSignalAnomaly = anomalies.find(
                     (a) => a.type.startsWith('risk-signal:') && a.type.includes('arkose')
                 );
                 assert.ok(arkoseSignalAnomaly, 'Expected risk-signal anomaly containing arkose');
                 assert.equal(arkoseSignalAnomaly.actionStep, 'step-arkose-challenge');
+                assert.ok(arkoseSignalAnomaly.matchedSignals.some((s) => s.name === 'arkose' && s.source === 'url'));
 
                 const forbiddenAnomaly = anomalies.find((a) => a.type === 'http-403-forbidden');
                 assert.ok(forbiddenAnomaly, 'Expected http-403-forbidden anomaly');
                 assert.equal(forbiddenAnomaly.actionStep, 'step-forbidden-submit');
                 assert.equal(forbiddenAnomaly.status, 403);
+
+                const forbiddenSignals = anomalies
+                    .filter((a) => a.correlationId === forbiddenAnomaly.correlationId)
+                    .flatMap((a) => a.matchedSignals || []);
                 assert.ok(
-                    forbiddenAnomaly.payloadFile && forbiddenAnomaly.payloadFile.startsWith('payloads/res-')
+                    forbiddenSignals.some((s) => s.name === 'checkpoint' && s.source === 'headers'),
+                    'Expected checkpoint attribution from the response header'
                 );
+                assert.equal(forbiddenSignals.some((s) => s.name === 'deny'), false);
+
+                const httpEvents = readNdjsonFile(profile.trafficPaths.trafficNdjsonPath);
+                for (const anomaly of [rateLimitAnomaly, forbiddenAnomaly]) {
+                    const egress = httpEvents.find((e) => e.type === 'egress' && e.correlationId === anomaly.correlationId);
+                    const ingress = httpEvents.find((e) => e.type === 'ingress' && e.correlationId === anomaly.correlationId);
+                    assert.ok(egress?.payloadFile?.startsWith('payloads/req-'));
+                    assert.equal(anomaly.payloadFile, egress.payloadFile);
+                    assert.equal(fs.existsSync(path.join(profile.trafficPaths.trafficDir, anomaly.payloadFile)), true);
+                    assert.equal(ingress.status, anomaly.status);
+                    assert.equal(ingress.bodyOmittedReason, 'unbounded-response-reader');
+                    assert.equal(ingress.payloadFile, null);
+                }
 
                 const proxyFailureAnomaly = anomalies.find(
                     (a) => a.failureText === 'NS_ERROR_PROXY_CONNECTION_REFUSED'
@@ -914,6 +946,7 @@ async function runTests() {
                             os: 'windows',
                             profilesDir: tempProfilesDir,
                             useSharedBrowser: false,
+                            sslKeyLog: true,
                             accountId: 'win-acct-1',
                             accountEmail: 'win.user@gmail.com'
                         }
@@ -926,17 +959,19 @@ async function runTests() {
                             os: 'macos',
                             profilesDir: tempProfilesDir,
                             useSharedBrowser: false,
+                            sslKeyLog: true,
                             accountId: 'mac-acct-2',
                             accountEmail: 'mac.user@gmail.com'
                         }
                     )
                 ]);
 
-                assert.equal(mockEngine.launchedBrowsers.length - browserCountBefore, 2);
+                const launches = mockEngine.launchedBrowsers.slice(browserCountBefore);
+                assert.equal(launches.length, 2);
 
-                // Verify each launched Camoufox browser received its own isolated SSLKEYLOGFILE in env
-                const winLaunchEnv = profileWin.browser.launchOptions.env;
-                const macLaunchEnv = profileMac.browser.launchOptions.env;
+                // Inspect launch settings on the mock engine for each dedicated browser.
+                const winLaunchEnv = launches.find(({ launchOptions }) => launchOptions.os === 'windows').launchOptions.env;
+                const macLaunchEnv = launches.find(({ launchOptions }) => launchOptions.os === 'macos').launchOptions.env;
 
                 assert.ok(winLaunchEnv && winLaunchEnv.SSLKEYLOGFILE);
                 assert.ok(macLaunchEnv && macLaunchEnv.SSLKEYLOGFILE);
@@ -991,6 +1026,8 @@ async function runTests() {
                 );
 
                 // Verify zero cross-profile contamination in NDJSON
+                assert.ok(winEvents.some((e) => e.type === 'ingress' && e.status === 200));
+                assert.ok(macEvents.some((e) => e.type === 'ingress' && e.status === 201));
                 assert.equal(
                     winEvents.every((e) => e.attribution.profileId === 'profile-traffic-win'),
                     true
@@ -1113,6 +1150,8 @@ async function runTests() {
                 assert.equal(wireLogContent.includes('POST /v3/signin/wire-test?hl=en HTTP/1.1'), true);
                 assert.equal(wireLogContent.includes('X-Custom-Order: first-before-tls'), true);
                 assert.equal(wireLogContent.includes('HTTP/1.1 200 OK'), true);
+                const responsePrefix = longResPayload.slice(0, 32);
+                assert.equal(wireLogContent.includes(responsePrefix), false);
 
                 // Verify recorder.formatTransactionWireDump(corrId)
                 const truncEvents = readNdjsonFile(profileTrunc.trafficPaths.trafficNdjsonPath);
@@ -1126,26 +1165,29 @@ async function runTests() {
                 assert.equal(wireDump6.includes('<<< INGRESS [POST-TLS NECKO CHANNEL]'), true);
                 assert.equal(wireDump6.includes(egress6.correlationId), true);
                 assert.equal(wireDump6.includes(longReqPayload), true);
-                assert.equal(wireDump6.includes(longResPayload), true);
+                assert.equal(wireDump6.includes(responsePrefix), false);
 
-                // Verify maxBodyBytes: 32 truncation on disk with payloadTruncated: true
+                // Verify the 32-byte request attachment and request digest.
                 assert.equal(egress6.payloadTruncated, true);
-                assert.equal(ingress6.payloadTruncated, true);
+                assert.equal(egress6.postDataBytes, Buffer.byteLength(longReqPayload));
                 assert.equal(egress6.postDataSha256, sha256Hex(longReqPayload));
-                assert.equal(ingress6.bodySha256, sha256Hex(longResPayload));
 
                 const req6DiskPath = path.join(profileTrunc.trafficPaths.trafficDir, egress6.payloadFile);
-                const res6DiskPath = path.join(profileTrunc.trafficPaths.trafficDir, ingress6.payloadFile);
                 assert.equal(fs.readFileSync(req6DiskPath).byteLength, 32);
-                assert.equal(fs.readFileSync(res6DiskPath).byteLength, 32);
                 assert.equal(
                     fs.readFileSync(req6DiskPath, 'utf8'),
                     Buffer.from(longReqPayload, 'utf8').subarray(0, 32).toString('utf8')
                 );
-                assert.equal(
-                    fs.readFileSync(res6DiskPath, 'utf8'),
-                    Buffer.from(longResPayload, 'utf8').subarray(0, 32).toString('utf8')
-                );
+
+                assert.equal(ingress6.correlationId, egress6.correlationId);
+                assert.equal(ingress6.status, 200);
+                assert.equal(ingress6.headers['x-frame-options'], 'DENY');
+                assert.equal(ingress6.bodyOmittedReason, 'unbounded-response-reader');
+                assert.equal(ingress6.payloadTruncated, false);
+                assert.equal(ingress6.bodySha256, null);
+                assert.equal(ingress6.bodyPreview, null);
+                assert.equal(ingress6.payloadFile, null);
+                assert.deepEqual(fs.readdirSync(profileTrunc.trafficPaths.payloadsDir), [path.basename(egress6.payloadFile)]);
 
                 await profileTrunc.delete();
 
@@ -1174,9 +1216,23 @@ async function runTests() {
                     body: JSON.stringify({ ok: true })
                 });
 
+                let bodyReads = 0;
+                for (const [message, methods] of [
+                    [reqNoBody, ['postData', 'postDataBuffer']],
+                    [resNoBody, ['body', 'text']]
+                ]) {
+                    for (const method of methods) {
+                        const read = message[method];
+                        message[method] = () => {
+                            bodyReads += 1;
+                            return read();
+                        };
+                    }
+                }
                 await emitHttpTransaction(noBodiesContext, reqNoBody, resNoBody);
                 await profileNoBodies.getTrafficAttribution();
 
+                assert.equal(bodyReads, 0);
                 const payloadFiles = fs.readdirSync(profileNoBodies.trafficPaths.payloadsDir);
                 assert.equal(
                     payloadFiles.length,
@@ -1187,8 +1243,12 @@ async function runTests() {
                 const noBodyEvents = readNdjsonFile(profileNoBodies.trafficPaths.trafficNdjsonPath);
                 const noBodyEgress = noBodyEvents.find((e) => e.type === 'egress');
                 const noBodyIngress = noBodyEvents.find((e) => e.type === 'ingress');
-                assert.equal(noBodyEgress.payloadFile, null);
-                assert.equal(noBodyIngress.payloadFile, null);
+                for (const event of [noBodyEgress, noBodyIngress]) {
+                    assert.equal(event.recordBodies, false);
+                    assert.equal(event.bodyOmittedReason, 'body-recording-disabled');
+                    assert.equal(event.bodyPreview, null);
+                    assert.equal(event.payloadFile, null);
+                }
 
                 await profileNoBodies.delete();
             }
@@ -1332,12 +1392,13 @@ async function runTests() {
         );
 
         // =========================================================================
-        // Test 8: Offline Query & Wire-Dump CLI (scripts/query-traffic-attribution.js) + Shared-Browser SSLKEYLOGFILE & MOZ_LOG
+        // Test 8: Offline Query & Wire-Dump CLI (scripts/query-traffic-attribution.js) and Native Log Isolation
         // =========================================================================
         await testSection(
-            'Test 8: Offline Query & Wire-Dump CLI (scripts/query-traffic-attribution.js) + Shared-Browser SSLKEYLOGFILE & MOZ_LOG',
+            'Test 8: Offline Query & Wire-Dump CLI (scripts/query-traffic-attribution.js) and Native Log Isolation',
             async () => {
-                // 1) Verify neckoMozLog: true injects MOZ_LOG and MOZ_LOG_FILE into browser launch env
+                // Verify the dedicated browser receives the explicitly enabled Necko log settings.
+                const mozBrowserCount = mockEngine.launchedBrowsers.length;
                 const mozLogProfile = await createAndStartProfile(
                     'Traffic_Test_8_MozLog',
                     null,
@@ -1346,18 +1407,21 @@ async function runTests() {
                         os: 'linux',
                         profilesDir: tempProfilesDir,
                         useSharedBrowser: false,
-                        neckoMozLog: true
+                        neckoMozLog: true,
+                        neckoMozLogModules: 'timestamp,nsHttp:5'
                     }
                 );
 
-                const mozEnv = mozLogProfile.browser.launchOptions.env;
+                assert.equal(mockEngine.launchedBrowsers.length, mozBrowserCount + 1);
+                const mozEnv = mockEngine.launchedBrowsers[mozBrowserCount].launchOptions.env;
                 assert.ok(mozEnv && mozEnv.MOZ_LOG, 'Expected MOZ_LOG in launch env');
                 assert.equal(mozEnv.MOZ_LOG.includes('nsHttp:5'), true);
                 assert.equal(mozEnv.MOZ_LOG_FILE, mozLogProfile.trafficPaths.neckoMozLogPath);
                 await mozLogProfile.delete();
 
-                // 2) Verify shared-browser mode syncs _shared_sslkeylog.txt into per-profile sslkeylog.txt
+                // Shared browsers receive no native log settings, even when requested for the profile.
                 await closeSharedBrowser();
+                const sharedBrowserCount = mockEngine.launchedBrowsers.length;
                 const sharedProfile = await createAndStartProfile(
                     'Traffic_Test_8_Shared',
                     'http://10.88.0.1:8080',
@@ -1366,19 +1430,27 @@ async function runTests() {
                         os: 'windows',
                         profilesDir: tempProfilesDir,
                         useSharedBrowser: true,
+                        sslKeyLog: true,
+                        neckoMozLog: true,
+                        recordBodies: true,
                         accountId: 'acct-cli-888',
                         accountEmail: 'cli.audit888@gmail.com'
                     }
                 );
 
+                assert.equal(mockEngine.launchedBrowsers.length, sharedBrowserCount + 1);
+                const sharedEnv = mockEngine.launchedBrowsers[sharedBrowserCount].launchOptions.env;
+                for (const name of ['SSLKEYLOGFILE', 'MOZ_LOG', 'MOZ_LOG_FILE']) {
+                    assert.ok(!sharedEnv[name]);
+                }
+                assert.equal(sharedProfile.trafficPaths.sslKeyLogPath, null);
+                assert.equal(sharedProfile.trafficPaths.neckoMozLogPath, null);
                 const sharedKeyLogPath = path.join(tempProfilesDir, '_shared_sslkeylog.txt');
-                assert.equal(sharedProfile.browser._sharedSslKeyLogPath, sharedKeyLogPath);
-                assert.equal(fs.existsSync(sharedKeyLogPath), true);
+                assert.equal(fs.existsSync(sharedKeyLogPath), false);
 
-                // Simulate NSS writing a TLS 1.3 secret line into _shared_sslkeylog.txt
-                const mockTlsSecretLine =
-                    'CLIENT_HANDSHAKE_TRAFFIC_SECRET 0123456789abcdef0123456789abcdef aabbccddeeff00112233445566778899';
-                fs.appendFileSync(sharedKeyLogPath, `${mockTlsSecretLine}\n`, 'utf8');
+                // Seed a legacy shared log with a synthetic marker to check that stop leaves profile logs isolated.
+                const mockTlsSecretLine = `CLIENT_HANDSHAKE_TRAFFIC_SECRET ${'a'.repeat(64)} ${'b'.repeat(64)}`;
+                fs.writeFileSync(sharedKeyLogPath, `${mockTlsSecretLine}\n`, { mode: 0o600 });
 
                 const page = await sharedProfile.getPage();
                 const context = await sharedProfile.getContext();
@@ -1418,18 +1490,14 @@ async function runTests() {
 
                 await emitHttpTransaction(context, req8, res8);
 
-                // Stop profile (triggers syncSharedSslKeyLog + flushes attribution-index.json)
                 await sharedProfile.stop();
 
-                const profileSslKeyLogContent = fs.readFileSync(
-                    sharedProfile.trafficPaths.sslKeyLogPath,
-                    'utf8'
-                );
-                assert.equal(
-                    profileSslKeyLogContent.includes(mockTlsSecretLine),
-                    true,
-                    'Expected shared _shared_sslkeylog.txt secrets to sync into per-profile sslkeylog.txt'
-                );
+                const profileTrafficDir = sharedProfile.trafficPaths.trafficDir;
+                const profileNativeDir = path.join(path.dirname(profileTrafficDir), '.native');
+                for (const directory of [profileTrafficDir, profileNativeDir]) {
+                    assert.equal(fs.existsSync(path.join(directory, 'sslkeylog.txt')), false);
+                    assert.equal(fs.existsSync(path.join(directory, 'necko-pre-tls.moz_log')), false);
+                }
 
                 // 3) Verify programmatic queryProfileTraffic()
                 const listResult = queryProfileTraffic({ profilesDir: tempProfilesDir });
@@ -1468,8 +1536,11 @@ async function runTests() {
                 assert.equal(wireResult.actionStep, 'step-8-cli-audit');
                 assert.equal(wireResult.triggerAction.actionType, 'page.click');
                 assert.equal(wireResult.triggerAction.target, '#submit-audit-btn');
-                assert.equal(wireResult.requestPayload, reqPayload8);
-                assert.equal(wireResult.responsePayload, resPayload8);
+                assert.equal(wireResult.requestPayload, null);
+                assert.equal(wireResult.requestPayloadFile, null);
+                assert.equal(wireResult.responsePayload, null);
+                assert.equal(wireResult.ingress.bodyOmittedReason, 'unbounded-response-reader');
+                assert.ok(!wireResult.wireDump.includes(mockTlsSecretLine));
                 assert.equal(wireResult.wireDump.includes('>>> EGRESS [PRE-TLS NECKO CHANNEL]'), true);
                 assert.equal(wireResult.wireDump.includes('<<< INGRESS [POST-TLS NECKO CHANNEL]'), true);
 
@@ -1505,8 +1576,9 @@ async function runTests() {
                 const cliWireJson = JSON.parse(cliWireJsonRaw);
                 assert.equal(cliWireJson.mode, 'wire-dump');
                 assert.equal(cliWireJson.correlationId, targetCorrId);
-                assert.equal(cliWireJson.requestPayload, reqPayload8);
-                assert.equal(cliWireJson.responsePayload, resPayload8);
+                assert.equal(cliWireJson.requestPayload, null);
+                assert.equal(cliWireJson.responsePayload, null);
+                assert.equal(cliWireJson.ingress.bodyOmittedReason, 'unbounded-response-reader');
 
                 const cliWireTextRaw = execFileSync(
                     process.execPath,
@@ -1521,8 +1593,10 @@ async function runTests() {
                 assert.equal(cliWireTextRaw.includes('>>> EGRESS [PRE-TLS NECKO CHANNEL]'), true);
                 assert.equal(cliWireTextRaw.includes('<<< INGRESS [POST-TLS NECKO CHANNEL]'), true);
                 assert.equal(cliWireTextRaw.includes('X-Audit-Header: pre-tls-verified'), true);
-                assert.equal(cliWireTextRaw.includes(reqPayload8), true);
-                assert.equal(cliWireTextRaw.includes(resPayload8), true);
+                assert.equal(cliWireTextRaw.includes('[no egress body]'), true);
+                assert.equal(cliWireTextRaw.includes('[no ingress body]'), true);
+                assert.equal(cliWireTextRaw.includes(reqPayload8), false);
+                assert.equal(cliWireTextRaw.includes(resPayload8), false);
 
                 await sharedProfile.delete();
                 await closeSharedBrowser();
@@ -1633,6 +1707,8 @@ async function runTests() {
                 const events = readNdjsonFile(ndjsonPath);
                 const egress9 = events.find((e) => e.type === 'egress');
                 assert.ok(egress9, 'Expected egress event in traffic.ndjson');
+                assert.ok(egress9.payloadFile?.startsWith('payloads/req-'));
+                assert.equal(egress9.postDataSha256, sha256Hex(reqBody9));
                 assert.equal(egress9.headers['proxy-authorization'], 'Basic [REDACTED]');
                 assert.equal(egress9.headers['x-proxy-authorization'], 'Bearer [REDACTED]');
                 assert.equal(egress9.headers['x-api-key'], '[REDACTED]');
@@ -1643,12 +1719,18 @@ async function runTests() {
                 assert.ok(proxyAuthArrEntry);
                 assert.equal(proxyAuthArrEntry.value, 'Basic [REDACTED]');
 
+                const ingress9 = events.find((e) => e.type === 'ingress');
+                assert.equal(ingress9.correlationId, egress9.correlationId);
+                assert.equal(ingress9.bodyOmittedReason, 'unbounded-response-reader');
+                assert.equal(ingress9.payloadFile, null);
+                assert.equal(ingress9.bodySha256, null);
+
                 // 2) Verify SHA-256 hash chain structure in traffic.ndjson and summary.integrity
                 assert.ok(summary.integrity, 'Expected integrity section in attribution-index.json');
                 assert.equal(summary.integrity.algorithm, 'sha256-chain');
                 assert.equal(summary.integrity.genesisHash, '0'.repeat(64));
                 assert.equal(summary.integrity.eventCount, events.length);
-                assert.equal(summary.integrity.payloadCount, 2);
+                assert.equal(summary.integrity.payloadCount, 1);
 
                 let expectedPrevHash = '0'.repeat(64);
                 for (const ev of events) {
@@ -1663,7 +1745,7 @@ async function runTests() {
                 const validCheck = verifyTrafficIntegrity(trafficDir);
                 assert.equal(validCheck.valid, true, `Expected valid integrity, got errors: ${validCheck.errors.join('; ')}`);
                 assert.equal(validCheck.eventCount, events.length);
-                assert.equal(validCheck.verifiedPayloads, 2);
+                assert.equal(validCheck.verifiedPayloads, 1);
                 assert.equal(validCheck.chainHeadHash, summary.integrity.chainHeadHash);
                 assert.equal(validCheck.errors.length, 0);
 
@@ -1674,7 +1756,7 @@ async function runTests() {
                 });
                 assert.equal(queryCheck.mode, 'verify-integrity');
                 assert.equal(queryCheck.valid, true);
-                assert.equal(queryCheck.verifiedPayloads, 2);
+                assert.equal(queryCheck.verifiedPayloads, 1);
 
                 const cliScriptPath = path.join(__dirname, 'query-traffic-attribution.js');
                 const cliValidOut = execFileSync(
@@ -1690,7 +1772,7 @@ async function runTests() {
                 );
                 const cliValidJson = JSON.parse(cliValidOut);
                 assert.equal(cliValidJson.valid, true);
-                assert.equal(cliValidJson.verifiedPayloads, 2);
+                assert.equal(cliValidJson.verifiedPayloads, 1);
 
                 // 4) Tamper with 1 byte in a payload file and verify detection
                 const payloadRelPath = egress9.payloadFile;
@@ -1788,6 +1870,8 @@ async function runTests() {
                         os: 'windows',
                         profilesDir: tempProfilesDir,
                         useSharedBrowser: false,
+                        recordTraffic: true,
+                        sslKeyLog: true,
                         accountId: 'acct-wire-10',
                         accountEmail: 'wire10@gmail.com'
                     }
@@ -1796,7 +1880,6 @@ async function runTests() {
                 const context = await profile.getContext();
                 const recorder = profile.getTrafficRecorder();
                 const trafficDir = profile.trafficPaths.trafficDir;
-                const ndjsonPath = profile.trafficPaths.trafficNdjsonPath;
                 const sslKeyLogPath = profile.trafficPaths.sslKeyLogPath;
 
                 profile.setTrafficStep('step-10-wire-header-inspection');
@@ -1835,7 +1918,7 @@ async function runTests() {
 
                 await emitHttpTransaction(context, anomalousReq, anomalousRes);
 
-                // 2) Record valid NSS TLS 1.3 secrets via recordSslKeyLogSecret
+                // Write synthetic TLS records to the profile diagnostic and a legacy archive fixture.
                 const clientRandomHex =
                     '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
                 const tls13Secrets = [
@@ -1857,21 +1940,19 @@ async function runTests() {
                     ]
                 ];
 
-                assert.equal(
-                    typeof recorder.recordSslKeyLogSecret,
-                    'function',
-                    'Expected recorder.recordSslKeyLogSecret to be a function'
-                );
+                const legacyDir = fs.mkdtempSync(path.join(tempProfilesDir, 'legacy-nss-'));
+                const legacyOptions = {
+                    trafficDir: legacyDir,
+                    sslKeyLog: true,
+                    sslKeyLogPath: path.join(legacyDir, 'sslkeylog.txt'),
+                    neckoMozLog: false,
+                    recordBodies: true,
+                    recordWireLog: false
+                };
+                const legacyRecorder = new CamoufoxTrafficRecorder(legacyOptions);
                 for (const [label, secretHex] of tls13Secrets) {
-                    if (recorder.recordSslKeyLogSecret.length >= 2) {
-                        recorder.recordSslKeyLogSecret(label, clientRandomHex, secretHex);
-                    } else {
-                        recorder.recordSslKeyLogSecret(
-                            `${label} ${clientRandomHex} ${secretHex}`,
-                            clientRandomHex,
-                            secretHex
-                        );
-                    }
+                    recorder.recordSslKeyLogSecret(label, clientRandomHex, secretHex);
+                    legacyRecorder.recordSslKeyLogSecret(label, clientRandomHex, secretHex);
                 }
 
                 const summary = await profile.getTrafficAttribution();
@@ -1893,66 +1974,63 @@ async function runTests() {
                     `Expected proxy-anonymity-leak in [${anomalyTypes.join(', ')}]`
                 );
 
-                // Verify NSS sslKeyLog summary metrics and cryptographic integrity
-                assert.ok(summary.sslKeyLog, 'Expected summary.sslKeyLog block');
-                assert.ok(
-                    summary.sslKeyLog.tls13SessionCount >= 1,
-                    `Expected summary.sslKeyLog.tls13SessionCount >= 1, got ${summary.sslKeyLog.tls13SessionCount}`
-                );
-
-                const integrityValid = verifyTrafficIntegrity(trafficDir);
-                assert.equal(
-                    integrityValid.valid,
-                    true,
-                    `Expected valid integrity after recording TLS 1.3 secrets, got errors: ${integrityValid.errors.join('; ')}`
-                );
-
-                // Tamper with sslkeylog.txt and assert verifyTrafficIntegrity detects it
-                const originalSslKeyLog = fs.readFileSync(sslKeyLogPath, 'utf8');
-                fs.writeFileSync(
-                    sslKeyLogPath,
-                    `${originalSslKeyLog}CLIENT_TRAFFIC_SECRET_0 ${clientRandomHex} ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n`,
-                    'utf8'
-                );
-                const tamperedSslIntegrity = verifyTrafficIntegrity(trafficDir);
-                assert.equal(
-                    tamperedSslIntegrity.valid,
-                    false,
-                    'Expected verifyTrafficIntegrity(trafficDir).valid === false after tampering with sslkeylog.txt'
-                );
-
-                // Restore sslkeylog.txt and stop profile
-                fs.writeFileSync(sslKeyLogPath, originalSslKeyLog, 'utf8');
+                // Sibling native files are outside the public profile archive.
                 await profile.stop();
-                assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+                assert.equal(fs.existsSync(sslKeyLogPath), true);
+                const publicIndex = JSON.parse(fs.readFileSync(profile.trafficPaths.attributionIndexPath, 'utf8'));
+                assert.equal(publicIndex.sslKeyLog.tls13SessionCount, 1);
+                assert.equal(publicIndex.sslKeyLog.sha256, null);
+                assert.equal(publicIndex.artifacts.sslKeyLogPath, null);
+                assert.equal(publicIndex.integrity.sslKeyLogSha256, null);
+                assert.equal(publicIndex.integrity.sslKeyLogBytes, 0);
+                assert.equal(Object.hasOwn(publicIndex.integrity, 'sslKeyLogFile'), false);
 
-                // 3) Simulate a crashed partial trailing line in traffic.ndjson and verify self-healing on resume
-                const preCrashIntegrity = verifyTrafficIntegrity(trafficDir);
-                assert.equal(preCrashIntegrity.valid, true);
+                const publicCheck = verifyTrafficIntegrity(trafficDir);
+                assert.equal(publicCheck.valid, true, publicCheck.errors.join('; '));
+                assert.equal(publicCheck.sslKeyLog.exists, false);
 
-                fs.appendFileSync(ndjsonPath, '{"type":"egress","corrupted":', 'utf8');
-                const healedRecorder = new CamoufoxTrafficRecorder({
-                    profileId: 'traffic-test-10-wire-anomalies',
-                    trafficDir,
-                    sslKeyLogPath,
-                    os: 'windows'
-                });
-                await healedRecorder.flushSummary();
+                // Legacy indexes used canonical artifact names without an explicit file entry.
+                const legacyContext = createEventHub();
+                legacyRecorder.attachContext(legacyContext);
+                await emitHttpTransaction(legacyContext, anomalousReq, anomalousRes);
+                const legacyIndex = await legacyRecorder.stop();
+                const { sslKeyLogPath: archivedKeyLog } = legacyOptions;
+                const originalKeyLog = fs.readFileSync(archivedKeyLog, 'utf8');
+                assert.equal(legacyIndex.integrity.sslKeyLogSha256, sha256Hex(originalKeyLog));
+                assert.equal(legacyIndex.integrity.sslKeyLogBytes, Buffer.byteLength(originalKeyLog));
+                delete legacyIndex.integrity.sslKeyLogFile;
+                fs.writeFileSync(legacyRecorder.attributionIndexPath, JSON.stringify(legacyIndex), 'utf8');
 
-                const rawNdjsonAfterHeal = fs.readFileSync(ndjsonPath, 'utf8');
-                assert.equal(
-                    rawNdjsonAfterHeal.includes('"corrupted"'),
-                    false,
-                    'Expected _resumeExistingChainIfPresent() to truncate corrupted partial trailing NDJSON line'
-                );
+                const legacyCheck = verifyTrafficIntegrity(legacyDir);
+                assert.equal(legacyCheck.valid, true, legacyCheck.errors.join('; '));
+                assert.equal(legacyCheck.sslKeyLog.entryCount, tls13Secrets.length);
+                assert.ok(legacyCheck.verifiedPayloads > 0);
 
-                const postHealIntegrity = verifyTrafficIntegrity(trafficDir);
-                assert.equal(
-                    postHealIntegrity.valid,
-                    true,
-                    `Expected valid integrity after crash self-healing, got errors: ${postHealIntegrity.errors.join('; ')}`
-                );
-                assert.equal(postHealIntegrity.eventCount, preCrashIntegrity.eventCount);
+                const fixtureSecret = tls13Secrets[0][1];
+                const modifiedKeyLog = originalKeyLog.replace(fixtureSecret, 'f'.repeat(fixtureSecret.length));
+                assert.notEqual(modifiedKeyLog, originalKeyLog);
+                fs.writeFileSync(archivedKeyLog, modifiedKeyLog, 'utf8');
+                const tamperedCheck = verifyTrafficIntegrity(legacyDir);
+                assert.equal(tamperedCheck.valid, false);
+                assert.ok(tamperedCheck.errors.includes('sslkeylog.txt SHA-256 mismatch'));
+                fs.writeFileSync(archivedKeyLog, originalKeyLog, 'utf8');
+
+                // Recover an interrupted JSON record while retaining the original ledger.
+                const ndjsonPath = legacyRecorder.trafficNdjsonPath;
+                const originalLedger = fs.readFileSync(ndjsonPath);
+                fs.appendFileSync(ndjsonPath, '{"type":"egress","interrupted":', 'utf8');
+                assert.equal(verifyTrafficIntegrity(legacyDir).valid, false);
+
+                const healedRecorder = new CamoufoxTrafficRecorder(legacyOptions);
+                await healedRecorder.stop();
+                assert.deepEqual(fs.readFileSync(ndjsonPath), originalLedger);
+
+                const healedCheck = verifyTrafficIntegrity(legacyDir);
+                assert.equal(healedCheck.valid, true, healedCheck.errors.join('; '));
+                assert.equal(healedCheck.eventCount, legacyCheck.eventCount);
+                assert.equal(healedCheck.chainHeadHash, legacyCheck.chainHeadHash);
+                assert.equal(healedCheck.verifiedPayloads, legacyCheck.verifiedPayloads);
+                assert.equal(healedCheck.sslKeyLog.sha256, legacyCheck.sslKeyLog.sha256);
 
                 await profile.delete();
             }
@@ -2029,6 +2107,18 @@ async function runTests() {
                 });
 
                 await emitHttpTransaction(context, req11, res11);
+                const publicBody = JSON.stringify({ label: 'synthetic-public-attachment' });
+                const publicRequest = createMockRequest({
+                    method: 'POST',
+                    url: 'https://example.test/notes',
+                    headersArray: [{ name: 'Content-Type', value: 'application/json' }],
+                    postData: publicBody
+                });
+                await emitHttpTransaction(context, publicRequest, createMockResponse({
+                    request: publicRequest,
+                    status: 200,
+                    body: 'synthetic-response'
+                }));
                 await profile.stop();
 
                 // 1) Export HAR 1.2 directly via recorder.exportHar()
@@ -2065,8 +2155,7 @@ async function runTests() {
                     ),
                     'Expected HAR request headers to preserve X-Har-Test'
                 );
-                assert.ok(harEntry.request.postData, 'Expected HAR request.postData');
-                assert.equal(harEntry.request.postData.text, reqPostPayload);
+                assert.equal(harEntry.request.postData?.text ?? '', '');
 
                 assert.equal(harEntry.response.status, 200);
                 assert.ok(
@@ -2076,7 +2165,7 @@ async function runTests() {
                     'Expected HAR response headers to preserve X-Har-Response'
                 );
                 assert.ok(harEntry.response.content, 'Expected HAR response.content');
-                assert.equal(harEntry.response.content.text, resJsonPayload);
+                assert.equal(harEntry.response.content.text ?? '', '');
                 assert.ok(harEntry.timings && typeof harEntry.timings.wait === 'number');
                 assert.ok(
                     harEntry._attribution,
@@ -2110,10 +2199,16 @@ async function runTests() {
                     e.request?.url?.includes('/v3/signin/identifier')
                 );
                 assert.ok(cliHarEntry);
-                assert.equal(cliHarEntry.request.postData.text, reqPostPayload);
-                assert.equal(cliHarEntry.response.content.text, resJsonPayload);
+                assert.equal(cliHarEntry.request.postData?.text ?? '', '');
+                assert.equal(cliHarEntry.response.content.text ?? '', '');
                 assert.ok(cliHarEntry._attribution);
                 assert.equal(cliHarEntry._attribution.actionStep, 'step-11-har-export');
+                for (const exported of [directHar, cliHar]) {
+                    const publicEntry = exported.log.entries.find((e) => e.request.url === publicRequest.url());
+                    assert.equal(publicEntry?.request.postData?.text, publicBody);
+                    assert.equal(publicEntry.response.content.text ?? '', '');
+                    assert.equal(JSON.stringify(exported).includes('tok_har_11'), false);
+                }
 
                 await profile.delete();
             }
@@ -2367,6 +2462,7 @@ async function runTests() {
                         os: 'linux',
                         profilesDir: tempProfilesDir,
                         useSharedBrowser: false,
+                        recordTraffic: true,
                         neckoMozLog: true
                     }
                 );
@@ -2425,32 +2521,49 @@ async function runTests() {
                     'HTTP/2.0 200 OK'
                 );
 
-                // Verify untampered integrity passes
-                const validCheck = verifyTrafficIntegrity(trafficDir);
-                assert.equal(
-                    validCheck.valid,
-                    true,
-                    `Expected verifyTrafficIntegrity(trafficDir).valid === true, got errors: ${validCheck.errors.join('; ')}`
-                );
+                assert.equal(fs.existsSync(neckoMozLogPath), true);
+                const publicIndex = JSON.parse(fs.readFileSync(profile.trafficPaths.attributionIndexPath, 'utf8'));
+                assert.equal(publicIndex.neckoMozLog.exists, true);
+                assert.equal(publicIndex.neckoMozLog.sha256, null);
+                assert.equal(publicIndex.artifacts.neckoMozLogPath, null);
+                assert.equal(publicIndex.integrity.neckoMozLogSha256, null);
+                assert.equal(publicIndex.integrity.neckoMozLogBytes, 0);
+                assert.equal(Object.hasOwn(publicIndex.integrity, 'neckoMozLogFile'), false);
 
-                // Tamper with necko-pre-tls.moz_log on disk and verify tamper detection
-                const originalMozLog = fs.readFileSync(neckoMozLogPath, 'utf8');
-                fs.writeFileSync(
-                    neckoMozLogPath,
-                    `${originalMozLog}\n2026-11-25 17:20:02.000000 UTC - [Parent 41200: Main Thread]: V/nsHttp TAMPERED_LINE\n`,
-                    'utf8'
-                );
+                const publicCheck = verifyTrafficIntegrity(trafficDir);
+                assert.equal(publicCheck.valid, true, publicCheck.errors.join('; '));
+                assert.equal(publicCheck.neckoMozLog.exists, false);
 
-                const tamperedCheck = verifyTrafficIntegrity(trafficDir);
-                assert.equal(
-                    tamperedCheck.valid,
-                    false,
-                    'Expected verifyTrafficIntegrity(trafficDir).valid === false after tampering with necko-pre-tls.moz_log'
-                );
-                assert.equal(
-                    tamperedCheck.errors.some((e) => e.includes('necko-pre-tls.moz_log')),
-                    true
-                );
+                const legacyDir = fs.mkdtempSync(path.join(tempProfilesDir, 'legacy-necko-'));
+                const archivedMozLog = path.join(legacyDir, 'necko-pre-tls.moz_log');
+                const legacyRecorder = new CamoufoxTrafficRecorder({
+                    trafficDir: legacyDir,
+                    sslKeyLog: false,
+                    neckoMozLog: true,
+                    neckoMozLogPath: archivedMozLog,
+                    recordWireLog: false
+                });
+                legacyRecorder.recordNeckoMozLogBlock(realisticNeckoMozLog);
+                const legacyIndex = await legacyRecorder.stop();
+                const originalMozLog = fs.readFileSync(archivedMozLog, 'utf8');
+                assert.equal(legacyIndex.integrity.neckoMozLogSha256, sha256Hex(originalMozLog));
+                assert.equal(legacyIndex.integrity.neckoMozLogBytes, Buffer.byteLength(originalMozLog));
+                delete legacyIndex.integrity.neckoMozLogFile;
+                fs.writeFileSync(legacyRecorder.attributionIndexPath, JSON.stringify(legacyIndex), 'utf8');
+
+                const legacyCheck = verifyTrafficIntegrity(legacyDir);
+                assert.equal(legacyCheck.valid, true, legacyCheck.errors.join('; '));
+                assert.equal(legacyCheck.neckoMozLog.requestBlockCount, summary.neckoMozLog.requestBlockCount);
+
+                const modifiedMozLog = originalMozLog.replace('flags=0', 'flags=1');
+                assert.notEqual(modifiedMozLog, originalMozLog);
+                fs.writeFileSync(archivedMozLog, modifiedMozLog, 'utf8');
+                const tamperedCheck = verifyTrafficIntegrity(legacyDir);
+                assert.equal(tamperedCheck.valid, false);
+                assert.ok(tamperedCheck.errors.includes('necko-pre-tls.moz_log SHA-256 mismatch'));
+
+                fs.writeFileSync(archivedMozLog, originalMozLog, 'utf8');
+                assert.equal(verifyTrafficIntegrity(legacyDir).valid, true);
 
                 await profile.delete();
             }

@@ -4,9 +4,15 @@
  */
 
 import puppeteer from 'puppeteer-core';
-import axios from 'axios';
 import logger from '../utils/logger.js';
 import dolphinClient from './client.js';
+import {
+    ControllerUrlError,
+    connectBrowser,
+    parseControllerUrl,
+    toWebSocketUrl,
+    validateControllerEndpoint
+} from '../utils/controller-url.js';
 
 class DolphinProfile {
     constructor(profileId, webSocketUrl = null) {
@@ -34,66 +40,56 @@ class DolphinProfile {
                 throw new Error('Failed to get WebSocket URL from Dolphin Anty');
             }
 
+            let endpoint = toWebSocketUrl(parseControllerUrl(this.webSocketUrl, 'ws:'));
+
             // Wait a bit for browser to fully start
             await new Promise(resolve => setTimeout(resolve, 3000));
 
-            // Connect to browser using WebSocket URL
-            let wsEndpoint = this.webSocketUrl;
-            
-            // Ensure WebSocket URL is properly formatted
-            if (!wsEndpoint.startsWith('ws://') && !wsEndpoint.startsWith('wss://')) {
-                wsEndpoint = `ws://${wsEndpoint.replace(/^(https?):\/\//, '')}`;
-            }
-
-            // Retry connection with multiple attempts
-            let browser = null;
-            let lastError = null;
+            let browser;
+            let lastError;
             const retries = 5;
-            
-            for (let attempt = 1; attempt <= retries; attempt++) {
-                try {
-                    logger.info(`Connecting to Dolphin Anty browser (attempt ${attempt}/${retries})...`);
-                    
-                    browser = await puppeteer.connect({
-                        browserWSEndpoint: wsEndpoint,
-                        ignoreHTTPSErrors: true,
-                        defaultViewport: null // Don't override viewport - Dolphin handles it
-                    });
 
-                    // Test connection
-                    const pages = await browser.pages();
-                    logger.info('Dolphin Anty browser connected successfully', { 
+            for (let attempt = 1; attempt <= retries; attempt++) {
+                let connection;
+                try {
+                    logger.info(`Connecting to Dolphin Anty browser (attempt ${attempt}/${retries})...`, {
                         profileId: this.profileId,
-                        pagesCount: pages.length,
-                        wsEndpoint: wsEndpoint
+                        controller: endpoint.origin
+                    });
+                    connection = await connectBrowser(puppeteer, endpoint);
+                    const pages = await connection.pages();
+                    browser = connection;
+                    this.webSocketUrl = endpoint.href;
+                    logger.info('Dolphin Anty browser connected successfully', {
+                        profileId: this.profileId,
+                        pagesCount: pages.length
                     });
                     break;
-                } catch (e) {
-                    lastError = e;
-                    logger.warn(`Dolphin Anty browser connection attempt ${attempt} failed`, { 
-                        error: e.message,
-                        profileId: this.profileId,
-                        wsEndpoint: wsEndpoint
+                } catch (error) {
+                    if (error instanceof ControllerUrlError) throw error;
+                    if (connection) await connection.disconnect();
+                    lastError = error;
+                    logger.warn(`Dolphin Anty browser connection attempt ${attempt} failed`, {
+                        error: error.message,
+                        profileId: this.profileId
                     });
-                    
+
                     if (attempt < retries) {
-                        // Progressive wait time: 2s, 3s, 4s, 5s
                         const waitTime = Math.min(2000 + (attempt * 1000), 8000);
-                        logger.info(`Waiting ${waitTime/1000}s before retry...`);
+                        logger.info(`Waiting ${waitTime / 1000}s before retry...`);
                         await new Promise(resolve => setTimeout(resolve, waitTime));
-                        
-                        // Try to refresh WebSocket URL
+
+                        let address;
                         try {
                             const startData = await dolphinClient.startProfile(this.profileId);
-                            if (startData.ws || startData.webSocketDebuggerUrl) {
-                                wsEndpoint = startData.ws || startData.webSocketDebuggerUrl;
-                                if (!wsEndpoint.startsWith('ws://') && !wsEndpoint.startsWith('wss://')) {
-                                    wsEndpoint = `ws://${wsEndpoint.replace(/^(https?):\/\//, '')}`;
-                                }
-                                logger.info('Refreshed WebSocket endpoint', { wsEndpoint });
-                            }
+                            address = startData.ws || startData.webSocketDebuggerUrl;
                         } catch (refreshError) {
-                            logger.debug('Could not refresh endpoint, using previous', { error: refreshError.message });
+                            if (refreshError instanceof ControllerUrlError) throw refreshError;
+                            logger.debug('Could not refresh Dolphin Anty browser endpoint', { error: refreshError.message });
+                        }
+                        if (address) {
+                            const refreshed = toWebSocketUrl(parseControllerUrl(address, 'ws:'));
+                            endpoint = validateControllerEndpoint(refreshed, endpoint);
                         }
                     }
                 }

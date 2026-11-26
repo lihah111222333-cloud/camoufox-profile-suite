@@ -18,8 +18,7 @@ function finalizeDetectedPage(page, detected) {
                 page._lastDetectedGmailStep = detected.type;
                 page.setTrafficStep(`gmail-page:${String(detected.type).toLowerCase()}`, {
                     pageType: detected.type,
-                    action: detected.action || null,
-                    url: detected.url || (typeof page.url === 'function' ? page.url() : null)
+                    action: detected.action || null
                 });
             }
         } catch {
@@ -643,7 +642,7 @@ export async function waitForPageLoad(page, timeout = 30000) {
         await page.waitForTimeout(2000); // Additional wait for rendering
         logger.debug('Page loaded and settled');
     } catch (error) {
-        logger.warn(`Page load might not be complete or timed out: ${error.message}`);
+        logger.warn('Page load might not be complete or timed out', { error });
     }
 }
 

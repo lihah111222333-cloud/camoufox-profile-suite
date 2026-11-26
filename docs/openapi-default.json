@@ -905,10 +905,10 @@
                 },
                 "proxy": {
                   "protocol": "socks5",
-                  "host": "127.0.0.1",
+                  "host": "192.0.2.10",
                   "port": 10809,
-                  "proxyUsername": "name",
-                  "proxyPassword": "pass",
+                  "proxyUsername": "REPLACE_WITH_PROXY_USERNAME",
+                  "proxyPassword": "REPLACE_WITH_PROXY_PASSWORD",
                   "rotateUrl": "https://testip.com",
                   "repeatItem": false,
                   "publicViewing": 0,
@@ -1012,7 +1012,7 @@
                   "allowMultipleOpenings": 1,
                   "autofillList": [],
                   "belongToMe": false,
-                  "cookie": "[{\"domain\":\".google.com.hk\",\"expirationDate\":1765528457,\"hostOnly\":false,\"httpOnly\":true,\"name\":\"NID\",\"path\":\"/\",\"sameSite\":\"no_restriction\",\"secure\":true,\"session\":false,\"storeId\":\"0\",\"value\":\"524=EhNBoM1iqv-G5B6hyOlKwquTFayaU7ToBaUifX4ulODXN84jYy8Gv4BQiHCVg-GX0rvY6uljVDt7aUxytbX6iAhqmLAEgAygx5fta8tM8RdNy_Mz_WwQxj9WMRKiKLHqmSdJZ2jGW2bOUhWLvM9pHvSQaePzLODzJYOcD7xCPIWAFdsB6XKqPHGm8tQdGTlPLoCI9Ou2j4JL2H4jbzkafqY\"},{\"domain\":\".helper.mostlogin.com\",\"hostOnly\":false,\"httpOnly\":false,\"name\":\"ProfileId\",\"path\":\"/\",\"sameSite\":\"unspecified\",\"secure\":true,\"session\":true,\"storeId\":\"0\",\"value\":\"d6255fc4f8fe4e8fbe2b419d880897b2\"},{\"domain\":\".helper.mostlogin.com\",\"hostOnly\":false,\"httpOnly\":false,\"name\":\"ServerPort\",\"path\":\"/\",\"sameSite\":\"unspecified\",\"secure\":true,\"session\":true,\"storeId\":\"0\",\"value\":\"30898\"},{\"domain\":\".google.com\",\"expirationDate\":1767082340.019446,\"hostOnly\":false,\"httpOnly\":true,\"name\":\"NID\",\"path\":\"/\",\"sameSite\":\"no_restriction\",\"secure\":true,\"session\":false,\"storeId\":\"0\",\"value\":\"525=h8CSYfs7AtD__kc6UK9usrv0-eTTzbsqqcjk0ctnFxXbvbjVEU4DqdsZpGGhUFZrsp9_akfly3L2fjmifH-_tMA1NlCJFCPPwSzb2hWHbCTlSEK7Kj1hyvUddE4pB_6SMIeNbZtv0IYLieNMyoJf_CIAQ7TTjUSvyNOA8R_KgpYb7y6TdJclBx_vfNYoV5nMoZCoZg\"}]",
+                  "cookie": "[{\"domain\":\"example.com\",\"expirationDate\":1765528457,\"hostOnly\":false,\"httpOnly\":true,\"name\":\"NID\",\"path\":\"/\",\"sameSite\":\"no_restriction\",\"secure\":true,\"session\":false,\"storeId\":\"0\",\"value\":\"REPLACE_WITH_COOKIE_VALUE\"},{\"domain\":\"example.com\",\"hostOnly\":false,\"httpOnly\":false,\"name\":\"ProfileId\",\"path\":\"/\",\"sameSite\":\"unspecified\",\"secure\":true,\"session\":true,\"storeId\":\"0\",\"value\":\"REPLACE_WITH_COOKIE_VALUE\"},{\"domain\":\"example.com\",\"hostOnly\":false,\"httpOnly\":false,\"name\":\"ServerPort\",\"path\":\"/\",\"sameSite\":\"unspecified\",\"secure\":true,\"session\":true,\"storeId\":\"0\",\"value\":\"REPLACE_WITH_COOKIE_VALUE\"},{\"domain\":\"example.com\",\"expirationDate\":1767082340.019446,\"hostOnly\":false,\"httpOnly\":true,\"name\":\"NID\",\"path\":\"/\",\"sameSite\":\"no_restriction\",\"secure\":true,\"session\":false,\"storeId\":\"0\",\"value\":\"REPLACE_WITH_COOKIE_VALUE\"}]",
                   "extensionInfoList": [],
                   "fingerprint": {
                     "architecture": "x86",
@@ -1271,18 +1271,18 @@
                   },
                   "proxy": {
                     "duplicateCheck": false,
-                    "host": "1.2.3.4",
+                    "host": "192.0.2.10",
                     "ipCheckService": "MaxMind",
                     "lastCountry": "DE",
                     "lastIp": "1.2.3.4",
                     "port": 59059,
                     "protocol": "socks5",
                     "proxyMethod": 4,
-                    "proxyPassword": "111",
-                    "proxyUsername": "222"
+                    "proxyPassword": "REPLACE_WITH_PROXY_PASSWORD",
+                    "proxyUsername": "REPLACE_WITH_PROXY_USERNAME"
                   },
                   "seq": 36,
-                  "sk": "546a21ef9988428203fc086a4f87885e1751c4d8f2afc19c7f255d45f28826c6",
+                  "sk": "REPLACE_WITH_SECRET_KEY",
                   "status": 0,
                   "workbench": 1
                 }
@@ -1416,12 +1416,12 @@
                 ]
               },
               "example": {
-                "host": "43.157.93.237",
+                "host": "192.0.2.10",
                 "port": 59059,
                 "protocol": "socks5",
                 "proxyMethod": 0,
-                "proxyPassword": "VRJr4q7o",
-                "proxyUsername": "40LKLj9B",
+                "proxyPassword": "REPLACE_WITH_PROXY_PASSWORD",
+                "proxyUsername": "REPLACE_WITH_PROXY_USERNAME",
                 "ids": [
                   "d6255fc4f8fe4e8fbe2b419d880897b2"
                 ]
@@ -1492,7 +1492,7 @@
               "example": {
                 "protocol": "socks5",
                 "duplicateCheck": false,
-                "extractionUrl": "https://test.com",
+                "extractionUrl": "https://proxy.example.com/extraction",
                 "extractMethod": 1,
                 "ids": [
                   "59f60bfed2814e4a9fa488651835efbe"
@@ -1900,10 +1900,10 @@
               },
               "example": {
                 "protocol": "socks5",
-                "host": "1.2.3.4",
+                "host": "192.0.2.10",
                 "port": 1234,
-                "proxyUsername": "1111",
-                "proxyPassword": "2222"
+                "proxyUsername": "REPLACE_WITH_PROXY_USERNAME",
+                "proxyPassword": "REPLACE_WITH_PROXY_PASSWORD"
               }
             }
           }
@@ -2005,10 +2005,10 @@
               },
               "example": {
                 "protocol": "socks5",
-                "host": "127.0.0.1",
+                "host": "192.0.2.10",
                 "port": 10809,
-                "proxyUsername": "name",
-                "proxyPassword": "pass",
+                "proxyUsername": "REPLACE_WITH_PROXY_USERNAME",
+                "proxyPassword": "REPLACE_WITH_PROXY_PASSWORD",
                 "rotateUrl": "https://testip.com",
                 "repeatItem": false,
                 "publicViewing": 0,
@@ -2182,7 +2182,7 @@
               "example": {
                 "protocol": "socks5",
                 "extractMethod": 0,
-                "extractionUrl": "https://test-extraction.com/extract",
+                "extractionUrl": "https://proxy.example.com/extraction",
                 "duplicateCheck": false,
                 "publicViewing": 0,
                 "repeatItem": false
@@ -2267,7 +2267,7 @@
               "example": {
                 "protocol": "socks5",
                 "extractMethod": 0,
-                "extractionUrl": "https://test-extraction.com2222/extract",
+                "extractionUrl": "https://proxy.example.com/extraction",
                 "publicViewing": 0,
                 "id": "78c9c3971d8f4b00ace9ae4ee695df0f"
               }
@@ -8916,7 +8916,7 @@
           "token": {
             "type": "string",
             "description": "The **exact** JWT bearer token generated in the web panel\n(https://dolphin-anty.com/panel). The value is stored locally (encrypted\nif the OS keychain is available) and will be attached to all subsequent\nrequests sent by the Local API to the remote Dolphin{anty} endpoints.\n",
-            "example": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+            "example": "REPLACE_WITH_API_TOKEN"
           }
         }
       },

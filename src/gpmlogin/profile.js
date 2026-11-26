@@ -7,6 +7,53 @@ import puppeteer from 'puppeteer-core';
 import axios from 'axios';
 import logger from '../utils/logger.js';
 import gpmClient from './client.js';
+import {
+    ControllerUrlError,
+    connectBrowser,
+    controllerRequestOptions,
+    parseControllerUrl,
+    toWebSocketUrl,
+    validateControllerEndpoint
+} from '../utils/controller-url.js';
+
+const discoveryPaths = ['/json/version', '/json', '/json/list'];
+const discoveryRetryCodes = new Set([
+    'ECONNABORTED', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ERR_BAD_RESPONSE'
+]);
+
+async function discoverBrowserEndpoint(controller, paths, timeout) {
+    const originalPath = controller.pathname.replace(/\/$/, '');
+    const webSocketController = toWebSocketUrl(controller);
+
+    for (const path of paths) {
+        const url = new URL(controller);
+        url.pathname = originalPath + path;
+        let data;
+        try {
+            ({ data } = await axios.get(url.href, { ...controllerRequestOptions, timeout }));
+        } catch (error) {
+            if (error.response?.status !== 404 && !discoveryRetryCodes.has(error.code)) {
+                throw error;
+            }
+            logger.debug('Could not discover GPM browser endpoint', { path });
+            continue;
+        }
+
+        const page = path === '/json' && Array.isArray(data) ? data[0] : null;
+        const target = path === '/json/version'
+            ? data
+            : Array.isArray(data) && (data.find(entry => entry?.type === 'browser') || page);
+        if (!target?.webSocketDebuggerUrl) continue;
+
+        const endpoint = parseControllerUrl(target.webSocketDebuggerUrl);
+        validateControllerEndpoint(endpoint, webSocketController, true);
+        if (target === page && target.type !== 'browser') {
+            endpoint.pathname = endpoint.pathname.replace(/\/devtools\/page\/[^/]+$/, '/devtools/browser');
+        }
+        return endpoint;
+    }
+    return null;
+}
 
 class GPMLoginProfile {
     constructor(profileId, remoteDebuggingAddress = null) {
@@ -34,170 +81,52 @@ class GPMLoginProfile {
                 throw new Error('Failed to get remote debugging address from GPM');
             }
 
-            // Connect to browser using remote debugging address
-            // GPM returns address like "127.0.0.1:9222" or "http://127.0.0.1:9222"
-            let wsEndpoint = this.remoteDebuggingAddress;
-            
-            // Remove http:// or https:// or ws:// or wss:// if present
-            const cleanAddress = wsEndpoint.replace(/^(https?|ws|wss):\/\//, '');
-            
+            const controller = parseControllerUrl(this.remoteDebuggingAddress, 'http:');
+            const needsDiscovery = controller.protocol === 'http:' || controller.protocol === 'https:';
+
             // Wait a bit for browser to fully start
             await new Promise(resolve => setTimeout(resolve, 2000));
-            
-            // Try multiple methods to get WebSocket endpoint
-            let foundEndpoint = false;
-            
-            // Method 1: Try /json/version endpoint
-            try {
-                const browserInfo = await axios.get(`http://${cleanAddress}/json/version`, {
-                    timeout: 5000
-                });
-                if (browserInfo.data && browserInfo.data.webSocketDebuggerUrl) {
-                    wsEndpoint = browserInfo.data.webSocketDebuggerUrl;
-                    foundEndpoint = true;
-                    logger.info('Got WebSocket endpoint from /json/version', { wsEndpoint });
-                }
-            } catch (e) {
-                logger.debug('Could not get endpoint from /json/version', { error: e.message });
-            }
-            
-            // Method 2: Try /json endpoint to get browser WebSocket
-            if (!foundEndpoint) {
-                try {
-                    const pagesInfo = await axios.get(`http://${cleanAddress}/json`, {
-                        timeout: 5000
-                    });
-                    if (pagesInfo.data && Array.isArray(pagesInfo.data) && pagesInfo.data.length > 0) {
-                        // Try to find browser target
-                        const browserTarget = pagesInfo.data.find(p => p.type === 'browser');
-                        if (browserTarget && browserTarget.webSocketDebuggerUrl) {
-                            wsEndpoint = browserTarget.webSocketDebuggerUrl;
-                            foundEndpoint = true;
-                            logger.info('Got WebSocket endpoint from /json (browser target)', { wsEndpoint });
-                        } else if (pagesInfo.data[0] && pagesInfo.data[0].webSocketDebuggerUrl) {
-                            // Use first page's WebSocket and extract browser endpoint
-                            const pageWs = pagesInfo.data[0].webSocketDebuggerUrl;
-                            // Convert page WebSocket to browser WebSocket
-                            wsEndpoint = pageWs.replace(/\/devtools\/page\/[^/]+$/, '/devtools/browser');
-                            foundEndpoint = true;
-                            logger.info('Got WebSocket endpoint from /json (converted from page)', { wsEndpoint });
-                        }
-                    }
-                } catch (e) {
-                    logger.debug('Could not get endpoint from /json', { error: e.message });
-                }
-            }
-            
-            // Method 2.5: Try /json/list endpoint (alternative)
-            if (!foundEndpoint) {
-                try {
-                    const listInfo = await axios.get(`http://${cleanAddress}/json/list`, {
-                        timeout: 5000
-                    });
-                    if (listInfo.data && Array.isArray(listInfo.data) && listInfo.data.length > 0) {
-                        const browserTarget = listInfo.data.find(p => p.type === 'browser');
-                        if (browserTarget && browserTarget.webSocketDebuggerUrl) {
-                            wsEndpoint = browserTarget.webSocketDebuggerUrl;
-                            foundEndpoint = true;
-                            logger.info('Got WebSocket endpoint from /json/list', { wsEndpoint });
-                        }
-                    }
-                } catch (e) {
-                    logger.debug('Could not get endpoint from /json/list', { error: e.message });
-                }
-            }
-            
-            // Method 3: Fallback - construct WebSocket URL manually
-            if (!foundEndpoint) {
-                wsEndpoint = `ws://${cleanAddress}/devtools/browser`;
-                logger.warn('Using fallback WebSocket endpoint', { wsEndpoint });
+
+            let endpoint = toWebSocketUrl(controller);
+            if (needsDiscovery) {
+                endpoint.pathname = endpoint.pathname.replace(/\/$/, '') + '/devtools/browser';
+                endpoint = await discoverBrowserEndpoint(controller, discoveryPaths, 5000) ?? endpoint;
             }
 
-            logger.info('Connecting to browser', { 
-                profileId: this.profileId,
-                wsEndpoint: wsEndpoint 
-            });
-
-            // Retry logic for connection with endpoint refresh
             let browser;
-            let retries = 8; // Increased retries
             let lastError;
-            let currentWsEndpoint = wsEndpoint;
-
+            const retries = 8;
             for (let attempt = 1; attempt <= retries; attempt++) {
-                try {
-                    logger.info(`Browser connection attempt ${attempt}/${retries}...`);
-                    
-                    // Try to refresh WebSocket endpoint on retries (after first attempt)
-                    if (attempt > 1 && attempt % 2 === 0) {
-                        let refreshed = false;
-                        
-                        // Try /json/version first
-                        try {
-                            const browserInfo = await axios.get(`http://${cleanAddress}/json/version`, {
-                                timeout: 3000
-                            });
-                            if (browserInfo.data && browserInfo.data.webSocketDebuggerUrl) {
-                                currentWsEndpoint = browserInfo.data.webSocketDebuggerUrl;
-                                refreshed = true;
-                                logger.info('Refreshed WebSocket endpoint from /json/version', { wsEndpoint: currentWsEndpoint });
-                            }
-                        } catch (e) {
-                            // Try /json as fallback
-                            try {
-                                const pagesInfo = await axios.get(`http://${cleanAddress}/json`, {
-                                    timeout: 3000
-                                });
-                                if (pagesInfo.data && Array.isArray(pagesInfo.data) && pagesInfo.data.length > 0) {
-                                    const browserTarget = pagesInfo.data.find(p => p.type === 'browser');
-                                    if (browserTarget && browserTarget.webSocketDebuggerUrl) {
-                                        currentWsEndpoint = browserTarget.webSocketDebuggerUrl;
-                                        refreshed = true;
-                                        logger.info('Refreshed WebSocket endpoint from /json', { wsEndpoint: currentWsEndpoint });
-                                    } else if (pagesInfo.data[0] && pagesInfo.data[0].webSocketDebuggerUrl) {
-                                        const pageWs = pagesInfo.data[0].webSocketDebuggerUrl;
-                                        currentWsEndpoint = pageWs.replace(/\/devtools\/page\/[^/]+$/, '/devtools/browser');
-                                        refreshed = true;
-                                        logger.info('Refreshed WebSocket endpoint from /json (converted)', { wsEndpoint: currentWsEndpoint });
-                                    }
-                                }
-                            } catch (e2) {
-                                // Keep using previous endpoint
-                                logger.debug('Could not refresh endpoint, using previous', { error: e2.message });
-                            }
-                        }
-                        
-                        if (!refreshed) {
-                            logger.debug('Using previous WebSocket endpoint for retry');
-                        }
-                    }
-                    
-                    browser = await puppeteer.connect({
-                        browserWSEndpoint: currentWsEndpoint,
-                        ignoreHTTPSErrors: true,
-                        defaultViewport: null // Don't override viewport - GPM handles it
-                    });
+                if (needsDiscovery && attempt > 1 && attempt % 2 === 0) {
+                    endpoint = await discoverBrowserEndpoint(controller, discoveryPaths.slice(0, 2), 3000) ?? endpoint;
+                }
 
-                    // Test connection
-                    const pages = await browser.pages();
-                    logger.info('Browser connected successfully', { 
+                let connection;
+                try {
+                    logger.info(`Browser connection attempt ${attempt}/${retries}...`, {
                         profileId: this.profileId,
-                        pagesCount: pages.length,
-                        wsEndpoint: currentWsEndpoint
+                        controller: endpoint.origin
+                    });
+                    connection = await connectBrowser(puppeteer, endpoint);
+                    const pages = await connection.pages();
+                    browser = connection;
+                    logger.info('Browser connected successfully', {
+                        profileId: this.profileId,
+                        pagesCount: pages.length
                     });
                     break;
-                } catch (e) {
-                    lastError = e;
-                    logger.warn(`Browser connection attempt ${attempt} failed`, { 
-                        error: e.message,
-                        profileId: this.profileId,
-                        wsEndpoint: currentWsEndpoint
+                } catch (error) {
+                    if (error instanceof ControllerUrlError) throw error;
+                    if (connection) await connection.disconnect();
+                    lastError = error;
+                    logger.warn(`Browser connection attempt ${attempt} failed`, {
+                        error: error.message,
+                        profileId: this.profileId
                     });
-                    
+
                     if (attempt < retries) {
-                        // Progressive wait time: 2s, 3s, 4s, 5s, etc.
                         const waitTime = Math.min(2000 + (attempt * 1000), 8000);
-                        logger.info(`Waiting ${waitTime/1000}s before retry...`);
+                        logger.info(`Waiting ${waitTime / 1000}s before retry...`);
                         await new Promise(resolve => setTimeout(resolve, waitTime));
                     }
                 }

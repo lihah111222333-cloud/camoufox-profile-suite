@@ -2,81 +2,13 @@
 
 ## SMS Provider Configuration
 
-### اختيار مزود خدمة الأرقام
+يستخدم مزود SMS Verification مفتاحه الخاص. توقّف محول 5SIM Legacy عن إرسال الطلبات لأن نقطة الاتصال القديمة تستخدم HTTP. عند اختيار المحول القديم، تتوقف العملية محلياً قبل إرسال أي مفتاح.
 
 ```env
-# SMS Provider Selection
-# Options: 'sms-verification' (default) or 'fivesim-legacy'
-SMS_PROVIDER=sms-verification
-```
-
-#### المزودون المدعومون:
-
-1. **SMS Verification** (افتراضي)
-   - API: `api.sms-verification.com`
-   - متغيرات مطلوبة:
-     ```env
-     SMS_VERIFY_API_KEY=your_api_key_here
-     SMS_VERIFY_LANG=ru  # أو 'en'
-     ```
-
-2. **5SIM Legacy** 
-   - API: `api1.5sim.net`
-   - متغيرات مطلوبة:
-     ```env
-     SMS_PROVIDER=fivesim-legacy
-     FIVESIM_API_KEY=your_api_key_here
-     # أو يمكن استخدام SMS_VERIFY_API_KEY
-     ```
-
-### إعدادات 5SIM Legacy (اختيارية)
-
-```env
-# Country (default: 'england')
-# Available: saudiarabia, england, russia, india, germany, etc.
-FIVESIM_COUNTRY=saudiarabia
-
-# Operator (default: 'any')
-# ⚠️ RECOMMENDED: Use 'any' to avoid NO_NUMBERS errors
-# Options: any, virtual58, vodafone, virtual15, etc.
-FIVESIM_OPERATOR=any
-
-# Service (default: 'go' for Google/YouTube)
-# Options: 'go' (Google/YouTube), 'fu' (Snapchat), etc.
-FIVESIM_SERVICE=go
-
-# Maximum price in dollars (default: 50)
-FIVESIM_MAX_PRICE=50
-```
-
-## مثال كامل لملف .env
-
-### استخدام SMS Verification (افتراضي)
-```env
-# SMS Provider
 SMS_PROVIDER=sms-verification
 SMS_VERIFY_API_KEY=your_sms_verify_api_key
 SMS_VERIFY_LANG=ru
 ```
-
-### استخدام 5SIM Legacy
-```env
-# SMS Provider
-SMS_PROVIDER=fivesim-legacy
-FIVESIM_API_KEY=your_5sim_api_key
-FIVESIM_COUNTRY=saudiarabia
-FIVESIM_OPERATOR=any
-FIVESIM_SERVICE=go
-FIVESIM_MAX_PRICE=50
-```
-
-**ملاحظة:** إذا لم يتم تحديد `FIVESIM_COUNTRY` أو `FIVESIM_OPERATOR` في `.env`، سيتم استخدام القيم من الكود (الدولة المحددة في `config.smsVerify.countries` والمشغل `any`).
-
-## ملاحظات
-
-- إذا لم يتم تحديد `SMS_PROVIDER`، سيتم استخدام `sms-verification` افتراضياً
-- يمكن استخدام `SMS_VERIFY_API_KEY` مع 5SIM Legacy إذا لم يتم تحديد `FIVESIM_API_KEY`
-- جميع الإعدادات الاختيارية لها قيم افتراضية معقولة
 
 ---
 
@@ -106,29 +38,41 @@ CAMOUFOX_CANVAS_NOISE=true
 # Persistent storage directory for profile cookies (datr, ig_did, ttwid) & localStorage
 CAMOUFOX_STORAGE_DIR=./profiles
 
+# URL filtering checks browser-visible destinations.
+CAMOUFOX_PORT_SCAN_MODE=url-only
+
 # Optional: run in-browser C++ fingerprint coherence audit automatically on profile startup
 CAMOUFOX_AUDIT_ON_START=false
 
 # Pre-TLS traffic recording (Necko egress/ingress NDJSON + per-profile/account attribution index)
 CAMOUFOX_RECORD_TRAFFIC=true
 
-# Capture plaintext request/response bodies inside profiles/<profileId>/traffic/payloads/
+# Record eligible request and WebSocket content. Responses without a bounded reader retain metadata.
 CAMOUFOX_RECORD_BODIES=true
 
 # Write canonical pre-TLS HTTP/1.1 & HTTP/2 wire stream to profiles/<profileId>/traffic/pre-tls-wire.log
 CAMOUFOX_RECORD_WIRE_LOG=true
 
-# Export Firefox NSS TLS 1.2/1.3 secrets to profiles/<profileId>/traffic/sslkeylog.txt
-CAMOUFOX_SSLKEYLOG=true
+# Private TLS key log for a dedicated browser process, stored in the profile .native directory
+CAMOUFOX_SSLKEYLOG=false
 
-# Optional: enable Firefox C++ Necko kernel MOZ_LOG to profiles/<profileId>/traffic/necko-pre-tls.moz_log
+# Optional: enable Firefox C++ Necko kernel MOZ_LOG for a dedicated browser in the profile .native directory
 CAMOUFOX_NECKO_MOZ_LOG=false
 CAMOUFOX_NECKO_MOZ_LOG_MODULES=timestamp,nsHttp:5,nsSocketTransport:5,nsHostResolver:4
 
-# Optional: record full Playwright HAR 1.2 archive to profiles/<profileId>/traffic/trace.har
+# Optional: export a sanitized HAR 1.2 archive to profiles/<profileId>/traffic/trace.har
 CAMOUFOX_RECORD_HAR=false
 
-# Maximum plaintext body size (in bytes) captured per request/response (default: 5MB)
+# Maximum stored body size in bytes
 CAMOUFOX_TRAFFIC_MAX_BODY_BYTES=5242880
 ```
 
+In a deployment that forces browser traffic through a controlled proxy, `CAMOUFOX_PORT_SCAN_MODE=managed-proxy` checks the selected profile proxy against `CAMOUFOX_MANAGED_EGRESS_ORIGIN`. Set the origin to the operator's existing proxy scheme, host and explicit port, without credentials. The proxy owns the policy for the resolved destination IP on every connection, including redirected requests. Its ACL must be verified at the proxy. The `transport` setting requires verified enforcement and stops if the launcher cannot provide it.
+
+On the first reopen of a profile with legacy native logs inside `traffic/`, the application keeps the original archive and its manifest together under the same profile’s private `.native/legacy-*/traffic/` directory. New diagnostics are written to the profile’s current `traffic/` directory.
+
+## Host filesystem permissions
+
+On POSIX hosts, the app sets private directory and file modes to `0700` and `0600`. These settings follow the host running Node.js.
+
+On native Windows, deploy the app in a dedicated local NTFS directory with operator-provisioned discretionary access control lists (DACLs). Limit access to the app's run account and authorized system principals. Verify the DACLs on the directories holding results, summaries, logs, browser state and native diagnostics, and on any existing files. Also check a synthetic record after creation and atomic replacement by the run account, since a new file inherits access from its containing directory. The app relies on this Windows host setup.

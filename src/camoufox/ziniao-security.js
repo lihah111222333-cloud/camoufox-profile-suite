@@ -6,9 +6,9 @@
  * Ziniao Browser V6 (`entries/main.index.js`, `workbench/main2.js`, `envkit/env-kit`,
  * `envkit/ziniao-gateway`, and the `ziniaobrowser` Chromium 137 C++ kernel):
  *
- *   1. Active Localhost / Private-LAN Port-Scan Protection (`port_scan_protection` + `checkRDP`/`checkProxy`):
- *      Blocks and logs websites attempting to probe 127.0.0.1 / localhost / [::1] / RFC1918 LAN ports
- *      (RDP 3389, VNC 5900, TeamViewer 5938, AnyDesk 7070, CDP 9222, Marionette 2828, Clash/V2Ray 7890/10808).
+ *   1. URL-Level Localhost / Private-LAN Port-Scan Guard:
+ *      Classifies the host in an intercepted request URL. Connection-level isolation requires an
+ *      egress policy that checks the actual destination before connecting, including at the proxy.
  *   2. Per-Domain Canvas & WebGL Consistency Ledger with 64-Bit Hamming Distance (`hanming_distance` +
  *      `AddCanvasFingerprint`/`AddWebGlFingerprint` + `canvas_fingerprint_skip_hosts` + `is_skip_cpu_canvas_mask`):
  *      Persists per-profile, per-domain 64-bit Canvas/WebGL hashes, computes bitwise Hamming distance
@@ -27,6 +27,8 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { readPrivateFile, writePrivateFile } from '../utils/private-storage.js';
+import { assertManagedProxyBinding, resolveNetworkPolicyMode } from './network-policy.js';
 
 /**
  * 1. Sensitive Local Ports Probed by E-Commerce & Anti-Bot Scripts
@@ -276,8 +278,8 @@ export function classifyScannedPortRisk(port) {
 }
 
 /**
- * Evaluate whether a network request is a localhost / private-LAN port-scan probe
- * that must be blocked under Ziniao-absorbed `port_scan_protection`.
+ * Evaluate the requested URL host for the localhost / private-LAN port guard.
+ * This classification uses the URL alone. It has no resolved destination or proxy peer.
  *
  * @param {string} targetUrl
  * @param {{
@@ -837,7 +839,7 @@ export class CanvasWebglConsistencyLedger {
     loadFromDisk() {
         if (!this.ledgerPath || !fs.existsSync(this.ledgerPath)) return false;
         try {
-            const raw = JSON.parse(fs.readFileSync(this.ledgerPath, 'utf8'));
+            const raw = JSON.parse(readPrivateFile(this.ledgerPath));
             if (Array.isArray(raw.entries)) {
                 this.entries.clear();
                 for (const item of raw.entries) {
@@ -858,7 +860,7 @@ export class CanvasWebglConsistencyLedger {
     saveToDisk() {
         if (!this.ledgerPath) return false;
         try {
-            fs.mkdirSync(path.dirname(this.ledgerPath), { recursive: true });
+            fs.mkdirSync(path.dirname(this.ledgerPath), { recursive: true, mode: 0o700 });
             const payload = {
                 profileId: this.profileId,
                 maxHammingDistance: this.maxHammingDistance,
@@ -866,7 +868,7 @@ export class CanvasWebglConsistencyLedger {
                 entries: Array.from(this.entries.values()),
                 driftAlerts: this.driftAlerts
             };
-            fs.writeFileSync(this.ledgerPath, JSON.stringify(payload, null, 2), 'utf8');
+            writePrivateFile(this.ledgerPath, JSON.stringify(payload, null, 2));
             return true;
         } catch {
             return false;
@@ -1652,11 +1654,21 @@ export function buildZiniaoWebRtcSecurityInitScript(options = {}) {
 })();`;
 }
 
+export function assertPrivateNetworkIsolationAvailable(portScanProtection, managedProxyBinding) {
+    const mode = resolveNetworkPolicyMode(portScanProtection);
+    if (mode === 'managed-proxy') assertManagedProxyBinding(managedProxyBinding);
+    return mode;
+}
+
 export async function attachZiniaoSecurityGuardsToContext(context, options = {}) {
+    const portProtOpts = options.portScanProtection || {};
+    const mode = assertPrivateNetworkIsolationAvailable(portProtOpts, options.managedProxyBinding);
+
     const blockedPortScans = [];
     const blockedInternalSchemes = [];
     const profileId = String(options.profileId || 'default-profile');
-    const portProtOpts = options.portScanProtection || {};
+    const portScanProtectionEnabled =
+        portProtOpts.enabled !== undefined ? Boolean(portProtOpts.enabled) : true;
     let webrtcInitScriptAttached = false;
 
     if (context && typeof context.addInitScript === 'function' && portProtOpts.enabled !== false) {
@@ -1672,8 +1684,9 @@ export async function attachZiniaoSecurityGuardsToContext(context, options = {})
 
     const getStats = () => ({
         profileId,
-        portScanProtectionEnabled:
-            portProtOpts.enabled !== undefined ? Boolean(portProtOpts.enabled) : true,
+        portScanProtectionEnabled,
+        portScanProtectionMode: portScanProtectionEnabled ? mode : 'disabled',
+        ...(mode === 'managed-proxy' ? { destinationIpPolicy: 'managed-proxy-unverified' } : {}),
         webrtcInitScriptAttached,
         blockedPortScanCount: blockedPortScans.length,
         blockedInternalSchemeCount: blockedInternalSchemes.length,

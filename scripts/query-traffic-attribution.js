@@ -20,12 +20,15 @@
  *   --signatures               List all detected anti-bot platform signatures and their causal actionStep / triggerAction
  *   --platform=<platformName>  Filter signatures & events by platform (bytedance, twitter, meta, google, arkose, cloudflare)
  *   --verify-integrity         Verify cryptographic SHA-256 event hash chain & payload manifest integrity
+ *   --export-har[=<path>]       Export HAR 1.2 to a new ./traffic.har or to the selected path
  *   --json                     Emit structured JSON output to stdout
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readCaptureFile } from '../src/camoufox/capture-io.js';
+import { resolveProfileNativeDirectory } from '../src/camoufox/profile-storage.js';
 import {
     verifyTrafficIntegrity,
     exportTrafficToHar,
@@ -35,6 +38,13 @@ import {
     parseCookieHeader,
     detectWireHeaderAnomalies,
     extractPlatformSignatures,
+    readCaptureExportBody,
+    redactDiagnosticMetadata,
+    redactDiagnosticText,
+    redactNeckoMozLogSummary,
+    redactProxyUrl,
+    redactSensitiveHeaders,
+    redactTriggerAction,
     redactUrlSecrets
 } from '../src/camoufox/traffic-recorder.js';
 
@@ -205,10 +215,9 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
  * @returns {Array<object>}
  */
 export function readNdjsonEvents(filePath) {
-    if (!filePath || !fs.existsSync(filePath)) {
-        return [];
-    }
-    const raw = fs.readFileSync(filePath, 'utf8');
+    if (!filePath) return [];
+    const raw = readCaptureFile(path.dirname(filePath), path.basename(filePath), { optional: true })?.toString('utf8');
+    if (!raw) return [];
     const lines = raw.split(/\r?\n/);
     const events = [];
     for (const line of lines) {
@@ -230,11 +239,11 @@ export function readNdjsonEvents(filePath) {
  * @returns {object|null}
  */
 function readJsonSafe(filePath) {
-    if (!filePath || !fs.existsSync(filePath)) {
-        return null;
-    }
+    if (!filePath) return null;
+    const raw = readCaptureFile(path.dirname(filePath), path.basename(filePath), { optional: true });
+    if (!raw) return null;
     try {
-        return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        return JSON.parse(raw.toString('utf8'));
     } catch {
         return null;
     }
@@ -546,7 +555,8 @@ export function listTrafficProfiles(profilesDir) {
             ? readNdjsonEvents(trafficNdjsonPath)
             : [];
 
-        const profileId = indexData?.session?.profileId || entry.name;
+        const session = shareableRecord(indexData?.session || {});
+        const profileId = session.profileId || entry.name;
         const totals = indexData?.totals || {
             totalRequests: events.filter((e) => e.type === 'egress').length,
             totalResponses: events.filter((e) => e.type === 'ingress').length,
@@ -562,15 +572,15 @@ export function listTrafficProfiles(profilesDir) {
             profileId,
             profileDir,
             trafficDir,
-            accountId: indexData?.session?.accountId ?? null,
-            accountEmail: indexData?.session?.accountEmail ?? null,
-            os: indexData?.session?.os ?? null,
-            proxyServer: indexData?.session?.proxyServer ?? null,
-            startedAt: indexData?.session?.startedAt ?? null,
-            endedAt: indexData?.session?.endedAt ?? null,
+            accountId: session.accountId ?? null,
+            accountEmail: session.accountEmail ?? null,
+            os: session.os ?? null,
+            proxyServer: session.proxyServer ?? null,
+            startedAt: session.startedAt ?? null,
+            endedAt: session.endedAt ?? null,
             totals,
             anomalyCount: anomalies.length,
-            steps: indexData?.byActionStep ? Object.keys(indexData.byActionStep) : [],
+            steps: Object.keys(indexData?.byActionStep || {}).map(redactDiagnosticText),
             domains: indexData?.byDomain ? Object.keys(indexData.byDomain) : [],
             triggers: indexData?.byTriggerAction ? Object.keys(indexData.byTriggerAction) : [],
             artifacts: {
@@ -585,33 +595,46 @@ export function listTrafficProfiles(profilesDir) {
     return summaries;
 }
 
-/**
- * Read a payload file from `trafficDir` (e.g. `payloads/req-1-abcd1234.json`),
- * returning both UTF-8 text and size info.
- *
- * @param {string} trafficDir
- * @param {string|null} relativePayloadFile
- * @returns {{ exists: boolean, fullPath: string|null, content: string|null, byteLength: number }}
- */
-function readPayloadContent(trafficDir, relativePayloadFile) {
-    if (!trafficDir || !relativePayloadFile) {
-        return { exists: false, fullPath: null, content: null, byteLength: 0 };
-    }
-    const fullPath = path.isAbsolute(relativePayloadFile)
-        ? relativePayloadFile
-        : path.join(trafficDir, relativePayloadFile);
+function capturedMimeType(record) {
+    const { headers, headersArray } = redactSensitiveHeaders(record || {});
+    return record?.mimeType || headersArray.find((header) => header.name.toLowerCase() === 'content-type')?.value ||
+        Object.entries(headers).find(([name]) => name.toLowerCase() === 'content-type')?.[1];
+}
 
-    if (!fs.existsSync(fullPath)) {
-        return { exists: false, fullPath, content: null, byteLength: 0 };
-    }
+function shareableRecord(record, { body, url = record?.url, recordBodies = true } = {}) {
+    if (!record || typeof record !== 'object') return record;
+    const { headers, headersArray, cookieObservations, bodyPreview, postData, ...metadata } = record;
+    const safe = { ...redactDiagnosticMetadata(metadata) };
+    if (safe.attribution && typeof safe.attribution === 'object') safe.attribution = { ...safe.attribution };
+    if (headers || headersArray) Object.assign(safe, redactSensitiveHeaders({ headers, headersArray }));
 
-    const buf = fs.readFileSync(fullPath);
-    return {
-        exists: true,
-        fullPath,
-        content: buf.toString('utf8'),
-        byteLength: buf.byteLength
-    };
+    if (Array.isArray(cookieObservations)) {
+        safe.cookieObservations = cookieObservations.filter(Boolean).map(({ value, rawValue, ...observation }) => ({
+            ...redactDiagnosticMetadata(observation), maskedValue: '[REDACTED]'
+        }));
+    }
+    if (safe.maskedPreview != null) safe.maskedPreview = '[REDACTED]';
+    if (Array.isArray(safe.platformSignatures)) {
+        safe.platformSignatures = safe.platformSignatures.filter(Boolean).map((signature) => ({
+            ...signature, maskedPreview: '[REDACTED]'
+        }));
+    }
+    for (const target of [safe, safe.attribution]) {
+        if (!target || typeof target !== 'object') continue;
+        if (target.triggerAction) target.triggerAction = redactTriggerAction(target.triggerAction);
+        if (Object.hasOwn(target, 'accountEmail')) target.accountEmail = null;
+        if (target.proxyServer) target.proxyServer = redactUrlSecrets(redactProxyUrl(target.proxyServer)) || null;
+    }
+    if (Object.hasOwn(record, 'payloadFile')) safe.payloadFile = body?.payloadFile || null;
+    if (bodyPreview != null || postData != null) {
+        const preview = body?.text === null ? null : readCaptureExportBody(null, {
+            recordBodies: record.recordBodies, bodyOmittedReason: record.bodyOmittedReason,
+            bodyPreview, postData
+        }, { recordBodies, url, mimeType: capturedMimeType(record) }).text;
+        if (Object.hasOwn(record, 'bodyPreview')) safe.bodyPreview = preview;
+        if (Object.hasOwn(record, 'postData')) safe.postData = preview;
+    }
+    return safe;
 }
 
 /**
@@ -668,7 +691,7 @@ function buildRedirectChain(correlationId, events) {
         chain.push({
             correlationId: cursor,
             method: eg?.method || inEv?.method || 'GET',
-            url: eg?.url || inEv?.url || '',
+            url: redactUrlSecrets(eg?.url || inEv?.url),
             status: inEv?.status ?? null,
             redirectedFromCorrelationId:
                 eg?.redirectedFromCorrelationId || inEv?.redirectedFromCorrelationId || null
@@ -690,6 +713,7 @@ function buildRedirectChain(correlationId, events) {
  * @param {string} params.correlationId
  * @param {Array<object>} params.events
  * @param {Array<object>} [params.anomalies=[]]
+ * @param {boolean} [params.recordBodies=true]
  * @returns {object}
  */
 export function reconstructTransactionWireDump({
@@ -697,17 +721,27 @@ export function reconstructTransactionWireDump({
     trafficDir,
     correlationId,
     events = [],
-    anomalies = []
+    anomalies = [],
+    recordBodies = true
 }) {
     const corrEvents = events.filter((e) => e && e.correlationId === correlationId);
-    const egress = corrEvents.find((e) => e.type === 'egress') || null;
-    const ingress = corrEvents.find((e) => e.type === 'ingress') || null;
-    const finished = corrEvents.find((e) => e.type === 'request-finished') || null;
-    const failed = corrEvents.find((e) => e.type === 'request-failed') || null;
-    const securityBlock = corrEvents.find((e) => e.type === 'security-block') || null;
-    const wsEvents = corrEvents.filter((e) => typeof e.type === 'string' && e.type.startsWith('ws-'));
+    const request = corrEvents.find((e) => e.type === 'egress') || null;
+    const response = corrEvents.find((e) => e.type === 'ingress') || null;
+    const requestUrl = request?.url || response?.url;
+    const responseUrl = response?.url || requestUrl;
+    const project = (record, options) => shareableRecord(record, { recordBodies, ...options });
+    const reqBody = readCaptureExportBody(trafficDir, request, { recordBodies, url: requestUrl, mimeType: capturedMimeType(request) });
+    const resBody = readCaptureExportBody(trafficDir, response, { recordBodies, url: responseUrl, mimeType: capturedMimeType(response) });
+    const egress = project(request, { body: reqBody, url: requestUrl });
+    const ingress = project(response, { body: resBody, url: responseUrl });
+    const finished = project(corrEvents.find((e) => e.type === 'request-finished') || null);
+    const failed = project(corrEvents.find((e) => e.type === 'request-failed') || null);
+    const securityBlock = project(corrEvents.find((e) => e.type === 'security-block') || null);
+    const wsEvents = corrEvents.filter((e) => typeof e.type === 'string' && e.type.startsWith('ws-'))
+        .map((event) => project(event));
 
-    const matchingAnomalies = anomalies.filter((a) => a && a.correlationId === correlationId);
+    const matchingAnomalies = anomalies.filter((a) => a && a.correlationId === correlationId)
+        .map((anomaly) => project(anomaly));
     const redirectChain = buildRedirectChain(correlationId, events);
 
     const primaryEvent = egress || ingress || failed || securityBlock || finished || wsEvents[0] || null;
@@ -721,15 +755,8 @@ export function reconstructTransactionWireDump({
         extractTriggerAction(primaryEvent) ||
         null;
 
-    const reqPayloadDisk = readPayloadContent(trafficDir, egress?.payloadFile || null);
-    const resPayloadDisk = readPayloadContent(trafficDir, ingress?.payloadFile || null);
-
-    const requestPayload = reqPayloadDisk.exists
-        ? reqPayloadDisk.content
-        : (egress?.bodyPreview ?? egress?.postData ?? null);
-    const responsePayload = resPayloadDisk.exists
-        ? resPayloadDisk.content
-        : (ingress?.bodyPreview ?? null);
+    const requestPayload = reqBody.text;
+    const responsePayload = resBody.text;
 
     const durationMs = finished?.durationMs ?? failed?.durationMs ?? null;
     const timing = finished?.timing ?? null;
@@ -794,7 +821,7 @@ export function reconstructTransactionWireDump({
             egress.searchParams && Object.keys(egress.searchParams).length > 0
                 ? `?${new URLSearchParams(egress.searchParams).toString()}`
                 : '';
-        const targetPath = `${egress.pathname || '/'}${searchStr}`;
+        const targetPath = redactUrlSecrets(`${egress.pathname || '/'}${searchStr}`);
         lines.push(`${egress.method || 'GET'} ${targetPath} HTTP/1.1`);
         lines.push(`X-Camoufox-Full-Url: ${egress.url || ''}`);
 
@@ -885,10 +912,10 @@ export function reconstructTransactionWireDump({
         wsEvents,
         requestPayload,
         requestPayloadFile: egress?.payloadFile || null,
-        requestPayloadExistsOnDisk: reqPayloadDisk.exists,
+        requestPayloadExistsOnDisk: reqBody.bytes !== null,
         responsePayload,
         responsePayloadFile: ingress?.payloadFile || null,
-        responsePayloadExistsOnDisk: resPayloadDisk.exists,
+        responsePayloadExistsOnDisk: resBody.bytes !== null,
         anomalies: matchingAnomalies,
         wireDump
     };
@@ -981,20 +1008,30 @@ function buildTransactionsList(events) {
     return Array.from(txMap.values());
 }
 
-/**
- * Rebuild cookieLineage map from recorded NDJSON events when attribution-index.json
- * does not already contain a `cookieLineage` block.
- *
- * @param {Array<object>} events
- * @returns {Record<string, object>}
- */
+function cookieObservationsForEvent(event) {
+    if (Array.isArray(event.cookieObservations)) {
+        return event.cookieObservations.filter((item) => typeof item?.name === 'string' && item.name);
+    }
+    const headerName = event.type === 'ingress' ? 'set-cookie' : 'cookie';
+    const headers = (Array.isArray(event.headersArray) ? event.headersArray : [])
+        .filter((header) => String(header?.name).toLowerCase() === headerName && header.value)
+        .map((header) => String(header.value));
+    if (headers.length === 0) {
+        for (const [name, value] of Object.entries(event.headers || {})) {
+            if (name.toLowerCase() === headerName && value) headers.push(String(value));
+        }
+    }
+    return event.type === 'ingress'
+        ? headers.flatMap((header) => header.split(/\r?\n/).map(parseSetCookieHeader).filter(Boolean))
+        : headers.flatMap(parseCookieHeader);
+}
+
+/** Rebuild the lineage from recorded observations, with legacy header parsing as a fallback. */
 function buildCookieLineageFromEvents(events = []) {
     const lineageMap = new Map();
 
     for (const ev of events) {
-        if (!ev || typeof ev !== 'object') continue;
-        const headers = ev.headers || {};
-        const headersArray = Array.isArray(ev.headersArray) ? ev.headersArray : [];
+        if (!ev || (ev.type !== 'ingress' && ev.type !== 'egress')) continue;
         const correlationId = ev.correlationId || null;
         const actionStep = extractActionStep(ev) || 'init';
         const triggerAction = extractTriggerAction(ev);
@@ -1002,161 +1039,136 @@ function buildCookieLineageFromEvents(events = []) {
         const timestamp = ev.timestamp || null;
         const host = extractHost(ev) || null;
 
+        const observedCookies = cookieObservationsForEvent(ev);
         if (ev.type === 'ingress') {
-            const rawSetCookies = [];
-            for (const h of headersArray) {
-                if (h && String(h.name || '').toLowerCase() === 'set-cookie' && h.value) {
-                    rawSetCookies.push(String(h.value));
-                }
-            }
-            if (rawSetCookies.length === 0) {
-                for (const [k, v] of Object.entries(headers)) {
-                    if (String(k).toLowerCase() === 'set-cookie' && v) {
-                        rawSetCookies.push(String(v));
+            for (const parsed of observedCookies) {
+                let entry = lineageMap.get(parsed.name);
+                if (!entry) {
+                    entry = {
+                        name: parsed.name,
+                        isAntiBotToken: Boolean(parsed.isAntiBotToken),
+                        domain: parsed.domain ?? host,
+                        path: parsed.path ?? '/',
+                        secure: Boolean(parsed.secure),
+                        httpOnly: Boolean(parsed.httpOnly),
+                        sameSite: parsed.sameSite ?? null,
+                        firstSetAt: timestamp,
+                        firstSetByCorrelationId: correlationId,
+                        firstSetAtStep: actionStep,
+                        firstSetByTrigger: triggerActionId,
+                        firstSetUrl: ev.url || null,
+                        lastSetAt: timestamp,
+                        lastSetByCorrelationId: correlationId,
+                        lastSetAtStep: actionStep,
+                        lastValueSha256: null,
+                        lastMaskedValue: null,
+                        mutationsCount: 0,
+                        sentCount: 0,
+                        lastSentAt: null,
+                        lastSentByCorrelationId: null,
+                        lastSentAtStep: null,
+                        matchesLatestSetCookie: null,
+                        valueHistory: [],
+                        sentInCorrelationIds: new Set()
+                    };
+                    lineageMap.set(parsed.name, entry);
+                } else {
+                    if (parsed.domain) entry.domain = parsed.domain;
+                    if (parsed.path) entry.path = parsed.path;
+                    entry.secure = Boolean(parsed.secure);
+                    entry.httpOnly = Boolean(parsed.httpOnly);
+                    if (parsed.sameSite) entry.sameSite = parsed.sameSite;
+                    if (!entry.firstSetAt) {
+                        entry.firstSetAt = timestamp;
+                        entry.firstSetByCorrelationId = correlationId;
+                        entry.firstSetAtStep = actionStep;
+                        entry.firstSetByTrigger = triggerActionId;
+                        entry.firstSetUrl = ev.url || null;
                     }
                 }
-            }
 
-            for (const rawBlock of rawSetCookies) {
-                for (const line of String(rawBlock).split(/\r?\n/)) {
-                    const parsed = parseSetCookieHeader(line);
-                    if (!parsed) continue;
-                    let entry = lineageMap.get(parsed.name);
-                    if (!entry) {
-                        entry = {
-                            name: parsed.name,
-                            isAntiBotToken: Boolean(parsed.isAntiBotToken),
-                            domain: parsed.domain ?? host,
-                            path: parsed.path ?? '/',
-                            secure: Boolean(parsed.secure),
-                            httpOnly: Boolean(parsed.httpOnly),
-                            sameSite: parsed.sameSite ?? null,
-                            firstSetAt: timestamp,
-                            firstSetByCorrelationId: correlationId,
-                            firstSetAtStep: actionStep,
-                            firstSetByTrigger: triggerActionId,
-                            firstSetUrl: ev.url || null,
-                            lastSetAt: timestamp,
-                            lastSetByCorrelationId: correlationId,
-                            lastSetAtStep: actionStep,
-                            lastValueSha256: null,
-                            lastMaskedValue: null,
-                            mutationsCount: 0,
-                            sentCount: 0,
-                            lastSentAt: null,
-                            lastSentByCorrelationId: null,
-                            lastSentAtStep: null,
-                            matchesLatestSetCookie: null,
-                            valueHistory: [],
-                            sentInCorrelationIds: new Set()
-                        };
-                        lineageMap.set(parsed.name, entry);
-                    } else {
-                        if (parsed.domain) entry.domain = parsed.domain;
-                        if (parsed.path) entry.path = parsed.path;
-                        entry.secure = Boolean(parsed.secure);
-                        entry.httpOnly = Boolean(parsed.httpOnly);
-                        if (parsed.sameSite) entry.sameSite = parsed.sameSite;
-                        if (!entry.firstSetAt) {
-                            entry.firstSetAt = timestamp;
-                            entry.firstSetByCorrelationId = correlationId;
-                            entry.firstSetAtStep = actionStep;
-                            entry.firstSetByTrigger = triggerActionId;
-                            entry.firstSetUrl = ev.url || null;
-                        }
-                    }
-
-                    if (entry.lastValueSha256 !== parsed.valueSha256) {
-                        entry.mutationsCount += 1;
-                    }
-                    entry.lastSetAt = timestamp;
-                    entry.lastSetByCorrelationId = correlationId;
-                    entry.lastSetAtStep = actionStep;
-                    entry.lastValueSha256 = parsed.valueSha256;
-                    entry.lastMaskedValue = parsed.maskedValue;
-                    entry.valueHistory.push({
-                        correlationId,
-                        actionStep,
-                        triggerActionId,
-                        timestamp,
-                        status: ev.status ?? null,
-                        valueSha256: parsed.valueSha256,
-                        maskedValue: parsed.maskedValue,
-                        isDeleted: Boolean(parsed.isDeleted)
-                    });
+                if (entry.lastValueSha256 !== parsed.valueSha256) {
+                    entry.mutationsCount += 1;
                 }
+                entry.lastSetAt = timestamp;
+                entry.lastSetByCorrelationId = correlationId;
+                entry.lastSetAtStep = actionStep;
+                entry.lastValueSha256 = parsed.valueSha256;
+                entry.lastMaskedValue = '[REDACTED]';
+                entry.valueHistory.push({
+                    correlationId,
+                    actionStep,
+                    triggerActionId,
+                    timestamp,
+                    status: ev.status ?? null,
+                    valueSha256: parsed.valueSha256,
+                    maskedValue: '[REDACTED]',
+                    isDeleted: Boolean(parsed.isDeleted)
+                });
             }
-        } else if (ev.type === 'egress') {
-            const rawCookies = [];
-            for (const h of headersArray) {
-                if (h && String(h.name || '').toLowerCase() === 'cookie' && h.value) {
-                    rawCookies.push(String(h.value));
+        } else {
+            for (const cookie of observedCookies) {
+                let entry = lineageMap.get(cookie.name);
+                if (!entry) {
+                    entry = {
+                        name: cookie.name,
+                        isAntiBotToken: Boolean(cookie.isAntiBotToken),
+                        domain: host,
+                        path: '/',
+                        secure: String(ev.url || '').startsWith('https://'),
+                        httpOnly: false,
+                        sameSite: null,
+                        firstSetAt: null,
+                        firstSetByCorrelationId: null,
+                        firstSetAtStep: null,
+                        firstSetByTrigger: null,
+                        firstSetUrl: null,
+                        lastSetAt: null,
+                        lastSetByCorrelationId: null,
+                        lastSetAtStep: null,
+                        lastValueSha256: null,
+                        lastMaskedValue: '[REDACTED]',
+                        mutationsCount: 0,
+                        sentCount: 0,
+                        lastSentAt: null,
+                        lastSentByCorrelationId: null,
+                        lastSentAtStep: null,
+                        matchesLatestSetCookie: false,
+                        valueHistory: [],
+                        sentInCorrelationIds: new Set()
+                    };
+                    lineageMap.set(cookie.name, entry);
                 }
-            }
-            if (rawCookies.length === 0) {
-                for (const [k, v] of Object.entries(headers)) {
-                    if (String(k).toLowerCase() === 'cookie' && v) {
-                        rawCookies.push(String(v));
-                    }
+                if (correlationId) {
+                    entry.sentInCorrelationIds.add(correlationId);
                 }
-            }
-
-            for (const rawCookieHeader of rawCookies) {
-                for (const cookie of parseCookieHeader(rawCookieHeader)) {
-                    let entry = lineageMap.get(cookie.name);
-                    if (!entry) {
-                        entry = {
-                            name: cookie.name,
-                            isAntiBotToken: Boolean(cookie.isAntiBotToken),
-                            domain: host,
-                            path: '/',
-                            secure: String(ev.url || '').startsWith('https://'),
-                            httpOnly: false,
-                            sameSite: null,
-                            firstSetAt: null,
-                            firstSetByCorrelationId: null,
-                            firstSetAtStep: null,
-                            firstSetByTrigger: null,
-                            firstSetUrl: null,
-                            lastSetAt: null,
-                            lastSetByCorrelationId: null,
-                            lastSetAtStep: null,
-                            lastValueSha256: null,
-                            lastMaskedValue: cookie.maskedValue,
-                            mutationsCount: 0,
-                            sentCount: 0,
-                            lastSentAt: null,
-                            lastSentByCorrelationId: null,
-                            lastSentAtStep: null,
-                            matchesLatestSetCookie: false,
-                            valueHistory: [],
-                            sentInCorrelationIds: new Set()
-                        };
-                        lineageMap.set(cookie.name, entry);
-                    }
-                    if (correlationId) {
-                        entry.sentInCorrelationIds.add(correlationId);
-                    }
-                    entry.sentCount += 1;
-                    entry.lastSentAt = timestamp;
-                    entry.lastSentByCorrelationId = correlationId;
-                    entry.lastSentAtStep = actionStep;
-                    entry.matchesLatestSetCookie = Boolean(
-                        entry.lastValueSha256 && cookie.valueSha256 === entry.lastValueSha256
-                    );
-                }
+                entry.sentCount += 1;
+                entry.lastSentAt = timestamp;
+                entry.lastSentByCorrelationId = correlationId;
+                entry.lastSentAtStep = actionStep;
+                entry.matchesLatestSetCookie = Boolean(
+                    entry.lastValueSha256 && cookie.valueSha256 === entry.lastValueSha256
+                );
             }
         }
     }
 
-    const out = {};
-    for (const [name, entry] of lineageMap.entries()) {
-        out[name] = {
-            ...entry,
-            sentInCorrelationIds: Array.from(entry.sentInCorrelationIds)
-        };
-    }
-    return out;
+    return Object.fromEntries(Array.from(lineageMap, ([name, entry]) => [name, {
+        ...entry, sentInCorrelationIds: Array.from(entry.sentInCorrelationIds)
+    }]));
+}
+
+function redactStoredCookieLineage(lineage) {
+    return Object.fromEntries(Object.entries(lineage).filter(([, entry]) => entry && typeof entry === 'object')
+        .map(([name, { value, rawValue, lastValue, lastMaskedValue, valueHistory, ...metadata }]) => [name, {
+            ...redactDiagnosticMetadata(metadata),
+            lastMaskedValue: lastMaskedValue == null ? null : '[REDACTED]',
+            valueHistory: Array.isArray(valueHistory)
+                ? valueHistory.filter(Boolean).map(({ value, rawValue, maskedValue, ...previous }) => ({
+                    ...redactDiagnosticMetadata(previous), maskedValue: '[REDACTED]'
+                }))
+                : []
+        }]));
 }
 
 /**
@@ -1263,10 +1275,23 @@ function buildPlatformSignaturesFromEvents(events = [], indexData = null) {
  * @param {boolean} [options.cookies=false]
  * @param {string} [options.cookie]
  * @param {string} [options.cookieName]
+ * @param {boolean} [options.recordBodies=true]
  * @returns {object}
  */
 export function queryProfileTraffic(options = {}) {
     const profilesDir = resolveProfilesDir(options.profilesDir);
+    const verifyResolvedCapture = ({ profileDir, trafficDir }) => {
+        const trustedLocal = options.trustedLocal === true;
+        if (options.trafficDir) {
+            return verifyTrafficIntegrity(trafficDir, { nativeDir: options.nativeDir, trustedLocal });
+        }
+        if (path.dirname(path.resolve(profileDir)) !== profilesDir) {
+            throw new Error('Expected a direct Camoufox profile directory for integrity verification');
+        }
+        const nativeDir = resolveProfileNativeDirectory(path.basename(profileDir), profilesDir, { trustedLocal });
+        const captureDir = nativeDir ? path.join(path.dirname(nativeDir), 'traffic') : trafficDir;
+        return verifyTrafficIntegrity(captureDir, { nativeDir, trustedLocal });
+    };
     let targetProfileId = options.profile || options.profileId || null;
     const correlationId =
         options.dumpWire || options.correlation || options.correlationId || null;
@@ -1355,7 +1380,7 @@ export function queryProfileTraffic(options = {}) {
             };
         } else if (candidates.length > 1) {
             const perProfile = candidates.map((cand) => {
-                const check = verifyTrafficIntegrity(cand.trafficDir);
+                const check = verifyResolvedCapture(cand);
                 return {
                     profileId: cand.profileId,
                     trafficDir: cand.trafficDir,
@@ -1373,6 +1398,10 @@ export function queryProfileTraffic(options = {}) {
                 profileId: 'all-profiles',
                 profilesDir,
                 valid: allValid,
+                scope: perProfile.every((profile) => profile.scope === 'profile') ? 'profile' : 'capture',
+                unverifiedNativeArtifacts: perProfile.flatMap((profile) =>
+                    profile.unverifiedNativeArtifacts.map((name) => `${profile.profileId}/${name}`)
+                ),
                 eventCount: totalEvents,
                 verifiedPayloads: totalPayloads,
                 chainHeadHash: perProfile[perProfile.length - 1]?.chainHeadHash || '0'.repeat(64),
@@ -1400,7 +1429,7 @@ export function queryProfileTraffic(options = {}) {
     const { profileId, profileDir, trafficDir } = resolvedPaths;
 
     if (options.verifyIntegrity) {
-        const integrityResult = verifyTrafficIntegrity(trafficDir);
+        const integrityResult = verifyResolvedCapture(resolvedPaths);
         return {
             mode: 'verify-integrity',
             profileId,
@@ -1417,8 +1446,8 @@ export function queryProfileTraffic(options = {}) {
             options.exportHar.trim().length > 0 &&
             options.exportHar !== 'true'
                 ? path.resolve(options.exportHar)
-                : path.join(trafficDir, 'traffic.har');
-        const harResult = exportTrafficToHar(trafficDir, customHarPath, { profileId });
+                : undefined;
+        const harResult = exportTrafficToHar(trafficDir, customHarPath, { profileId }, { recordBodies: options.recordBodies });
         return {
             mode: 'export-har',
             profileId,
@@ -1442,17 +1471,20 @@ export function queryProfileTraffic(options = {}) {
 
     const allEvents = readNdjsonEvents(trafficNdjsonPath);
     const indexData = readJsonSafe(attributionIndexPath);
-    const fullCookieLineage =
+    const recordBodies = options.recordBodies !== false && indexData?.session?.recordBodies !== false;
+    const project = (record) => shareableRecord(record, { recordBodies });
+    const fullCookieLineage = redactStoredCookieLineage(
         indexData?.cookieLineage &&
         typeof indexData.cookieLineage === 'object' &&
         Object.keys(indexData.cookieLineage).length > 0
             ? indexData.cookieLineage
-            : buildCookieLineageFromEvents(allEvents);
-    const neckoMozLog = indexData?.neckoMozLog || parseNeckoMozLog(neckoMozLogPath);
+            : buildCookieLineageFromEvents(allEvents)
+    );
+    const neckoMozLog = redactNeckoMozLogSummary(indexData?.neckoMozLog) || null;
 
     if (cookiesRequested) {
         if (cookieNameFilter) {
-            let matchedEntry = fullCookieLineage[cookieNameFilter] || null;
+            let matchedEntry = Object.hasOwn(fullCookieLineage, cookieNameFilter) ? fullCookieLineage[cookieNameFilter] : null;
             if (!matchedEntry) {
                 const lowerTarget = cookieNameFilter.toLowerCase();
                 for (const [k, v] of Object.entries(fullCookieLineage)) {
@@ -1522,7 +1554,7 @@ export function queryProfileTraffic(options = {}) {
         recordMatchesFilters(sig, filters, txStatusByCorrelation, {
             useTransactionStatusFallback: true
         })
-    );
+    ).map(project);
     const filteredByPlatform = {};
     for (const sig of filteredSignatures) {
         if (!sig || !sig.platform) continue;
@@ -1624,7 +1656,8 @@ export function queryProfileTraffic(options = {}) {
             trafficDir,
             correlationId,
             events: allEvents,
-            anomalies: rawAnomalies
+            anomalies: rawAnomalies,
+            recordBodies
         });
     }
 
@@ -1634,14 +1667,14 @@ export function queryProfileTraffic(options = {}) {
             useTransactionStatusFallback: true,
             platformCorrelations
         })
-    );
+    ).map(project);
 
     const filteredEvents = allEvents.filter((event) =>
         recordMatchesFilters(event, filters, txStatusByCorrelation, {
             useTransactionStatusFallback: false,
             platformCorrelations
         })
-    );
+    ).map(project);
 
     // Build transactions matching filters (using transaction status fallback so egress+ingress stay paired)
     const eventsForTransactions = allEvents.filter((event) =>
@@ -1650,7 +1683,8 @@ export function queryProfileTraffic(options = {}) {
             platformCorrelations
         })
     );
-    const transactions = buildTransactionsList(eventsForTransactions);
+    const transactions = buildTransactionsList(eventsForTransactions.map(project));
+    const session = project(indexData?.session || { profileId });
 
     if (filters.anomaliesOnly) {
         return {
@@ -1659,7 +1693,7 @@ export function queryProfileTraffic(options = {}) {
             profileDir,
             trafficDir,
             filters,
-            session: indexData?.session || { profileId },
+            session,
             totals: indexData?.totals || null,
             count: filteredAnomalies.length,
             anomalies: filteredAnomalies,
@@ -1673,7 +1707,7 @@ export function queryProfileTraffic(options = {}) {
         profileDir,
         trafficDir,
         filters,
-        session: indexData?.session || { profileId },
+        session,
         artifacts: {
             trafficNdjsonPath: fs.existsSync(trafficNdjsonPath) ? trafficNdjsonPath : null,
             attributionIndexPath: fs.existsSync(attributionIndexPath) ? attributionIndexPath : null,
@@ -1688,8 +1722,12 @@ export function queryProfileTraffic(options = {}) {
                 (e) => e.type === 'request-failed' || e.type === 'security-block'
             ).length
         },
-        byActionStep: indexData?.byActionStep || {},
-        byTriggerAction: indexData?.byTriggerAction || {},
+        byActionStep: Object.fromEntries(Object.entries(indexData?.byActionStep || {}).map(([name, stats]) => [
+            redactDiagnosticText(name), redactDiagnosticMetadata(stats)
+        ])),
+        byTriggerAction: Object.fromEntries(Object.entries(indexData?.byTriggerAction || {}).map(([id, stats]) => [
+            id, redactTriggerAction(redactDiagnosticMetadata(stats))
+        ])),
         byDomain: indexData?.byDomain || {},
         cookieLineage: fullCookieLineage,
         platformSignatures: {
@@ -1730,6 +1768,10 @@ export function formatCliReport(result) {
             : 'INVALID (TAMPERING OR CORRUPTION DETECTED)';
         lines.push(`🔐 Traffic Cryptographic Integrity Verification — Profile: ${result.profileId}`);
         lines.push(`   Status           : ${statusText}`);
+        lines.push(`   Scope            : ${result.scope}`);
+        if (result.unverifiedNativeArtifacts?.length) {
+            lines.push(`   Unverified profile files: ${result.unverifiedNativeArtifacts.join(', ')}`);
+        }
         lines.push(`   Chained Events   : ${result.eventCount}`);
         lines.push(`   Verified Payloads: ${result.verifiedPayloads}`);
         lines.push(`   Chain Head Hash  : ${result.chainHeadHash}`);
@@ -1898,7 +1940,7 @@ export function runCli(argv = process.argv.slice(2)) {
                 '  --signatures                List all detected anti-bot platform signatures and causal step/trigger',
                 '  --platform=<platformName>   Filter signatures & events by platform (bytedance, twitter, meta, google, arkose, cloudflare)',
                 '  --verify-integrity          Verify SHA-256 tamper-evident hash chain & payload manifest',
-                '  --export-har[=<path>]       Export recorded profile traffic to W3C HAR 1.2 archive',
+                '  --export-har[=<path>]       Export HAR 1.2 to a new ./traffic.har or to the selected path',
                 '  --json                      Output structured JSON'
             ].join('\n')
         );

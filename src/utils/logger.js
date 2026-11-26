@@ -3,9 +3,9 @@
  * نظام السجلات للتطبيق
  */
 
-import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { appendPrivateFile, ensurePrivateDirectory } from './private-storage.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,22 +20,51 @@ const LOG_LEVELS = {
 const LOG_LEVEL = process.env.LOG_LEVEL?.toUpperCase() || 'INFO';
 const LOG_DIR = path.join(__dirname, '../../logs');
 
-// Ensure logs directory exists
-if (!fs.existsSync(LOG_DIR)) {
-    fs.mkdirSync(LOG_DIR, { recursive: true });
+try {
+    ensurePrivateDirectory(LOG_DIR);
+} catch {
+    throw new Error('Could not secure the application log directory');
 }
 
 const logFile = path.join(LOG_DIR, `app-${new Date().toISOString().split('T')[0]}.log`);
 
+const REDACTED_FIELDS = new Set([
+    'code', 'otp', 'otpcode', 'phonecode', 'verificationcode', 'lastcode',
+    'password', 'passwd', 'proxypassword', 'passphrase', 'passcode',
+    'key', 'apikey', 'omocaptchakey', 'token', 'secret', 'credential', 'credentials',
+    'authorization', 'cookie', 'setcookie',
+    'expected', 'actual', 'entered', 'currentvalue', 'text',
+    'stack', 'errormessage', 'message', 'response'
+]);
+const ERROR_NAMES = new Set(['Error', 'TypeError', 'RangeError', 'SyntaxError', 'TimeoutError', 'AbortError']);
+
+function getErrorType(error) {
+    return ERROR_NAMES.has(error.name) ? error.name : 'Error';
+}
+
 function safeStringify(data) {
     const seen = new WeakSet();
     try {
-        return JSON.stringify(data, (_key, value) => {
+        if (data instanceof Error) return JSON.stringify({ name: getErrorType(data) });
+        return JSON.stringify(data, (key, value) => {
+            const field = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+            if (field === 'error' || field === 'err') {
+                return value instanceof Error ? { name: getErrorType(value) } : '[Redacted]';
+            }
+            if (REDACTED_FIELDS.has(field) || field.endsWith('apikey')) return '[Redacted]';
+            if (field.endsWith('url') && typeof value === 'string') {
+                try {
+                    const origin = new URL(value).origin;
+                    return origin === 'null' ? '[Redacted]' : origin;
+                } catch {
+                    return '[Redacted]';
+                }
+            }
             if (typeof value === 'bigint') {
                 return value.toString();
             }
             if (value instanceof Error) {
-                return { name: value.name, message: value.message, stack: value.stack };
+                return { name: getErrorType(value) };
             }
             if (typeof value === 'object' && value !== null) {
                 if (seen.has(value)) {
@@ -46,7 +75,7 @@ function safeStringify(data) {
             return value;
         });
     } catch {
-        return String(data);
+        return '"[Unserializable log data]"';
     }
 }
 
@@ -77,9 +106,9 @@ function writeLog(level, message, data = null) {
 
     // File output
     try {
-        fs.appendFileSync(logFile, formatted);
-    } catch (error) {
-        console.error('Failed to write to log file:', error.message);
+        appendPrivateFile(logFile, formatted);
+    } catch {
+        console.error('Failed to write to the application log file');
     }
 }
 

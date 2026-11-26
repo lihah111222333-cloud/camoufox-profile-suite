@@ -3,6 +3,7 @@
  * توليد الأسماء العشوائية
  */
 
+import { randomInt } from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -77,21 +78,22 @@ class NameGenerator {
      * توليد كلمة مرور قوية
      */
     generatePassword(length = 16) {
-        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*';
-        const arr = [
-            'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[Math.floor(Math.random() * 26)],
-            'abcdefghijklmnopqrstuvwxyz'[Math.floor(Math.random() * 26)],
-            '0123456789'[Math.floor(Math.random() * 10)],
-            '!@#$%^&*'[Math.floor(Math.random() * 8)]
+        const groups = [
+            'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+            'abcdefghijklmnopqrstuvwxyz',
+            '0123456789',
+            '!@#$%^&*'
         ];
+        const chars = groups.join('');
+        const arr = groups.map(group => group[randomInt(group.length)]);
         
         for (let i = arr.length; i < length; i++) {
-            arr.push(chars[Math.floor(Math.random() * chars.length)]);
+            arr.push(chars[randomInt(chars.length)]);
         }
         
         // Unbiased Fisher-Yates shuffle
         for (let i = arr.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
+            const j = randomInt(i + 1);
             const tmp = arr[i];
             arr[i] = arr[j];
             arr[j] = tmp;

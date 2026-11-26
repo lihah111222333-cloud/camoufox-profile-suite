@@ -8,9 +8,6 @@
 # GoLogin API Configuration (if you use GoLogin paths — optional for GPM/Dolphin-only flows)
 GOLOGIN_API_KEY=your_gologin_api_key_here
 
-# OMO Captcha Extension API Key
-OMOCAPTCHA_KEY=your_omocaptcha_key_here
-
 # SMS Verification API Configuration
 SMS_VERIFY_API_KEY=your_sms_verify_api_key_here
 SMS_VERIFY_LANG=ru

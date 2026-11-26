@@ -42,7 +42,7 @@
 
 ## حول المشروع (About)
 
-**منشئ حسابات Gmail** أداة أتمتة بـ **Node.js** لتشغيل تدفق **إنشاء حساب Google / Gmail** داخل **بروفايل متصفح مضاد للبصمة** ([GPM Login](https://gpmlogin.com/) أو [Dolphin Anty](https://dolphin-anty.com/))، مع الربط عبر **Puppeteer**، وحل **reCAPTCHA** عبر إضافة **OMO Captcha**، وإكمال **التحقق بالهاتف** عبر واجهات **SMS** (SMS Verification أو 5SIM Legacy). يدعم **البروكسيات**، **إدخالاً شبيهاً بالإنسان**، وتشغيلاً **متوازياً** مع حفظ النتائج في JSON وسجلات.
+**منشئ حسابات Gmail** أداة أتمتة بـ **Node.js** لتشغيل تدفق **إنشاء حساب Google / Gmail** داخل **بروفايل متصفح مضاد للبصمة** ([GPM Login](https://gpmlogin.com/) أو [Dolphin Anty](https://dolphin-anty.com/))، مع الربط عبر **Puppeteer**، وحل **reCAPTCHA** عبر إضافة **OMO Captcha**، وإكمال **التحقق بالهاتف** عبر واجهات **SMS** (SMS Verification). يدعم **البروكسيات**، **إدخالاً شبيهاً بالإنسان**، وتشغيلاً **متوازياً** مع حفظ النتائج في JSON وسجلات.
 
 | | |
 |--|--|
@@ -76,7 +76,7 @@
 ثم يستخدم **Puppeteer** للاتصال بنفس المتصفح وملء نماذج إنشاء حساب Google، مع:
 
 - **إضافة OMO Captcha** لمعالجة اختبارات مثل reCAPTCHA  
-- **مزود SMS** لتأكيد رقم الهاتف (SMS Verification أو 5SIM Legacy حسب الإعدادات)
+- **مزود SMS** لتأكيد رقم الهاتف (SMS Verification)
 
 ---
 
@@ -118,9 +118,8 @@ cp .env.example .env
 | `PROFILE_SERVICE` | `gpm` (افتراضي) أو `dolphin` لاختيار منصة البروفايلات |
 | `GPM_API_URL` | عنوان API لـ GPM Login محلياً |
 | `DOLPHIN_API_KEY`, `DOLPHIN_API_URL`, `DOLPHIN_FOLDER_ID` | إعدادات Dolphin عند اختيار `dolphin` |
-| `OMOCAPTCHA_KEY` | مفتاح خدمة OMO Captcha |
 | `SMS_VERIFY_API_KEY` | مفتاح SMS Verification (عند استخدام المزود الافتراضي) |
-| `SMS_PROVIDER` | `sms-verification` أو `fivesim-legacy` — التفاصيل في [`ENV_VARIABLES.md`](ENV_VARIABLES.md) |
+| `SMS_PROVIDER` | `sms-verification` — التفاصيل في [`ENV_VARIABLES.md`](ENV_VARIABLES.md) |
 | `ACCOUNTS_COUNT` | عدد الحسابات المطلوب إنشاؤها في التشغيلة |
 | `THREADS_COUNT` | عدد المهام المتزامنة (الخيوط) |
 
@@ -202,8 +201,8 @@ npm run list-folders
 3. **إنشاء بروفايل** باسم يتضمن بادئة `Gmail_` والوقت، ثم **تشغيله** عبر GPM أو Dolphin.  
 4. **ربط Puppeteer** بعنوان التصحيح البعيد (remote debugging) للمتصفح داخل البروفايل.  
 5. **تشغيل مسار التسجيل** في `createGmailAccount` داخل `src/gmail/creator.js`: فتح صفحات Google، ملء الحقول، سلوك بشري محاكى، كشف الصفحات (`page-detector.js`).  
-6. **طلب رقم SMS واستلام الرمز** عبر طبقة `src/providers/sms-provider.js` حسب `SMS_PROVIDER`.  
-7. **عند النجاح:** حفظ سجل في `results.json` يتضمن البريد وكلمة المرور وتفاصيل البروفايل والبروكسي وعنوان IP الظاهر للبروفايل إن وُجد.  
+6. إذا طُلبت كلمة مرور أو رمز تحقق، تتوقف المحاولة الآلية ويُطلب الإكمال اليدوي.
+7. عند النجاح تُحفظ حالة المحاولة في `results.json`. تُستبعد كلمات المرور ورموز التحقق وبيانات اعتماد البروكسي.
 8. **عند الفشل:** تسجيل الخطأ في `results.json` أيضاً.  
 9. **في جميع الأحوال:** إيقاف البروفايل في كتلة `finally` لتفريغ الموارد.
 
@@ -258,7 +257,6 @@ sequenceDiagram
   participant Pr as بروفايل GPM أو Dolphin
   participant PP as صفحة Puppeteer
   participant G as createGmailAccount
-  participant S as sms-provider
 
   M->>P: getNextProxy
   M->>N: generateAccountData
@@ -266,7 +264,6 @@ sequenceDiagram
   Pr->>PP: getBrowser / getPage
   M->>G: createGmailAccount(page, data)
   G->>PP: تنقّل وملء حقول وكابتشا وهاتف
-  G->>S: شراء رقم وانتظار الرسالة
   G-->>M: كائن النتيجة
   M->>M: saveResult إلى results.json
   M->>Pr: stop
@@ -280,14 +277,14 @@ flowchart TD
   B --> C[ملء الاسم والبيانات الأولى]
   C --> D{حالة الصفحة}
   D -->|اقتراحات بريد| E[اختيار مقترح أو مخصص]
-  D -->|كلمة المرور| F[تعيين كلمة المرور]
+  D -->|كلمة المرور| F[تحتاج إلى إكمال يدوي]
   D -->|تاريخ الميلاد والجنس| G[fillBirthdayAndGenderForm]
   E --> D
-  F --> D
   G --> H[انتظار reCAPTCHA وOMO]
   H --> I[handlePhoneVerification]
-  I --> J[completeAccountCreation]
-  J --> K[إرجاع بيانات الدخول والميتاداتا]
+  I -->|خطوة اختيارية| J[completeAccountCreation]
+  I -->|يلزم رمز| F
+  J --> K[إرجاع حالة المحاولة]
 ```
 
 ### جدول — نموذج التزامن
@@ -316,9 +313,9 @@ flowchart TD
 | `src/dolphin/profile.js` | صنف `DolphinProfile` ومصنع `createAndStartProfile`. |
 | `src/gologin/client.js` | عميل GoLogin السحابي (اختياري، ملف كبير). |
 | `src/gologin/profile.js` | صنف `GoLoginProfile` ومصنع `createAndStartProfile`. |
-| `src/providers/sms-provider.js` | اختيار مزود SMS الموحّد (SMS Verification أو 5SIM Legacy). |
+| `src/providers/sms-provider.js` | اختيار مزود SMS الموحّد (SMS Verification). |
 | `src/providers/sms-verification-api.js` | دوال HTTP لمزود SMS Verification. |
-| `src/providers/fivesim-api-legacy.js` | تكامل 5SIM Legacy (`api1.5sim.net`). |
+| `src/providers/fivesim-api-legacy.js` | يرفض طلبات المحول القديم الذي يستخدم HTTP. |
 | `src/utils/logger.js` | مستويات السجل، ملف يومي تحت `logs/`. |
 | `src/utils/proxy-manager.js` | قراءة `config/proxies.txt` وتنسيقات البروكسي. |
 | `src/utils/name-generator.js` | توليد هوية من `config/names.json`. |
@@ -357,7 +354,6 @@ flowchart TD
 
 | الدالة | الدور |
 |--------|--------|
-| `getCountrySelection` | اختيار دولة الرسائل حسب المزود والإعدادات. |
 | `humanLikeType` | كتابة شبيهة بالإنسان في حقل إدخال. |
 | `ensurePageOpen` | التأكد أن الصفحة جاهزة قبل العمليات. |
 | `navigateToSignUp` | فتح مسار التسجيل. |
@@ -367,8 +363,7 @@ flowchart TD
 | `fillUsernameAndPassword` | اسم المستخدم وكلمة المرور والخطوات المرتبطة. |
 | `fillBirthdayAndGenderForm` | تاريخ الميلاد والجنس. |
 | `waitForRecaptcha` | انتظار/التعامل مع reCAPTCHA مع OMO. |
-| `handlePhoneVerification` | شراء رقم، إدخاله، استلام الرمز عبر المزود. |
-| `generateRecoveryEmail` | توليد بريد استرداد عند الحاجة. |
+| `handlePhoneVerification` | يتخطى الخطوة الاختيارية ويطلب الإكمال اليدوي إذا كان الرمز مطلوباً. |
 | `completeAccountCreation` | خطوات الإنهاء والمراجعة. |
 | `clickNextButton` | الضغط على «التالي» مع بدائل للمحSelectors. |
 
@@ -388,8 +383,7 @@ flowchart TD
 |--------|---------|
 | `checkRecaptchaExtension` | التحقق من وجود إضافة الكابتشا. |
 | `openOMOCaptchaExtension` | فتح واجهة الإضافة. |
-| `setOMOCaptchaKeyViaAPI` | تعيين مفتاح OMO عبر API الإضافة إن أمكن. |
-| `enterOMOCaptchaKey` | إدخال المفتاح عبر واجهة الإضافة. |
+| `setOMOCaptchaKeyViaAPI` / `enterOMOCaptchaKey` | يطلبان إعداد المفتاح يدوياً في الإضافة. |
 | `clickRecaptchaRefreshButton` | تحديث عنصر الكابتشا. |
 | `setupOMOCaptchaExtension` | تسلسل إعداد OMO قبل الحاجة للكابتشا. |
 
@@ -470,7 +464,7 @@ flowchart TD
 | `getBalance`, `buyNumber`, `buyNumberAndGetSMS` | واجهة موحّدة بعد تحميل المزود. |
 | `getOrderStatus`, `waitForSMS` | متابعة الطلب والرسالة. |
 | `cancelOrder`, `finishOrder`, `requestResend`, `setOrderStatus` | إدارة الطلب. |
-| `reportNumberUsed` | خاص بـ 5SIM عند الحاجة. |
+| `reportNumberUsed` | واجهة توافق للمزود. |
 | `getServiceName`, `getProviderType` | للسجلات والتشخيص. |
 | `SMS_PROVIDER_INFO` | `{ current: SMS_PROVIDER }`. |
 | أسماء بديلة | `buySmsVerifyNumber`, `waitForSmsVerifyCode`, … تطابق الواجهة القديمة. |

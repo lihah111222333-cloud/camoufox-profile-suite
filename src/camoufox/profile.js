@@ -4,7 +4,7 @@
  */
 
 import logger from '../utils/logger.js';
-import camoufoxClient from './client.js';
+import camoufoxClient, { validateCamoufoxNetworkPolicy } from './client.js';
 import { auditProfileCoherence, evaluateWireToDomCoherence } from './coherence-auditor.js';
 
 const WAIT_UNTIL_MAP = {
@@ -83,74 +83,53 @@ function wrapMultiArgEvaluate(originalEvaluate, decorateResult = null) {
     };
 }
 
-let lastActiveTrafficRecorder = null;
+const contextBindings = new WeakMap();
+const pageContexts = new WeakMap();
+const framePages = new WeakMap();
+const handleOwners = new WeakMap();
 
-function resolveFrameRecorder(frame) {
-    if (!frame || typeof frame !== 'object') {
-        return lastActiveTrafficRecorder || null;
+function bindContext(context, profile) {
+    let binding = contextBindings.get(context);
+    if (!binding) {
+        binding = { closed: false };
+        contextBindings.set(context, binding);
+        context.once?.('close', () => {
+            binding.closed = true;
+        });
     }
-    if (typeof frame.getTrafficRecorder === 'function') {
-        const rec = frame.getTrafficRecorder();
-        if (rec) return rec;
-    }
-    if (frame._camoufoxProfile?.trafficRecorder) {
-        return frame._camoufoxProfile.trafficRecorder;
-    }
-    if (frame._camoufoxContext?._camoufoxTrafficRecorder) {
-        return frame._camoufoxContext._camoufoxTrafficRecorder;
-    }
-    if (typeof frame.page === 'function') {
-        try {
-            const page = frame.page();
-            if (page) {
-                const rec =
-                    page.getTrafficRecorder?.() ||
-                    page._camoufoxProfile?.trafficRecorder ||
-                    page.context?.()?._camoufoxTrafficRecorder;
-                if (rec) return rec;
-            }
-        } catch {
-            // Ignore frame.page() resolution error
+    if (profile?.context === context) {
+        binding.profile ??= profile;
+        if (binding.trafficRecorder === undefined && profile.trafficRecorder !== undefined) {
+            binding.trafficRecorder = profile.trafficRecorder;
+        }
+        if (profile instanceof CamoufoxProfile) {
+            binding.manager ??= profile;
         }
     }
-    if (typeof frame.context === 'function') {
-        try {
-            const ctx = frame.context();
-            if (ctx?._camoufoxTrafficRecorder) {
-                return ctx._camoufoxTrafficRecorder;
-            }
-        } catch {
-            // Ignore frame.context() resolution error
-        }
-    }
-    return lastActiveTrafficRecorder || null;
+    return binding;
 }
 
-function resolveHandleRecorder(handle) {
-    if (!handle || typeof handle !== 'object') {
-        return lastActiveTrafficRecorder || null;
+function isContextUsable(context) {
+    if (!context || (typeof context.isClosed === 'function' && context.isClosed())) {
+        return false;
     }
-    const owner = handle._camoufoxOwner;
-    if (owner) {
-        if (typeof owner.recordTriggerAction === 'function') {
-            return owner;
-        }
-        const rec = resolveFrameRecorder(owner);
-        if (rec) return rec;
-    }
-    if (typeof handle.getTrafficRecorder === 'function') {
-        const rec = handle.getTrafficRecorder();
-        if (rec) return rec;
-    }
-    const internalPage = handle._page || (typeof handle._frame?.page === 'function' ? handle._frame.page() : null);
-    if (internalPage) {
-        const rec = resolveFrameRecorder(internalPage);
-        if (rec) return rec;
-    }
-    if (handle._context?._camoufoxTrafficRecorder) {
-        return handle._context._camoufoxTrafficRecorder;
-    }
-    return lastActiveTrafficRecorder || null;
+    const binding = contextBindings.get(context);
+    return !binding?.closed && binding?.isBrowserConnected?.() !== false;
+}
+
+function resolvePageContext(page) {
+    return pageContexts.get(page) || page?.context?.() || null;
+}
+
+function resolveContextRecorder(context) {
+    if (!isContextUsable(context)) return null;
+    const recorder = contextBindings.get(context)?.trafficRecorder;
+    return recorder && !recorder.stopped ? recorder : null;
+}
+
+function resolveFrameRecorder(frame) {
+    const page = framePages.get(frame) || frame?.page?.() || frame;
+    return resolveContextRecorder(resolvePageContext(page));
 }
 
 /**
@@ -163,14 +142,7 @@ export function attachElementHandleCompatibility(handle, owner = null, targetHin
         return handle;
     }
 
-    if (owner && !handle._camoufoxOwner) {
-        Object.defineProperty(handle, '_camoufoxOwner', {
-            value: owner,
-            enumerable: false,
-            configurable: true,
-            writable: true
-        });
-    }
+    if (owner && !handleOwners.has(handle)) handleOwners.set(handle, owner);
 
     if (targetHint && !handle._camoufoxTargetHint) {
         Object.defineProperty(handle, '_camoufoxTargetHint', {
@@ -196,7 +168,7 @@ export function attachElementHandleCompatibility(handle, owner = null, targetHin
         handle.$ = async (selector) =>
             attachElementHandleCompatibility(
                 await originalQuery(selector),
-                handle._camoufoxOwner || handle,
+                handleOwners.get(handle),
                 selector
             );
     }
@@ -207,7 +179,7 @@ export function attachElementHandleCompatibility(handle, owner = null, targetHin
             const elements = await originalQueryAll(selector);
             return Array.isArray(elements)
                 ? elements.map((el) =>
-                      attachElementHandleCompatibility(el, handle._camoufoxOwner || handle, selector)
+                      attachElementHandleCompatibility(el, handleOwners.get(handle), selector)
                   )
                 : elements;
         };
@@ -222,7 +194,7 @@ export function attachElementHandleCompatibility(handle, owner = null, targetHin
         handle.waitForSelector = async (selector, options) =>
             attachElementHandleCompatibility(
                 await originalWaitForSelector(selector, normalizeWaitForOptions(options)),
-                handle._camoufoxOwner || handle,
+                handleOwners.get(handle),
                 selector
             );
     }
@@ -267,7 +239,7 @@ export function attachElementHandleCompatibility(handle, owner = null, targetHin
                     [fnSource, args]
                 );
             }
-            return attachElementHandleCompatibility(res, handle._camoufoxOwner || handle);
+            return attachElementHandleCompatibility(res, handleOwners.get(handle));
         };
     }
 
@@ -276,7 +248,7 @@ export function attachElementHandleCompatibility(handle, owner = null, targetHin
             const originalMethod = handle[methodName].bind(handle);
             handle[methodName] = async (...args) => {
                 try {
-                    const recorder = resolveHandleRecorder(handle);
+                    const recorder = resolveFrameRecorder(handleOwners.get(handle));
                     const target = handle._camoufoxTargetHint || 'ElementHandle';
                     const meta = {};
                     if (methodName === 'press' && typeof args[0] === 'string') {
@@ -301,7 +273,7 @@ export function attachElementHandleCompatibility(handle, owner = null, targetHin
         handle.asElement = () =>
             attachElementHandleCompatibility(
                 originalAsElement(),
-                handle._camoufoxOwner || handle,
+                handleOwners.get(handle),
                 handle._camoufoxTargetHint || null
             );
     } else {
@@ -315,10 +287,12 @@ export function attachElementHandleCompatibility(handle, owner = null, targetHin
  * Decorate a Playwright Frame with Puppeteer compatibility shims
  * (`$x`, `waitForXPath`, `waitForTimeout`, multi-arg `evaluate`, `networkidle2`).
  */
-export function attachFrameCompatibility(frame) {
-    if (!frame || typeof frame !== 'object' || frame._camoufoxFrameCompatAttached) {
+export function attachFrameCompatibility(frame, page = null) {
+    if (!frame || typeof frame !== 'object') {
         return frame;
     }
+    if (page && !framePages.has(frame)) framePages.set(frame, page);
+    if (frame._camoufoxFrameCompatAttached) return frame;
 
     Object.defineProperty(frame, '_camoufoxFrameCompatAttached', {
         value: true,
@@ -411,64 +385,44 @@ export function attachPageCompatibility(page, context = null, profile = null) {
         return page;
     }
 
-    if (context && !page._camoufoxContext) {
+    const owningContext = resolvePageContext(page) || context;
+    if (owningContext && !pageContexts.has(page)) {
+        pageContexts.set(page, owningContext);
         Object.defineProperty(page, '_camoufoxContext', {
-            value: context,
-            enumerable: false,
-            configurable: true,
-            writable: true
+            value: owningContext
         });
     }
 
-    if (profile && !page._camoufoxProfile) {
-        Object.defineProperty(page, '_camoufoxProfile', {
-            value: profile,
-            enumerable: false,
-            configurable: true,
-            writable: true
-        });
-    }
-
-    const resolveContext = () =>
-        page._camoufoxContext ||
-        context ||
-        page._camoufoxProfile?.context ||
-        (typeof page.context === 'function' ? page.context() : null);
-
-    const resolveBrowser = () => {
-        const p = page._camoufoxProfile || profile;
-        if (p) {
-            if (p.browser) {
-                return p.browser;
-            }
-            if (
-                typeof p.contexts === 'function' ||
-                typeof p.newContext === 'function' ||
-                typeof p.isConnected === 'function'
-            ) {
-                return p;
+    if (owningContext) {
+        const binding = bindContext(owningContext, profile);
+        if (!binding.browserView) {
+            const owningProfile = profile?.context === owningContext ? profile : null;
+            const browser = owningContext.browser?.() || owningProfile?.browser;
+            if (browser) {
+                attachBrowserCompatibility(browser, owningProfile || { context: owningContext });
             }
         }
-        const ctx = resolveContext();
-        return ctx && typeof ctx.browser === 'function' ? ctx.browser() : null;
-    };
-
-    // Traffic attribution helpers directly on page
-    page.getTrafficRecorder = () =>
-        (page._camoufoxProfile || profile)?.trafficRecorder ||
-        resolveContext()?._camoufoxTrafficRecorder ||
-        null;
-
-    page.setTrafficStep = (stepName, meta = {}) =>
-        page.getTrafficRecorder()?.setStep(stepName, meta) || null;
-    page.setStep = page.setTrafficStep;
-
-    page.recordTrafficTrigger = (actionType, target = null, meta = {}) =>
-        page.getTrafficRecorder()?.recordTriggerAction?.(actionType, target, meta) || null;
+    }
 
     if (page._camoufoxPageCompatAttached) {
         return page;
     }
+
+    const resolveContext = () => resolvePageContext(page);
+    const resolveRecorder = () => resolveContextRecorder(resolveContext());
+    page.getTrafficRecorder = resolveRecorder;
+    page.setTrafficStep = (stepName, meta = {}) => resolveRecorder()?.setStep(stepName, meta) || null;
+    page.setStep = page.setTrafficStep;
+    page.recordTrafficTrigger = (actionType, target = null, meta = {}) =>
+        resolveRecorder()?.recordTriggerAction?.(actionType, target, meta) || null;
+
+    Object.defineProperty(page, '_camoufoxProfile', {
+        get() {
+            const ctx = resolveContext();
+            const manager = contextBindings.get(ctx)?.manager;
+            return manager?.context === ctx ? manager : null;
+        }
+    });
 
     Object.defineProperty(page, '_camoufoxPageCompatAttached', {
         value: true,
@@ -489,12 +443,14 @@ export function attachPageCompatibility(page, context = null, profile = null) {
         const normalizedGoto = page.goto.bind(page);
         page.goto = async (url, options) => {
             try {
-                const recorder = page.getTrafficRecorder?.();
-                const targetUrl = typeof url === 'string' ? url : String(url ?? '');
-                recorder?.recordTriggerAction?.('page.goto', targetUrl, {
-                    url: targetUrl,
-                    pageUrl: typeof page.url === 'function' ? page.url() : null
-                });
+                const recorder = resolveRecorder();
+                if (recorder) {
+                    const targetUrl = typeof url === 'string' ? url : String(url ?? '');
+                    recorder.recordTriggerAction?.('page.goto', targetUrl, {
+                        url: targetUrl,
+                        pageUrl: typeof page.url === 'function' ? page.url() : null
+                    });
+                }
             } catch {
                 // Never allow instrumentation to interfere with navigation
             }
@@ -508,7 +464,7 @@ export function attachPageCompatibility(page, context = null, profile = null) {
             const originalMethod = page[methodName].bind(page);
             page[methodName] = async (selector, ...rest) => {
                 try {
-                    const recorder = page.getTrafficRecorder?.();
+                    const recorder = resolveRecorder();
                     const targetSelector =
                         typeof selector === 'string' ? selector : String(selector ?? '');
                     const meta = {
@@ -647,23 +603,7 @@ export function attachPageCompatibility(page, context = null, profile = null) {
                     // Fallback to profile metadata or OS-coherent Firefox User-Agent
                 }
             }
-            const p = page._camoufoxProfile || profile;
-            const metaUa =
-                p?.metadata?.userAgent ||
-                p?.metadata?.hardwareProfile?.userAgent ||
-                p?.options?.userAgent ||
-                null;
-            if (typeof metaUa === 'string' && metaUa.trim().length > 0) {
-                return metaUa;
-            }
-            const os = String(p?.metadata?.os || p?.options?.os || 'windows').toLowerCase();
-            if (os === 'macos' || os === 'mac' || os === 'darwin') {
-                return 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0';
-            }
-            if (os === 'linux') {
-                return 'Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0';
-            }
-            return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0';
+            return profileUserAgent(page._camoufoxProfile || contextBindings.get(resolveContext())?.profile);
         };
     }
 
@@ -826,244 +766,117 @@ export function attachPageCompatibility(page, context = null, profile = null) {
         page.frames = () => {
             const frames = originalFrames();
             return Array.isArray(frames)
-                ? frames.map((f) => attachFrameCompatibility(f))
+                ? frames.map((f) => attachFrameCompatibility(f, page))
                 : frames;
         };
     }
 
     if (typeof page.mainFrame === 'function') {
         const originalMainFrame = page.mainFrame.bind(page);
-        page.mainFrame = () => attachFrameCompatibility(originalMainFrame());
+        page.mainFrame = () => attachFrameCompatibility(originalMainFrame(), page);
     }
 
-    // Puppeteer page.browser() -> returns compatibility-decorated Browser instance
-    if (typeof page.browser !== 'function') {
-        page.browser = () => {
-            const targetBrowser = resolveBrowser();
-            const targetContext = resolveContext();
-            return targetBrowser
-                ? attachBrowserCompatibility(targetBrowser, page._camoufoxProfile || { context: targetContext })
-                : null;
-        };
-    }
+    page.browser = () => contextBindings.get(resolveContext())?.browserView || null;
 
     return page;
 }
 
+function profileUserAgent(profile) {
+    const metaUa =
+        profile?.metadata?.userAgent ||
+        profile?.metadata?.hardwareProfile?.userAgent ||
+        profile?.options?.userAgent ||
+        null;
+    if (typeof metaUa === 'string' && metaUa.trim().length > 0) {
+        return metaUa;
+    }
+    const os = String(profile?.metadata?.os || profile?.options?.os || 'windows').toLowerCase();
+    if (os === 'macos' || os === 'mac' || os === 'darwin') {
+        return 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0';
+    }
+    if (os === 'linux') {
+        return 'Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0';
+    }
+    return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0';
+}
+
 /**
- * Decorate a Playwright Browser with `pages()`, `newPage()`, `disconnect()`, and `isConnected()`
- * convenience methods so callers expecting Puppeteer's `Browser` API work transparently.
+ * Expose the Puppeteer browser operations that can be fulfilled by one Playwright context.
  */
 export function attachBrowserCompatibility(browser, profile = null) {
-    if (!browser) {
-        return browser;
-    }
+    if (!browser || !profile || browser === profile) return null;
 
-    const rawBrowser = browser._camoufoxRawBrowser || browser;
-    const isBrowserLikeProfile =
-        profile === rawBrowser ||
-        profile === browser ||
-        (profile &&
-            !profile.context &&
-            typeof profile.contexts === 'function' &&
-            typeof profile.pages !== 'function');
-    const effectiveProfile = isBrowserLikeProfile ? null : profile;
+    const context =
+        profile.context ||
+        (typeof profile.pages === 'function' &&
+        typeof profile.newPage === 'function' &&
+        typeof profile.contexts !== 'function'
+            ? profile
+            : null);
+    const binding = context ? bindContext(context, profile) : null;
+    if (binding?.browserView) return binding.browserView;
 
-    const extractContextFromProfile = (prof) => {
-        if (!prof) return null;
-        if (prof.context) return prof.context;
-        if (typeof prof.pages === 'function' && typeof prof.newPage === 'function') {
-            return prof;
+    const getPages = context?.pages?.bind(context);
+    const createPage = context?.newPage?.bind(context);
+    const closeContext = context?.close?.bind(context);
+    const decoratePage = (page) => attachPageCompatibility(page, context);
+    const listPages = () => (isContextUsable(context) && getPages ? getPages().map(decoratePage) : []);
+    const newPage = async (...args) => {
+        if (!isContextUsable(context) || !createPage) {
+            throw new Error('No active Playwright context available to create a new page');
         }
-        return null;
+        const page = await createPage(...args);
+        await resolveContextRecorder(context)?.attachPage?.(page);
+        return decoratePage(page);
     };
 
-    const isContextUsable = (ctx) =>
-        Boolean(ctx && (typeof ctx.isClosed !== 'function' || !ctx.isClosed()));
-
-    const createScopedMethods = (boundProfile) => {
-        const resolvePrimaryContext = () => {
-            const prof = boundProfile || rawBrowser._camoufoxBoundProfile || null;
-            const explicitCtx = extractContextFromProfile(prof);
-            if (isContextUsable(explicitCtx)) {
-                return explicitCtx;
-            }
-            const contexts =
-                typeof rawBrowser.contexts === 'function' ? rawBrowser.contexts() : [];
-            return contexts.find((ctx) => isContextUsable(ctx)) || contexts[0] || null;
-        };
-
-        const originalBrowserNewPage =
-            typeof rawBrowser._camoufoxOriginalNewPage === 'function'
-                ? rawBrowser._camoufoxOriginalNewPage
-                : typeof rawBrowser.newPage === 'function'
-                  ? rawBrowser.newPage.bind(rawBrowser)
-                  : null;
-
-        return {
-            pages: async () => {
-                const prof = boundProfile || rawBrowser._camoufoxBoundProfile || null;
-                const primaryContext = resolvePrimaryContext();
-                if (primaryContext && typeof primaryContext.pages === 'function') {
-                    return primaryContext
-                        .pages()
-                        .map((p) => attachPageCompatibility(p, primaryContext, prof || rawBrowser));
-                }
-                const contexts =
-                    typeof rawBrowser.contexts === 'function' ? rawBrowser.contexts() : [];
-                return contexts.flatMap((ctx) =>
-                    ctx.pages().map((p) => attachPageCompatibility(p, ctx, prof || rawBrowser))
-                );
-            },
-            newPage: async (...args) => {
-                const prof = boundProfile || rawBrowser._camoufoxBoundProfile || null;
-                const primaryContext = resolvePrimaryContext();
-                if (primaryContext && typeof primaryContext.newPage === 'function') {
-                    const page = await primaryContext.newPage(...args);
-                    return attachPageCompatibility(page, primaryContext, prof || rawBrowser);
-                }
-                if (originalBrowserNewPage) {
-                    const page = await originalBrowserNewPage(...args);
-                    return attachPageCompatibility(
-                        page,
-                        page?.context?.() || null,
-                        prof || rawBrowser
-                    );
-                }
-                throw new Error('No active Playwright context available to create a new page');
-            },
-            disconnect: async () => {
-                const prof = boundProfile || rawBrowser._camoufoxBoundProfile || null;
-                if (prof && typeof prof.saveStorageState === 'function') {
-                    await prof.saveStorageState();
-                }
-            },
-            userAgent: async () => {
-                const prof = boundProfile || rawBrowser._camoufoxBoundProfile || null;
-                const primaryContext = resolvePrimaryContext();
-                if (primaryContext && typeof primaryContext.pages === 'function') {
-                    const pages = primaryContext.pages();
-                    if (Array.isArray(pages) && pages.length > 0) {
-                        const firstPage = attachPageCompatibility(
-                            pages[0],
-                            primaryContext,
-                            prof || rawBrowser
-                        );
-                        if (typeof firstPage?.userAgent === 'function') {
-                            return firstPage.userAgent();
-                        }
-                    }
-                }
-                const metaUa =
-                    prof?.metadata?.userAgent ||
-                    prof?.metadata?.hardwareProfile?.userAgent ||
-                    prof?.options?.userAgent ||
-                    null;
-                if (typeof metaUa === 'string' && metaUa.trim().length > 0) {
-                    return metaUa;
-                }
-                const os = String(prof?.metadata?.os || prof?.options?.os || 'windows').toLowerCase();
-                if (os === 'macos' || os === 'mac' || os === 'darwin') {
-                    return 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0';
-                }
-                if (os === 'linux') {
-                    return 'Mozilla/5.0 (X11; Linux x86_64; rv:135.0) Gecko/20100101 Firefox/135.0';
-                }
-                return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0';
-            }
-        };
-    };
-
-    if (!rawBrowser._camoufoxOriginalNewPage && typeof rawBrowser.newPage === 'function') {
-        Object.defineProperty(rawBrowser, '_camoufoxOriginalNewPage', {
-            value: rawBrowser.newPage.bind(rawBrowser),
-            enumerable: false,
-            configurable: true
-        });
-    }
-
-    if (!rawBrowser._camoufoxProfileViews) {
-        Object.defineProperty(rawBrowser, '_camoufoxProfileViews', {
-            value: new WeakMap(),
-            enumerable: false,
-            configurable: true
-        });
-    }
-
-    const currentBound = rawBrowser._camoufoxBoundProfile;
-    const currentBoundCtx = extractContextFromProfile(currentBound);
-    if (
-        effectiveProfile &&
-        (!currentBound || currentBound === effectiveProfile || !isContextUsable(currentBoundCtx))
-    ) {
-        Object.defineProperty(rawBrowser, '_camoufoxBoundProfile', {
-            value: effectiveProfile,
-            enumerable: false,
-            configurable: true,
-            writable: true
-        });
-    }
-
-    if (!rawBrowser._camoufoxPagesWrapped) {
-        const rootMethods = createScopedMethods(null);
-        rawBrowser.pages = rootMethods.pages;
-        rawBrowser.newPage = rootMethods.newPage;
-        if (typeof rawBrowser.disconnect !== 'function') {
-            rawBrowser.disconnect = rootMethods.disconnect;
-        }
-        if (typeof rawBrowser.userAgent !== 'function') {
-            rawBrowser.userAgent = rootMethods.userAgent;
-        }
-        if (typeof rawBrowser.isConnected !== 'function') {
-            rawBrowser.isConnected = () => true;
-        }
-        Object.defineProperty(rawBrowser, '_camoufoxPagesWrapped', {
-            value: true,
-            enumerable: false,
-            configurable: true
-        });
-        Object.defineProperty(rawBrowser, '_camoufoxNewPageWrapped', {
-            value: true,
-            enumerable: false,
-            configurable: true
-        });
-    }
-
-    if (!effectiveProfile || rawBrowser._camoufoxBoundProfile === effectiveProfile) {
-        return browser._camoufoxBoundProfile === effectiveProfile ? browser : rawBrowser;
-    }
-
-    const targetCtx = extractContextFromProfile(effectiveProfile);
-    const cacheKey =
-        typeof effectiveProfile === 'object' && effectiveProfile !== null
-            ? effectiveProfile
-            : targetCtx;
-    if (cacheKey && rawBrowser._camoufoxProfileViews.has(cacheKey)) {
-        return rawBrowser._camoufoxProfileViews.get(cacheKey);
-    }
-
-    const scopedMethods = createScopedMethods(effectiveProfile);
-    const scopedBrowser = new Proxy(rawBrowser, {
-        get(target, prop, receiver) {
-            if (prop === 'pages') return scopedMethods.pages;
-            if (prop === 'newPage') return scopedMethods.newPage;
-            if (prop === 'disconnect') return scopedMethods.disconnect;
-            if (prop === 'userAgent') return scopedMethods.userAgent;
-            if (prop === '_camoufoxBoundProfile') return effectiveProfile;
-            if (prop === '_camoufoxRawBrowser') return rawBrowser;
-            const val = Reflect.get(target, prop, receiver);
-            return typeof val === 'function' ? val.bind(target) : val;
+    const view = Object.freeze({
+        pages: async () => listPages(),
+        newPage,
+        isConnected: () => isContextUsable(context),
+        async disconnect() {
+            if (isContextUsable(context)) await profile.saveStorageState?.();
+        },
+        async userAgent() {
+            const [page] = listPages();
+            return page ? page.userAgent() : profileUserAgent(profile);
         }
     });
 
-    if (cacheKey) {
-        rawBrowser._camoufoxProfileViews.set(cacheKey, scopedBrowser);
-        if (targetCtx && targetCtx !== cacheKey) {
-            rawBrowser._camoufoxProfileViews.set(targetCtx, scopedBrowser);
+    if (binding) {
+        binding.browserView = view;
+        binding.isBrowserConnected = () =>
+            (profile === context || profile.context === context) && browser.isConnected?.() !== false;
+        context.browser = () => view;
+        if (getPages) context.pages = listPages;
+        if (createPage) context.newPage = newPage;
+        if (closeContext) {
+            context.close = (...args) => {
+                binding.closed = true;
+                return closeContext(...args);
+            };
         }
+        context.on?.('page', decoratePage);
     }
+    return view;
+}
 
-    return scopedBrowser;
+/**
+ * Keep the native browser with the client lifecycle and return the profile-scoped view.
+ */
+export function attachSessionCompatibility(session) {
+    const { browser, context, page, profileId, profilesDir, metadata, trafficRecorder } = session;
+    const view = attachBrowserCompatibility(browser, {
+        context,
+        metadata,
+        trafficRecorder: trafficRecorder ?? null,
+        saveStorageState: () => camoufoxClient.saveProfileStorageState(profileId, context, profilesDir)
+    });
+    return {
+        ...session,
+        browser: view,
+        page: attachPageCompatibility(page, context)
+    };
 }
 
 export class CamoufoxProfile {
@@ -1297,32 +1110,8 @@ export class CamoufoxProfile {
             this.securityGuards = session.securityGuards || null;
             this.gpuPerformanceScaler = session.gpuPerformanceScaler || null;
 
-            if (this.context) {
-                this.context._camoufoxTrafficRecorder = this.trafficRecorder;
-            }
-            if (this.trafficRecorder) {
-                lastActiveTrafficRecorder = this.trafficRecorder;
-            }
-
-            this.browser = attachBrowserCompatibility(session.browser, this);
+            this.browser = session.browser;
             this.page = attachPageCompatibility(session.page, this.context, this);
-
-            // Wrap context.newPage so any additional pages also receive compatibility helpers
-            if (this.context && !this.context._camoufoxNewPageWrapped) {
-                const originalNewPage = this.context.newPage.bind(this.context);
-                this.context.newPage = async (...args) => {
-                    const newPage = await originalNewPage(...args);
-                    if (this.trafficRecorder && typeof this.trafficRecorder.attachPage === 'function') {
-                        await this.trafficRecorder.attachPage(newPage);
-                    }
-                    return attachPageCompatibility(newPage, this.context, this);
-                };
-                Object.defineProperty(this.context, '_camoufoxNewPageWrapped', {
-                    value: true,
-                    enumerable: false,
-                    configurable: true
-                });
-            }
 
             if (this.options?.verifyCoherence || process.env.CAMOUFOX_AUDIT_ON_START === 'true') {
                 await this.auditCoherence(this.metadata?.os);
@@ -1474,6 +1263,7 @@ export class CamoufoxProfile {
  */
 export async function createAndStartProfile(profileName, proxy = null, options = {}) {
     try {
+        validateCamoufoxNetworkPolicy(options, proxy || options.proxy || null);
         const isAvailable = await camoufoxClient.checkCamoufoxConnection();
         if (!isAvailable) {
             throw new Error(

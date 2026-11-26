@@ -8,9 +8,18 @@ import logger from '../utils/logger.js';
 import { generateAndroidUserAgent } from '../gpmlogin/client.js';
 import { generateAndroidFingerprint } from '../gpmlogin/client.js';
 import config from '../config.js';
+import {
+    controllerApiUrl,
+    controllerRequestOptions,
+    parseControllerUrl,
+    toWebSocketUrl,
+    validateControllerEndpoint
+} from '../utils/controller-url.js';
+import { requireProxyProtocol } from '../utils/proxy-protocol.js';
 
 const DOLPHIN_API_URL = config.dolphin.apiUrl;
 const DOLPHIN_API_KEY = config.dolphin.apiKey;
+const controllerClient = axios.create(controllerRequestOptions);
 
 // Helper function to format Authorization header
 // دالة مساعدة لتنسيق رأس Authorization
@@ -38,7 +47,7 @@ function getAuthHeader() {
  */
 export async function checkDolphinConnection() {
     try {
-        const response = await axios.post(`${DOLPHIN_API_URL}/api/profile/getProfiles`, 
+        const response = await controllerClient.post(controllerApiUrl(DOLPHIN_API_URL, '/api/profile/getProfiles'),
             { page: 1, pageSize: 1 },
             {
                 headers: {
@@ -69,12 +78,36 @@ export async function checkDolphinConnection() {
     }
 }
 
+// The base-proxy API uses the same protocol and credential fields on create and update.
+function formatBaseProxy(proxy) {
+    if (!proxy) throw new Error('Proxy host and port are required');
+    const protocol = requireProxyProtocol(proxy, ['http', 'https', 'socks4', 'socks5'], 'Dolphin Anty');
+    const host = (proxy.host || proxy.ip)?.trim();
+    const port = Number(proxy.port);
+    if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error('Proxy host and a valid port are required');
+    }
+    return {
+        proxyMethod: 0,
+        protocol,
+        host,
+        port,
+        proxyUsername: proxy.username || proxy.proxyUsername || '',
+        proxyPassword: proxy.password || proxy.proxyPassword || ''
+    };
+}
+
 /**
  * Create a new profile in Dolphin Anty
  * إنشاء بروفايل جديد في Dolphin Anty
  */
 export async function createProfile(profileName, proxy = null) {
     try {
+        const proxyObj = proxy ? formatBaseProxy(proxy) : null;
+        if (proxyObj) {
+            proxyObj.proxyUsername = proxyObj.proxyUsername.trim();
+            proxyObj.proxyPassword = proxyObj.proxyPassword.trim();
+        }
         const timestamp = Date.now();
         const randomNum = Math.floor(Math.random() * 10000);
         let finalName = `Gmail_${timestamp}_${randomNum}`;
@@ -249,40 +282,6 @@ export async function createProfile(profileName, proxy = null) {
             cores: hardwareConcurrency
         });
         
-        // Build proxy object if provided
-        // Dolphin API uses proxyMethod: 0 for base proxy
-        // According to API example, proxy format uses: protocol, host, port, proxyUsername, proxyPassword
-        // بناء كائن البروكسي إذا تم توفيره
-        // Dolphin API يستخدم proxyMethod: 0 للبروكسي الأساسي
-        let proxyObj = null;
-        if (proxy && proxy.ip && proxy.port) {
-            const proxyType = (proxy.type || 'http').toLowerCase();
-            const username = (proxy.username || proxy.proxyUsername || '').trim();
-            const password = (proxy.password || proxy.proxyPassword || '').trim();
-            
-            proxyObj = {
-                proxyMethod: 0, // 0 = base proxy (recommended)
-                protocol: proxyType === 'socks5' ? 'socks5' : (proxyType === 'socks4' ? 'socks4' : 'http'),
-                host: proxy.ip.trim(),
-                port: parseInt(proxy.port, 10),
-                proxyUsername: username,
-                proxyPassword: password
-            };
-            
-            // Validate port
-            if (isNaN(proxyObj.port) || proxyObj.port <= 0 || proxyObj.port > 65535) {
-                throw new Error(`Invalid proxy port: ${proxy.port}`);
-            }
-            
-            logger.info('Creating Dolphin profile with base proxy (proxyMethod: 0)', {
-                proxy: `${proxyObj.host}:${proxyObj.port}`,
-                protocol: proxyObj.protocol,
-                hasAuth: !!(username && password),
-                usernameLength: username.length,
-                passwordLength: password.length
-            });
-        }
-     
         // Get or create folder
         // الحصول على مجلد أو إنشاؤه
         let folderId = config.dolphin.folderId;
@@ -347,7 +346,7 @@ export async function createProfile(profileName, proxy = null) {
             authHeaderLength: authHeader ? authHeader.length : 0
         });
         
-        const response = await axios.post(`${DOLPHIN_API_URL}/api/profile/advancedCreateProfile`, requestBody, {
+        const response = await controllerClient.post(controllerApiUrl(DOLPHIN_API_URL, '/api/profile/advancedCreateProfile'), requestBody, {
             headers: {
                 'Authorization': authHeader,
                 'Content-Type': 'application/json'
@@ -423,7 +422,7 @@ export async function startProfile(profileId) {
     try {
         logger.info('Starting Dolphin Anty profile', { profileId });
         
-        const response = await axios.post(`${DOLPHIN_API_URL}/api/browser/openBrowser`, 
+        const response = await controllerClient.post(controllerApiUrl(DOLPHIN_API_URL, '/api/browser/openBrowser'),
             { profileId },
             {
                 headers: {
@@ -443,20 +442,23 @@ export async function startProfile(profileId) {
             }
         }
         
-        if (responseData && responseData.ws) {
-            logger.info('Dolphin Anty profile started successfully', { 
+        const address = responseData?.ws || responseData?.webSocketDebuggerUrl;
+        if (address) {
+            const endpoint = toWebSocketUrl(parseControllerUrl(address, 'ws:'));
+            validateControllerEndpoint(endpoint, parseControllerUrl(DOLPHIN_API_URL));
+            logger.info('Dolphin Anty profile started successfully', {
                 profileId,
-                ws: responseData.ws,
+                controller: endpoint.origin,
                 port: responseData.port
             });
             return {
-                ws: responseData.ws,
-                webSocketDebuggerUrl: responseData.ws,
+                ws: endpoint.href,
+                webSocketDebuggerUrl: endpoint.href,
                 port: responseData.port,
                 pid: responseData.pid
             };
         }
-        
+
         throw new Error(`Invalid response from Dolphin API: ${JSON.stringify(responseData)}`);
     } catch (error) {
         if (error.response) {
@@ -491,7 +493,7 @@ export async function stopProfile(profileId) {
     try {
         logger.info('Stopping Dolphin Anty profile', { profileId });
         
-        const response = await axios.post(`${DOLPHIN_API_URL}/api/browser/closeProfiles`,
+        const response = await controllerClient.post(controllerApiUrl(DOLPHIN_API_URL, '/api/browser/closeProfiles'),
             { profileIds: [profileId] },
             {
                 headers: {
@@ -521,7 +523,7 @@ export async function deleteProfile(profileId) {
     try {
         logger.info('Deleting Dolphin Anty profile', { profileId });
         
-        const response = await axios.post(`${DOLPHIN_API_URL}/api/profile/delete`,
+        const response = await controllerClient.post(controllerApiUrl(DOLPHIN_API_URL, '/api/profile/delete'),
             { profileIds: [profileId] },
             {
                 headers: {
@@ -549,7 +551,7 @@ export async function deleteProfile(profileId) {
  */
 export async function getProfile(profileId) {
     try {
-        const response = await axios.post(`${DOLPHIN_API_URL}/api/profile/detail`,
+        const response = await controllerClient.post(controllerApiUrl(DOLPHIN_API_URL, '/api/profile/detail'),
             { profileId },
             {
                 headers: {
@@ -577,7 +579,7 @@ export async function getProfile(profileId) {
  * @param {Object} proxy - Proxy configuration object
  * @param {string} proxy.host - Proxy host/IP
  * @param {number} proxy.port - Proxy port
- * @param {string} proxy.protocol - Proxy protocol (http, https, socks5, ssh)
+ * @param {string} proxy.protocol - Proxy protocol (http, https, socks4, socks5)
  * @param {string} proxy.username - Proxy username (optional)
  * @param {string} proxy.password - Proxy password (optional)
  */
@@ -586,29 +588,15 @@ export async function updateProfileProxy(profileIds, proxy) {
         // Ensure profileIds is an array
         const ids = Array.isArray(profileIds) ? profileIds : [profileIds];
         
-        if (!proxy || !proxy.host || !proxy.port) {
-            throw new Error('Proxy host and port are required');
-        }
-        
-        const proxyType = (proxy.protocol || proxy.type || 'http').toLowerCase();
-        
-        const requestBody = {
-            host: proxy.host || proxy.ip,
-            port: parseInt(proxy.port, 10),
-            protocol: proxyType === 'socks5' ? 'socks5' : (proxyType === 'socks4' ? 'socks4' : (proxyType === 'https' ? 'https' : 'http')),
-            proxyMethod: 0, // 0 = base proxy
-            proxyUsername: proxy.username || proxy.proxyUsername || '',
-            proxyPassword: proxy.password || proxy.proxyPassword || '',
-            ids: ids
-        };
-        
+        const requestBody = { ...formatBaseProxy(proxy), ids };
+
         logger.info('Updating profile proxy', {
             profileIds: ids,
             proxy: `${requestBody.host}:${requestBody.port}`,
             protocol: requestBody.protocol
         });
         
-        const response = await axios.post(`${DOLPHIN_API_URL}/api/profile/updateProfileBaseProxy`, 
+        const response = await controllerClient.post(controllerApiUrl(DOLPHIN_API_URL, '/api/profile/updateProfileBaseProxy'),
             requestBody,
             {
                 headers: {
@@ -685,7 +673,7 @@ export async function getFolderList(page = 1, pageSize = 100) {
         let lastError = null;
         for (const authFormat of authFormats) {
             try {
-                const response = await axios.post(`${DOLPHIN_API_URL}/api/folder/list`, 
+                const response = await controllerClient.post(controllerApiUrl(DOLPHIN_API_URL, '/api/folder/list'),
                     { page, pageSize },
                     {
                         headers: {
@@ -824,7 +812,7 @@ export async function createFolder(folderName, folderColor = '#3370FF', sortOrde
     try {
         logger.info('Creating Dolphin folder', { folderName, folderColor });
         
-        const response = await axios.post(`${DOLPHIN_API_URL}/api/folder/add`, 
+        const response = await controllerClient.post(controllerApiUrl(DOLPHIN_API_URL, '/api/folder/add'),
             { 
                 folderName,
                 folderColor,

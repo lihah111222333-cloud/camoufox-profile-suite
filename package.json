@@ -11,7 +11,7 @@
     "bin",
     "src",
     "scripts",
-    "config",
+    "config/names.json",
     "docs",
     "assets",
     ".env.example",
@@ -32,7 +32,8 @@
     "test:coherence": "node scripts/test-coherence-auditor.js",
     "test:compat": "node scripts/test-page-compat.js",
     "test:traffic": "node scripts/test-traffic-attribution.js",
-    "test": "node scripts/test-camoufox-isolation.js && node scripts/test-coherence-auditor.js && node scripts/test-page-compat.js && node scripts/test-traffic-attribution.js && node scripts/verify-camoufox-coherence.js --dry-run",
+    "test:security": "cd tests/security && node --test",
+    "test": "node scripts/test-camoufox-isolation.js && node scripts/test-coherence-auditor.js && node scripts/test-page-compat.js && node scripts/test-traffic-attribution.js && node scripts/verify-camoufox-coherence.js --dry-run && npm run test:security",
     "prepack": "node --check src/index.js && node --check bin/gmail-account-creator.js"
   },
   "keywords": [

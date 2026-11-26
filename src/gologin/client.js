@@ -6,11 +6,10 @@
 import dotenv from 'dotenv';
 import axios from 'axios';
 import http from 'http';
-import https from 'https';
-import { URL } from 'url';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import logger from '../utils/logger.js';
+import { requireProxyProtocol } from '../utils/proxy-protocol.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -27,6 +26,26 @@ const GOLOGIN_API_KEY = process.env.GOLOGIN_API_KEY;
 
 if (!GOLOGIN_API_KEY) {
     logger.error('GOLOGIN_API_KEY is not set in environment variables');
+}
+
+// The profile API's supported modes do not include HTTPS proxies.
+function formatGoLoginProxy(proxy) {
+    if (proxy == null) return proxy;
+    const mode = requireProxyProtocol(proxy, ['http', 'socks4', 'socks5', 'none'], 'GoLogin');
+    if (mode === 'none') return { mode };
+
+    const host = (proxy.host || proxy.ip)?.trim();
+    const port = Number(proxy.port);
+    if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error('Proxy host and a valid port are required');
+    }
+    return {
+        mode,
+        host,
+        port,
+        ...(proxy.username && { username: proxy.username.trim() }),
+        ...(proxy.password && { password: proxy.password.trim() })
+    };
 }
 
 /**
@@ -370,8 +389,27 @@ class GoLoginClient {
         };
     }
 
-    async createProfile(profileData) {
+    async createProfile(profileData, testProxyConnection = false) {
         try {
+            const proxy = formatGoLoginProxy(profileData.proxy);
+            if (testProxyConnection && proxy?.mode === 'http') {
+                const address = `${proxy.host}:${proxy.port}`;
+                logger.info('Testing proxy connection before creating profile', { proxy: address });
+                try {
+                    const result = await this.testProxy(proxy);
+                    if (!result.valid) {
+                        logger.warn('Proxy test failed, but continuing with profile creation', {
+                            proxy: address,
+                            error: result.error
+                        });
+                    }
+                } catch (error) {
+                    logger.warn('Proxy test failed, but continuing with profile creation', {
+                        proxy: address,
+                        error: error.message
+                    });
+                }
+            }
             // Generate unique Android fingerprint for each profile
             // توليد بصمة Android فريدة لكل بروفايل
             const uniqueFingerprint = this.generateAndroidFingerprint();
@@ -419,7 +457,8 @@ class GoLoginClient {
                     fillBasedOnIp: true
                 },
                 // Merge with provided profileData (proxy, etc.) - this overrides defaults
-                ...profileData
+                ...profileData,
+                proxy
             };
 
             // Use /browser/custom endpoint with unique fingerprint for better authenticity
@@ -453,8 +492,7 @@ class GoLoginClient {
                 } catch (proxyError) {
                     logger.warn('Failed to update proxy, continuing anyway', { 
                         profileId: response.id,
-                        error: proxyError.message,
-                        proxyData: defaultProfile.proxy
+                        error: proxyError.message
                     });
                 }
             }
@@ -479,7 +517,8 @@ class GoLoginClient {
      */
     async updateProfile(profileId, updates) {
         // Retry up to 2 times for server errors
-        const response = await this.request('PUT', `/browser/${profileId}`, updates, 2);
+        const data = updates?.proxy ? { ...updates, proxy: formatGoLoginProxy(updates.proxy) } : updates;
+        const response = await this.request('PUT', `/browser/${profileId}`, data, 2);
         logger.info('Profile updated', { profileId });
         return response;
     }
@@ -492,7 +531,7 @@ class GoLoginClient {
         // Use dedicated proxy endpoint (PATCH /browser/:id/proxy)
         // This only requires proxy data, not full profile update
         // Retry up to 2 times for server errors
-        await this.request('PATCH', `/browser/${profileId}/proxy`, proxyData, 2);
+        await this.request('PATCH', `/browser/${profileId}/proxy`, formatGoLoginProxy(proxyData), 2);
         logger.info('Profile proxy updated', { profileId });
         return true;
     }
@@ -557,11 +596,13 @@ class GoLoginClient {
      * اختبار اتصال البروكسي باستخدام HTTP CONNECT
      */
     async testProxy(proxy) {
-        if (!proxy || !proxy.ip || !proxy.port) {
+        const host = proxy?.host || proxy?.ip;
+        if (!host || !proxy.port) {
             return { valid: false, error: 'Proxy data is missing' };
         }
 
         try {
+            requireProxyProtocol(proxy, ['http'], 'GoLogin proxy preflight');
             const port = parseInt(proxy.port, 10);
             if (isNaN(port) || port < 1 || port > 65535) {
                 return { valid: false, error: `Invalid proxy port: ${proxy.port}` };
@@ -582,7 +623,7 @@ class GoLoginClient {
                     resolved = true;
                     if (req) req.destroy(); // Destroy request if still active
                     logger.warn('Proxy test failed - timeout', { 
-                        proxy: `${proxy.ip}:${port}` 
+                        proxy: `${host}:${port}`
                     });
                     resolve({ valid: false, error: 'Connection timeout' });
                 }, timeout + 1000); // Add 1 second buffer
@@ -600,7 +641,7 @@ class GoLoginClient {
                 }
                 
                 const requestOptions = {
-                    hostname: proxy.ip,
+                    hostname: host,
                     port: port,
                     method: 'CONNECT',
                     path: connectPath,
@@ -615,13 +656,13 @@ class GoLoginClient {
                     
                     if (res.statusCode === 200) {
                         logger.info('Proxy test successful', { 
-                            proxy: `${proxy.ip}:${port}`,
+                            proxy: `${host}:${port}`,
                             statusCode: res.statusCode
                         });
-                        resolve({ valid: true, ip: proxy.ip });
+                        resolve({ valid: true, ip: host });
                     } else {
                         logger.warn('Proxy test failed - invalid status', { 
-                            proxy: `${proxy.ip}:${port}`,
+                            proxy: `${host}:${port}`,
                             statusCode: res.statusCode 
                         });
                         resolve({ valid: false, error: `Proxy returned status ${res.statusCode}` });
@@ -634,7 +675,7 @@ class GoLoginClient {
                     clearTimeout(timeoutId);
                     resolved = true;
                     logger.warn('Proxy test failed - connection error', { 
-                        proxy: `${proxy.ip}:${port}`,
+                        proxy: `${host}:${port}`,
                         error: error.message 
                     });
                     resolve({ valid: false, error: error.message });
@@ -646,7 +687,7 @@ class GoLoginClient {
                     resolved = true;
                     req.destroy();
                     logger.warn('Proxy test failed - request timeout', { 
-                        proxy: `${proxy.ip}:${port}` 
+                        proxy: `${host}:${port}`
                     });
                     resolve({ valid: false, error: 'Request timeout' });
                 });
@@ -657,7 +698,7 @@ class GoLoginClient {
         } catch (error) {
             const errorMsg = error.message || 'Unknown proxy error';
             logger.warn('Proxy test failed', { 
-                proxy: `${proxy.ip}:${proxy.port}`,
+                proxy: `${host}:${proxy.port}`,
                 error: errorMsg 
             });
             return { valid: false, error: errorMsg };
@@ -669,77 +710,7 @@ class GoLoginClient {
      * إنشاء بروفايل مع بروكسي
      */
     async createProfileWithProxy(name, proxy, testProxyConnection = true) {
-        // Validate and format proxy according to GoLogin API requirements
-        // التحقق من البروكسي وتنسيقه حسب متطلبات GoLogin API
-        let proxyData = undefined;
-        
-        if (proxy) {
-            // Validate required fields
-            if (!proxy.ip || !proxy.port) {
-                throw new Error('Proxy must have ip and port');
-            }
-            
-            // Parse port to integer and validate
-            const port = parseInt(proxy.port, 10);
-            if (isNaN(port) || port < 1 || port > 65535) {
-                throw new Error(`Invalid proxy port: ${proxy.port}`);
-            }
-            
-            // Test proxy connection if enabled (with timeout to avoid hanging)
-            // اختبار اتصال البروكسي إذا كان مفعلاً (مع timeout لتجنب التعليق)
-            if (testProxyConnection) {
-                logger.info('Testing proxy connection before creating profile...', { 
-                    proxy: `${proxy.ip}:${port}` 
-                });
-                try {
-                    // Wrap test in Promise.race to ensure we don't hang forever
-                    const testPromise = this.testProxy(proxy);
-                    const timeoutPromise = new Promise((resolve) => 
-                        setTimeout(() => resolve({ valid: false, error: 'Test timeout' }), 6000)
-                    );
-                    
-                    const testResult = await Promise.race([testPromise, timeoutPromise]);
-                    
-                    if (!testResult.valid) {
-                        logger.warn('Proxy test failed, but continuing with profile creation', { 
-                            proxy: `${proxy.ip}:${port}`,
-                            error: testResult?.error || 'Unknown error'
-                        });
-                        // Don't throw - let GoLogin API handle proxy validation
-                        // لا نرمي خطأ - نترك GoLogin API يتعامل مع التحقق من البروكسي
-                    } else {
-                        logger.info('Proxy test passed', { 
-                            proxy: `${proxy.ip}:${port}`,
-                            detectedIp: testResult.ip 
-                        });
-                    }
-                } catch (testError) {
-                    logger.warn('Proxy test error, continuing anyway', { 
-                        proxy: `${proxy.ip}:${port}`,
-                        error: testError.message 
-                    });
-                    // Continue with profile creation even if test fails
-                }
-            }
-            
-            // Format proxy according to GoLogin API specification
-            // API expects: { mode: 'http'|'socks4'|'socks5'|'none', host: string, port: number, username?: string, password?: string }
-            proxyData = {
-                mode: 'http', // Default to http (can be changed to socks4/socks5 if needed)
-                host: proxy.ip.trim(),
-                port: port,
-                // username and password are optional in API - include only if provided
-                ...(proxy.username && { username: proxy.username.trim() }),
-                ...(proxy.password && { password: proxy.password.trim() })
-            };
-        }
-        
-        const profileData = {
-            name,
-            proxy: proxyData
-        };
-
-        return await this.createProfile(profileData);
+        return this.createProfile({ name, proxy }, testProxyConnection);
     }
 }
 

@@ -310,10 +310,10 @@ function createMockPlaywrightStack() {
     const initialPage = createMockPage(context);
     state.pages.push(initialPage);
 
-    attachBrowserCompatibility(browser, profile);
-    attachPageCompatibility(initialPage, context, browser);
+    profile.browser = attachBrowserCompatibility(browser, profile);
+    attachPageCompatibility(initialPage, context, profile);
 
-    return { browser, context, page: initialPage, profile, state };
+    return { browser: profile.browser, context, page: initialPage, profile, state };
 }
 
 async function runTests() {
@@ -448,6 +448,7 @@ async function runTests() {
 
     // 10. Test page.browser(), browser.pages(), browser.newPage(), browser.disconnect(), browser.isConnected()
     assert.equal(page.browser(), browser);
+    assert.equal(page.context().browser(), browser);
     assert.equal(browser.isConnected(), true);
     const newTab = await browser.newPage();
     assert.equal(typeof newTab.$x, 'function');

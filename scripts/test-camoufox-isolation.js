@@ -713,11 +713,20 @@ async function runTests() {
 
                 // All 3 concurrent profiles in shared-browser mode must share ONE browser process
                 assert.equal(mockEngine.launchedBrowsers.length - browserCountBefore, 1);
-                assert.equal(sharedWin.browser, sharedMac.browser);
-                assert.equal(sharedMac.browser, sharedLin.browser);
-                assert.equal(sharedWin.ownsBrowser, false);
-                assert.equal(sharedMac.ownsBrowser, false);
-                assert.equal(sharedLin.ownsBrowser, false);
+                const nativeBrowser = mockEngine.launchedBrowsers[browserCountBefore];
+                const sessions = [sharedWin, sharedMac, sharedLin];
+                assert.deepEqual(
+                    new Set(nativeBrowser.contexts()),
+                    new Set(sessions.map(({ context }) => context))
+                );
+                assert.equal(new Set(sessions.map(({ browser }) => browser)).size, 3);
+                for (const { browser, context, page, ownsBrowser } of sessions) {
+                    assert.equal(ownsBrowser, false);
+                    assert.notEqual(browser, nativeBrowser);
+                    assert.equal(context.browser(), browser);
+                    assert.equal(page.browser(), browser);
+                    assert.deepEqual(await browser.pages(), [page]);
+                }
 
                 // While having strictly distinct BrowserContexts with per-context OS and proxy
                 assert.notEqual(sharedWin.context, sharedMac.context);
@@ -744,6 +753,9 @@ async function runTests() {
                 // Stopping one shared profile must close only its context, keeping the shared browser alive
                 await stopProfile('shared-win', { profilesDir: tempProfilesDir });
                 assert.equal(sharedWin.context.isClosed(), true);
+                assert.equal(nativeBrowser.isConnected(), true);
+                assert.deepEqual(await sharedWin.browser.pages(), []);
+                await assert.rejects(sharedWin.browser.newPage(), /No active Playwright context/);
                 assert.equal(sharedMac.browser.isConnected(), true);
                 assert.equal(sharedMac.context.isClosed(), false);
                 assert.equal(sharedLin.context.isClosed(), false);
@@ -930,6 +942,7 @@ async function runTests() {
         await testSection(
             'Multi-session profile restart traffic hash-chain continuity (Restart_Chain_Win)',
             async () => {
+                let responseBodyReads = 0;
                 const profileSession1 = await createAndStartProfile(
                     'Restart_Chain_Win',
                     'http://10.40.1.1:8080',
@@ -969,7 +982,10 @@ async function runTests() {
                     statusText: () => 'OK',
                     headers: () => ({ 'content-type': 'application/json' }),
                     headersArray: async () => [{ name: 'content-type', value: 'application/json' }],
-                    body: async () => Buffer.from(session1ResBody, 'utf8'),
+                    async body() {
+                        responseBodyReads += 1;
+                        return Buffer.from(session1ResBody, 'utf8');
+                    },
                     serverAddr: async () => ({ ipAddress: '142.250.80.109', port: 443 }),
                     securityDetails: async () => ({ protocol: 'TLS 1.3' })
                 };
@@ -991,7 +1007,7 @@ async function runTests() {
                     `Expected valid traffic integrity after Session 1, got errors: ${integrityAfterSession1.errors.join('; ')}`
                 );
                 assert.ok(integrityAfterSession1.eventCount >= 2);
-                assert.equal(integrityAfterSession1.verifiedPayloads, 2);
+                assert.equal(integrityAfterSession1.verifiedPayloads, 1);
                 const session1EventCount = integrityAfterSession1.eventCount;
                 const session1ChainHead = integrityAfterSession1.chainHeadHash;
 
@@ -1030,7 +1046,10 @@ async function runTests() {
                     statusText: () => 'OK',
                     headers: () => ({ 'content-type': 'application/json' }),
                     headersArray: async () => [{ name: 'content-type', value: 'application/json' }],
-                    body: async () => Buffer.from(session2ResBody, 'utf8'),
+                    async body() {
+                        responseBodyReads += 1;
+                        return Buffer.from(session2ResBody, 'utf8');
+                    },
                     serverAddr: async () => ({ ipAddress: '142.250.80.109', port: 443 }),
                     securityDetails: async () => ({ protocol: 'TLS 1.3' })
                 };
@@ -1055,15 +1074,15 @@ async function runTests() {
                     `Expected multi-session eventCount (${integrityAfterSession2.eventCount}) to include Session 1 (${session1EventCount}) and Session 2 events`
                 );
                 assert.notEqual(integrityAfterSession2.chainHeadHash, session1ChainHead);
-                assert.equal(integrityAfterSession2.verifiedPayloads, 4);
+                assert.equal(integrityAfterSession2.verifiedPayloads, 2);
 
                 const finalIndex = JSON.parse(
                     fs.readFileSync(path.join(trafficDir, 'attribution-index.json'), 'utf8')
                 );
                 assert.equal(finalIndex.integrity.eventCount, integrityAfterSession2.eventCount);
-                assert.equal(Object.keys(finalIndex.integrity.payloadManifest).length, 4);
+                assert.equal(Object.keys(finalIndex.integrity.payloadManifest).length, 2);
 
-                // Verify all 4 payload files from Session 1 and Session 2 exist on disk and are in payloadManifest
+                // Verify request payloads and response metadata from both sessions.
                 const ndjsonLines = fs
                     .readFileSync(path.join(trafficDir, 'traffic.ndjson'), 'utf8')
                     .trim()
@@ -1071,7 +1090,14 @@ async function runTests() {
                     .map((l) => JSON.parse(l));
                 assert.equal(ndjsonLines.length, integrityAfterSession2.eventCount);
                 const payloadEvents = ndjsonLines.filter((e) => e.payloadFile);
-                assert.equal(payloadEvents.length, 4);
+                assert.equal(payloadEvents.length, 2);
+                assert.ok(payloadEvents.every((event) => event.type === 'egress'));
+                const responses = ndjsonLines.filter((event) => event.type === 'ingress');
+                assert.equal(responses.length, 2);
+                assert.ok(responses.every((event) =>
+                    event.status === 200 && event.bodyOmittedReason === 'unbounded-response-reader'
+                ));
+                assert.equal(responseBodyReads, 0);
                 for (const ev of payloadEvents) {
                     assert.ok(
                         finalIndex.integrity.payloadManifest[ev.payloadFile],

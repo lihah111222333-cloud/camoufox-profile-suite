@@ -13,11 +13,14 @@ const ORDER_STATUS = {
     OK: 'STATUS_OK'
 };
 
-/**
- * Get API key from environment
- */
+class SmsVerifyKeyError extends Error {}
+
 function getApiKey() {
-    return process.env.SMS_VERIFY_API_KEY || '';
+    const apiKey = process.env.SMS_VERIFY_API_KEY;
+    if (!apiKey?.trim()) {
+        throw new SmsVerifyKeyError('SMS Verification API key not configured. Set SMS_VERIFY_API_KEY in .env');
+    }
+    return apiKey;
 }
 
 /**
@@ -35,66 +38,45 @@ function getLang() {
  */
 async function makeRequest(action, params = {}) {
     const apiKey = getApiKey();
-    if (!apiKey) {
-        throw new Error('SMS Verification API key not configured. Set SMS_VERIFY_API_KEY in .env');
-    }
-
-    const queryParams = {
-        api_key: apiKey,
-        action,
-        lang: getLang(),
-        ...params
-    };
-
+    let response;
+    let data;
     try {
+        const queryParams = { ...params, api_key: apiKey, action, lang: getLang() };
         const url = new URL(SMS_VERIFY_API_URL);
-        for (const [k, v] of Object.entries(queryParams)) {
-            if (v !== undefined && v !== null) {
-                url.searchParams.append(k, String(v));
+        for (const [name, value] of Object.entries(queryParams)) {
+            if (value !== undefined && value !== null) {
+                url.searchParams.append(name, String(value));
             }
         }
 
-        const response = await fetch(url.toString(), {
+        response = await fetch(url.toString(), {
             method: 'GET',
+            redirect: 'error',
             signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(30000) : undefined
         });
-
-        const rawText = await response.text();
-        let data = rawText;
-        try {
-            data = JSON.parse(rawText);
-        } catch {
-            // Keep string response format (e.g. ACCESS_NUMBER:..., BAD_KEY)
-        }
-
-        if (!response.ok) {
-            if (typeof data === 'string' && data === 'BAD_KEY') {
-                throw new Error('BAD_KEY');
-            }
-            const err = new Error(`HTTP ${response.status}: ${rawText}`);
-            err.response = { status: response.status, data };
-            throw err;
-        }
-
-        if (typeof data === 'string' && data === 'BAD_KEY') {
-            throw new Error('BAD_KEY');
-        }
-
-        return data;
-    } catch (error) {
-        if (error.response?.data) {
-            const errorData = error.response.data;
-            if (typeof errorData === 'string' && errorData === 'BAD_KEY') {
-                throw new Error('BAD_KEY');
-            }
-            console.error(`SMS Verify API Error [${action}]:`, errorData);
-        } else if (error.message === 'BAD_KEY') {
-            throw error;
-        } else {
-            console.error(`SMS Verify API Error [${action}]:`, error.message);
-        }
-        throw error;
+        data = await response.text();
+    } catch {
+        // Transport errors can contain the key-bearing request URL.
+        throw new Error('SMS Verification API request failed');
     }
+
+    try {
+        data = JSON.parse(data);
+    } catch {
+        // Keep string response format (e.g. ACCESS_NUMBER:..., BAD_KEY).
+    }
+
+    if (data === 'BAD_KEY') {
+        throw new SmsVerifyKeyError('BAD_KEY');
+    }
+
+    if (!response.ok) {
+        // Caller handling relies on these error codes. Discard other response text.
+        const knownError = data === 'NO_NUMBERS' || data === 'NO_BALANCE' ? ` (${data})` : '';
+        throw new Error(`SMS Verification API returned HTTP ${response.status}${knownError}`);
+    }
+
+    return data;
 }
 
 /**
@@ -102,14 +84,8 @@ async function makeRequest(action, params = {}) {
  * @returns {Promise<number>} Current balance
  */
 export async function getSmsVerifyBalance() {
-    try {
-        const balance = await makeRequest('getBalance');
-        console.log(`✓ SMS Verify Balance: ${balance}`);
-        return parseFloat(balance);
-    } catch (error) {
-        console.error('Error getting SMS Verify balance:', error.message);
-        throw error;
-    }
+    const balance = await makeRequest('getBalance');
+    return parseFloat(balance);
 }
 
 /**
@@ -117,13 +93,7 @@ export async function getSmsVerifyBalance() {
  * @returns {Promise<Array>} List of countries with operators
  */
 export async function getSmsVerifyCountries() {
-    try {
-        const data = await makeRequest('getCountryAndOperators');
-        return data;
-    } catch (error) {
-        console.error('Error getting countries:', error.message);
-        throw error;
-    }
+    return makeRequest('getCountryAndOperators');
 }
 
 /**
@@ -134,17 +104,11 @@ export async function getSmsVerifyCountries() {
  * @returns {Promise<Object>} Prices data
  */
 export async function getSmsVerifyPrices(country, operator, service) {
-    try {
-        const params = { country };
-        if (operator) params.operator = operator;
-        if (service) params.service = service;
+    const params = { country };
+    if (operator) params.operator = operator;
+    if (service) params.service = service;
 
-        const data = await makeRequest('getPrices', params);
-        return data;
-    } catch (error) {
-        console.error('Error getting prices:', error.message);
-        throw error;
-    }
+    return makeRequest('getPrices', params);
 }
 
 /**
@@ -155,17 +119,11 @@ export async function getSmsVerifyPrices(country, operator, service) {
  * @returns {Promise<Array>} Services with prices
  */
 export async function getSmsVerifyServices(country, operator, service) {
-    try {
-        const params = { country };
-        if (operator) params.operator = operator;
-        if (service) params.service = service;
+    const params = { country };
+    if (operator) params.operator = operator;
+    if (service) params.service = service;
 
-        const data = await makeRequest('getServicesAndCost', params);
-        return data;
-    } catch (error) {
-        console.error('Error getting services:', error.message);
-        throw error;
-    }
+    return makeRequest('getServicesAndCost', params);
 }
 
 /**
@@ -178,61 +136,32 @@ export async function getSmsVerifyServices(country, operator, service) {
  * @returns {Promise<{id: number, phone: string, price?: number}>}
  */
 export async function buySmsVerifyNumber(service = 'fu', country = 16, operator = 'any', options = {}) {
-    try {
-        // Check if API key is configured
-        const apiKey = getApiKey();
-        if (!apiKey) {
-            throw new Error('SMS Verification API key not configured. Please set SMS_VERIFY_API_KEY in your .env file');
+    const params = { service, country, operator };
+    if (options.maxPrice) params.maxPrice = options.maxPrice;
+
+    const response = await makeRequest('getNumber', params);
+
+    // Parse response: ACCESS_NUMBER:ID:NUMBER
+    if (typeof response === 'string') {
+        if (response === 'NO_BALANCE') {
+            throw new Error('Insufficient balance in your SMS Verification account');
         }
-
-        console.log(`Buying SMS Verify number: service=${service}, country=${country}, operator=${operator}...`);
-
-        const params = { service, country, operator };
-        if (options.maxPrice) params.maxPrice = options.maxPrice;
-
-        const response = await makeRequest('getNumber', params);
-
-        // Parse response: ACCESS_NUMBER:ID:NUMBER
-        if (typeof response === 'string') {
-            if (response === 'BAD_KEY') {
-                throw new Error('Invalid API key. Please check your SMS_VERIFY_API_KEY in .env file. The API key may be incorrect or expired.');
-            }
-            if (response === 'NO_BALANCE') {
-                throw new Error('Insufficient balance in your SMS Verification account');
-            }
-            if (response === 'NO_NUMBERS') {
-                throw new Error(`No phone numbers available for service=${service}, country=${country}, operator=${operator}`);
-            }
-            if (response.startsWith('WRONG_MAX_PRICE:')) {
-                const minPrice = response.split(':')[1];
-                throw new Error(`Price too low. Minimum price: ${minPrice}`);
-            }
-            if (response.startsWith('ACCESS_NUMBER:')) {
-                const parts = response.split(':');
-                const id = parseInt(parts[1]);
-                const phone = parts[2];
-
-                console.log(`✓ SMS Verify number purchased: ${phone} (ID: ${id})`);
-
-                return { id, phone };
-            }
+        if (response === 'NO_NUMBERS') {
+            throw new Error('No phone numbers available for the requested service, country and operator');
         }
-
-        throw new Error(`Unexpected response from API: ${response}`);
-    } catch (error) {
-        // Provide more helpful error messages
-        if (error.message.includes('BAD_KEY')) {
-            console.error('❌ SMS Verification API Error: Invalid API Key');
-            console.error('   Please check your SMS_VERIFY_API_KEY in .env file');
-            console.error('   Make sure the key is correct and active');
-        } else if (error.message.includes('not configured')) {
-            console.error('❌ SMS Verification API Error: API Key not configured');
-            console.error('   Please set SMS_VERIFY_API_KEY in your .env file');
-        } else {
-            console.error('Error buying SMS Verify number:', error.message);
+        if (response.startsWith('WRONG_MAX_PRICE:')) {
+            throw new Error('Price too low for the requested SMS number');
         }
-        throw error;
+        if (response.startsWith('ACCESS_NUMBER:')) {
+            const parts = response.split(':');
+            const id = parseInt(parts[1]);
+            const phone = parts[2];
+
+            return { id, phone };
+        }
     }
+
+    throw new Error('Unexpected response from SMS Verification API');
 }
 
 /**
@@ -244,37 +173,28 @@ export async function buySmsVerifyNumber(service = 'fu', country = 16, operator 
  * @returns {Promise<Object>} Order data
  */
 export async function buySmsVerifyNumberV2(service = 'fu', country = 16, operator = 'any', options = {}) {
-    try {
-        console.log(`Buying SMS Verify number (V2): service=${service}, country=${country}...`);
+    const params = { service, country, operator };
+    if (options.maxPrice) params.maxPrice = options.maxPrice;
 
-        const params = { service, country, operator };
-        if (options.maxPrice) params.maxPrice = options.maxPrice;
+    const response = await makeRequest('getNumberV2', params);
 
-        const response = await makeRequest('getNumberV2', params);
-
-        if (typeof response === 'string') {
-            if (response === 'NO_BALANCE') throw new Error('Insufficient balance');
-            if (response === 'NO_NUMBERS') throw new Error('No numbers available');
-            if (response.startsWith('WRONG_MAX_PRICE:')) {
-                throw new Error(`Price too low. Min: ${response.split(':')[1]}`);
-            }
+    if (typeof response === 'string') {
+        if (response === 'NO_BALANCE') throw new Error('Insufficient balance');
+        if (response === 'NO_NUMBERS') throw new Error('No numbers available');
+        if (response.startsWith('WRONG_MAX_PRICE:')) {
+            throw new Error('Price too low for the requested SMS number');
         }
-
-        console.log(`✓ SMS Verify number purchased: ${response.phoneNumber} (ID: ${response.activationId})`);
-
-        return {
-            id: response.activationId,
-            phone: response.phoneNumber,
-            price: response.activationCost,
-            currency: response.currency,
-            countryCode: response.countryCode,
-            operator: response.activationOperator,
-            time: response.activationTime
-        };
-    } catch (error) {
-        console.error('Error buying SMS Verify number (V2):', error.message);
-        throw error;
     }
+
+    return {
+        id: response.activationId,
+        phone: response.phoneNumber,
+        price: response.activationCost,
+        currency: response.currency,
+        countryCode: response.countryCode,
+        operator: response.activationOperator,
+        time: response.activationTime
+    };
 }
 
 /**
@@ -283,27 +203,22 @@ export async function buySmsVerifyNumberV2(service = 'fu', country = 16, operato
  * @returns {Promise<{status: string, code?: string}>}
  */
 export async function checkSmsVerifyOrder(orderId) {
-    try {
-        const response = await makeRequest('getStatus', { id: orderId });
+    const response = await makeRequest('getStatus', { id: orderId });
 
-        if (typeof response === 'string') {
-            if (response === 'STATUS_WAIT_CODE') {
-                return { status: 'PENDING', code: null };
-            }
-            if (response === 'STATUS_CANCEL') {
-                return { status: 'CANCELED', code: null };
-            }
-            if (response.startsWith('STATUS_OK:')) {
-                const code = response.split(':')[1];
-                return { status: 'RECEIVED', code };
-            }
+    if (typeof response === 'string') {
+        if (response === ORDER_STATUS.WAIT_CODE) {
+            return { status: 'PENDING', code: null };
         }
-
-        return { status: 'UNKNOWN', code: null, raw: response };
-    } catch (error) {
-        console.error('Error checking order status:', error.message);
-        throw error;
+        if (response === ORDER_STATUS.CANCEL) {
+            return { status: 'CANCELED', code: null };
+        }
+        if (response.startsWith(`${ORDER_STATUS.OK}:`)) {
+            const code = response.split(':')[1];
+            return { status: 'RECEIVED', code };
+        }
     }
+
+    return { status: 'UNKNOWN', code: null };
 }
 
 /**
@@ -313,18 +228,13 @@ export async function checkSmsVerifyOrder(orderId) {
  * @returns {Promise<string>} Response
  */
 export async function setSmsVerifyStatus(orderId, status) {
-    try {
-        const response = await makeRequest('setStatus', { id: orderId, status });
+    const response = await makeRequest('setStatus', { id: orderId, status });
 
-        if (response === 'CANNOT_BEFORE_2_MIN') {
-            throw new Error('Cannot cancel before 2 minutes after ordering');
-        }
-
-        return response;
-    } catch (error) {
-        console.error('Error setting order status:', error.message);
-        throw error;
+    if (response === 'CANNOT_BEFORE_2_MIN') {
+        throw new Error('Cannot cancel before 2 minutes after ordering');
     }
+
+    return response;
 }
 
 /**
@@ -335,11 +245,9 @@ export async function setSmsVerifyStatus(orderId, status) {
 export async function cancelSmsVerifyOrder(orderId) {
     try {
         const response = await setSmsVerifyStatus(orderId, 8);
-        console.log(`✓ Order ${orderId}: Canceled`);
         return response === 'ACCESS_CANCEL';
     } catch (error) {
         if (error.message.includes('2 minutes')) {
-            console.log(`⚠ Order ${orderId}: Cannot cancel yet (wait 2 min)`);
             return false;
         }
         throw error;
@@ -352,14 +260,8 @@ export async function cancelSmsVerifyOrder(orderId) {
  * @returns {Promise<boolean>} Success
  */
 export async function finishSmsVerifyOrder(orderId) {
-    try {
-        const response = await setSmsVerifyStatus(orderId, 6);
-        console.log(`✓ Order ${orderId}: Finished`);
-        return response === 'ACCESS_ACTIVATION';
-    } catch (error) {
-        console.error(`Error finishing order ${orderId}:`, error.message);
-        throw error;
-    }
+    const response = await setSmsVerifyStatus(orderId, 6);
+    return response === 'ACCESS_ACTIVATION';
 }
 
 /**
@@ -368,14 +270,8 @@ export async function finishSmsVerifyOrder(orderId) {
  * @returns {Promise<boolean>} Success
  */
 export async function retrySmsVerifyOrder(orderId) {
-    try {
-        const response = await setSmsVerifyStatus(orderId, 3);
-        console.log(`✓ Order ${orderId}: Waiting for new SMS`);
-        return response === 'ACCESS_RETRY_GET';
-    } catch (error) {
-        console.error(`Error requesting new SMS for order ${orderId}:`, error.message);
-        throw error;
-    }
+    const response = await setSmsVerifyStatus(orderId, 3);
+    return response === 'ACCESS_RETRY_GET';
 }
 
 /**
@@ -388,19 +284,13 @@ export async function retrySmsVerifyOrder(orderId) {
  * @returns {Promise<Array>} List of activations
  */
 export async function getSmsVerifyActivations(options = {}) {
-    try {
-        const params = {};
-        if (options.status !== undefined) params.status = options.status;
-        if (options.limit) params.limit = options.limit;
-        if (options.order) params.order = options.order;
-        if (options.orderBy) params.orderBy = options.orderBy;
+    const params = {};
+    if (options.status !== undefined) params.status = options.status;
+    if (options.limit) params.limit = options.limit;
+    if (options.order) params.order = options.order;
+    if (options.orderBy) params.orderBy = options.orderBy;
 
-        const data = await makeRequest('getCurrentActivationsList', params);
-        return data;
-    } catch (error) {
-        console.error('Error getting activations:', error.message);
-        throw error;
-    }
+    return makeRequest('getCurrentActivationsList', params);
 }
 
 /**
@@ -411,38 +301,37 @@ export async function getSmsVerifyActivations(options = {}) {
  * @returns {Promise<string>} SMS code
  */
 export async function waitForSmsVerifyCode(orderId, maxWaitTime = 300000, checkInterval = 3000) {
-    const startTime = Date.now();
+    const startTime = performance.now();
     let lastStatus = 'PENDING';
 
-    console.log(`Waiting for SMS (Order: ${orderId}, Max: ${maxWaitTime / 1000}s)...`);
+    console.log('Waiting for SMS...');
 
-    while (Date.now() - startTime < maxWaitTime) {
+    while (performance.now() - startTime < maxWaitTime) {
+        let result;
         try {
-            const result = await checkSmsVerifyOrder(orderId);
+            result = await checkSmsVerifyOrder(orderId);
+        } catch (error) {
+            if (error instanceof SmsVerifyKeyError) throw error;
+            console.log('Retrying SMS status request');
+        }
 
+        if (result) {
             if (result.status !== lastStatus) {
                 console.log(`  Status: ${lastStatus} -> ${result.status}`);
                 lastStatus = result.status;
             }
 
-            if (result.code) {
-                console.log(`✓ SMS code received: ${result.code}`);
-                return result.code;
-            }
+            if (result.code) return result.code;
 
             if (result.status === 'CANCELED') {
                 throw new Error('Order was canceled');
             }
-
-        } catch (error) {
-            if (error.message.includes('canceled')) throw error;
-            console.log(`  Retry after error: ${error.message}`);
         }
 
-        await new Promise(r => setTimeout(r, checkInterval));
+        await new Promise(resolve => setTimeout(resolve, checkInterval));
     }
 
-    throw new Error(`Timeout waiting for SMS (Order: ${orderId})`);
+    throw new Error('Timeout waiting for SMS');
 }
 
 /**

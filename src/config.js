@@ -62,6 +62,7 @@ export const config = {
         geoip: process.env.CAMOUFOX_GEOIP !== 'false', // Default: true when proxy is used
         canvasNoise: process.env.CAMOUFOX_CANVAS_NOISE !== 'false', // Default: true for cross-OS isolation
         enablePortScanProtection: process.env.CAMOUFOX_PORT_SCAN_PROTECTION !== 'false', // Default: true (Ziniao-absorbed localhost/RFC1918 LAN port-scan guard)
+        portScanProtectionMode: process.env.CAMOUFOX_PORT_SCAN_MODE || 'url-only',
         allowedLocalPorts: process.env.CAMOUFOX_ALLOWED_LOCAL_PORTS
             ? process.env.CAMOUFOX_ALLOWED_LOCAL_PORTS.split(',')
                   .map((p) => parseInt(p.trim(), 10))
@@ -78,10 +79,10 @@ export const config = {
         recordTraffic: process.env.CAMOUFOX_RECORD_TRAFFIC !== 'false', // Default: true (pre-TLS Necko egress/ingress NDJSON + attribution)
         recordBodies: process.env.CAMOUFOX_RECORD_BODIES !== 'false', // Default: true (capture plaintext request/response payloads)
         recordWireLog: process.env.CAMOUFOX_RECORD_WIRE_LOG !== 'false', // Default: true (writes canonical pre-TLS HTTP/1.1 & HTTP/2 wire stream to pre-tls-wire.log)
-        sslKeyLog: process.env.CAMOUFOX_SSLKEYLOG !== 'false', // Default: true (export NSS pre-TLS secrets to sslkeylog.txt)
+        sslKeyLog: process.env.CAMOUFOX_SSLKEYLOG === 'true', // Private diagnostic for a dedicated browser process
         neckoMozLog: process.env.CAMOUFOX_NECKO_MOZ_LOG === 'true', // Default: false (enables Firefox C++ Necko kernel MOZ_LOG to necko-pre-tls.moz_log)
         neckoMozLogModules: process.env.CAMOUFOX_NECKO_MOZ_LOG_MODULES || 'timestamp,nsHttp:5,nsSocketTransport:5,nsHostResolver:4',
-        recordHar: process.env.CAMOUFOX_RECORD_HAR === 'true', // Default: false (optional Playwright HAR 1.2 archive)
+        recordHar: process.env.CAMOUFOX_RECORD_HAR === 'true', // Optional sanitized HAR 1.2 archive
         maxBodyBytes: parseInt(process.env.CAMOUFOX_TRAFFIC_MAX_BODY_BYTES || '5242880', 10) // Default: 5MB
     },
     gologin: {
@@ -141,10 +142,6 @@ if (config.profileService === 'gpm') {
 } else {
     console.warn(`⚠ Unknown PROFILE_SERVICE: ${config.profileService}. Using default: gpm`);
     config.profileService = 'gpm';
-}
-
-if (!config.omocaptcha.apiKey) {
-    console.warn('⚠ OMOCAPTCHA_KEY is not set');
 }
 
 if (!config.smsVerify.apiKey) {

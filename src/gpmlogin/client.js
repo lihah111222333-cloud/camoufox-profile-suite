@@ -5,8 +5,16 @@
 
 import axios from 'axios';
 import logger from '../utils/logger.js';
+import {
+    controllerApiUrl,
+    controllerRequestOptions,
+    parseControllerUrl,
+    validateControllerEndpoint
+} from '../utils/controller-url.js';
+import { requireProxyProtocol } from '../utils/proxy-protocol.js';
 
 const GPM_API_URL = process.env.GPM_API_URL || 'http://127.0.0.1:14517';
+const controllerClient = axios.create(controllerRequestOptions);
 
 /**
  * Generate realistic Android User-Agent with variations
@@ -218,7 +226,7 @@ export function generateAndroidFingerprint() {
  */
 export async function checkGPMConnection() {
     try {
-        const response = await axios.get(`${GPM_API_URL}/api/v3/profiles`, {
+        const response = await controllerClient.get(controllerApiUrl(GPM_API_URL, '/api/v3/profiles'), {
             timeout: 5000
         });
         logger.info('GPM API is connected and responding');
@@ -309,10 +317,13 @@ export async function createProfile(profileName, proxy = null) {
         const OMOCAPTCHA_EXTENSION_ID = 'dfjghhjachoacpgpkmbpdlpppeagojhe';
         requestBody.extension_ids = [OMOCAPTCHA_EXTENSION_ID];
         
-        // Add proxy if provided
-        if (proxy && proxy.ip && proxy.port) {
+        // GPM's raw proxy format here only represents HTTP and SOCKS5.
+        if (proxy) {
+            const proxyType = requireProxyProtocol(proxy, ['http', 'socks5', 'socks'], 'GPM Login');
+            if (!proxy.ip || !proxy.port) {
+                throw new Error('Proxy host and port are required');
+            }
             let rawProxy = '';
-            const proxyType = (proxy.type || 'http').toLowerCase();
             
             if (proxyType === 'socks5' || proxyType === 'socks') {
                 if (proxy.username && proxy.password) {
@@ -337,7 +348,7 @@ export async function createProfile(profileName, proxy = null) {
         
         logger.info('Creating GPM profile', { name: finalName, userAgent: userAgent.substring(0, 50) + '...' });
         
-        const response = await axios.post(`${GPM_API_URL}/api/v3/profiles/create`, requestBody, {
+        const response = await controllerClient.post(controllerApiUrl(GPM_API_URL, '/api/v3/profiles/create'), requestBody, {
             headers: {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json'
@@ -425,20 +436,22 @@ export async function startProfile(profileId, options = {}) {
             params.append('addination_args', options.addination_args);
         }
         
-        let url = `${GPM_API_URL}/api/v3/profiles/start/${profileId}`;
+        let url = controllerApiUrl(GPM_API_URL, `/api/v3/profiles/start/${profileId}`);
         if (params.toString()) {
             url += `?${params.toString()}`;
         }
         
-        const response = await axios.get(url, { timeout: 30000 });
+        const response = await controllerClient.get(url, { timeout: 30000 });
         
         if (response.data) {
             const data = response.data.data || response.data;
             
             if (data.remote_debugging_address) {
+                const endpoint = parseControllerUrl(data.remote_debugging_address, 'http:');
+                validateControllerEndpoint(endpoint, parseControllerUrl(GPM_API_URL));
                 return {
                     driver_path: data.driver_path || '',
-                    remote_debugging_address: data.remote_debugging_address
+                    remote_debugging_address: endpoint.href
                 };
             }
         }
@@ -471,7 +484,7 @@ export async function stopProfile(profileId, maxRetries = 3) {
     
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            const response = await axios.get(`${GPM_API_URL}/api/v3/profiles/stop/${profileId}`, {
+            const response = await controllerClient.get(controllerApiUrl(GPM_API_URL, `/api/v3/profiles/stop/${profileId}`), {
                 timeout: 10000
             });
             
@@ -535,8 +548,8 @@ export async function deleteProfile(profileId, mode = 2) {
         
         logger.info('Deleting profile', { profileId, mode });
         
-        const deleteUrl = `${GPM_API_URL}/api/v3/profiles/delete/${profileId}?mode=${mode}`;
-        const response = await axios.delete(deleteUrl, {
+        const deleteUrl = controllerApiUrl(GPM_API_URL, `/api/v3/profiles/delete/${profileId}?mode=${mode}`);
+        const response = await controllerClient.delete(deleteUrl, {
             headers: {
                 'Accept': 'application/json'
             },
@@ -575,7 +588,7 @@ export async function deleteProfile(profileId, mode = 2) {
  */
 export async function getProfile(profileId) {
     try {
-        const response = await axios.get(`${GPM_API_URL}/api/v3/profiles/${profileId}`, {
+        const response = await controllerClient.get(controllerApiUrl(GPM_API_URL, `/api/v3/profiles/${profileId}`), {
             timeout: 10000
         });
         

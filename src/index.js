@@ -6,13 +6,7 @@
  * نقطة البداية الرئيسية للتطبيق
  */
 
-import logger from './utils/logger.js';
-import proxyManager from './utils/proxy-manager.js';
-import nameGenerator from './utils/name-generator.js';
-import { createAndStartProfile as createAndStartCamoufoxProfile } from './camoufox/profile.js';
-import { createGmailAccount } from './gmail/creator.js';
-import config from './config.js';
-import fs from 'fs';
+import { appendAccountResult, migrateExistingAccountOutputs, writeRunSummary } from './utils/account-results.js';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 
@@ -20,29 +14,47 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const RESULTS_FILE = path.join(__dirname, '../results.json');
+const SUMMARY_FILE = path.join(__dirname, '../summary.json');
+
+class AccountOutputWriteError extends Error {
+    constructor(message, cause) {
+        super(message, { cause });
+        this.code = 'ACCOUNT_OUTPUT_WRITE_FAILED';
+    }
+}
+
+async function loadRuntime() {
+    const { default: config } = await import('./config.js');
+    const [
+        { default: logger },
+        { default: proxyManager },
+        { default: nameGenerator },
+        { createGmailAccount }
+    ] = await Promise.all([
+        import('./utils/logger.js'),
+        import('./utils/proxy-manager.js'),
+        import('./utils/name-generator.js'),
+        import('./gmail/creator.js')
+    ]);
+    return { config, logger, proxyManager, nameGenerator, createGmailAccount };
+}
 
 /**
  * Save account result
  * حفظ نتيجة الحساب
  */
-function saveResult(result) {
+function saveResult(result, logger) {
+    let saved;
     try {
-        let results = [];
-        if (fs.existsSync(RESULTS_FILE)) {
-            const content = fs.readFileSync(RESULTS_FILE, 'utf8');
-            results = JSON.parse(content);
-        }
-        
-        results.push({
-            ...result,
-            createdAt: new Date().toISOString()
-        });
-        
-        fs.writeFileSync(RESULTS_FILE, JSON.stringify(results, null, 2));
-        logger.info('Result saved', { email: result.email });
+        saved = appendAccountResult(RESULTS_FILE, result);
     } catch (error) {
-        logger.error('Failed to save result', { error: error.message });
+        const message = result.success
+            ? 'An account was created and its result could not be saved safely in results.json.'
+            : 'A failed account attempt could not be saved safely in results.json.';
+        throw new AccountOutputWriteError(message, error);
     }
+    logger.info('Result saved', { email: saved.email });
+    return saved;
 }
 
 /**
@@ -50,6 +62,12 @@ function saveResult(result) {
  * إنشاء حساب Gmail واحد
  */
 async function createAccount(accountNumber = null) {
+    migrateExistingAccountOutputs(RESULTS_FILE, SUMMARY_FILE);
+    return createAccountWithRuntime(await loadRuntime(), accountNumber);
+}
+
+async function createAccountWithRuntime(runtime, accountNumber) {
+    const { config, logger, proxyManager, nameGenerator, createGmailAccount } = runtime;
     let profile = null;
     let phoneOrder = null;
     let proxy = null; // Initialize proxy variable
@@ -85,6 +103,7 @@ async function createAccount(accountNumber = null) {
         
         // Format proxy according to service
         if (profileService === 'camoufox') {
+            const { createAndStartProfile: createAndStartCamoufoxProfile } = await import('./camoufox/profile.js');
             const camoufoxProxy = proxy ? proxyManager.getCamoufoxFormat(proxy) : null;
             profile = await createAndStartCamoufoxProfile(profileName, camoufoxProxy, {
                 os: config.camoufox?.os,
@@ -95,6 +114,10 @@ async function createAccount(accountNumber = null) {
                 geoip: config.camoufox?.geoip,
                 canvas_noise: config.camoufox?.canvasNoise,
                 enablePortScanProtection: config.camoufox?.enablePortScanProtection,
+                portScanProtection: {
+                    mode: config.camoufox?.portScanProtectionMode,
+                    enabled: config.camoufox?.enablePortScanProtection
+                },
                 allowedLocalPorts: config.camoufox?.allowedLocalPorts,
                 enableGpuPerformanceScaling: config.camoufox?.enableGpuPerformanceScaling,
                 canvasSkipHosts: config.camoufox?.canvasSkipHosts,
@@ -195,29 +218,28 @@ async function createAccount(accountNumber = null) {
         const finalCamoufoxTelemetry =
             typeof profile?.getTelemetrySummary === 'function' ? profile.getTelemetrySummary() : null;
 
-        // Step 7: Save result with all details
-        saveResult({
-            success: true,
+        // Step 7: Save account outcome
+        const accountResult = saveResult({
             ...result,
+            success: true,
             profileId: profile.profileId,
             profileType: serviceName,
-            proxy: proxyManager.getStringFormat(proxy),
             proxyIP: proxy ? proxy.ip : null,
             profileIP: profileIP,
             trafficAttribution: profile.trafficPaths || null,
             ...(finalCamoufoxTelemetry ? { camoufoxTelemetry: finalCamoufoxTelemetry } : {}),
             timestamp: new Date().toISOString()
-        });
+        }, logger);
 
         logger.info(`${accountLabel} === Account Creation Completed Successfully ===`, {
             email: result.email
         });
 
-        return {
-            ...result,
-            trafficAttribution: profile.trafficPaths || null
-        };
+        return accountResult;
     } catch (error) {
+        if (error instanceof AccountOutputWriteError) {
+            throw error;
+        }
         logger.error(`${accountLabel} === Account Creation Failed ===`, {
             error: error.message,
             stack: error.stack
@@ -226,11 +248,12 @@ async function createAccount(accountNumber = null) {
         // Save failure result
         saveResult({
             success: false,
-            error: error.message,
+            errorCode: error.code,
+            errorStage: error.stage,
             profileId: profile?.profileId || null,
             trafficAttribution: profile?.trafficPaths || null,
             timestamp: new Date().toISOString()
-        });
+        }, logger);
 
         throw error;
     } finally {
@@ -256,22 +279,31 @@ async function createAccount(accountNumber = null) {
  * Process queue with concurrency control
  * معالجة قائمة الانتظار مع التحكم في التزامن
  */
-async function processQueue(queue, concurrency) {
+async function processQueue(queue, concurrency, logger) {
     const results = [];
     const executing = [];
     let completed = 0;
     let failed = 0;
+    let outputWriteError;
 
     const executeTask = async (task, index) => {
         try {
             logger.info(`[Thread ${index + 1}] Starting account creation ${completed + failed + 1}/${queue.length}`);
             const result = await task();
             completed++;
-            results.push({ success: true, result, index });
+            results.push(result);
             logger.info(`[Thread ${index + 1}] Account created successfully (${completed} success, ${failed} failed)`);
         } catch (error) {
+            if (error instanceof AccountOutputWriteError) {
+                outputWriteError ??= error;
+                return;
+            }
             failed++;
-            results.push({ success: false, error: error.message, index });
+            results.push({
+                success: false,
+                errorCode: error.code,
+                errorStage: error.stage
+            });
             logger.error(`[Thread ${index + 1}] Account creation failed (${completed} success, ${failed} failed)`, {
                 error: error.message
             });
@@ -285,6 +317,9 @@ async function processQueue(queue, concurrency) {
         while (executing.length >= concurrency) {
             await Promise.race(executing);
         }
+        if (outputWriteError) {
+            break;
+        }
 
         const promise = executeTask(task, i).then(() => {
             executing.splice(executing.indexOf(promise), 1);
@@ -295,6 +330,9 @@ async function processQueue(queue, concurrency) {
 
     // Wait for all remaining tasks
     await Promise.all(executing);
+    if (outputWriteError) {
+        throw outputWriteError;
+    }
 
     return {
         results,
@@ -312,6 +350,10 @@ async function processQueue(queue, concurrency) {
  * الدالة الرئيسية
  */
 async function main() {
+    migrateExistingAccountOutputs(RESULTS_FILE, SUMMARY_FILE);
+    const runtime = await loadRuntime();
+    const { config, logger, proxyManager } = runtime;
+
     try {
         // Parse command line arguments
         const args = process.argv.slice(2);
@@ -363,7 +405,7 @@ async function main() {
         // Create queue of tasks
         const queue = [];
         for (let i = 0; i < accountsCount; i++) {
-            queue.push(() => createAccount(i + 1));
+            queue.push(() => createAccountWithRuntime(runtime, i + 1));
         }
 
         logger.info(`Starting creation of ${accountsCount} accounts with ${threadsCount} concurrent threads`);
@@ -371,7 +413,7 @@ async function main() {
         const startTime = Date.now();
         
         // Process queue with concurrency control
-        const { results, stats } = await processQueue(queue, threadsCount);
+        const { results, stats } = await processQueue(queue, threadsCount, logger);
 
         const endTime = Date.now();
         const duration = ((endTime - startTime) / 1000).toFixed(2);
@@ -384,7 +426,7 @@ async function main() {
             averageTime: `${(duration / accountsCount).toFixed(2)}s per account`
         });
 
-        // Save summary with full details
+        // Save run statistics and account outcomes
         const summary = {
             timestamp: new Date().toISOString(),
             configuration: {
@@ -395,44 +437,23 @@ async function main() {
             },
             stats,
             duration: `${duration}s`,
-            results: results.map(r => {
-                if (r.success && r.result) {
-                    return {
-                        success: true,
-                        email: r.result.email || null,
-                        password: r.result.password || null,
-                        firstName: r.result.firstName || null,
-                        lastName: r.result.lastName || null,
-                        fullName: r.result.fullName || null,
-                        username: r.result.username || null,
-                        phone: r.result.phone || null,
-                        phoneCode: r.result.phoneCode || null,
-                        orderId: r.result.orderId || null,
-                        profileId: r.result.profileId || null,
-                        profileType: r.result.profileType || null,
-                        proxy: r.result.proxy || null,
-                        proxyIP: r.result.proxyIP || null,
-                        profileIP: r.result.profileIP || null,
-                        timestamp: r.result.timestamp || null,
-                        error: null
-                    };
-                } else {
-                    return {
-                        success: false,
-                        email: null,
-                        error: r.error || null
-                    };
-                }
-            })
+            results
         };
 
-        const summaryFile = path.join(__dirname, '../summary.json');
-        fs.writeFileSync(summaryFile, JSON.stringify(summary, null, 2));
+        try {
+            writeRunSummary(SUMMARY_FILE, summary);
+        } catch (error) {
+            throw new AccountOutputWriteError('Run summary could not be saved safely in summary.json.', error);
+        }
         logger.info('Summary saved to summary.json');
 
         logger.info('=== Bot execution completed ===');
     } catch (error) {
-        logger.error('Fatal error in main', { error: error.message, stack: error.stack });
+        if (error instanceof AccountOutputWriteError) {
+            logger.error(error.message);
+        } else {
+            logger.error('Fatal error in main', { error: error.message, stack: error.stack });
+        }
         process.exit(1);
     }
 }
@@ -455,7 +476,7 @@ const isMainModule = (() => {
 
 if (isMainModule) {
     main().catch(error => {
-        logger.error('Unhandled error', { error: error.message });
+        console.error(error.message);
         process.exit(1);
     });
 }
