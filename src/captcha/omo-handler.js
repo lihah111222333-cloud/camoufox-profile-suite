@@ -17,13 +17,24 @@ let omoSetupInProgress = false;
  * Detect whether the active profile/page runs on Camoufox (Firefox / Gecko),
  * where `chrome-extension://` CRX URLs are unsupported.
  */
-async function isFirefoxOrCamoufoxEngine(page = null) {
+async function isFirefoxOrCamoufoxEngine(target = null) {
     if (config.profileService === 'camoufox') {
         return true;
     }
-    if (page && typeof page.evaluate === 'function') {
+    if (
+        target &&
+        (target._camoufoxCompatAttached ||
+            target._camoufoxProfile ||
+            target._camoufoxContext ||
+            target._camoufoxNewPageWrapped ||
+            target._camoufoxPagesWrapped ||
+            target._camoufoxActiveProfile)
+    ) {
+        return true;
+    }
+    if (target && typeof target.evaluate === 'function') {
         try {
-            return await page.evaluate(() => {
+            return await target.evaluate(() => {
                 const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
                 return /\bFirefox\/\d+/i.test(ua) && typeof chrome === 'undefined';
             });
@@ -40,6 +51,10 @@ async function isFirefoxOrCamoufoxEngine(page = null) {
  */
 export async function checkRecaptchaExtension(browser) {
     try {
+        if (await isFirefoxOrCamoufoxEngine(browser)) {
+            logger.info('Camoufox/Firefox engine detected — skipping Chrome CRX reCAPTCHA extension check');
+            return { installed: false, enabled: false, skippedOnCamoufox: true, error: null };
+        }
         logger.info('Checking reCAPTCHA Extension', { extensionId: OMOCAPTCHA_EXTENSION_ID });
         
         const tempPage = await browser.newPage();
@@ -75,6 +90,9 @@ export async function checkRecaptchaExtension(browser) {
 export async function openOMOCaptchaExtension(page) {
     let newPage = null;
     try {
+        if (await isFirefoxOrCamoufoxEngine(page)) {
+            return { page: null, opened: false, skippedOnCamoufox: true };
+        }
         logger.info('Opening OMO Captcha Extension in new tab');
         
         const browser = page.browser();
@@ -151,6 +169,9 @@ export async function openOMOCaptchaExtension(page) {
  */
 export async function setOMOCaptchaKeyViaAPI(page) {
     try {
+        if (await isFirefoxOrCamoufoxEngine(page)) {
+            return { success: false, skippedOnCamoufox: true };
+        }
         logger.info('Attempting to set OMO Captcha API key via Chrome Extension API');
         
         // Navigate to a regular page to access Chrome APIs

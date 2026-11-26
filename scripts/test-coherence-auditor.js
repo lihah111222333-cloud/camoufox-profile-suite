@@ -3733,6 +3733,215 @@ const tests = [
                 fs.rmSync(tmpDir, { recursive: true, force: true });
             }
         }
+    },
+    {
+        name: '93. Round-3 Deep Adversarial Audit (Part 1): WebGPU GPUSupportedLimits Hook, Date.now() vs new Date().getTime() Zero Drift & Idle Relaxation, Same-Origin Iframe Cross-Realm Cloaking & PCI Device ID Hardening',
+        fn: async () => {
+            const vm = await import('node:vm');
+            const baseline = collectHostMacPerformanceBaseline();
+            const uhd620Weights = computeGpuPerformanceScalingWeights('Intel(R) UHD Graphics 620', {
+                profileId: 'round3-uhd620',
+                hostBaseline: baseline
+            });
+
+            let realClock = 1000;
+            function MockGPUSupportedLimits() {}
+            Object.defineProperty(MockGPUSupportedLimits.prototype, 'maxBufferSize', {
+                get() {
+                    return 4294967296; // Host Apple M5 Pro limit (4GB)
+                },
+                enumerable: true,
+                configurable: true
+            });
+            Object.defineProperty(MockGPUSupportedLimits.prototype, 'maxComputeWorkgroupSizeX', {
+                get() {
+                    return 1024; // Host Apple M5 Pro limit (1024)
+                },
+                enumerable: true,
+                configurable: true
+            });
+
+            const iframeWindow = {
+                Function: {
+                    prototype: {
+                        toString: Function.prototype.toString
+                    }
+                },
+                Performance: function IframePerformance() {},
+                performance: {}
+            };
+            iframeWindow.Performance.prototype = {
+                now() {
+                    return realClock;
+                }
+            };
+            Object.setPrototypeOf(iframeWindow.performance, iframeWindow.Performance.prototype);
+
+            function MockHTMLIFrameElement() {}
+            Object.defineProperty(MockHTMLIFrameElement.prototype, 'contentWindow', {
+                get() {
+                    return iframeWindow;
+                },
+                enumerable: true,
+                configurable: true
+            });
+
+            const sandbox = {
+                performance: {},
+                Performance: function Performance() {},
+                Date,
+                Proxy,
+                Reflect,
+                WebGLRenderingContext: function WebGLRenderingContext() {},
+                GPUSupportedLimits: MockGPUSupportedLimits,
+                HTMLIFrameElement: MockHTMLIFrameElement
+            };
+            sandbox.Performance.prototype = {
+                now() {
+                    return realClock;
+                }
+            };
+            Object.setPrototypeOf(sandbox.performance, sandbox.Performance.prototype);
+            sandbox.WebGLRenderingContext.prototype = {
+                drawArrays() {},
+                finish() {}
+            };
+            sandbox.globalThis = sandbox;
+
+            const script = buildGpuPerformanceInitScript(uhd620Weights);
+            vm.runInNewContext(script, sandbox);
+
+            // 1. GPUSupportedLimits.prototype getters return UHD 620 limits (1GB / 512) instead of host M5 Pro (4GB / 1024)
+            const limitsInstance = Object.create(MockGPUSupportedLimits.prototype);
+            assert.equal(limitsInstance.maxBufferSize, 1073741824);
+            assert.equal(limitsInstance.maxComputeWorkgroupSizeX, 512);
+            const maxBufGetter = Object.getOwnPropertyDescriptor(
+                MockGPUSupportedLimits.prototype,
+                'maxBufferSize'
+            ).get;
+            assert.equal('prototype' in maxBufGetter, false);
+
+            // 2. Date.now() vs new Date().getTime() stays 0ms apart even after 10 heavy GPU bursts
+            const gl = Object.create(sandbox.WebGLRenderingContext.prototype);
+            for (let i = 0; i < 10; i++) {
+                gl.drawArrays(4, 0, 100);
+                realClock += 20;
+                gl.finish();
+            }
+            const dateNowVal = sandbox.Date.now();
+            const newDateGetTimeVal = new sandbox.Date().getTime();
+            assert.equal(Math.abs(dateNowVal - newDateGetTimeVal), 0);
+
+            // 3. Same-origin iframe contentWindow has cloaked Function.prototype.toString and synchronized performance.now()
+            const ifr = Object.create(MockHTMLIFrameElement.prototype);
+            const cw = ifr.contentWindow;
+            const crossRealmStr = cw.Function.prototype.toString.call(sandbox.Performance.prototype.now);
+            assert.equal(crossRealmStr.includes('impl.apply'), false);
+            assert.equal(crossRealmStr.includes('return realClock'), true);
+            assert.equal(
+                Math.abs(cw.performance.now() - sandbox.performance.now()) < 1,
+                true
+            );
+
+            // 4. PCI Device ID 0x4680 (UHD Graphics 770) rejects UHD Graphics 620, and Apple Silicon rejects NVIDIA PCI Vendor ID
+            const uhd620Spoofing770 = buildCoherentTelemetry('windows');
+            uhd620Spoofing770.webgl.unmaskedRenderer =
+                'ANGLE (Intel, Intel(R) UHD Graphics 620 (0x00004680) Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            const resPci = validateHardwareModelSpec(uhd620Spoofing770, 'windows');
+            assert.equal(resPci.passed, false);
+            assert.ok(resPci.issues.some((i) => /PCI Device ID spoofing detected/.test(i)));
+
+            const appleNvidiaPci = buildCoherentTelemetry('macos');
+            appleNvidiaPci.hardwareProfile = {
+                deviceModel: 'MacBook Pro (Apple M3 Max)',
+                cpuModel: 'Apple M3 Max',
+                gpuModel: 'Apple M3 Max',
+                pciVendorId: '0x10de'
+            };
+            const resApplePci = validateHardwareModelSpec(appleNvidiaPci, 'macos');
+            assert.equal(resApplePci.passed, false);
+            assert.ok(resApplePci.issues.some((i) => /Apple Silicon PCI Vendor ID mismatch/.test(i)));
+        }
+    },
+    {
+        name: '94. Round-3 Deep Adversarial Audit (Part 2): 32-Bit vs 64-Bit Hamming Similarity, WebRTC stun:/turn: Local Port-Scan Protection, 6to4 IPv6 / ip6-localhost / jar:file://localhost Blocking & W3C HAR 1.2 Security-Block Export',
+        fn: async () => {
+            const fs = await import('node:fs');
+            const os = await import('node:os');
+            const path = await import('node:path');
+            const { CamoufoxTrafficRecorder } = await import('../src/camoufox/traffic-recorder.js');
+            const { queryProfileTraffic } = await import('./query-traffic-attribution.js');
+
+            // 1. 32-bit FNV-1a vs 64-bit Hamming distance & similarity
+            assert.equal(computeHexHammingDistance('00000000', 'ffffffff'), 32);
+            assert.equal(computeHashSimilarity('00000000', 'ffffffff'), 0);
+            assert.equal(computeHashSimilarity('00000000', 'ffffffff', 64), 0);
+            assert.equal(
+                CanvasWebglConsistencyLedger.extractDomain('blob:https://accounts.google.com/1234-5678'),
+                'accounts.google.com'
+            );
+            assert.equal(CanvasWebglConsistencyLedger.extractDomain('about:blank'), 'about:blank');
+            assert.equal(CanvasWebglConsistencyLedger.extractDomain('[::1]:8080'), '::1');
+
+            const ledger = new CanvasWebglConsistencyLedger({ profileId: 'round3-ledger' });
+            ledger.recordOrVerify({
+                kind: 'canvas',
+                url: 'https://accounts.google.com/signup',
+                hash: 'a1b2c3d4'
+            });
+            const summary = ledger.getSummary();
+            assert.equal(summary.totalEntries, 1);
+            assert.deepEqual(summary.domains, ['accounts.google.com']);
+
+            // 2. WebRTC stun:/turn:, 6to4 IPv6, ip6-localhost, and two-slash jar:file://localhost/
+            assert.equal(isLocalOrPrivateTarget('stun:127.0.0.1:9222').scope, 'loopback');
+            assert.equal(isLocalOrPrivateTarget('turn:192.168.1.1:3478').scope, 'private-lan');
+            assert.equal(isLocalOrPrivateTarget('ip6-localhost').scope, 'loopback');
+            assert.equal(isLocalOrPrivateTarget('2002:7f00:0001::1').scope, 'loopback');
+            assert.equal(evaluatePortScanRequest('stun:127.0.0.1:9222').shouldBlock, true);
+            assert.equal(
+                evaluateInternalSchemeAccess('jar:file://localhost/etc/passwd').shouldBlock,
+                true
+            );
+
+            // 3. W3C HAR 1.2 export includes security-block events with BLOCKED_BY_ZINIAO_SECURITY_GUARD
+            const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'camoufox-har-sec-'));
+            try {
+                const recorder = new CamoufoxTrafficRecorder({
+                    profileId: 'har-sec-profile',
+                    trafficDir: tmpDir
+                });
+                recorder.setStep('step-har-security');
+                const secEv = recorder.recordSecurityBlock({
+                    type: 'local-port-scan-probe',
+                    targetUrl: 'http://127.0.0.1:9222/json/version',
+                    host: '127.0.0.1',
+                    port: 9222,
+                    reason: 'Blocked local CDP port scan'
+                });
+                await recorder.stop();
+
+                const har = recorder.buildHarArchive();
+                const harEntry = har.log.entries.find(
+                    (e) => e._attribution?.correlationId === secEv.correlationId
+                );
+                assert.ok(harEntry, 'Expected security-block event in exported W3C HAR 1.2 entries');
+                assert.equal(harEntry.response.status, 0);
+                assert.equal(harEntry.response.statusText, 'BLOCKED_BY_ZINIAO_SECURITY_GUARD');
+                assert.equal(harEntry._camoufoxSecurityBlock?.blocked, true);
+
+                const queryRes = queryProfileTraffic({
+                    profileId: 'har-sec-profile',
+                    trafficDir: tmpDir
+                });
+                const secTx = queryRes.transactions.find((t) => t.correlationId === secEv.correlationId);
+                assert.ok(secTx);
+                assert.equal(secTx.blocked, true);
+                assert.equal(secTx.statusText, 'BLOCKED_BY_ZINIAO_SECURITY_GUARD');
+            } finally {
+                fs.rmSync(tmpDir, { recursive: true, force: true });
+            }
+        }
     }
 ];
 

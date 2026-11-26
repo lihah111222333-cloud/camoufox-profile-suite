@@ -2230,11 +2230,16 @@ export function sanitizeAdsPowerProfileToCoherentPreset(rawAdsPowerProfile = {})
             );
         }
 
-        // 4. Heal DeviceName product line to match chip tier (base / pro / max / ultra) and strip Windows hostnames
+        // 4. Heal DeviceName product line to match chip tier (base / pro / max / ultra) and strip Windows/product-only hostnames
         const isLeakedWinHost = /^(?:DESKTOP|LAPTOP|WIN)-/i.test(rawDeviceName);
-        const ownerPrefix = isLeakedWinHost
+        const rawCandidateOwner = isLeakedWinHost
             ? 'Alex'
             : rawDeviceName.split(/['.-]/)[0]?.trim() || 'Alex';
+        const ownerPrefix = /^(?:Mac|MacBook|iMac|MacStudio|MacPro|MacMini|localhost|User|Admin)$/i.test(
+            rawCandidateOwner
+        )
+            ? 'Alex'
+            : rawCandidateOwner;
         let healedDeviceName = rawDeviceName;
         if (sku.tier === 'base') {
             if (

@@ -60,14 +60,16 @@ class NameGenerator {
      * توليد اسم مستخدم عشوائي
      */
     generateUsername(firstName, lastName = null) {
-        const randomNum = Math.floor(Math.random() * 10000);
+        const cleanFirst = String(firstName || 'user').toLowerCase().replace(/[^a-z0-9]/g, '');
+        const cleanLast = lastName ? String(lastName).toLowerCase().replace(/[^a-z0-9]/g, '') : '';
+        const randomNum = 10 + Math.floor(Math.random() * 9990);
         const year = 1990 + Math.floor(Math.random() * 30);
         
-        if (lastName) {
-            return `${firstName.toLowerCase()}${lastName.toLowerCase()}${year}`;
+        if (cleanLast) {
+            return `${cleanFirst}${cleanLast}${year}${randomNum}`;
         }
         
-        return `${firstName.toLowerCase()}${randomNum}${year}`;
+        return `${cleanFirst}${randomNum}${year}`;
     }
 
     /**
@@ -76,21 +78,25 @@ class NameGenerator {
      */
     generatePassword(length = 16) {
         const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*';
-        let password = '';
+        const arr = [
+            'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[Math.floor(Math.random() * 26)],
+            'abcdefghijklmnopqrstuvwxyz'[Math.floor(Math.random() * 26)],
+            '0123456789'[Math.floor(Math.random() * 10)],
+            '!@#$%^&*'[Math.floor(Math.random() * 8)]
+        ];
         
-        // Ensure at least one of each type
-        password += 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[Math.floor(Math.random() * 26)];
-        password += 'abcdefghijklmnopqrstuvwxyz'[Math.floor(Math.random() * 26)];
-        password += '0123456789'[Math.floor(Math.random() * 10)];
-        password += '!@#$%^&*'[Math.floor(Math.random() * 8)];
-        
-        // Fill the rest
-        for (let i = password.length; i < length; i++) {
-            password += chars[Math.floor(Math.random() * chars.length)];
+        for (let i = arr.length; i < length; i++) {
+            arr.push(chars[Math.floor(Math.random() * chars.length)]);
         }
         
-        // Shuffle
-        return password.split('').sort(() => Math.random() - 0.5).join('');
+        // Unbiased Fisher-Yates shuffle
+        for (let i = arr.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            const tmp = arr[i];
+            arr[i] = arr[j];
+            arr[j] = tmp;
+        }
+        return arr.join('');
     }
 
     /**
@@ -100,7 +106,10 @@ class NameGenerator {
     generateAccountData() {
         const gender = Math.random() < 0.5 ? 'female' : 'male';
         const firstName = this.getRandomName(gender);
-        const lastName = this.getRandomName(gender);
+        let lastName = this.getRandomName(gender);
+        if (lastName === firstName) {
+            lastName = this.getRandomName(gender);
+        }
         const username = this.generateUsername(firstName, lastName);
         const password = this.generatePassword();
         const email = `${username}@gmail.com`;

@@ -1896,19 +1896,19 @@ export const PCI_DEVICE_ID_CATALOG = Object.freeze({
     '0x9a49': Object.freeze({ vendor: 'intel', name: 'Intel(R) Iris(R) Xe Graphics', pattern: /Iris\(R\)\s+Xe/i }),
     '0x46a6': Object.freeze({ vendor: 'intel', name: 'Intel(R) Iris(R) Xe Graphics', pattern: /Iris\(R\)\s+Xe/i }),
     '0xa7a1': Object.freeze({ vendor: 'intel', name: 'Intel(R) Iris(R) Xe Graphics', pattern: /Iris\(R\)\s+Xe/i }),
-    '0x4680': Object.freeze({ vendor: 'intel', name: 'Intel(R) UHD Graphics 770', pattern: /UHD\s+Graphics(?:\s+770)?/i }),
-    '0xa780': Object.freeze({ vendor: 'intel', name: 'Intel(R) UHD Graphics 770', pattern: /UHD\s+Graphics(?:\s+770)?/i }),
+    '0x4680': Object.freeze({ vendor: 'intel', name: 'Intel(R) UHD Graphics 770', pattern: /UHD\s+Graphics(?:\s+770\b|(?!\s+\d{3}))/i }),
+    '0xa780': Object.freeze({ vendor: 'intel', name: 'Intel(R) UHD Graphics 770', pattern: /UHD\s+Graphics(?:\s+770\b|(?!\s+\d{3}))/i }),
     '0x56a0': Object.freeze({ vendor: 'intel', name: 'Intel(R) Arc(TM) A770 Graphics', pattern: /Arc\(TM\)\s+A770/i }),
-    '0x2684': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 4090', pattern: /RTX\s*4090(?!\s+Laptop)/i }),
+    '0x2684': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 4090', pattern: /RTX\s*4090(?!.*\b(?:Laptop|Mobile|Max-Q)\b)/i }),
     '0x2717': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 4090 Laptop GPU', pattern: /RTX\s*4090\s+Laptop/i }),
-    '0x2704': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 4080', pattern: /RTX\s*4080(?!\s+Laptop)/i }),
-    '0x2786': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 4070', pattern: /RTX\s*4070(?!\s+Laptop)/i }),
-    '0x2882': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 4060', pattern: /RTX\s*4060(?!\s+Laptop)/i }),
-    '0x2204': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3090', pattern: /RTX\s*3090(?!\s+Laptop)/i }),
-    '0x2206': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3080', pattern: /RTX\s*3080(?!\s+Laptop)/i }),
-    '0x2484': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3070', pattern: /RTX\s*3070(?!\s+Laptop)/i }),
-    '0x2503': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3060', pattern: /RTX\s*3060(?!\s+Laptop)/i }),
-    '0x2504': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3060', pattern: /RTX\s*3060(?!\s+Laptop)/i }),
+    '0x2704': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 4080', pattern: /RTX\s*4080(?!.*\b(?:Laptop|Mobile|Max-Q)\b)/i }),
+    '0x2786': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 4070', pattern: /RTX\s*4070(?!.*\b(?:Laptop|Mobile|Max-Q)\b)/i }),
+    '0x2882': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 4060', pattern: /RTX\s*4060(?!.*\b(?:Laptop|Mobile|Max-Q)\b)/i }),
+    '0x2204': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3090', pattern: /RTX\s*3090(?!.*\b(?:Laptop|Mobile|Max-Q)\b)/i }),
+    '0x2206': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3080', pattern: /RTX\s*3080(?!.*\b(?:Laptop|Mobile|Max-Q)\b)/i }),
+    '0x2484': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3070', pattern: /RTX\s*3070(?!.*\b(?:Laptop|Mobile|Max-Q)\b)/i }),
+    '0x2503': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3060', pattern: /RTX\s*3060(?!.*\b(?:Laptop|Mobile|Max-Q)\b)/i }),
+    '0x2504': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3060', pattern: /RTX\s*3060(?!.*\b(?:Laptop|Mobile|Max-Q)\b)/i }),
     '0x2520': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3060 Laptop GPU', pattern: /RTX\s*3060\s+Laptop/i }),
     '0x1f82': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce GTX 1650', pattern: /GTX\s*1650/i }),
     '0x2184': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce GTX 1660', pattern: /GTX\s*1660/i }),
@@ -3282,6 +3282,10 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
                 `GPU PCI Vendor ID mismatch: hardwareProfile.pciVendorId="${pciVendorId}" contradicts ${pcGpuSku.vendor.toUpperCase()} GPU "${renderer}" (expected ${expectedPciVendor})`
             );
         }
+    } else if (activeAppleSkuName && pciVendorId && pciVendorId !== PCI_VENDOR_ID_BY_GPU_VENDOR.apple) {
+        issues.push(
+            `Apple Silicon PCI Vendor ID mismatch: hardwareProfile.pciVendorId="${pciVendorId}" contradicts Apple GPU "${renderer}" (expected ${PCI_VENDOR_ID_BY_GPU_VENDOR.apple})`
+        );
     }
 
     // Extract PCI Device ID from ANGLE renderer string e.g. "(0x00002504)" or explicit hw.pciDeviceId

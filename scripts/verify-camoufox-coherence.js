@@ -162,6 +162,14 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
         },
         prototypeIntegrity: {
             toStringIntact: true,
+            functionToString: {
+                exists: true,
+                isMethod: true,
+                source: 'function toString() {\n    [native code]\n}',
+                name: 'toString',
+                length: 0,
+                isNative: true
+            },
             ownNavigatorOverrides: [],
             userAgentGetter: { exists: true, isGetter: true, source: 'function get userAgent() {\n    [native code]\n}', isNative: true },
             webdriverGetter: { exists: true, isGetter: true, source: 'function get webdriver() {\n    [native code]\n}', isNative: true },

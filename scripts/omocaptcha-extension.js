@@ -595,7 +595,7 @@ export async function setupOMOCaptchaExtension(page) {
         
         // Step 3: Click refresh button to activate extension
         console.log('\n[Step 3/3] Clicking refresh button to activate extension...');
-      //  const refreshClicked = await clickRecaptchaRefreshButton(omoPage);
+        const refreshClicked = await clickRecaptchaRefreshButton(omoPage);
         if (!refreshClicked) {
             console.log('⚠ Could not click refresh button, but continuing...');
         }

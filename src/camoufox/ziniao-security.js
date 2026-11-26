@@ -80,6 +80,17 @@ export function isLocalOrPrivateTarget(rawHost) {
         return { isLocalOrPrivate: false, scope: 'public' };
     }
 
+    // Unwrap nested wrapper schemes and WebRTC stun:/stuns:/turn:/turns: URIs
+    while (
+        /^(?:blob|view-source|filesystem):/i.test(host) ||
+        (/^jar:/i.test(host) && !/^jar:file:/i.test(host))
+    ) {
+        host = host.replace(/^(?:blob|view-source|filesystem|jar):/i, '').trim();
+    }
+    if (/^(?:stuns?|turns?):/i.test(host)) {
+        host = `http://${host.replace(/^(?:stuns?|turns?):(?:\/\/)?/i, '')}`;
+    }
+
     // If a full URL, protocol-relative URL, userinfo@host, [ipv6]:port, or host:port was passed directly, extract the hostname
     if (host.includes('://') || host.startsWith('//')) {
         try {
@@ -150,6 +161,14 @@ export function isLocalOrPrivateTarget(rawHost) {
             const hi = parseInt(mappedHexMatch[1], 16);
             const lo = parseInt(mappedHexMatch[2], 16);
             host = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+        } else {
+            // 3. 6to4 IPv6 addresses (2002:WWXX:YYZZ::) embedding an IPv4 address
+            const sixToFourMatch = host.match(/^2002:([0-9a-f]{1,4}):([0-9a-f]{1,4}):/i);
+            if (sixToFourMatch) {
+                const hi = parseInt(sixToFourMatch[1], 16);
+                const lo = parseInt(sixToFourMatch[2], 16);
+                host = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+            }
         }
     }
 
@@ -157,6 +176,10 @@ export function isLocalOrPrivateTarget(rawHost) {
     if (
         host === 'localhost' ||
         host.endsWith('.localhost') ||
+        host === 'ip6-localhost' ||
+        host.endsWith('.ip6-localhost') ||
+        host === 'ip6-loopback' ||
+        host.endsWith('.ip6-loopback') ||
         host === 'localdomain' ||
         host.endsWith('.localdomain') ||
         host === 'localtest.me' ||
@@ -293,7 +316,11 @@ export function evaluatePortScanRequest(targetUrl, options = {}) {
             .replace(/^(?:blob|view-source|filesystem|jar):/i, '')
             .replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, '');
     }
-    if (normalizedTarget.startsWith('//')) {
+    let webrtcScheme = null;
+    if (/^(?:stuns?|turns?):/i.test(normalizedTarget)) {
+        webrtcScheme = normalizedTarget.split(':')[0].toLowerCase() + ':';
+        normalizedTarget = `http://${normalizedTarget.replace(/^(?:stuns?|turns?):(?:\/\/)?/i, '')}`;
+    } else if (normalizedTarget.startsWith('//')) {
         normalizedTarget = `http:${normalizedTarget}`;
     }
 
@@ -314,12 +341,13 @@ export function evaluatePortScanRequest(targetUrl, options = {}) {
         };
     }
 
-    const protocol = parsed.protocol.toLowerCase();
-    if (!['http:', 'https:', 'ws:', 'wss:', 'ftp:'].includes(protocol)) {
+    const protocol = webrtcScheme || parsed.protocol.toLowerCase();
+    const cleanHostname = parsed.hostname.replace(/^\[|\]$/g, '');
+    if (!['http:', 'https:', 'ws:', 'wss:', 'ftp:', 'stun:', 'stuns:', 'turn:', 'turns:'].includes(protocol)) {
         return {
             shouldBlock: false,
             isPortScanProbe: false,
-            host: parsed.hostname,
+            host: cleanHostname,
             port: null,
             scope: 'public',
             service: null,
@@ -329,12 +357,12 @@ export function evaluatePortScanRequest(targetUrl, options = {}) {
         };
     }
 
-    const hostCheck = isLocalOrPrivateTarget(parsed.hostname);
+    const hostCheck = isLocalOrPrivateTarget(cleanHostname);
     if (!hostCheck.isLocalOrPrivate) {
         return {
             shouldBlock: false,
             isPortScanProbe: false,
-            host: parsed.hostname,
+            host: cleanHostname,
             port: parsed.port ? Number(parsed.port) : null,
             scope: 'public',
             service: null,
@@ -345,7 +373,15 @@ export function evaluatePortScanRequest(targetUrl, options = {}) {
     }
 
     const getDefaultPortForProtocol = (proto) =>
-        proto === 'https:' || proto === 'wss:' ? 443 : proto === 'ftp:' ? 21 : 80;
+        proto === 'stuns:' || proto === 'turns:'
+            ? 5349
+            : proto === 'stun:' || proto === 'turn:'
+              ? 3478
+              : proto === 'https:' || proto === 'wss:'
+                ? 443
+                : proto === 'ftp:'
+                  ? 21
+                  : 80;
     const defaultPort = getDefaultPortForProtocol(protocol);
     const port = parsed.port ? Number(parsed.port) : defaultPort;
     const risk = classifyScannedPortRisk(port);
@@ -407,14 +443,14 @@ export function evaluatePortScanRequest(targetUrl, options = {}) {
  *    Absorbed from Ziniao `defaultSpecialList` / `debugSpecialList` (`main.index.js`).
  */
 export const BLOCKED_INTERNAL_URL_PATTERNS = Object.freeze([
-    /^about:(?:config|debugging|devtools|support|telemetry|networking|memory|cache|processes|profiles|serviceworkers|webrtc|addons|plugins|buildconfig|preferences|logins|policies|crashes|crashcontent|sync-log|url-classifier)\b/i,
+    /^about:(?:config|debugging|devtools|support|telemetry|networking|memory|cache|processes|profiles|serviceworkers|webrtc|addons|plugins|buildconfig|preferences|logins|policies|crashes|crashcontent|sync-log|url-classifier|logging|fingerprintingprotection|performance|studies|protections|certificate|third-party)\b/i,
     /^chrome:\/\//i,
     /^devtools:\/\//i,
     /^chrome-extension:\/\//i,
     /^moz-extension:\/\//i,
     /^resource:\/\//i,
-    /^jar:file:\/\/\//i,
-    /^file:\/\//i,
+    /^jar:file:/i,
+    /^file:/i,
     /^view-source:about:/i
 ]);
 
@@ -501,9 +537,17 @@ export const DEFAULT_CANVAS_SKIP_HOSTS = Object.freeze([
 
 const POPCOUNT_NIBBLE = Object.freeze([0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4]);
 
+function resolveCanonicalHexLength(rawMaxLen) {
+    if (rawMaxLen <= 8) return 8;
+    if (rawMaxLen <= 16) return 16;
+    if (rawMaxLen <= 32) return 32;
+    if (rawMaxLen <= 64) return 64;
+    return rawMaxLen;
+}
+
 /**
  * Compute the exact bitwise Hamming distance between two hexadecimal fingerprint hashes
- * (e.g. 64-bit / 16-hex-char or 256-bit / 64-hex-char Canvas/WebGL hashes).
+ * (e.g. 32-bit / 8-hex-char FNV-1a, 64-bit / 16-hex-char, or 256-bit / 64-hex-char Canvas/WebGL hashes).
  *
  * @param {string} hexHashA
  * @param {string} hexHashB
@@ -516,7 +560,7 @@ export function computeHexHammingDistance(hexHashA, hexHashB) {
         throw new Error(`Invalid hexadecimal hash input for Hamming distance: "${hexHashA}" vs "${hexHashB}"`);
     }
 
-    const maxLen = Math.max(cleanA.length, cleanB.length);
+    const maxLen = resolveCanonicalHexLength(Math.max(cleanA.length, cleanB.length));
     const padA = cleanA.padStart(maxLen, '0');
     const padB = cleanB.padStart(maxLen, '0');
 
@@ -534,14 +578,24 @@ export function computeHexHammingDistance(hexHashA, hexHashB) {
  *
  * @param {string} hexHashA
  * @param {string} hexHashB
+ * @param {number | null} [totalBits]
  * @returns {number}
  */
-export function computeHashSimilarity(hexHashA, hexHashB) {
+export function computeHashSimilarity(hexHashA, hexHashB, totalBits = null) {
     const cleanA = String(hexHashA ?? '').trim().toLowerCase().replace(/^0x/, '');
     const cleanB = String(hexHashB ?? '').trim().toLowerCase().replace(/^0x/, '');
     const dist = computeHexHammingDistance(cleanA, cleanB);
-    const totalBits = Math.max(cleanA.length, cleanB.length) * 4;
-    return Number((((totalBits - dist) / totalBits) * 100).toFixed(2));
+    const canonicalBits = resolveCanonicalHexLength(Math.max(cleanA.length, cleanB.length)) * 4;
+    const effectiveBits =
+        totalBits !== null &&
+        totalBits !== undefined &&
+        Number.isFinite(Number(totalBits)) &&
+        Number(totalBits) > 0 &&
+        Number(totalBits) >= dist &&
+        Number(totalBits) <= canonicalBits
+            ? Number(totalBits)
+            : canonicalBits;
+    return Number((Math.max(0, (effectiveBits - dist) / effectiveBits) * 100).toFixed(2));
 }
 
 /**
@@ -619,15 +673,26 @@ export class CanvasWebglConsistencyLedger {
     }
 
     static extractDomain(urlOrDomain) {
-        const raw = String(urlOrDomain || 'unknown').trim().toLowerCase();
-        if (raw.includes('://')) {
+        let raw = String(urlOrDomain || 'unknown').trim().toLowerCase();
+        while (/^(?:blob|view-source|filesystem|jar):/i.test(raw)) {
+            raw = raw.replace(/^(?:blob|view-source|filesystem|jar):/i, '').trim();
+        }
+        if (/^about:/i.test(raw)) {
+            return raw.split(/[?#]/)[0] || 'about:blank';
+        }
+        if (raw.includes('://') || raw.startsWith('//')) {
             try {
-                return new URL(raw).hostname.toLowerCase().replace(/\.+$/, '');
+                const u = new URL(raw.startsWith('//') ? `http:${raw}` : raw);
+                return u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '') || 'unknown';
             } catch {
                 return raw.replace(/\.+$/, '');
             }
         }
-        return raw.split('/')[0].split(':')[0].replace(/\.+$/, '');
+        const authority = raw.split(/[/?#]/)[0];
+        if (authority.startsWith('[') && authority.includes(']')) {
+            return authority.slice(1, authority.indexOf(']')).replace(/\.+$/, '');
+        }
+        return authority.split(':')[0].replace(/\.+$/, '') || 'unknown';
     }
 
     buildEntryKey({ kind = 'canvas', domain, width = 300, height = 150, drewText = '' }) {
@@ -755,6 +820,17 @@ export class CanvasWebglConsistencyLedger {
             canonicalHash: existing.hash,
             canonicalDataUrl: existing.dataUrl,
             driftDetected
+        };
+    }
+
+    getSummary() {
+        return {
+            profileId: this.profileId,
+            maxHammingDistance: this.maxHammingDistance,
+            totalEntries: this.entries.size,
+            driftAlertCount: this.driftAlerts.length,
+            domains: Array.from(new Set(Array.from(this.entries.values()).map((e) => e.domain))),
+            driftAlerts: [...this.driftAlerts]
         };
     }
 
@@ -1002,10 +1078,21 @@ export async function attachZiniaoSecurityGuardsToContext(context, options = {})
     const profileId = String(options.profileId || 'default-profile');
     const portProtOpts = options.portScanProtection || {};
 
+    const getStats = () => ({
+        profileId,
+        portScanProtectionEnabled:
+            portProtOpts.enabled !== undefined ? Boolean(portProtOpts.enabled) : true,
+        blockedPortScanCount: blockedPortScans.length,
+        blockedInternalSchemeCount: blockedInternalSchemes.length,
+        blockedPortScans: [...blockedPortScans],
+        blockedInternalSchemes: [...blockedInternalSchemes]
+    });
+
     if (!context || typeof context.route !== 'function') {
         return {
             blockedPortScans,
             blockedInternalSchemes,
+            getStats,
             detach: async () => {}
         };
     }
@@ -1099,6 +1186,7 @@ export async function attachZiniaoSecurityGuardsToContext(context, options = {})
     return {
         blockedPortScans,
         blockedInternalSchemes,
+        getStats,
         detach: async () => {
             if (typeof context.unroute === 'function') {
                 await context.unroute('**/*', routeHandler);

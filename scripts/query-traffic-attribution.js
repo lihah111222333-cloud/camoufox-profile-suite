@@ -899,6 +899,15 @@ function buildTransactionsList(events) {
 
     for (const ev of events) {
         if (!ev || !ev.correlationId) continue;
+        if (
+            ev.type !== 'egress' &&
+            ev.type !== 'ingress' &&
+            ev.type !== 'request-finished' &&
+            ev.type !== 'request-failed' &&
+            ev.type !== 'security-block'
+        ) {
+            continue;
+        }
         if (!txMap.has(ev.correlationId)) {
             txMap.set(ev.correlationId, {
                 correlationId: ev.correlationId,
@@ -906,6 +915,9 @@ function buildTransactionsList(events) {
                 url: ev.url || null,
                 host: extractHost(ev) || null,
                 status: null,
+                statusText: null,
+                blocked: false,
+                blockType: null,
                 actionStep: extractActionStep(ev),
                 triggerAction: extractTriggerAction(ev),
                 redirectedFromCorrelationId: ev.redirectedFromCorrelationId || null,
@@ -916,7 +928,8 @@ function buildTransactionsList(events) {
                 egress: null,
                 ingress: null,
                 finished: null,
-                failed: null
+                failed: null,
+                securityBlock: null
             });
         }
         const tx = txMap.get(ev.correlationId);
@@ -935,6 +948,7 @@ function buildTransactionsList(events) {
         } else if (ev.type === 'ingress') {
             tx.ingress = ev;
             tx.status = ev.status ?? tx.status;
+            tx.statusText = ev.statusText ?? tx.statusText;
             tx.responsePayloadFile = ev.payloadFile || null;
         } else if (ev.type === 'request-finished') {
             tx.finished = ev;
@@ -942,10 +956,19 @@ function buildTransactionsList(events) {
                 tx.status = ev.status;
             }
             tx.durationMs = ev.durationMs ?? tx.durationMs;
-        } else if (ev.type === 'request-failed' || ev.type === 'security-block') {
+        } else if (ev.type === 'request-failed') {
             tx.failed = ev;
-            tx.failureText = ev.reason || ev.failureText || 'SECURITY_BLOCK';
+            tx.failureText = ev.failureText || 'REQUEST_FAILED';
             tx.durationMs = ev.durationMs ?? tx.durationMs;
+        } else if (ev.type === 'security-block') {
+            tx.securityBlock = ev;
+            tx.failed = tx.failed || ev;
+            tx.blocked = true;
+            tx.blockType = ev.blockType || 'security-probe';
+            tx.status = tx.status ?? 0;
+            tx.statusText = 'BLOCKED_BY_ZINIAO_SECURITY_GUARD';
+            tx.failureText = ev.reason || ev.failureText || 'BLOCKED_BY_ZINIAO_SECURITY_GUARD';
+            tx.durationMs = ev.durationMs ?? tx.durationMs ?? 0;
         }
     }
 

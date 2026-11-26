@@ -268,6 +268,9 @@ export async function humanClickAt(page, x, y, options = {}) {
         }
         
         await page.mouse.click(x, y);
+        if (page && typeof page === 'object') {
+            pageMousePositions.set(page, { x, y });
+        }
         
         if (postClickDelay) {
             await humanSleep(getHumanDelay('afterClick'));
@@ -300,12 +303,16 @@ export async function humanScroll(page, options = {}) {
         const stepDistance = scrollAmount / steps;
         
         for (let i = 0; i < steps; i++) {
-            await page.evaluate((dist) => {
-                window.scrollBy({
-                    top: dist,
-                    behavior: 'auto' // We control smoothness ourselves
-                });
-            }, stepDistance);
+            if (page?.mouse && typeof page.mouse.wheel === 'function') {
+                await page.mouse.wheel(0, stepDistance);
+            } else {
+                await page.evaluate((dist) => {
+                    window.scrollBy({
+                        top: dist,
+                        behavior: 'auto'
+                    });
+                }, stepDistance);
+            }
             
             // Variable delay between scroll steps
             const delay = 20 + Math.random() * 40;
@@ -337,10 +344,16 @@ export async function humanScrollToElement(page, element, options = {}) {
         // First, get element position
         const box = await element.boundingBox();
         if (!box) {
-            // Fallback to JavaScript scrollIntoView
-            await page.evaluate((el, blk) => {
-                el.scrollIntoView({ behavior: 'smooth', block: blk });
-            }, element, block);
+            // Fallback to JavaScript scrollIntoView via element.evaluate (1 arg, avoids multi-arg new Function CSP violation)
+            if (typeof element?.evaluate === 'function') {
+                await element.evaluate((el, blk) => {
+                    el.scrollIntoView({ behavior: 'smooth', block: blk });
+                }, block);
+            } else {
+                await page.evaluate((el, blk) => {
+                    el.scrollIntoView({ behavior: 'smooth', block: blk });
+                }, element, block);
+            }
             await humanSleep(500);
             return;
         }
@@ -448,10 +461,13 @@ export async function humanType(page, element, text, options = {}) {
                 await page.keyboard.press('Delete');
                 await humanSleep(50, 20);
                 
-                // Also clear via JavaScript
+                // Only clear via JavaScript if keyboard Delete left residual text
                 await element.evaluate(el => {
-                    el.value = '';
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    if (el.value) {
+                        el.value = '';
+                        const Evt = typeof InputEvent === 'function' ? InputEvent : Event;
+                        el.dispatchEvent(new Evt('input', { bubbles: true }));
+                    }
                 });
                 await humanSleep(50);
             } catch (e) {
@@ -700,18 +716,18 @@ export async function simulateTabSwitch(page, options = {}) {
     } = options;
     
     try {
-        // Blur page
+        // Blur page without firing contradictory visibilitychange while document.visibilityState === 'visible'
         await page.evaluate(() => {
-            window.dispatchEvent(new Event('blur'));
-            document.dispatchEvent(new Event('visibilitychange'));
+            const Evt = typeof FocusEvent === 'function' ? FocusEvent : Event;
+            window.dispatchEvent(new Evt('blur'));
         });
         
         await humanSleep(awayDuration);
         
         // Focus page again
         await page.evaluate(() => {
-            window.dispatchEvent(new Event('focus'));
-            document.dispatchEvent(new Event('visibilitychange'));
+            const Evt = typeof FocusEvent === 'function' ? FocusEvent : Event;
+            window.dispatchEvent(new Evt('focus'));
         });
         
         logger.debug('Tab switch simulation completed');

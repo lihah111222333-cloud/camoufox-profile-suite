@@ -5043,7 +5043,8 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}) {
             ev.type !== 'egress' &&
             ev.type !== 'ingress' &&
             ev.type !== 'request-finished' &&
-            ev.type !== 'request-failed'
+            ev.type !== 'request-failed' &&
+            ev.type !== 'security-block'
         ) {
             continue;
         }
@@ -5054,7 +5055,8 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}) {
                 egress: null,
                 ingress: null,
                 finished: null,
-                failed: null
+                failed: null,
+                securityBlock: null
             });
         }
         const tx = txMap.get(ev.correlationId);
@@ -5062,34 +5064,39 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}) {
         else if (ev.type === 'ingress') tx.ingress = ev;
         else if (ev.type === 'request-finished') tx.finished = ev;
         else if (ev.type === 'request-failed') tx.failed = ev;
+        else if (ev.type === 'security-block') tx.securityBlock = ev;
     }
 
     const entries = [];
     for (const [correlationId, tx] of txMap.entries()) {
-        const { egress, ingress, finished, failed } = tx;
-        const primary = egress || ingress || failed || finished;
+        const { egress, ingress, finished, failed, securityBlock } = tx;
+        const primary = egress || ingress || failed || securityBlock || finished;
         if (!primary) continue;
 
         const attribution =
             egress?.attribution ||
             ingress?.attribution ||
             failed?.attribution ||
+            securityBlock?.attribution ||
             finished?.attribution ||
             {};
         const actionStep =
             attribution.actionStep ||
             egress?.actionStep ||
             ingress?.actionStep ||
+            securityBlock?.actionStep ||
             'init';
         const stepIndex =
             attribution.stepIndex ??
             egress?.stepIndex ??
             ingress?.stepIndex ??
+            securityBlock?.stepIndex ??
             0;
         const triggerAction =
             egress?.triggerAction ||
             ingress?.triggerAction ||
             failed?.triggerAction ||
+            securityBlock?.triggerAction ||
             finished?.triggerAction ||
             null;
 
@@ -5097,6 +5104,7 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}) {
             egress?.timestamp ||
             ingress?.timestamp ||
             failed?.timestamp ||
+            securityBlock?.timestamp ||
             finished?.timestamp ||
             sessionMeta.startedAt ||
             new Date().toISOString();
@@ -5115,8 +5123,20 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}) {
             totalTimeMs = Math.max(0, ingress.epochMs - egress.epochMs);
         }
 
-        const rawUrl = egress?.url || ingress?.url || failed?.url || finished?.url || '';
-        const method = egress?.method || ingress?.method || failed?.method || finished?.method || 'GET';
+        const rawUrl =
+            egress?.url ||
+            ingress?.url ||
+            failed?.url ||
+            securityBlock?.url ||
+            finished?.url ||
+            '';
+        const method =
+            egress?.method ||
+            ingress?.method ||
+            failed?.method ||
+            securityBlock?.method ||
+            finished?.method ||
+            'GET';
 
         // Build request headers array
         const reqHeaders =
@@ -5230,7 +5250,11 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}) {
         const status = Number(ingress?.status ?? finished?.status ?? 0);
         const statusText =
             ingress?.statusText ??
-            (failed ? String(failed.failureText || 'FAILED') : '');
+            (securityBlock
+                ? 'BLOCKED_BY_ZINIAO_SECURITY_GUARD'
+                : failed
+                  ? String(failed.failureText || 'FAILED')
+                  : '');
 
         entries.push({
             pageref,
@@ -5274,6 +5298,26 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}) {
                 receive: 0
             },
             serverIPAddress: ingress?.serverAddr?.ipAddress || '',
+            ...(securityBlock
+                ? {
+                      _camoufoxSecurityBlock: {
+                          blocked: true,
+                          blockType: securityBlock.blockType || 'security-probe',
+                          severity: securityBlock.severity || 'critical',
+                          reason:
+                              securityBlock.reason ||
+                              securityBlock.failureText ||
+                              'BLOCKED_BY_ZINIAO_SECURITY_GUARD',
+                          host: securityBlock.host || null,
+                          port: securityBlock.port ?? null,
+                          scope: securityBlock.scope || null,
+                          service: securityBlock.service || null,
+                          category: securityBlock.category || null,
+                          matchedScheme: securityBlock.matchedScheme || null,
+                          initiatorUrl: securityBlock.initiatorUrl || null
+                      }
+                  }
+                : {}),
             _attribution: {
                 correlationId,
                 actionStep,
@@ -5289,6 +5333,7 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}) {
                     egress?.stage ||
                     ingress?.stage ||
                     failed?.stage ||
+                    securityBlock?.stage ||
                     'pre-tls-necko-channel',
                 redirectedFromCorrelationId:
                     egress?.redirectedFromCorrelationId ||
@@ -5296,7 +5341,11 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}) {
                     null,
                 requestPayloadFile: egress?.payloadFile || null,
                 responsePayloadFile: ingress?.payloadFile || null,
-                failureText: failed?.failureText || null
+                failureText:
+                    failed?.failureText ||
+                    securityBlock?.reason ||
+                    securityBlock?.failureText ||
+                    null
             }
         });
     }

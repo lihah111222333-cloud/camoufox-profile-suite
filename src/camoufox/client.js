@@ -959,7 +959,10 @@ export async function listProfiles(profilesDir = DEFAULT_PROFILES_DIR) {
 export async function startProfile(profileId, options = {}) {
     if (activeProfiles.has(profileId)) {
         const existing = activeProfiles.get(profileId);
-        if (existing.context && existing.browser?.isConnected?.() !== false) {
+        const contextClosed =
+            !existing.context ||
+            (typeof existing.context.isClosed === 'function' && existing.context.isClosed());
+        if (!contextClosed && existing.browser?.isConnected?.() !== false) {
             logger.info('Reusing active Camoufox profile session', { profileId });
             return existing;
         }

@@ -963,20 +963,20 @@ export function lookupGpuPerformanceSpec(rendererOrModel) {
     if (/GTX\s*1660\s*(?:SUPER|Ti)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce GTX 1660 SUPER'];
     if (/GTX\s*1660/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce GTX 1660'];
     if (/GTX\s*1650/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['NVIDIA GeForce GTX 1650'];
-    if (/RX\s*7900\s*XTX/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 7900 XTX'];
-    if (/RX\s*7800\s*XT/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 7800 XT'];
-    if (/RX\s*6800\s*XT|RX\s*6000\/7000/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 6800 XT'];
-    if (/RX\s*6700\s*XT/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 6700 XT'];
-    if (/RX\s*6600/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 6600'];
+    if (/RX\s*7900/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 7900 XTX'];
+    if (/RX\s*(?:7800|7700|6950|6900)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 7800 XT'];
+    if (/RX\s*6800|RX\s*6000\/7000/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 6800 XT'];
+    if (/RX\s*(?:6750|6700|7600)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 6700 XT'];
+    if (/RX\s*66\d0/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon RX 6600'];
     if (/W6[89]00X|Vega\s*II/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon Pro W6800X'];
     if (/5700(?:\s*XT)?|W5[57]00X|W6600X|Vega\s*(?:48|56|64)|Radeon\s+Pro\s+Desktop/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon Pro 5700 XT'];
     if (/5500(?:\s*XT|M)?|5600M|5300M?|580X|575X|570X|560X|555X|Vega\s*(?:16|20)|Radeon\s+Pro\s+Mobile/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon Pro 5500M'];
     if (/8[89]0M/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon 890M'];
     if (/7[68]0M/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon 780M'];
-    if (/(?:6[68]0M|740M|610M|Radeon(?:\(TM\))?\s+(?:Vega|Graphics|Integrated\s+APU))/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon 680M'];
-    if (/Arc(?:\(TM\))?.*A7[57]0/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['Intel(R) Arc(TM) A770 Graphics'];
+    if (/(?:6[68]0M|740M|610M|Radeon(?:\(TM\))?\s+(?:Vega|Graphics|Integrated\s+APU|HD\s+\d+)|AMD\s+APU)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['AMD Radeon 680M'];
+    if (/Arc(?:\(TM\))?.*A[57]\d0/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['Intel(R) Arc(TM) A770 Graphics'];
     if (/140V|130V/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['Intel(R) Arc(TM) 140V Graphics'];
-    if (/Arc(?:\(TM\))?\s+(?:A380\s+)?Graphics/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['Intel(R) Arc(TM) Graphics'];
+    if (/Arc(?:\(TM\))?(?:\s+A3\d0|\s+Graphics)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['Intel(R) Arc(TM) Graphics'];
     if (/Iris(?:\(R\))?\s*Xe|Intel(?:\(R\))?\s+Graphics|Intel\s+Integrated\s+UHD/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['Intel(R) Iris(R) Xe Graphics'];
     if (/UHD\s+Graphics\s+7[37]0/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['Intel(R) UHD Graphics 770'];
     if (/Iris.*(?:655|650|645|640|550|540|6100|G7|Pro|Plus|OpenGL)/i.test(raw)) return GPU_PERFORMANCE_SPEC_CATALOG['Intel(R) Iris(TM) Plus Graphics 655'];
@@ -1291,6 +1291,8 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                 pixelFillMultiplier: CFG.pixelFillMultiplier,
                 compositeShaderBenchmarkMultiplier: CFG.compositeShaderBenchmarkMultiplier,
                 profileVarianceFactor: CFG.profileVarianceFactor,
+                webgpuMaxBufferSize: CFG.webgpuMaxBufferSize,
+                webgpuMaxComputeWorkgroupSizeX: CFG.webgpuMaxComputeWorkgroupSizeX,
                 antiPenetrationActive: true
             }),
             enumerable: false,
@@ -1309,6 +1311,16 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                 return impl.apply(this, args);
             }
         })[methodName];
+
+    const createNativeGetterWrapper = (propName, impl) =>
+        Object.getOwnPropertyDescriptor(
+            {
+                get [propName]() {
+                    return impl.call(this);
+                }
+            },
+            propName
+        ).get;
 
     const cloak = (wrappedFn, origFn) => {
         try {
@@ -1336,6 +1348,24 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
             writable: origDesc ? Boolean(origDesc.writable) : true,
             enumerable: origDesc ? Boolean(origDesc.enumerable) : false,
             configurable: origDesc ? Boolean(origDesc.configurable) : true
+        });
+    };
+
+    const defineCloakedGetter = (targetObj, propName, impl) => {
+        if (!targetObj) return;
+        const origDesc = Object.getOwnPropertyDescriptor(targetObj, propName);
+        if (!origDesc || typeof origDesc.get !== 'function') return;
+        const origGetter = origDesc.get;
+        const wrappedGetter = createNativeGetterWrapper(propName, function () {
+            const nativeVal = origGetter.call(this);
+            return impl.call(this, nativeVal);
+        });
+        cloak(wrappedGetter, origGetter);
+        Object.defineProperty(targetObj, propName, {
+            get: wrappedGetter,
+            set: origDesc.set,
+            enumerable: Boolean(origDesc.enumerable),
+            configurable: Boolean(origDesc.configurable)
         });
     };
 
@@ -1399,6 +1429,14 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
             } else {
                 scaledDelta = realDelta * mult;
             }
+        } else if (realDelta > 0) {
+            // Smooth monotonic idle relaxation toward real wall-clock time between GPU bursts
+            const drift = virtualPerfNow - realNow;
+            if (drift < -0.001) {
+                scaledDelta = realDelta + Math.min(-drift, realDelta * 0.5);
+            } else if (drift > 0.001) {
+                scaledDelta = realDelta - Math.min(drift, realDelta * 0.8);
+            }
         }
         // Enforce strict monotonicity (+0.001ms minimum step when realDelta > 0)
         const minStep = realDelta > 0 ? Math.min(realDelta * 0.01, 0.001) : 0;
@@ -1417,6 +1455,37 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
         return Math.round(baseDateOrigin + (vNow - basePerfOrigin));
     });
     defineCloakedMethod(Date, 'now', patchedDateNow, origDateNow);
+
+    // Synchronize 0-arg new Date() and Date() with Date.now() so Date.now() - new Date().getTime() === 0
+    if (
+        typeof Date === 'function' &&
+        Date.prototype &&
+        typeof Proxy === 'function' &&
+        typeof Reflect === 'object'
+    ) {
+        try {
+            const OrigDate = Date;
+            const ProxiedDate = new Proxy(OrigDate, {
+                construct(target, args, newTarget) {
+                    if (args.length === 0) {
+                        return Reflect.construct(target, [patchedDateNow()], newTarget);
+                    }
+                    return Reflect.construct(target, args, newTarget);
+                },
+                apply(_target, _thisArg, _args) {
+                    return new OrigDate(patchedDateNow()).toString();
+                }
+            });
+            cloakedFns.set(ProxiedDate, nativeToString.call(OrigDate));
+            Object.defineProperty(OrigDate.prototype, 'constructor', {
+                value: ProxiedDate,
+                writable: true,
+                enumerable: false,
+                configurable: true
+            });
+            globalThis.Date = ProxiedDate;
+        } catch {}
+    }
 
     // Keep window.requestAnimationFrame callback timestamp monotonically synchronized with virtual performance.now()
     let lastVirtualRafTs = basePerfOrigin;
@@ -1797,6 +1866,61 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
             });
         });
         defineCloakedMethod(GPUBuffer.prototype, 'mapAsync', wrappedMapAsync, origMapAsync);
+    }
+
+    // Hook GPUSupportedLimits.prototype so WebGPU adapter.limits / device.limits match target GPU SKU
+    if (typeof GPUSupportedLimits !== 'undefined' && GPUSupportedLimits.prototype) {
+        defineCloakedGetter(GPUSupportedLimits.prototype, 'maxBufferSize', () => CFG.webgpuMaxBufferSize);
+        defineCloakedGetter(
+            GPUSupportedLimits.prototype,
+            'maxComputeWorkgroupSizeX',
+            () => CFG.webgpuMaxComputeWorkgroupSizeX
+        );
+    }
+
+    // Hook same-origin HTMLIFrameElement.prototype.contentWindow so cross-realm Function.prototype.toString
+    // and iframe performance.now() share the parent realm's cloaking map and virtual GPU clock
+    const hookedRealms = new WeakSet();
+    const hookSameOriginIframeRealm = (win) => {
+        if (!win || (typeof win !== 'object' && typeof win !== 'function') || hookedRealms.has(win)) {
+            return win;
+        }
+        try {
+            if (win.Function && win.Function.prototype && typeof win.Function.prototype.toString === 'function') {
+                hookedRealms.add(win);
+                const iframeOrigToString = win.Function.prototype.toString;
+                const iframePatchedToString = createNativeMethodWrapper('toString', function () {
+                    if (typeof this === 'function' && cloakedFns.has(this)) {
+                        return cloakedFns.get(this);
+                    }
+                    return iframeOrigToString.call(this);
+                });
+                defineCloakedMethod(win.Function.prototype, 'toString', iframePatchedToString, iframeOrigToString);
+            }
+            if (win.Performance && win.Performance.prototype && typeof win.Performance.prototype.now === 'function') {
+                const iframeOrigPerfNow = win.Performance.prototype.now;
+                const iframePatchedPerfNow = createNativeMethodWrapper('now', function () {
+                    iframeOrigPerfNow.call(this);
+                    return advanceVirtualClock();
+                });
+                defineCloakedMethod(win.Performance.prototype, 'now', iframePatchedPerfNow, iframeOrigPerfNow);
+            }
+            if (win.Date && typeof win.Date.now === 'function') {
+                defineCloakedMethod(win.Date, 'now', patchedDateNow, win.Date.now);
+            }
+            if (win.WebGLRenderingContext && win.WebGLRenderingContext.prototype) {
+                hookWebGLPrototype(win.WebGLRenderingContext.prototype);
+            }
+            if (win.WebGL2RenderingContext && win.WebGL2RenderingContext.prototype) {
+                hookWebGLPrototype(win.WebGL2RenderingContext.prototype);
+            }
+        } catch {}
+        return win;
+    };
+    if (typeof HTMLIFrameElement !== 'undefined' && HTMLIFrameElement.prototype) {
+        defineCloakedGetter(HTMLIFrameElement.prototype, 'contentWindow', function (cw) {
+            return hookSameOriginIframeRealm(cw);
+        });
     }
 })();`;
 }
