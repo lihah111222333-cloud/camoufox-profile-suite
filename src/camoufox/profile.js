@@ -838,6 +838,37 @@ export class CamoufoxProfile {
         this.trafficRecorder = null;
         this.trafficPaths = null;
         this.lastTrafficAttribution = null;
+        this.fingerprintLedger = null;
+        this.securityGuards = null;
+        this.gpuPerformanceScaler = null;
+    }
+
+    /**
+     * Get the Per-Domain Canvas & WebGL Fingerprint Consistency Ledger for this profile
+     */
+    getFingerprintLedger() {
+        return this.fingerprintLedger;
+    }
+
+    /**
+     * Record or verify a Canvas / WebGL observation in the profile's consistency ledger
+     */
+    recordOrVerifyFingerprint(observation = {}) {
+        return this.fingerprintLedger ? this.fingerprintLedger.recordOrVerify(observation) : null;
+    }
+
+    /**
+     * Get the active Ziniao-absorbed port-scan & internal-scheme security guard handle
+     */
+    getSecurityGuards() {
+        return this.securityGuards;
+    }
+
+    /**
+     * Get the Host-Mac-Calibrated GPU Performance Scaler attached to this profile
+     */
+    getGpuPerformanceScaler() {
+        return this.gpuPerformanceScaler;
     }
 
     /**
@@ -906,6 +937,9 @@ export class CamoufoxProfile {
             this.metadata = session.metadata;
             this.trafficRecorder = session.trafficRecorder || null;
             this.trafficPaths = session.trafficPaths || null;
+            this.fingerprintLedger = session.fingerprintLedger || null;
+            this.securityGuards = session.securityGuards || null;
+            this.gpuPerformanceScaler = session.gpuPerformanceScaler || null;
 
             if (this.context) {
                 this.context._camoufoxTrafficRecorder = this.trafficRecorder;

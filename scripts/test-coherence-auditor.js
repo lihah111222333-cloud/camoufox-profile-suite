@@ -3016,6 +3016,308 @@ const tests = [
             assert.match(skuCheck.details, /Host Mac GPU performance penetration detected/);
             assert.match(skuCheck.details, /Host Mac GPU timing leak detected/);
         }
+    },
+    {
+        name: '85. Subagent 2 Security Audit Hardening: IPv4-Mapped IPv6, Trailing-Dot FQDN, Integer/Hex IPv4, Nested Scheme Wrappers, C0 Controls & Full-UA Version Floor',
+        fn: () => {
+            // 1. IPv4-mapped IPv6 & WHATWG hex-pair form
+            assert.equal(isLocalOrPrivateTarget('[::ffff:127.0.0.1]').isLocalOrPrivate, true);
+            assert.equal(isLocalOrPrivateTarget('[::ffff:7f00:1]').isLocalOrPrivate, true);
+            assert.equal(isLocalOrPrivateTarget('[0:0:0:0:0:ffff:192.168.1.1]').scope, 'private-lan');
+            assert.equal(evaluatePortScanRequest('http://[::ffff:127.0.0.1]:3389/').shouldBlock, true);
+            assert.equal(evaluatePortScanRequest('http://[0:0:0:0:0:ffff:192.168.1.1]:8080/').shouldBlock, true);
+
+            // 2. Trailing-dot FQDN, integer/hex IPv4, ULA fd12::, link-local fe80::%en0, unspecified [::]
+            assert.equal(evaluatePortScanRequest('http://localhost.:9222/json').shouldBlock, true);
+            assert.equal(evaluatePortScanRequest('http://router.local.:80/').shouldBlock, true);
+            assert.equal(isLocalOrPrivateTarget('2130706433').scope, 'loopback');
+            assert.equal(isLocalOrPrivateTarget('0x7f000001').scope, 'loopback');
+            assert.equal(isLocalOrPrivateTarget('::').scope, 'loopback');
+            assert.equal(isLocalOrPrivateTarget('fd12:3456:789a::1').scope, 'private-lan');
+            assert.equal(isLocalOrPrivateTarget('fe80::1%25en0').scope, 'link-local');
+            assert.equal(evaluatePortScanRequest('blob:http://127.0.0.1:9222/abc').shouldBlock, true);
+            assert.equal(evaluatePortScanRequest('//127.0.0.1:3389/probe').shouldBlock, true);
+
+            // 3. Internal scheme access with C0 controls, embedded tabs, nested wrappers, and percent-encoded about:
+            assert.equal(evaluateInternalSchemeAccess('\u0001about:config').shouldBlock, true);
+            assert.equal(evaluateInternalSchemeAccess('ab\tout:config').shouldBlock, true);
+            assert.equal(evaluateInternalSchemeAccess('about://%63onfig').shouldBlock, true);
+            assert.equal(evaluateInternalSchemeAccess('view-source:chrome://gpu').shouldBlock, true);
+            assert.equal(
+                evaluateInternalSchemeAccess('blob:moz-extension://untrusted-id/page.html').shouldBlock,
+                true
+            );
+            assert.equal(
+                evaluateInternalSchemeAccess('blob:moz-extension://trusted-id/page.html', {
+                    allowedExtensionIds: ['trusted-id']
+                }).shouldBlock,
+                false
+            );
+            assert.equal(
+                evaluateInternalSchemeAccess('filesystem:chrome-extension://untrusted-id/temp/a.txt').shouldBlock,
+                true
+            );
+
+            // 4. CanvasWebglConsistencyLedger negative maxHammingDistance guard & invalid hash rejection
+            const ledger = new CanvasWebglConsistencyLedger({
+                profileId: 'neg_dist_test',
+                maxHammingDistance: -5
+            });
+            assert.equal(ledger.maxHammingDistance, 0);
+            const firstObs = ledger.recordOrVerify({
+                kind: 'canvas',
+                domain: 'accounts.google.com',
+                hash: '0x8f4a2c910b3e7d12'
+            });
+            assert.equal(firstObs.status, 'recorded-initial');
+            const secondObs = ledger.recordOrVerify({
+                kind: 'canvas',
+                domain: 'accounts.google.com',
+                hash: '8f4a2c910b3e7d12'
+            });
+            assert.equal(secondObs.status, 'consistent');
+            assert.equal(secondObs.driftDetected, false);
+            assert.throws(
+                () => ledger.recordOrVerify({ kind: 'canvas', domain: 'accounts.google.com', hash: '' }),
+                /Invalid hexadecimal fingerprint hash/
+            );
+
+            // 5. validateOsAndBrowserVersionMatch with full User-Agent string containing "Windows NT 10.0" or "Mac OS X 10.15"
+            const uaCheck = validateOsAndBrowserVersionMatch({
+                os: 'macos',
+                osVersion: '15.4.0',
+                cpuModel: 'Apple M4 Max',
+                browserVersion:
+                    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0'
+            });
+            assert.equal(uaCheck.actualBrowserMajor, 135);
+            assert.equal(uaCheck.passed, true);
+        }
+    },
+    {
+        name: '86. Subagent 1 Hardware SKU Edge-Case Hardening: Apple M4 Ultra, Multi-Digit macOS Minor Version (13.10), MacBook Pro + Ultra Rejection, X1P-42 Adreno X1-85 Rejection & Arc A770 Ultrabook Rejection',
+        fn: () => {
+            // 1. Apple M4 Ultra SKU is recognized and rejects laptop panel
+            assert.equal(parseAppleSiliconSkuName('Apple M4 Ultra'), 'Apple M4 Ultra');
+            const m4UltraLaptop = buildCoherentTelemetry('macos');
+            m4UltraLaptop.navigator.hardwareConcurrency = 32;
+            m4UltraLaptop.worker.hardwareConcurrency = 32;
+            m4UltraLaptop.iframeParity.hardwareConcurrency = 32;
+            m4UltraLaptop.webgl.unmaskedRenderer = 'Apple M4 Ultra';
+            m4UltraLaptop.screen.width = 1728;
+            m4UltraLaptop.screen.height = 1117;
+            const resM4U = validateHardwareModelSpec(m4UltraLaptop, 'macos');
+            assert.equal(resM4U.passed, false);
+            assert.ok(resM4U.issues.some((i) => i.includes('desktop-only SoC')));
+
+            // 2. Multi-digit minor macOS version "13.10" must NOT satisfy Apple M3's macOS 14.0 floor
+            const m3Mac1310 = buildCoherentTelemetry('macos');
+            m3Mac1310.navigator.hardwareConcurrency = 8;
+            m3Mac1310.webgl.unmaskedRenderer = 'Apple M3';
+            m3Mac1310.hardwareProfile = {
+                cpuModel: 'Apple M3',
+                gpuModel: 'Apple M3',
+                osVersion: '13.10.2',
+                ramGb: 16
+            };
+            const res1310 = validateHardwareModelSpec(m3Mac1310, 'macos');
+            assert.equal(res1310.passed, false);
+            assert.ok(res1310.issues.some((i) => i.includes('minimum bootable macOS violation')));
+
+            // 3. MacBook Pro paired with M3 Ultra & iMac Pro paired with Apple M1 are rejected
+            const mbpUltra = buildCoherentTelemetry('macos');
+            mbpUltra.navigator.hardwareConcurrency = 28;
+            mbpUltra.webgl.unmaskedRenderer = 'Apple M3 Ultra';
+            mbpUltra.screen.width = 2560;
+            mbpUltra.screen.height = 1440;
+            mbpUltra.hardwareProfile = {
+                deviceModel: 'MacBook Pro 16"',
+                cpuModel: 'Apple M3 Ultra',
+                ramGb: 96
+            };
+            const resMbpUltra = validateHardwareModelSpec(mbpUltra, 'macos');
+            assert.equal(resMbpUltra.passed, false);
+            assert.ok(resMbpUltra.issues.some((i) => i.includes('(MacBook Pro) never ships with desktop-only Ultra-tier SoC')));
+
+            // 4. Snapdragon X Plus X1P-42-100 (Adreno X1-45 only) rejects Adreno X1-85
+            const x1p42 = buildCoherentTelemetry('windows');
+            x1p42.navigator.hardwareConcurrency = 8;
+            x1p42.webgl.unmaskedVendor = 'Google Inc. (Qualcomm)';
+            x1p42.webgl.unmaskedRenderer =
+                'ANGLE (Qualcomm, Qualcomm(R) Adreno(TM) X1-85 GPU Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            x1p42.hardwareProfile = {
+                cpuModel: 'Snapdragon X Plus X1P-42-100',
+                ramGb: 16
+            };
+            const resX1p = validateHardwareModelSpec(x1p42, 'windows');
+            assert.equal(resX1p.passed, false);
+            assert.ok(resX1p.issues.some((i) => i.includes('Qualcomm Unified SoC "Snapdragon X Plus X1P-42-100" CPU/GPU mismatch')));
+
+            // 5. ThinkPad X1 Carbon Gen 12 rejects discrete Intel Arc A770 Graphics
+            const x1c12ArcA770 = buildCoherentTelemetry('windows');
+            x1c12ArcA770.navigator.hardwareConcurrency = 14;
+            x1c12ArcA770.webgl.unmaskedVendor = 'Google Inc. (Intel)';
+            x1c12ArcA770.webgl.unmaskedRenderer =
+                'ANGLE (Intel, Intel(R) Arc(TM) A770 Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            x1c12ArcA770.hardwareProfile = {
+                deviceModel: 'Lenovo ThinkPad X1 Carbon Gen 12',
+                cpuModel: 'Intel Core Ultra 7 155U',
+                ramGb: 32
+            };
+            const resX1c = validateHardwareModelSpec(x1c12ArcA770, 'windows');
+            assert.equal(resX1c.passed, false);
+            assert.ok(resX1c.issues.some((i) => i.includes('is integrated-GPU only') || i.includes('GPU mismatch')));
+        }
+    },
+    {
+        name: '87. Subagent 1 Auto-Healer Hardening: Apple M1 Non-Notch 1440x900 Healing, Leaked LAPTOP- Hostname on macOS, Windows RTX 4090 Preset Resolution & Ziniao Skip-Hosts Preservation',
+        fn: () => {
+            // 1. Apple M1 profile heals to non-notched 1440x900 and passes 17/17 checks
+            const healedM1 = sanitizeAdsPowerProfileToCoherentPreset({
+                fbccId: 'm1_heal_test',
+                Platform: 'MacIntel',
+                DeviceName: 'LAPTOP-WINLEAK99',
+                HardwareConcurrency: 4,
+                DeviceMemory: 64,
+                UNMASKED_RENDERER_WEBGL: 'ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)',
+                osVersion: '11.6.0'
+            });
+            assert.equal(healedM1.validation.passed, true, `Issues: ${healedM1.validation.issues.join('; ')}`);
+            assert.equal(healedM1.healedTelemetry.screen.width, 1440);
+            assert.equal(healedM1.healedTelemetry.screen.height, 900);
+            assert.doesNotMatch(healedM1.healedProfile.deviceName, /^LAPTOP-/i);
+            const m1Eval = evaluatePlatformCoherence(healedM1.healedTelemetry, 'macos');
+            assert.equal(m1Eval.passed, true);
+            assert.equal(m1Eval.score, 100);
+
+            // 2. Windows RTX 4090 profile heals directly to win-desktop-i9-14900k-rtx4090-64g
+            const healedWin4090 = sanitizeAdsPowerProfileToCoherentPreset({
+                fbccId: 'win_4090_heal',
+                Platform: 'Win32',
+                UNMASKED_RENDERER_WEBGL:
+                    'ANGLE (NVIDIA, NVIDIA GeForce RTX 4090 Direct3D11 vs_5_0 ps_5_0, D3D11)'
+            });
+            assert.equal(healedWin4090.healedPresetId, 'win-desktop-i9-14900k-rtx4090-64g');
+            assert.equal(healedWin4090.validation.passed, true);
+
+            // 3. Ziniao string os: "macos" + LAPTOP- hostname + preserved DEFAULT_CANVAS_SKIP_HOSTS
+            const healedZiniao = sanitizeZiniaoProfileToCoherentPreset({
+                ContainerId: 'ziniao_mac_str_os',
+                os: 'macos',
+                device_info_str: 'LAPTOP-ZINIAO1',
+                concurrent_hardware_num: 3,
+                device_memory: 6,
+                webgl_renderer: 'Apple M3 Pro'
+            });
+            assert.equal(healedZiniao.validation.passed, true);
+            assert.equal(healedZiniao.healedProfile.os, 'macos');
+            assert.ok(healedZiniao.absorbedSecurityPolicy.canvasSkipHosts.includes('figma.com'));
+        }
+    },
+    {
+        name: '88. Subagent 1 & 2 GPU Performance Init Script Hardening: Bounded Virtual-Clock Burst Window, Flush+Finish Preservation, Idempotent Timer Query Cache, GPUBuffer.mapAsync & __camoufoxGpuPerformanceState',
+        fn: async () => {
+            const vm = await import('node:vm');
+            const weights = computeGpuPerformanceScalingWeights('Intel(R) UHD Graphics 620', {
+                profileId: 'gpu_hardening_test'
+            });
+            const scriptSource = buildGpuPerformanceInitScript(weights);
+
+            let mockRealNow = 1000.0;
+            function MockPerformance() {}
+            MockPerformance.prototype.now = function now() {
+                return mockRealNow;
+            };
+            const perfInstance = new MockPerformance();
+            const MockDate = {
+                now: function now() {
+                    return Math.round(1700000000000 + mockRealNow);
+                }
+            };
+            function MockWebGL2() {}
+            MockWebGL2.prototype.drawArrays = function drawArrays() {};
+            MockWebGL2.prototype.flush = function flush() {
+                mockRealNow += 2.0;
+            };
+            MockWebGL2.prototype.finish = function finish() {
+                mockRealNow += 8.0;
+            };
+            MockWebGL2.prototype.clientWaitSync = function clientWaitSync() {
+                mockRealNow += 5.0;
+                return 0x911a;
+            };
+            MockWebGL2.prototype.beginQuery = function beginQuery() {};
+            MockWebGL2.prototype.getQueryParameter = function getQueryParameter() {
+                return 10_000_000;
+            };
+            function MockGPUBuffer() {}
+            MockGPUBuffer.prototype.mapAsync = function mapAsync() {
+                mockRealNow += 4.0;
+                return Promise.resolve();
+            };
+
+            const sandbox = {
+                Function,
+                Object,
+                Math,
+                WeakMap,
+                WeakSet,
+                Promise,
+                Performance: MockPerformance,
+                performance: perfInstance,
+                Date: MockDate,
+                WebGL2RenderingContext: MockWebGL2,
+                GPUBuffer: MockGPUBuffer
+            };
+            sandbox.globalThis = sandbox;
+            vm.createContext(sandbox);
+            vm.runInContext(scriptSource, sandbox);
+
+            // 1. __camoufoxGpuPerformanceState is exposed and non-enumerable
+            assert.ok(sandbox.__camoufoxGpuPerformanceState);
+            assert.equal(sandbox.__camoufoxGpuPerformanceState.targetGpuModel, 'Intel(R) UHD Graphics 620');
+            assert.equal(
+                Object.prototype.propertyIsEnumerable.call(sandbox, '__camoufoxGpuPerformanceState'),
+                false
+            );
+
+            // 2. gl.drawArrays -> gl.flush -> gl.finish preserves burst scaling across flush+finish
+            const gl = new MockWebGL2();
+            const t0 = perfInstance.now();
+            gl.drawArrays(4, 0, 3000);
+            gl.flush();
+            gl.finish();
+            const t1 = perfInstance.now();
+            // 10ms real elapsed on UHD 620 (~26x slower) must scale to > 150ms
+            assert.ok(t1 - t0 > 150, `Expected flush+finish scaled duration > 150ms, got ${t1 - t0}ms`);
+
+            // 3. Unsynchronized drawArrays followed by 5000ms idle time is capped by MAX_GPU_BURST_WINDOW_MS (100ms)
+            const tBeforeIdle = perfInstance.now();
+            gl.drawArrays(4, 0, 3000); // No finish() or readPixels() called!
+            mockRealNow += 5000.0; // 5 seconds of idle page time
+            const tAfterIdle = perfInstance.now();
+            const idleDelta = tAfterIdle - tBeforeIdle;
+            // Only the 100ms burst window is scaled (~2600ms) + 4900ms idle = ~7500ms, NOT 5000 * 26 = 130,000ms!
+            assert.ok(
+                idleDelta < 10000,
+                `Expected bounded burst window delta < 10000ms, got ${idleDelta}ms`
+            );
+
+            // 4. Repeated getQueryParameter(query, 0x8866) on the same query object returns identical cached value
+            const queryObj = {};
+            gl.beginQuery(0x88bf, queryObj);
+            const q1 = gl.getQueryParameter(queryObj, 0x8866);
+            const q2 = gl.getQueryParameter(queryObj, 0x8866);
+            assert.equal(q1, q2);
+
+            // 5. GPUBuffer.prototype.mapAsync is hooked and cloaked
+            const buf = new MockGPUBuffer();
+            const tBeforeMap = perfInstance.now();
+            await buf.mapAsync(1);
+            const tAfterMap = perfInstance.now();
+            assert.ok(tAfterMap - tBeforeMap > 20);
+            assert.match(Function.prototype.toString.call(MockGPUBuffer.prototype.mapAsync), /function mapAsync\(\)/);
+        }
     }
 ];
 

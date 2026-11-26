@@ -1858,12 +1858,30 @@ export function resolveDeterministicDeviceProfile(profileId = 'camoufox-profile-
         usageBytes
     };
 
+    let timezoneOffsetMinutes = 300;
+    try {
+        const tzParts = new Intl.DateTimeFormat('en-US', {
+            timeZone,
+            timeZoneName: 'shortOffset'
+        }).formatToParts(new Date());
+        const offsetPart = tzParts.find((p) => p.type === 'timeZoneName')?.value || '';
+        const offMatch = offsetPart.match(/GMT([+-])(\d{1,2})(?::(\d{2}))?/);
+        if (offMatch) {
+            const sign = offMatch[1] === '+' ? -1 : 1; // Date.prototype.getTimezoneOffset convention (UTC - local)
+            timezoneOffsetMinutes = sign * (Number(offMatch[2]) * 60 + Number(offMatch[3] || 0));
+        } else if (offsetPart === 'GMT' || offsetPart === 'UTC') {
+            timezoneOffsetMinutes = 0;
+        }
+    } catch {
+        timezoneOffsetMinutes = 300;
+    }
+
     const intlObj = {
         timeZone,
         locale: primaryLang,
         calendar: 'gregory',
         numberingSystem: 'latn',
-        timezoneOffsetMinutes: 300
+        timezoneOffsetMinutes
     };
 
     const telemetry = {
@@ -2066,9 +2084,11 @@ export function sanitizeAdsPowerProfileToCoherentPreset(rawAdsPowerProfile = {})
             'adspower-healed-profile'
     );
     const rawPlatform = String(
-        rawAdsPowerProfile.Platform ||
+        rawAdsPowerProfile.os ||
+            rawAdsPowerProfile.Platform ||
             rawAdsPowerProfile.platform ||
             rawAdsPowerProfile.navigator?.platform ||
+            rawAdsPowerProfile.userAgent ||
             'MacIntel'
     );
     const normOs = normalizePresetOs(rawPlatform);
@@ -2106,23 +2126,24 @@ export function sanitizeAdsPowerProfileToCoherentPreset(rawAdsPowerProfile = {})
 
     if (normOs !== 'macos') {
         // Resolve matching Windows or Linux preset
-        let candidatePreset = listUsableDevicePresets({ os: normOs }).find((p) =>
-            renderer && p.webgl.unmaskedRenderer.toLowerCase().includes(renderer.toLowerCase())
+        const osPresets = listUsableDevicePresets({ os: normOs });
+        const lowerRenderer = renderer.toLowerCase();
+        let candidatePreset = osPresets.find(
+            (p) =>
+                renderer &&
+                (p.webgl.unmaskedRenderer.toLowerCase().includes(lowerRenderer) ||
+                    lowerRenderer.includes(p.gpuModel.toLowerCase()))
         );
-        if (!candidatePreset && /RTX\s*4090/i.test(renderer)) {
-            candidatePreset = USABLE_DEVICE_PRESET_CATALOG.find(
-                (p) => p.presetId === 'win-desktop-i9-14900k-rtx4090'
-            );
-        }
-        if (!candidatePreset && /RTX\s*4080/i.test(renderer)) {
-            candidatePreset = USABLE_DEVICE_PRESET_CATALOG.find(
-                (p) => p.presetId === 'win-desktop-r7-7800x3d-rtx4080s'
-            );
-        }
-        if (!candidatePreset && /RTX\s*4070/i.test(renderer)) {
-            candidatePreset = USABLE_DEVICE_PRESET_CATALOG.find(
-                (p) => p.presetId === 'win-desktop-i7-14700k-rtx4070s'
-            );
+        if (!candidatePreset && normOs === 'windows') {
+            if (/RTX\s*4090\s*Laptop/i.test(renderer)) {
+                candidatePreset = osPresets.find((p) => p.presetId === 'win-razer-blade16-i9-rtx4090');
+            } else if (/RTX\s*4090/i.test(renderer)) {
+                candidatePreset = osPresets.find((p) => p.presetId === 'win-desktop-i9-14900k-rtx4090-64g');
+            } else if (/RTX\s*4080/i.test(renderer)) {
+                candidatePreset = osPresets.find((p) => p.presetId === 'win-desktop-r7-7800x3d-rtx4080-32g');
+            } else if (/RTX\s*4070/i.test(renderer)) {
+                candidatePreset = osPresets.find((p) => p.presetId === 'win-desktop-i7-13700k-rtx4070-32g');
+            }
         }
         const healedProfile = resolveDeterministicDeviceProfile(profileId, {
             os: normOs,
@@ -2176,42 +2197,57 @@ export function sanitizeAdsPowerProfileToCoherentPreset(rawAdsPowerProfile = {})
 
         // 3. Heal macOS version to meet minimum bootable macOS for chip generation
         const minOs = APPLE_SILICON_MIN_MACOS_VERSION[sku.generation] || 11.0;
+        const minReqMaj = Math.floor(minOs);
+        const minReqMin = Math.round((minOs - minReqMaj) * 10);
         const verMatch = rawOsVer.match(/^(\d+)(?:\.(\d+))?/);
-        const numVer = verMatch ? Number(verMatch[1]) + Number(verMatch[2] || 0) / 10 : 0;
+        const majVer = verMatch ? Number(verMatch[1]) : 0;
+        const minVer = verMatch ? Number(verMatch[2] || 0) : 0;
         let healedOsVer = rawOsVer;
-        if (numVer < minOs) {
+        if (majVer < minReqMaj || (majVer === minReqMaj && minVer < minReqMin)) {
             healedOsVer = sku.generation >= 5 ? '26.1.0' : '15.4.0';
             repairsApplied.push(
                 `Repaired ${sku.chip} macOS version from ${rawOsVer} -> ${healedOsVer} (min boot OS ${minOs.toFixed(1)})`
             );
         }
 
-        // 4. Heal DeviceName product line to match chip tier (base / pro / max / ultra)
-        const ownerPrefix = rawDeviceName.split(/['.-]/)[0]?.trim() || 'Alex';
+        // 4. Heal DeviceName product line to match chip tier (base / pro / max / ultra) and strip Windows hostnames
+        const isLeakedWinHost = /^(?:DESKTOP|LAPTOP|WIN)-/i.test(rawDeviceName);
+        const ownerPrefix = isLeakedWinHost
+            ? 'Alex'
+            : rawDeviceName.split(/['.-]/)[0]?.trim() || 'Alex';
         let healedDeviceName = rawDeviceName;
         if (sku.tier === 'base') {
-            if (/\b(?:Mac\s+Studio|Mac\s+Pro|Mac[-_]Studio|Mac[-_]Pro)\b/i.test(rawDeviceName)) {
+            if (
+                isLeakedWinHost ||
+                /\b(?:Mac\s+Studio|Mac\s+Pro|Mac[-_]Studio|Mac[-_]Pro|iMac[-_\s]+Pro)\b/i.test(rawDeviceName)
+            ) {
                 healedDeviceName = `${ownerPrefix}'s MacBook Air`;
                 repairsApplied.push(
                     `Repaired DeviceName from "${rawDeviceName}" -> "${healedDeviceName}" for base-tier ${sku.chip}`
                 );
             }
         } else if (sku.tier === 'pro') {
-            if (/\b(?:MacBook[-_\s]+Air|Mac[-_\s]+Studio|iMac|Mac[-_\s]+Pro)\b/i.test(rawDeviceName)) {
+            if (
+                isLeakedWinHost ||
+                /\b(?:MacBook[-_\s]+Air|Mac[-_\s]+Studio|iMac|Mac[-_\s]+Pro)\b/i.test(rawDeviceName)
+            ) {
                 healedDeviceName = `${ownerPrefix}'s MacBook Pro`;
                 repairsApplied.push(
                     `Repaired DeviceName from "${rawDeviceName}" -> "${healedDeviceName}" for Pro-tier ${sku.chip}`
                 );
             }
         } else if (sku.tier === 'max') {
-            if (/\b(?:MacBook[-_\s]+Air|Mac[-_\s]+mini|iMac|Mac[-_\s]+Pro)\b/i.test(rawDeviceName)) {
+            if (
+                isLeakedWinHost ||
+                /\b(?:MacBook[-_\s]+Air|Mac[-_\s]+mini|iMac|Mac[-_\s]+Pro)\b/i.test(rawDeviceName)
+            ) {
                 healedDeviceName = `${ownerPrefix}'s MacBook Pro`;
                 repairsApplied.push(
                     `Repaired DeviceName from "${rawDeviceName}" -> "${healedDeviceName}" for Max-tier ${sku.chip}`
                 );
             }
         } else if (sku.tier === 'ultra') {
-            if (!/\b(?:Mac[-_\s]+Studio|Mac[-_\s]+Pro)\b/i.test(rawDeviceName)) {
+            if (isLeakedWinHost || !/\b(?:Mac[-_\s]+Studio|Mac[-_\s]+Pro)\b/i.test(rawDeviceName)) {
                 healedDeviceName = `${ownerPrefix}'s Mac Studio`;
                 repairsApplied.push(
                     `Repaired DeviceName from "${rawDeviceName}" -> "${healedDeviceName}" for Ultra-tier ${sku.chip}`
@@ -2226,8 +2262,10 @@ export function sanitizeAdsPowerProfileToCoherentPreset(rawAdsPowerProfile = {})
         }
 
         const healedArch = sku.generation >= 3 ? 'metal-3' : 'common-3';
-        const width = sku.tier === 'ultra' ? 2560 : sku.tier === 'base' ? 1470 : 1512;
-        const height = sku.tier === 'ultra' ? 1440 : sku.tier === 'base' ? 956 : 982;
+        const width =
+            sku.tier === 'ultra' ? 2560 : sku.chip === 'Apple M1' ? 1440 : sku.tier === 'base' ? 1470 : 1512;
+        const height =
+            sku.tier === 'ultra' ? 1440 : sku.chip === 'Apple M1' ? 900 : sku.tier === 'base' ? 956 : 982;
 
         healedProfile.deviceName = healedDeviceName;
         healedProfile.productType = healedDeviceName;
@@ -2242,6 +2280,10 @@ export function sanitizeAdsPowerProfileToCoherentPreset(rawAdsPowerProfile = {})
         healedProfile.telemetry.screen.height = height;
         healedProfile.telemetry.screen.availWidth = width;
         healedProfile.telemetry.screen.availHeight = height - 38;
+        healedProfile.telemetry.screen.innerWidth = width;
+        healedProfile.telemetry.screen.innerHeight = Math.max(400, height - 122);
+        healedProfile.telemetry.screen.outerWidth = width;
+        healedProfile.telemetry.screen.outerHeight = height - 38;
         healedProfile.telemetry.iframeParity.width = width;
         healedProfile.telemetry.iframeParity.height = height;
         healedProfile.hardwareProfile = {
@@ -2340,7 +2382,9 @@ export function sanitizeZiniaoProfileToCoherentPreset(rawZiniaoConfig = {}) {
             'ziniao-healed-profile'
     );
 
-    const sysVal = Number(adv.os ?? adv.system_value ?? rawZiniaoConfig.system_value ?? 1);
+    const rawOsInput = adv.os ?? adv.system_value ?? rawZiniaoConfig.system_value ?? rawZiniaoConfig.os ?? 1;
+    const sysVal = Number(rawOsInput);
+    const osStr = typeof rawOsInput === 'string' ? rawOsInput.toLowerCase() : '';
     const uaStr = String(
         rawZiniaoConfig.Detail?.browser?.user_agent ||
             adv.ua ||
@@ -2348,9 +2392,9 @@ export function sanitizeZiniaoProfileToCoherentPreset(rawZiniaoConfig = {}) {
             ''
     );
     const normOs =
-        sysVal === 2 || /Macintosh|Mac OS X/i.test(uaStr)
+        sysVal === 2 || osStr.startsWith('mac') || /Macintosh|Mac OS X/i.test(uaStr)
             ? 'macos'
-            : sysVal === 3 || /X11;\s*Linux/i.test(uaStr)
+            : sysVal === 3 || osStr.startsWith('lin') || /X11;\s*Linux/i.test(uaStr)
               ? 'linux'
               : 'windows';
 
@@ -2369,7 +2413,7 @@ export function sanitizeZiniaoProfileToCoherentPreset(rawZiniaoConfig = {}) {
     }
 
     const rawHost = String(adv.device_info_str || rawZiniaoConfig.device_info_str || '').trim();
-    if (rawHost && normOs !== 'windows' && /^DESKTOP-/i.test(rawHost)) {
+    if (rawHost && normOs !== 'windows' && /^(?:DESKTOP|LAPTOP|WIN)-/i.test(rawHost)) {
         repairsApplied.push(
             `Repaired Ziniao h1a() Windows hostname "${rawHost}" on ${normOs} to OS-authentic hostname`
         );
@@ -2401,7 +2445,10 @@ export function sanitizeZiniaoProfileToCoherentPreset(rawZiniaoConfig = {}) {
     const delegated = sanitizeAdsPowerProfileToCoherentPreset({
         fbccId: profileId,
         Platform: normOs === 'macos' ? 'MacIntel' : normOs === 'linux' ? 'Linux x86_64' : 'Win32',
-        DeviceName: normOs === 'macos' && /^DESKTOP-/i.test(rawHost) ? "Alex's MacBook Pro" : rawHost || undefined,
+        DeviceName:
+            normOs === 'macos' && /^(?:DESKTOP|LAPTOP|WIN)-/i.test(rawHost)
+                ? "Alex's MacBook Pro"
+                : rawHost || undefined,
         HardwareConcurrency: rawCores,
         DeviceMemory: rawMem,
         UNMASKED_RENDERER_WEBGL: renderer || undefined
@@ -2422,18 +2469,24 @@ export function sanitizeZiniaoProfileToCoherentPreset(rawZiniaoConfig = {}) {
         rawZiniaoConfig.canvas_fingerprint_skip_hosts ||
         rawZiniaoConfig.Raw?.canvas_fingerprint_skip_hosts ||
         [];
-    const canvasSkipHosts = Array.isArray(skipHostsRaw)
+    const parsedSkipHosts = Array.isArray(skipHostsRaw)
         ? skipHostsRaw
         : typeof skipHostsRaw === 'string' && skipHostsRaw.trim()
           ? skipHostsRaw.split('|').map((s) => s.trim()).filter(Boolean)
           : [];
+    const canvasSkipHosts =
+        parsedSkipHosts.length > 0
+            ? parsedSkipHosts
+            : [...DEFAULT_CANVAS_SKIP_HOSTS];
 
     const absorbedSecurityPolicy = {
         portScanProtection: {
             enabled: portProtEnabled,
-            allowedPorts
+            allowedPorts,
+            allowSameOriginLocalDev: false
         },
-        canvasSkipHosts
+        canvasSkipHosts,
+        skipCpuSoftwareCanvasMask: true
     };
 
     delegated.healedProfile.securityPolicy = absorbedSecurityPolicy;

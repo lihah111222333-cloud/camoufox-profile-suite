@@ -985,6 +985,13 @@ export async function collectBrowserFingerprint(page) {
             }
         }
 
+        const gpuPerformance =
+            typeof window !== 'undefined' &&
+            window.__camoufoxGpuPerformanceState &&
+            typeof window.__camoufoxGpuPerformanceState === 'object'
+                ? { ...window.__camoufoxGpuPerformanceState }
+                : null;
+
         return {
             navigator: navigatorInfo,
             prototypeIntegrity,
@@ -1003,7 +1010,8 @@ export async function collectBrowserFingerprint(page) {
             geckoApiSurface,
             webgpu,
             stackAndMediaHygiene,
-            storageEstimate
+            storageEstimate,
+            ...(gpuPerformance ? { gpuPerformance } : {})
         };
     });
 }
@@ -1476,7 +1484,7 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
             new Set(
                 collected
                     .map((g) => String(g || '').trim())
-                    .filter((g) => g.length > 0 && (forbiddenSet.has(g) || forbiddenRegex.test(g) || g.length > 0))
+                    .filter((g) => g.length > 0 && (forbiddenSet.has(g) || forbiddenRegex.test(g)))
             )
         );
 
@@ -1523,7 +1531,10 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
                 (Boolean(webrtc.expectedPublicIp) || webrtc.blockPrivateIp !== false)
             ) {
                 for (const ip of webrtc.candidateIps) {
-                    if (isRfc1918PrivateIpv4(ip)) {
+                    const isPrivateCandidate =
+                        isRfc1918PrivateIpv4(ip) ||
+                        (typeof ip === 'string' && ip.includes(':') && isLocalOrPrivateTarget(ip).isLocalOrPrivate);
+                    if (isPrivateCandidate) {
                         issues.push(`WebRTC leaked RFC1918 private LAN IP "${ip}" in ICE candidates`);
                     } else if (webrtc.expectedPublicIp && ip !== webrtc.expectedPublicIp) {
                         issues.push(
@@ -2380,6 +2391,46 @@ export default {
     lookupPcCpuSku,
     lookupPcGpuSku,
     validateHardwareModelSpec,
+    OS_FONT_CATALOG,
+    LOCALE_FALLBACK_CHAINS,
+    COUNTRY_GEO_PROFILE_CATALOG,
+    OS_SPEECH_VOICES_CATALOG,
+    OS_MEDIA_DEVICES_CATALOG,
+    USABLE_DEVICE_PRESET_CATALOG,
+    normalizePresetOs,
+    listUsableDevicePresets,
+    expandCompatibleLanguages,
+    buildAcceptLanguageHeader,
+    resolveCountryGeoProfile,
+    selectCoherentSpeechVoices,
+    createCoherentMediaDevices,
+    resolveDeterministicDeviceProfile,
+    sanitizeAdsPowerProfileToCoherentPreset,
+    sanitizeZiniaoProfileToCoherentPreset,
+    SENSITIVE_LOCAL_PORT_CATALOG,
+    BLOCKED_INTERNAL_URL_PATTERNS,
+    DEFAULT_CANVAS_SKIP_HOSTS,
+    COUNTRY_METRO_COORDINATES_CATALOG,
+    isLocalOrPrivateTarget,
+    classifyScannedPortRisk,
+    evaluatePortScanRequest,
+    evaluateInternalSchemeAccess,
+    computeHexHammingDistance,
+    computeHashSimilarity,
+    shouldSkipCanvasNoiseForHost,
+    isSoftwareRasterizerRenderer,
+    CanvasWebglConsistencyLedger,
+    validateOsAndBrowserVersionMatch,
+    resolveGeoCoordinatesWithDeterministicJitter,
+    attachZiniaoSecurityGuardsToContext,
+    GPU_PERFORMANCE_SPEC_CATALOG,
+    lookupGpuPerformanceSpec,
+    collectHostMacPerformanceBaseline,
+    computeGpuPerformanceScalingWeights,
+    scaleGpuExecutionDurationMs,
+    buildGpuPerformanceInitScript,
+    attachGpuPerformanceScalerToContext,
+    validateGpuPerformanceScalingCoherence,
     normalizeTargetOs,
     gpuFitsOs,
     collectBrowserFingerprint,

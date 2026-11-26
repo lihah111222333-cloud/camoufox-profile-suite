@@ -13,6 +13,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { pathToFileURL } from 'url';
 import { validateHardwareModelSpec } from '../src/camoufox/hardware-models.js';
 import {
     USABLE_DEVICE_PRESET_CATALOG,
@@ -105,6 +106,7 @@ export function auditAdsPowerProfileDir(profileDir) {
             architecture: uam.architecture || null,
             osVersion: uam.platformVersion || null,
             ramGb: staticConfig.DeviceMemory ? Number(staticConfig.DeviceMemory) : null,
+            deviceMemory: staticConfig.DeviceMemory ? Number(staticConfig.DeviceMemory) : null,
             webgpuAdapterInfo: webglConfig.GPUAdapterInfo || null
         }
     };
@@ -162,7 +164,8 @@ function main() {
     }
 
     const showHeal = process.argv.includes('--heal');
-    const argDir = process.argv.find((a) => a.startsWith('--cache-dir='))?.split('=')[1];
+    const rawCacheArg = process.argv.find((a) => a.startsWith('--cache-dir='));
+    const argDir = rawCacheArg ? rawCacheArg.slice('--cache-dir='.length) : null;
     const cacheRoot =
         argDir || '/Volumes/hello/PrivacyData/adspower_global/cwd_global/source/cache';
 
@@ -209,6 +212,6 @@ function main() {
     }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
     main();
 }

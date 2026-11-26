@@ -841,7 +841,15 @@ export async function createProfile(profileName, proxy = null, options = {}) {
             presetId: options.presetId || options.preset || undefined,
             country: options.country || undefined,
             language: options.locale || undefined,
-            timeZone: options.timezoneId || undefined
+            timeZone: options.timezoneId || undefined,
+            portScanProtection:
+                options.portScanProtection !== undefined
+                    ? Boolean(options.portScanProtection)
+                    : options.enablePortScanProtection !== undefined
+                      ? Boolean(options.enablePortScanProtection)
+                      : true,
+            allowedLocalPorts: options.allowedLocalPorts || undefined,
+            canvasSkipHosts: options.canvasSkipHosts || undefined
         });
 
         const metadata = {
@@ -1149,6 +1157,41 @@ export async function startProfile(profileId, options = {}) {
                 context = await browser.newContext(contextOpts);
             }
 
+            const fingerprintLedger = new CanvasWebglConsistencyLedger({
+                profileId,
+                ledgerPath: path.join(storageInfo.profileDir, 'fingerprint-ledger.json'),
+                maxHammingDistance:
+                    options.maxHammingDistance ??
+                    mergedOptions.maxHammingDistance ??
+                    0,
+                skipHosts: mergedOptions.securityPolicy?.canvasSkipHosts
+            });
+
+            let securityGuards = null;
+            if (options.enablePortScanProtection || mergedOptions.enablePortScanProtection) {
+                securityGuards = await attachZiniaoSecurityGuardsToContext(context, {
+                    profileId,
+                    portScanProtection: mergedOptions.securityPolicy?.portScanProtection,
+                    allowedExtensionIds: options.allowedExtensionIds ?? mergedOptions.allowedExtensionIds,
+                    onBlockedAttempt: options.onBlockedAttempt ?? mergedOptions.onBlockedAttempt
+                });
+            }
+
+            let gpuPerformanceScaler = null;
+            if (
+                options.enableGpuPerformanceScaling !== false &&
+                mergedOptions.enableGpuPerformanceScaling !== false
+            ) {
+                gpuPerformanceScaler = await attachGpuPerformanceScalerToContext(
+                    context,
+                    mergedOptions.gpuPerformance ||
+                        mergedOptions.hardwareProfile?.gpuModel ||
+                        mergedOptions.deviceModel ||
+                        targetOs,
+                    { profileId }
+                );
+            }
+
             const existingPages = context.pages();
             const page = existingPages.length > 0 ? existingPages[0] : await context.newPage();
 
@@ -1171,35 +1214,6 @@ export async function startProfile(profileId, options = {}) {
                 });
                 await trafficRecorder.attachContext(context);
                 await trafficRecorder.attachPage(page);
-            }
-
-            const fingerprintLedger = new CanvasWebglConsistencyLedger({
-                profileId,
-                ledgerPath: path.join(storageInfo.profileDir, 'fingerprint-ledger.json'),
-                skipHosts: mergedOptions.securityPolicy?.canvasSkipHosts
-            });
-
-            let securityGuards = null;
-            if (options.enablePortScanProtection || mergedOptions.enablePortScanProtection) {
-                securityGuards = await attachZiniaoSecurityGuardsToContext(context, {
-                    profileId,
-                    portScanProtection: mergedOptions.securityPolicy?.portScanProtection
-                });
-            }
-
-            let gpuPerformanceScaler = null;
-            if (
-                options.enableGpuPerformanceScaling !== false &&
-                mergedOptions.enableGpuPerformanceScaling !== false
-            ) {
-                gpuPerformanceScaler = await attachGpuPerformanceScalerToContext(
-                    context,
-                    mergedOptions.gpuPerformance ||
-                        mergedOptions.hardwareProfile?.gpuModel ||
-                        mergedOptions.deviceModel ||
-                        targetOs,
-                    { profileId }
-                );
             }
 
             const session = {
@@ -1286,6 +1300,28 @@ export async function stopProfile(profileId, options = {}) {
                 logger.warn('Could not flush traffic recorder before stopping profile', {
                     profileId,
                     error: trafficErr.message
+                });
+            }
+        }
+
+        if (session.securityGuards && typeof session.securityGuards.detach === 'function') {
+            try {
+                await session.securityGuards.detach();
+            } catch (guardErr) {
+                logger.debug('Error detaching Ziniao security guards', {
+                    profileId,
+                    error: guardErr.message
+                });
+            }
+        }
+
+        if (session.fingerprintLedger && typeof session.fingerprintLedger.saveToDisk === 'function') {
+            try {
+                session.fingerprintLedger.saveToDisk();
+            } catch (ledgerErr) {
+                logger.debug('Error saving fingerprint consistency ledger before stopping profile', {
+                    profileId,
+                    error: ledgerErr.message
                 });
             }
         }
@@ -1535,5 +1571,23 @@ export default {
     USABLE_DEVICE_PRESET_CATALOG,
     listUsableDevicePresets,
     resolveDeterministicDeviceProfile,
-    sanitizeAdsPowerProfileToCoherentPreset
+    sanitizeAdsPowerProfileToCoherentPreset,
+    sanitizeZiniaoProfileToCoherentPreset,
+    CanvasWebglConsistencyLedger,
+    attachZiniaoSecurityGuardsToContext,
+    evaluatePortScanRequest,
+    evaluateInternalSchemeAccess,
+    computeHexHammingDistance,
+    computeHashSimilarity,
+    shouldSkipCanvasNoiseForHost,
+    validateOsAndBrowserVersionMatch,
+    resolveGeoCoordinatesWithDeterministicJitter,
+    GPU_PERFORMANCE_SPEC_CATALOG,
+    lookupGpuPerformanceSpec,
+    collectHostMacPerformanceBaseline,
+    computeGpuPerformanceScalingWeights,
+    scaleGpuExecutionDurationMs,
+    buildGpuPerformanceInitScript,
+    attachGpuPerformanceScalerToContext,
+    validateGpuPerformanceScalingCoherence
 };

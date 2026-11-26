@@ -74,6 +74,7 @@ const ALL_NOTCHED_LAPTOP_PANELS = Object.freeze([
 
 const ALL_LAPTOP_PANELS = Object.freeze([
     ...APPLE_LAPTOP_PANELS.nonNotch13,
+    ...APPLE_LAPTOP_PANELS.nonNotch15And16,
     ...ALL_NOTCHED_LAPTOP_PANELS
 ]);
 
@@ -426,6 +427,25 @@ export const APPLE_SILICON_SKU_CATALOG = Object.freeze({
         ]),
         webglLimits: DEFAULT_APPLE_METAL_WEBGL_LIMITS
     }),
+    'Apple M4 Ultra': Object.freeze({
+        chip: 'Apple M4 Ultra',
+        generation: 4,
+        tier: 'ultra',
+        cpuArch: 'arm',
+        cpuVendor: 'apple',
+        gpuRenderer: 'Apple M4 Ultra',
+        allowedCores: Object.freeze([28, 32]),
+        allowedRamGb: Object.freeze([96, 128, 256, 512]),
+        allowedStorageGb: Object.freeze([1024, 2048, 4096, 8192, 16384]),
+        allowedCoreRamPairs: Object.freeze([
+            { cores: 28, ramGb: Object.freeze([96, 128, 256]) },
+            { cores: 32, ramGb: Object.freeze([96, 128, 256, 512]) }
+        ]),
+        formFactors: Object.freeze(['desktop']),
+        allowedPanels: APPLE_LAPTOP_PANELS.desktopDisplays,
+        forbiddenPanels: ALL_LAPTOP_PANELS,
+        webglLimits: DEFAULT_APPLE_METAL_WEBGL_LIMITS
+    }),
     'Apple M5': Object.freeze({
         chip: 'Apple M5',
         generation: 5,
@@ -464,8 +484,8 @@ export const APPLE_SILICON_SKU_CATALOG = Object.freeze({
         allowedRamGb: Object.freeze([24, 36, 48, 64]),
         allowedStorageGb: Object.freeze([512, 1024, 2048, 4096]),
         allowedCoreRamPairs: Object.freeze([
-            { cores: 12, ramGb: Object.freeze([24, 48]) },
-            { cores: 14, ramGb: Object.freeze([24, 48, 64]) },
+            { cores: 12, ramGb: Object.freeze([24, 36, 48]) },
+            { cores: 14, ramGb: Object.freeze([24, 36, 48, 64]) },
             { cores: 18, ramGb: Object.freeze([24, 36, 48, 64]) }
         ]),
         formFactors: Object.freeze(['laptop-pro-notch', 'desktop']),
@@ -601,7 +621,7 @@ export const QUALCOMM_SNAPDRAGON_SKU_CATALOG = Object.freeze({
         allowedCores: Object.freeze([12]),
         allowedRamGb: Object.freeze([16, 32, 64]),
         allowedStorageGb: Object.freeze([256, 512, 1024, 2048]),
-        gpuPattern: /Adreno(?:\(TM\))?\s+X1-85|Qualcomm\(R\)\s+Adreno/i,
+        gpuPattern: /Adreno(?:\(TM\))?\s+X1-85|Qualcomm\(R\)\s+Adreno(?!\s*(?:\(TM\))?\s*X1-45)/i,
         allowedOs: Object.freeze(['win', 'lin'])
     }),
     'Snapdragon X Elite X1E-80-100': Object.freeze({
@@ -610,7 +630,7 @@ export const QUALCOMM_SNAPDRAGON_SKU_CATALOG = Object.freeze({
         allowedCores: Object.freeze([12]),
         allowedRamGb: Object.freeze([16, 32, 64]),
         allowedStorageGb: Object.freeze([256, 512, 1024, 2048]),
-        gpuPattern: /Adreno(?:\(TM\))?\s+X1-85|Qualcomm\(R\)\s+Adreno/i,
+        gpuPattern: /Adreno(?:\(TM\))?\s+X1-85|Qualcomm\(R\)\s+Adreno(?!\s*(?:\(TM\))?\s*X1-45)/i,
         allowedOs: Object.freeze(['win', 'lin'])
     }),
     'Snapdragon X Elite X1E-78-100': Object.freeze({
@@ -619,7 +639,7 @@ export const QUALCOMM_SNAPDRAGON_SKU_CATALOG = Object.freeze({
         allowedCores: Object.freeze([12]),
         allowedRamGb: Object.freeze([16, 32, 64]),
         allowedStorageGb: Object.freeze([256, 512, 1024, 2048]),
-        gpuPattern: /Adreno(?:\(TM\))?\s+X1-85|Qualcomm\(R\)\s+Adreno/i,
+        gpuPattern: /Adreno(?:\(TM\))?\s+X1-85|Qualcomm\(R\)\s+Adreno(?!\s*(?:\(TM\))?\s*X1-45)/i,
         allowedOs: Object.freeze(['win', 'lin'])
     }),
     'Snapdragon X Plus X1P-64-100': Object.freeze({
@@ -628,7 +648,7 @@ export const QUALCOMM_SNAPDRAGON_SKU_CATALOG = Object.freeze({
         allowedCores: Object.freeze([10]),
         allowedRamGb: Object.freeze([16, 32]),
         allowedStorageGb: Object.freeze([256, 512, 1024, 2048]),
-        gpuPattern: /Adreno(?:\(TM\))?\s+X1-85|Qualcomm\(R\)\s+Adreno/i,
+        gpuPattern: /Adreno(?:\(TM\))?\s+X1-85|Qualcomm\(R\)\s+Adreno(?!\s*(?:\(TM\))?\s*X1-45)/i,
         allowedOs: Object.freeze(['win', 'lin'])
     }),
     'Snapdragon X Plus X1P-42-100': Object.freeze({
@@ -637,7 +657,7 @@ export const QUALCOMM_SNAPDRAGON_SKU_CATALOG = Object.freeze({
         allowedCores: Object.freeze([8]),
         allowedRamGb: Object.freeze([16, 32]),
         allowedStorageGb: Object.freeze([256, 512, 1024]),
-        gpuPattern: /Adreno(?:\(TM\))?\s+X1-45|Qualcomm\(R\)\s+Adreno/i,
+        gpuPattern: /Adreno(?:\(TM\))?\s+X1-45|Qualcomm\(R\)\s+Adreno(?!\s*(?:\(TM\))?\s*X1-85)/i,
         allowedOs: Object.freeze(['win', 'lin'])
     })
 });
@@ -674,7 +694,7 @@ export const OEM_DEVICE_MODEL_CATALOG = Object.freeze({
         cpuVendor: 'intel',
         allowedCores: Object.freeze([12, 14, 16, 18, 22]),
         igpuOnly: true,
-        gpuPattern: /Intel\(R\)\s+(?:Arc\(TM\)|Graphics)/i,
+        gpuPattern: /Intel\(R\)\s+(?:Arc\(TM\)\s+)?Graphics/i,
         allowedRamGb: Object.freeze([16, 32, 64]),
         allowedStorageGb: Object.freeze([256, 512, 1024, 2048]),
         allowedOs: Object.freeze(['win', 'lin'])
@@ -718,7 +738,7 @@ export const OEM_DEVICE_MODEL_CATALOG = Object.freeze({
         cpuVendor: 'intel',
         allowedCores: Object.freeze([14, 16, 18, 22]),
         igpuOnly: true,
-        gpuPattern: /Intel\(R\)\s+(?:Arc\(TM\)|Graphics)/i,
+        gpuPattern: /Intel\(R\)\s+(?:Arc\(TM\)\s+)?Graphics/i,
         allowedRamGb: Object.freeze([16, 32, 64]),
         allowedStorageGb: Object.freeze([512, 1024, 2048, 4096]),
         allowedOs: Object.freeze(['win', 'lin'])
@@ -1364,7 +1384,7 @@ export const PC_CPU_SKU_CATALOG = Object.freeze({
         allowedRamGb: Object.freeze([16, 32, 64]),
         maxRamGb: 64,
         hasIntegratedGpu: true,
-        expectedIgpuPattern: /Intel\(R\)\s+(?:Arc\(TM\)|Graphics)/i
+        expectedIgpuPattern: /Intel\(R\)\s+(?:Arc\(TM\)\s+)?Graphics/i
     }),
     'Intel Core Ultra 7 155U': Object.freeze({
         model: 'Intel Core Ultra 7 155U',
@@ -1376,7 +1396,7 @@ export const PC_CPU_SKU_CATALOG = Object.freeze({
         allowedRamGb: Object.freeze([16, 32, 64]),
         maxRamGb: 64,
         hasIntegratedGpu: true,
-        expectedIgpuPattern: /Intel\(R\)\s+(?:Arc\(TM\)|Graphics)/i
+        expectedIgpuPattern: /Intel\(R\)\s+(?:Arc\(TM\)\s+)?Graphics/i
     }),
     'Intel Core Ultra 5 125H': Object.freeze({
         model: 'Intel Core Ultra 5 125H',
@@ -1388,7 +1408,7 @@ export const PC_CPU_SKU_CATALOG = Object.freeze({
         allowedRamGb: Object.freeze([16, 32, 64]),
         maxRamGb: 64,
         hasIntegratedGpu: true,
-        expectedIgpuPattern: /Intel\(R\)\s+(?:Arc\(TM\)|Graphics)/i
+        expectedIgpuPattern: /Intel\(R\)\s+(?:Arc\(TM\)\s+)?Graphics/i
     }),
     'Intel Core Ultra 7 155H': Object.freeze({
         model: 'Intel Core Ultra 7 155H',
@@ -1400,7 +1420,7 @@ export const PC_CPU_SKU_CATALOG = Object.freeze({
         allowedRamGb: Object.freeze([16, 32, 64]),
         maxRamGb: 64,
         hasIntegratedGpu: true,
-        expectedIgpuPattern: /Intel\(R\)\s+(?:Arc\(TM\)|Graphics)/i
+        expectedIgpuPattern: /Intel\(R\)\s+(?:Arc\(TM\)\s+)?Graphics/i
     }),
     'Intel Core Ultra 9 185H': Object.freeze({
         model: 'Intel Core Ultra 9 185H',
@@ -1412,7 +1432,7 @@ export const PC_CPU_SKU_CATALOG = Object.freeze({
         allowedRamGb: Object.freeze([16, 32, 64]),
         maxRamGb: 64,
         hasIntegratedGpu: true,
-        expectedIgpuPattern: /Intel\(R\)\s+(?:Arc\(TM\)|Graphics)/i
+        expectedIgpuPattern: /Intel\(R\)\s+(?:Arc\(TM\)\s+)?Graphics/i
     }),
     // Lunar Lake: Memory-on-Package (MoP) strictly locks 256V to 16GB and 258V/288V to 32GB, 8C/8T (no HT)
     'Intel Core Ultra 7 256V': Object.freeze({
@@ -1841,19 +1861,20 @@ export const PCI_DEVICE_ID_CATALOG = Object.freeze({
     '0x8a52': Object.freeze({ vendor: 'intel', name: 'Intel(R) Iris(TM) Plus Graphics', pattern: /Iris.*Plus/i }),
     '0x9a49': Object.freeze({ vendor: 'intel', name: 'Intel(R) Iris(R) Xe Graphics', pattern: /Iris\(R\)\s+Xe/i }),
     '0x46a6': Object.freeze({ vendor: 'intel', name: 'Intel(R) Iris(R) Xe Graphics', pattern: /Iris\(R\)\s+Xe/i }),
+    '0xa7a1': Object.freeze({ vendor: 'intel', name: 'Intel(R) Iris(R) Xe Graphics', pattern: /Iris\(R\)\s+Xe/i }),
     '0x4680': Object.freeze({ vendor: 'intel', name: 'Intel(R) UHD Graphics 770', pattern: /UHD\s+Graphics(?:\s+770)?/i }),
     '0xa780': Object.freeze({ vendor: 'intel', name: 'Intel(R) UHD Graphics 770', pattern: /UHD\s+Graphics(?:\s+770)?/i }),
     '0x56a0': Object.freeze({ vendor: 'intel', name: 'Intel(R) Arc(TM) A770 Graphics', pattern: /Arc\(TM\)\s+A770/i }),
     '0x2684': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 4090', pattern: /RTX\s*4090(?!\s+Laptop)/i }),
     '0x2717': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 4090 Laptop GPU', pattern: /RTX\s*4090\s+Laptop/i }),
-    '0x2704': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 4080', pattern: /RTX\s*4080/i }),
-    '0x2786': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 4070', pattern: /RTX\s*4070/i }),
-    '0x2882': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 4060', pattern: /RTX\s*4060/i }),
-    '0x2204': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3090', pattern: /RTX\s*3090/i }),
-    '0x2206': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3080', pattern: /RTX\s*3080/i }),
-    '0x2484': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3070', pattern: /RTX\s*3070/i }),
-    '0x2503': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3060', pattern: /RTX\s*3060/i }),
-    '0x2504': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3060', pattern: /RTX\s*3060/i }),
+    '0x2704': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 4080', pattern: /RTX\s*4080(?!\s+Laptop)/i }),
+    '0x2786': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 4070', pattern: /RTX\s*4070(?!\s+Laptop)/i }),
+    '0x2882': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 4060', pattern: /RTX\s*4060(?!\s+Laptop)/i }),
+    '0x2204': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3090', pattern: /RTX\s*3090(?!\s+Laptop)/i }),
+    '0x2206': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3080', pattern: /RTX\s*3080(?!\s+Laptop)/i }),
+    '0x2484': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3070', pattern: /RTX\s*3070(?!\s+Laptop)/i }),
+    '0x2503': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3060', pattern: /RTX\s*3060(?!\s+Laptop)/i }),
+    '0x2504': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3060', pattern: /RTX\s*3060(?!\s+Laptop)/i }),
     '0x2520': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce RTX 3060 Laptop GPU', pattern: /RTX\s*3060\s+Laptop/i }),
     '0x1f82': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce GTX 1650', pattern: /GTX\s*1650/i }),
     '0x2184': Object.freeze({ vendor: 'nvidia', name: 'NVIDIA GeForce GTX 1660', pattern: /GTX\s*1660/i }),
@@ -2519,9 +2540,12 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
     const hw = telemetry.hardwareProfile || {};
     const storageEstimate = telemetry.storageEstimate || hw.storageEstimate || null;
 
+    const toOptionalNumber = (v) =>
+        v !== undefined && v !== null && v !== '' && typeof v !== 'boolean' ? Number(v) : null;
+
     const renderer = String(webgl.unmaskedRenderer || '').trim();
     const vendor = String(webgl.unmaskedVendor || '').trim();
-    const cores = Number(nav.hardwareConcurrency);
+    const cores = toOptionalNumber(nav.hardwareConcurrency);
     const panelKey =
         Number.isFinite(scr.width) && Number.isFinite(scr.height)
             ? `${scr.width}x${scr.height}`
@@ -2530,12 +2554,9 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
     const deviceModel = hw.deviceModel ? String(hw.deviceModel).trim() : null;
     const cpuModel = hw.cpuModel ? String(hw.cpuModel).trim() : null;
     const gpuModel = hw.gpuModel ? String(hw.gpuModel).trim() : null;
-    const ramGb =
-        hw.ramGb !== undefined && hw.ramGb !== null ? Number(hw.ramGb) : null;
-    const storageGb =
-        hw.storageGb !== undefined && hw.storageGb !== null ? Number(hw.storageGb) : null;
-    const vramGb =
-        hw.vramGb !== undefined && hw.vramGb !== null ? Number(hw.vramGb) : null;
+    const ramGb = toOptionalNumber(hw.ramGb);
+    const storageGb = toOptionalNumber(hw.storageGb);
+    const vramGb = toOptionalNumber(hw.vramGb);
     const pciVendorId = hw.pciVendorId ? String(hw.pciVendorId).trim().toLowerCase() : null;
     const pciDeviceId = hw.pciDeviceId ? String(hw.pciDeviceId).trim().toLowerCase() : null;
 
@@ -2543,7 +2564,7 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
     const cpuAppleSkuName = parseAppleSiliconSkuName(cpuModel);
     const explicitGpuAppleSkuName = parseAppleSiliconSkuName(gpuModel);
 
-    let matchedSku = gpuAppleSkuName || cpuAppleSkuName || null;
+    let matchedSku = gpuAppleSkuName || cpuAppleSkuName || explicitGpuAppleSkuName || null;
 
     // =========================================================================
     // Rule A: SoC CPU-to-GPU Lockstep (Apple Silicon Unified Die & Explicit GPU Model)
@@ -2566,12 +2587,25 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
         issues.push(
             `Hardware profile gpuModel "${gpuModel}" contradicts WebGL unmaskedRenderer "${renderer}"`
         );
+    } else if (explicitGpuAppleSkuName && renderer && !gpuAppleSkuName) {
+        issues.push(
+            `Apple Silicon hardwareProfile.gpuModel "${gpuModel}" contradicts non-Apple-Silicon WebGL renderer "${renderer}"`
+        );
+    } else if (!explicitGpuAppleSkuName && gpuModel && gpuAppleSkuName) {
+        issues.push(
+            `Non-Apple-Silicon hardwareProfile.gpuModel "${gpuModel}" contradicts Apple Silicon WebGL renderer "${renderer}"`
+        );
+    }
+    if (cpuAppleSkuName && explicitGpuAppleSkuName && cpuAppleSkuName !== explicitGpuAppleSkuName) {
+        issues.push(
+            `Apple Silicon CPU "${cpuAppleSkuName}" contradicts hardwareProfile.gpuModel "${explicitGpuAppleSkuName}"`
+        );
     }
 
     // =========================================================================
     // Rule B, C, D, E: Exact Apple Silicon SKU Parameter Validation
     // =========================================================================
-    const activeAppleSkuName = gpuAppleSkuName || cpuAppleSkuName;
+    const activeAppleSkuName = gpuAppleSkuName || cpuAppleSkuName || explicitGpuAppleSkuName;
     if (activeAppleSkuName) {
         const sku = APPLE_SILICON_SKU_CATALOG[activeAppleSkuName];
 
@@ -2629,18 +2663,20 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
         }
 
         // Rule N: Apple Silicon Generation vs Minimum Bootable macOS Version (platformVersion / osVersion)
-        const rawOsVer = hw.osVersion || hw.platformVersion || telemetry.userAgentMetadata?.platformVersion || null;
-        if (rawOsVer && typeof rawOsVer === 'string') {
-            const verMatch = rawOsVer.trim().match(/^(\d+)(?:\.(\d+))?/);
+        const rawOsVer = hw.osVersion ?? hw.platformVersion ?? telemetry.userAgentMetadata?.platformVersion ?? null;
+        if (rawOsVer !== null && rawOsVer !== undefined && String(rawOsVer).trim() !== '') {
+            const rawOsVerStr = String(rawOsVer).trim();
+            const verMatch = rawOsVerStr.match(/^(\d+)(?:\.(\d+))?/);
             if (verMatch) {
                 const maj = Number(verMatch[1]);
                 const min = Number(verMatch[2] || 0);
-                const numericOsVer = maj + min / 10;
                 const minRequired = APPLE_SILICON_MIN_MACOS_VERSION[sku.generation] || 11.0;
-                // Note: macOS 10.15 in static Firefox UA is normal, but explicit platformVersion / osVersion (11.x..26.x) must meet min boot OS
-                if (maj >= 11 && numericOsVer < minRequired) {
+                const minReqMaj = Math.floor(minRequired);
+                const minReqMin = Math.round((minRequired - minReqMaj) * 10);
+                // Static Firefox UA reports 10.15, but explicit platformVersion / osVersion must meet min boot OS
+                if (rawOsVerStr !== '10.15' && (maj < minReqMaj || (maj === minReqMaj && min < minReqMin))) {
                     issues.push(
-                        `${sku.chip} minimum bootable macOS violation: osVersion="${rawOsVer}" is older than ${sku.chip}'s factory minimum macOS ${minRequired.toFixed(1)}`
+                        `${sku.chip} minimum bootable macOS violation: osVersion="${rawOsVerStr}" is older than ${sku.chip}'s factory minimum macOS ${minRequired.toFixed(1)}`
                     );
                 }
             }
@@ -2652,13 +2688,27 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
     //         MacBook Air, MacBook Pro, Mac mini, iMac, Mac Studio, Mac Pro)
     //         vs SoC Tier & CPU Architecture Lockstep (Discovered via AdsPower Audit)
     // =========================================================================
-    const macProductLabel = String(hw.deviceName || hw.productType || deviceModel || '').trim();
+    const macProductLabel = Array.from(
+        new Set(
+            [hw.deviceName, hw.productType, deviceModel]
+                .filter((s) => s && typeof s === 'string')
+                .map((s) => s.trim())
+                .filter(Boolean)
+        )
+    ).join(' ');
     const cpuArchClaim = String(hw.architecture || telemetry.userAgentMetadata?.architecture || '').trim().toLowerCase();
+    if (activeAppleSkuName && cpuArchClaim === 'x86') {
+        issues.push(
+            `Apple Silicon SoC "${activeAppleSkuName}" architecture violation: architecture="x86" is impossible on ARM64 Apple Silicon`
+        );
+    }
     if (macProductLabel) {
         const isMacStudio = /\bMac[\s_-]+Studio\b/i.test(macProductLabel);
         const isMacBookAir = /\bMacBook[\s_-]+Air\b/i.test(macProductLabel);
+        const isMacBookPro = /\bMacBook[\s_-]+Pro\b/i.test(macProductLabel);
         const isMacMini = /\bMac[\s_-]+mini\b/i.test(macProductLabel);
-        const isIMac = /\biMac(?:[\s_-]+Pro)?\b/i.test(macProductLabel);
+        const isIMacPro = /\biMac[\s_-]+Pro\b/i.test(macProductLabel);
+        const isIMac = !isIMacPro && /\biMac\b/i.test(macProductLabel);
         const isMacPro = /\bMac[\s_-]+Pro\b/i.test(macProductLabel);
 
         if (isMacStudio) {
@@ -2681,6 +2731,13 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
                     `Mac product line violation: "${macProductLabel}" (MacBook Air) only ships with base Apple M-series SoCs (M1/M2/M3/M4/M5), never with ${sku.tier}-tier "${sku.chip}"`
                 );
             }
+        } else if (isMacBookPro && activeAppleSkuName) {
+            const sku = APPLE_SILICON_SKU_CATALOG[activeAppleSkuName];
+            if (sku.tier === 'ultra') {
+                issues.push(
+                    `Mac product line violation: "${macProductLabel}" (MacBook Pro) never ships with desktop-only Ultra-tier SoC "${sku.chip}"`
+                );
+            }
         } else if (isMacMini && activeAppleSkuName) {
             const sku = APPLE_SILICON_SKU_CATALOG[activeAppleSkuName];
             if (sku.tier === 'max' || sku.tier === 'ultra') {
@@ -2688,6 +2745,10 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
                     `Mac product line violation: "${macProductLabel}" (Mac mini) only ships with base or Pro Apple Silicon SoCs, never with ${sku.tier}-tier "${sku.chip}"`
                 );
             }
+        } else if (isIMacPro && activeAppleSkuName) {
+            issues.push(
+                `Mac product line violation: "${macProductLabel}" (2017 iMac Pro) is Intel Xeon W + Radeon Pro Vega exclusive and never existed with Apple Silicon "${activeAppleSkuName}"`
+            );
         } else if (isIMac && activeAppleSkuName) {
             const sku = APPLE_SILICON_SKU_CATALOG[activeAppleSkuName];
             if (sku.tier !== 'base') {
@@ -2730,7 +2791,7 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
                     `WebGPU GPUAdapterInfo.vendor="${wVendor}" contradicts AMD WebGL renderer "${renderer}"`
                 );
             }
-            if (/^gen-\d|^xe-/i.test(wArch) || /^common-\d|^metal-\d/i.test(wArch)) {
+            if (/^gen-\d|^xe2?-|^common-\d|^metal-\d|ada-lovelace|ampere|turing|adreno/i.test(wArch)) {
                 issues.push(
                     `WebGPU GPUAdapterInfo.architecture="${wArch}" (Intel/Apple architecture) contradicts AMD WebGL renderer "${renderer}"`
                 );
@@ -2741,7 +2802,7 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
                     `WebGPU GPUAdapterInfo.vendor="${wVendor}" contradicts NVIDIA WebGL renderer "${renderer}"`
                 );
             }
-            if (/^gen-\d|^common-\d|^metal-\d/i.test(wArch)) {
+            if (/^gen-\d|^xe2?-|^common-\d|^metal-\d|rdna|gcn|adreno/i.test(wArch)) {
                 issues.push(
                     `WebGPU GPUAdapterInfo.architecture="${wArch}" contradicts NVIDIA WebGL renderer "${renderer}"`
                 );
@@ -2752,12 +2813,33 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
                     `WebGPU GPUAdapterInfo.vendor="${wVendor}" contradicts Apple Silicon WebGL renderer "${renderer}"`
                 );
             }
-            if (/^gen-\d|^xe-|rdna|gcn/i.test(wArch)) {
+            if (/^gen-\d|^xe2?-|rdna|gcn|ada-lovelace|ampere|turing|adreno/i.test(wArch)) {
                 issues.push(
                     `WebGPU GPUAdapterInfo.architecture="${wArch}" contradicts Apple Silicon WebGL renderer "${renderer}"`
                 );
             }
+        } else if (/Qualcomm|Adreno/i.test(renderer)) {
+            if (wVendor && wVendor !== 'qualcomm') {
+                issues.push(
+                    `WebGPU GPUAdapterInfo.vendor="${wVendor}" contradicts Qualcomm Adreno WebGL renderer "${renderer}"`
+                );
+            }
+            if (/^gen-\d|^xe2?-|^common-\d|^metal-\d|rdna|gcn|ada-lovelace|ampere|turing/i.test(wArch)) {
+                issues.push(
+                    `WebGPU GPUAdapterInfo.architecture="${wArch}" contradicts Qualcomm Adreno WebGL renderer "${renderer}"`
+                );
+            }
         } else if (/Intel/i.test(renderer)) {
+            if (wVendor && wVendor !== 'intel') {
+                issues.push(
+                    `WebGPU GPUAdapterInfo.vendor="${wVendor}" contradicts Intel WebGL renderer "${renderer}"`
+                );
+            }
+            if (/^common-\d|^metal-\d|rdna|gcn|ada-lovelace|ampere|turing|adreno/i.test(wArch)) {
+                issues.push(
+                    `WebGPU GPUAdapterInfo.architecture="${wArch}" contradicts Intel WebGL renderer "${renderer}"`
+                );
+            }
             // 6th–9th Gen Intel GPUs (HD 520/530/620/630, Iris 540/550/Pro/6100, Iris Plus 640/645/650/655, UHD 617/620/630) are Gen8/Gen9, NEVER Gen12LP!
             const isLegacyGen8Or9Intel =
                 /Iris(?:\(TM\))?\s+(?:Pro|Graphics\s+(?:540|550|6100)|Plus\s+Graphics(?:\s+6[45]\d)?)|(?:HD|UHD)\s+Graphics\s+(?:5\d\d|6\d\d)|Iris\s+OpenGL\s+Engine/i.test(
@@ -2781,6 +2863,10 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
             issues.push(
                 `Cross-OS DeviceName violation: Windows hostname pattern "${rawHostName}" (DESKTOP-/LAPTOP-/WIN-) cannot appear on macOS targetOs="mac"`
             );
+        } else if (targetOs === 'lin' && /^(?:DESKTOP|WIN)-[A-Z0-9]+$/i.test(rawHostName)) {
+            issues.push(
+                `Cross-OS DeviceName violation: Windows hostname pattern "${rawHostName}" (DESKTOP-/WIN-) cannot appear on Linux targetOs="lin"`
+            );
         } else if (
             (targetOs === 'win' || targetOs === 'lin') &&
             /\b(?:MacBook|iMac|Mac[\s_-]+mini|Mac[\s_-]+Studio|Mac[\s_-]+Pro)\b/i.test(rawHostName)
@@ -2794,7 +2880,7 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
     const rawMacAddr = String(hw.macAddress || hw.mac_address_str || '').trim();
     if (rawMacAddr) {
         const macMatch = rawMacAddr.match(/^([0-9A-Fa-f]{2})(?:[:-][0-9A-Fa-f]{2}){5}$/);
-        if (!macMatch) {
+        if (!macMatch || /^00(?:[:-]00){5}$/.test(rawMacAddr)) {
             issues.push(`Invalid IEEE 802.3 MAC address format: "${rawMacAddr}"`);
         } else {
             const firstOctet = parseInt(macMatch[1], 16);
@@ -2813,9 +2899,9 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
 
     const rawDeviceMemory =
         hw.deviceMemory !== undefined && hw.deviceMemory !== null
-            ? Number(hw.deviceMemory)
+            ? toOptionalNumber(hw.deviceMemory)
             : nav.deviceMemory !== undefined && nav.deviceMemory !== null
-              ? Number(nav.deviceMemory)
+              ? toOptionalNumber(nav.deviceMemory)
               : null;
     if (rawDeviceMemory !== null) {
         const validW3cDeviceMemory = [0.25, 0.5, 1, 2, 4, 8];
@@ -2853,6 +2939,11 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
         if (targetOs && targetOs !== 'mac') {
             issues.push(`Intel Mac SKU "${intelMacSku.id}" cannot run under targetOs="${targetOs}"`);
         }
+        if (cpuModel && /(?:AMD|Ryzen|Threadripper|Snapdragon|Qualcomm|Apple\s+M\d)/i.test(cpuModel)) {
+            issues.push(
+                `Intel Mac SKU "${intelMacSku.id}" CPU vendor violation: requires an Intel Core/Xeon CPU, got "${cpuModel}"`
+            );
+        }
         if (renderer && !intelMacSku.gpuPattern.test(renderer)) {
             issues.push(
                 `Intel Mac SKU "${intelMacSku.id}" GPU mismatch: WebGL renderer "${renderer}" does not match factory GPU specification`
@@ -2889,6 +2980,11 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
     if (snapdragonSku) {
         if (!matchedSku) {
             matchedSku = snapdragonSku.chip;
+        }
+        if (cpuArchClaim === 'x86') {
+            issues.push(
+                `Qualcomm ARM64 SoC "${snapdragonSku.chip}" architecture violation: architecture="x86" is impossible on ARM64 Oryon`
+            );
         }
         if (targetOs && !snapdragonSku.allowedOs.includes(targetOs)) {
             issues.push(
@@ -2937,17 +3033,28 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
                 `OEM device model "${oemDeviceSku.model}" OS violation: cannot run targetOs="${targetOs}" (allowed: [${oemDeviceSku.allowedOs.join(', ')}])`
             );
         }
+        if (pcCpuSku && pcCpuSku.formFactor === 'desktop') {
+            issues.push(
+                `OEM laptop/tablet "${oemDeviceSku.model}" cannot house desktop socket CPU "${pcCpuSku.model}"`
+            );
+        }
         if (oemDeviceSku.cpuVendor && pcCpuSku && pcCpuSku.vendor !== oemDeviceSku.cpuVendor) {
             issues.push(
                 `OEM device model "${oemDeviceSku.model}" CPU vendor violation: requires ${oemDeviceSku.cpuVendor.toUpperCase()} CPU but got "${pcCpuSku.model}" (${pcCpuSku.vendor.toUpperCase()})`
             );
         } else if (oemDeviceSku.cpuVendor && cpuModel) {
             const lowerCpu = cpuModel.toLowerCase();
-            if (oemDeviceSku.cpuVendor === 'intel' && (lowerCpu.includes('amd') || lowerCpu.includes('ryzen') || lowerCpu.includes('apple'))) {
+            if (
+                oemDeviceSku.cpuVendor === 'intel' &&
+                (lowerCpu.includes('amd') || lowerCpu.includes('ryzen') || lowerCpu.includes('apple') || lowerCpu.includes('snapdragon') || lowerCpu.includes('qualcomm'))
+            ) {
                 issues.push(
                     `OEM device model "${oemDeviceSku.model}" requires an Intel processor but hardwareProfile.cpuModel is "${cpuModel}"`
                 );
-            } else if (oemDeviceSku.cpuVendor === 'amd' && (lowerCpu.includes('intel') || lowerCpu.includes('apple'))) {
+            } else if (
+                oemDeviceSku.cpuVendor === 'amd' &&
+                (lowerCpu.includes('intel') || lowerCpu.includes('apple') || lowerCpu.includes('snapdragon') || lowerCpu.includes('qualcomm'))
+            ) {
                 issues.push(
                     `OEM device model "${oemDeviceSku.model}" requires an AMD Ryzen processor but hardwareProfile.cpuModel is "${cpuModel}"`
                 );
@@ -3052,7 +3159,7 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
             );
         }
 
-        // Check 4: Desktop CPU vs Mobile-only GPU / Mobile Ultrabook CPU vs Desktop-only GPU
+        // Check 4: Desktop CPU vs Mobile-only GPU / Mobile Laptop CPU vs Desktop-only GPU
         if (pcCpuSku.formFactor === 'desktop' && renderer) {
             const isMobileOnlyGpu =
                 pcGpuSku?.formFactor === 'laptop' ||
@@ -3067,6 +3174,10 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
         } else if (pcCpuSku.formFactor === 'mobile-ultrabook' && pcGpuSku?.formFactor === 'desktop') {
             issues.push(
                 `Low-power Ultrabook CPU SKU "${pcCpuSku.model}" cannot be paired with full-size desktop discrete GPU "${renderer}"`
+            );
+        } else if (pcCpuSku.formFactor === 'mobile-h' && pcGpuSku?.formFactor === 'desktop') {
+            issues.push(
+                `High-performance laptop CPU SKU "${pcCpuSku.model}" cannot be paired with full-size desktop discrete GPU "${renderer}"`
             );
         }
     } else if (!activeAppleSkuName && !snapdragonSku && cpuModel) {
@@ -3087,8 +3198,14 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
     }
 
     // =========================================================================
-    // Rule L: GPU VRAM Capacity & PCI Vendor/Device ID Spoofing Detection
+    // Rule L: GPU VRAM Capacity, OS Support & PCI Vendor/Device ID Spoofing Detection
     // =========================================================================
+    if (pcGpuSku && targetOs && Array.isArray(pcGpuSku.osSupport) && !pcGpuSku.osSupport.includes(targetOs)) {
+        issues.push(
+            `GPU SKU "${pcGpuSku.id}" OS compatibility violation: not supported on targetOs="${targetOs}" (supported: [${pcGpuSku.osSupport.join(', ')}])`
+        );
+    }
+
     if (pcGpuSku && vramGb !== null) {
         if (!Number.isFinite(vramGb) || !pcGpuSku.vramGb.includes(vramGb)) {
             issues.push(
@@ -3108,11 +3225,18 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
 
     // Extract PCI Device ID from ANGLE renderer string e.g. "(0x00002504)" or explicit hw.pciDeviceId
     const rendererPciMatch = renderer.match(/\(\s*0x0*([0-9a-fA-F]{4})\s*\)/);
-    const normalizedPciDeviceId = rendererPciMatch
-        ? `0x${rendererPciMatch[1].toLowerCase()}`
-        : pciDeviceId
-          ? pciDeviceId.replace(/^0x0+([0-9a-f]{4})$/i, '0x$1').toLowerCase()
-          : null;
+    const rendererPciId = rendererPciMatch ? `0x${rendererPciMatch[1].toLowerCase()}` : null;
+    const explicitPciId = pciDeviceId
+        ? pciDeviceId.replace(/^0x0+([0-9a-f]{4})$/i, '0x$1').toLowerCase()
+        : null;
+
+    if (rendererPciId && explicitPciId && rendererPciId !== explicitPciId) {
+        issues.push(
+            `GPU PCI Device ID mismatch: hardwareProfile.pciDeviceId="${explicitPciId}" contradicts renderer PCI ID "${rendererPciId}" in "${renderer}"`
+        );
+    }
+
+    const normalizedPciDeviceId = rendererPciId || explicitPciId;
 
     if (normalizedPciDeviceId && Object.prototype.hasOwnProperty.call(PCI_DEVICE_ID_CATALOG, normalizedPciDeviceId)) {
         const pciEntry = PCI_DEVICE_ID_CATALOG[normalizedPciDeviceId];

@@ -71,36 +71,92 @@ export function isLocalOrPrivateTarget(rawHost) {
     if (!rawHost || typeof rawHost !== 'string') {
         return { isLocalOrPrivate: false, scope: 'public' };
     }
-    const host = rawHost.trim().toLowerCase().replace(/^\[|\]$/g, '');
+    let host = rawHost
+        .trim()
+        .toLowerCase()
+        .replace(/^\[|\]$/g, '')
+        .replace(/%.*$/, '')
+        .replace(/\.+$/, '');
 
+    if (!host) {
+        return { isLocalOrPrivate: false, scope: 'public' };
+    }
+
+    // Normalize shorthand / hex / octal / integer IPv4 literals (e.g. "2130706433", "0x7f000001", "127.1")
+    if (/^(?:0x[0-9a-f]+|0[0-7]+|\d+|\d+\.(?:0x[0-9a-f]+|\d+)(?:\.(?:0x[0-9a-f]+|\d+))?)$/i.test(host)) {
+        try {
+            host = new URL(`http://${host}`).hostname.toLowerCase().replace(/\.+$/, '');
+        } catch {
+            // Keep original host
+        }
+    }
+
+    // Unwrap IPv4-mapped IPv6 addresses:
+    // 1. Dotted-quad form: "::ffff:127.0.0.1", "0:0:0:0:0:ffff:192.168.1.1"
+    const mappedDottedMatch = host.match(
+        /^(?:(?:0+:){0,5}0*:|::)(?:ffff:(?:0+:)?|0+:)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i
+    );
+    if (mappedDottedMatch) {
+        host = mappedDottedMatch[1];
+    } else {
+        // 2. WHATWG URL canonical hex-pair form: "::ffff:7f00:1", "0:0:0:0:0:ffff:c0a8:101"
+        const mappedHexMatch = host.match(
+            /^(?:(?:0+:){0,5}0*:|::)ffff:(?:0+:)?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i
+        );
+        if (mappedHexMatch) {
+            const hi = parseInt(mappedHexMatch[1], 16);
+            const lo = parseInt(mappedHexMatch[2], 16);
+            host = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+        }
+    }
+
+    // Hostname / mDNS / local domain checks
+    if (host === 'localhost' || host.endsWith('.localhost')) {
+        return { isLocalOrPrivate: true, scope: 'loopback' };
+    }
+    if (host.endsWith('.local') || host.endsWith('.lan') || host.endsWith('.internal') || host.endsWith('.home.arpa')) {
+        return { isLocalOrPrivate: true, scope: 'private-lan' };
+    }
+
+    // IPv6 loopback (::1), unspecified (::), link-local (fe80::/10), and ULA (fc00::/7)
     if (
-        host === 'localhost' ||
-        host.endsWith('.localhost') ||
         host === '::1' ||
-        host === '0:0:0:0:0:0:0:1' ||
-        host === '0.0.0.0' ||
-        /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)
+        host === '::' ||
+        /^(?:0+:){7}0*1$/.test(host) ||
+        /^(?:0+:){7}0+$/.test(host)
     ) {
         return { isLocalOrPrivate: true, scope: 'loopback' };
     }
-
-    if (
-        /^169\.254\.\d{1,3}\.\d{1,3}$/.test(host) ||
-        host.startsWith('fe80:')
-    ) {
+    if (/^fe[89ab][0-9a-f]:/i.test(host)) {
         return { isLocalOrPrivate: true, scope: 'link-local' };
     }
-
-    if (
-        /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) ||
-        /^192\.168\.\d{1,3}\.\d{1,3}$/.test(host) ||
-        /^172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$/.test(host) ||
-        host.startsWith('fc00:') ||
-        host.startsWith('fd00:') ||
-        host.endsWith('.local') ||
-        host.endsWith('.lan')
-    ) {
+    if (/^(?:fc|fd)[0-9a-f]{2}:/i.test(host)) {
         return { isLocalOrPrivate: true, scope: 'private-lan' };
+    }
+
+    // Strict IPv4 octet check (0..255)
+    const ipv4Match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (ipv4Match) {
+        const a = Number(ipv4Match[1]);
+        const b = Number(ipv4Match[2]);
+        const c = Number(ipv4Match[3]);
+        const d = Number(ipv4Match[4]);
+        if (a <= 255 && b <= 255 && c <= 255 && d <= 255) {
+            if (a === 127 || a === 0) {
+                return { isLocalOrPrivate: true, scope: 'loopback' };
+            }
+            if (a === 169 && b === 254) {
+                return { isLocalOrPrivate: true, scope: 'link-local' };
+            }
+            if (
+                a === 10 ||
+                (a === 192 && b === 168) ||
+                (a === 172 && b >= 16 && b <= 31) ||
+                (a === 100 && b >= 64 && b <= 127)
+            ) {
+                return { isLocalOrPrivate: true, scope: 'private-lan' };
+            }
+        }
     }
 
     return { isLocalOrPrivate: false, scope: 'public' };
@@ -162,9 +218,17 @@ export function evaluatePortScanRequest(targetUrl, options = {}) {
     const allowSameOriginLocalDev =
         options.allowSameOriginLocalDev !== undefined ? Boolean(options.allowSameOriginLocalDev) : false;
 
+    let normalizedTarget = typeof targetUrl === 'string' ? targetUrl.trim() : '';
+    while (/^(?:blob|view-source|filesystem):/i.test(normalizedTarget)) {
+        normalizedTarget = normalizedTarget.replace(/^(?:blob|view-source|filesystem):/i, '').trim();
+    }
+    if (normalizedTarget.startsWith('//')) {
+        normalizedTarget = `http:${normalizedTarget}`;
+    }
+
     let parsed;
     try {
-        parsed = new URL(targetUrl);
+        parsed = new URL(normalizedTarget);
     } catch {
         return {
             shouldBlock: false,
@@ -209,14 +273,20 @@ export function evaluatePortScanRequest(targetUrl, options = {}) {
         };
     }
 
-    const defaultPort = protocol === 'https:' || protocol === 'wss:' ? 443 : 80;
+    const getDefaultPortForProtocol = (proto) =>
+        proto === 'https:' || proto === 'wss:' ? 443 : proto === 'ftp:' ? 21 : 80;
+    const defaultPort = getDefaultPortForProtocol(protocol);
     const port = parsed.port ? Number(parsed.port) : defaultPort;
     const risk = classifyScannedPortRisk(port);
 
     if (allowSameOriginLocalDev && options.initiatorUrl) {
         try {
             const initParsed = new URL(options.initiatorUrl);
-            if (initParsed.hostname === parsed.hostname && (initParsed.port ? Number(initParsed.port) : defaultPort) === port) {
+            const initDefaultPort = getDefaultPortForProtocol(initParsed.protocol.toLowerCase());
+            const initPort = initParsed.port ? Number(initParsed.port) : initDefaultPort;
+            const normInitHost = initParsed.hostname.toLowerCase().replace(/\.+$/, '');
+            const normTargetHost = parsed.hostname.toLowerCase().replace(/\.+$/, '');
+            if (normInitHost === normTargetHost && initPort === port) {
                 return {
                     shouldBlock: false,
                     isPortScanProbe: false,
@@ -266,12 +336,14 @@ export function evaluatePortScanRequest(targetUrl, options = {}) {
  *    Absorbed from Ziniao `defaultSpecialList` / `debugSpecialList` (`main.index.js`).
  */
 export const BLOCKED_INTERNAL_URL_PATTERNS = Object.freeze([
-    /^about:(?:config|debugging|devtools|support|telemetry|networking|memory|cache|processes|profiles|serviceworkers|webrtc|addons|plugins|buildconfig)\b/i,
+    /^about:(?:config|debugging|devtools|support|telemetry|networking|memory|cache|processes|profiles|serviceworkers|webrtc|addons|plugins|buildconfig|preferences|logins|policies|crashes|crashcontent|sync-log|url-classifier)\b/i,
     /^chrome:\/\//i,
+    /^devtools:\/\//i,
     /^chrome-extension:\/\//i,
     /^moz-extension:\/\//i,
     /^resource:\/\//i,
     /^jar:file:\/\/\//i,
+    /^file:\/\//i,
     /^view-source:about:/i
 ]);
 
@@ -286,12 +358,35 @@ export function evaluateInternalSchemeAccess(targetUrl, options = {}) {
     if (!targetUrl || typeof targetUrl !== 'string') {
         return { shouldBlock: false, matchedScheme: null, reason: null };
     }
-    const trimmed = targetUrl.trim();
+    // Strip WHATWG leading/trailing C0 controls (\u0000-\u0020) and embedded ASCII tabs/newlines (\t, \r, \n)
+    let cleaned = targetUrl
+        .replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, '')
+        .replace(/[\t\r\n]/g, '');
+
+    // Recursively unwrap nested wrapper schemes (blob:, filesystem:, view-source:, jar: except jar:file:)
+    while (/^(?:blob|filesystem|view-source):/i.test(cleaned) || (/^jar:/i.test(cleaned) && !/^jar:file:/i.test(cleaned))) {
+        cleaned = cleaned
+            .replace(/^(?:blob|filesystem|view-source|jar):/i, '')
+            .replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, '');
+    }
+
+    // Normalize percent-encoded or slash-prefixed about: URLs (e.g. "about://%63onfig" -> "about:config")
+    if (/^about:/i.test(cleaned)) {
+        const rawAboutRest = cleaned.slice(6).replace(/^\/+/, '');
+        let decodedAboutRest = rawAboutRest;
+        try {
+            decodedAboutRest = decodeURIComponent(rawAboutRest);
+        } catch {
+            // Keep rawAboutRest if malformed percent-encoding
+        }
+        cleaned = `about:${decodedAboutRest}`;
+    }
+
     const allowedExt = new Set((options.allowedExtensionIds || []).map((s) => String(s).toLowerCase()));
 
-    if (/^(?:moz-extension|chrome-extension):\/\//i.test(trimmed)) {
+    if (/^(?:moz-extension|chrome-extension):\/\//i.test(cleaned)) {
         try {
-            const u = new URL(trimmed);
+            const u = new URL(cleaned);
             if (allowedExt.has(u.hostname.toLowerCase())) {
                 return { shouldBlock: false, matchedScheme: u.protocol, reason: null };
             }
@@ -301,12 +396,12 @@ export function evaluateInternalSchemeAccess(targetUrl, options = {}) {
     }
 
     for (const pattern of BLOCKED_INTERNAL_URL_PATTERNS) {
-        if (pattern.test(trimmed)) {
-            const scheme = trimmed.split(':')[0].toLowerCase();
+        if (pattern.test(cleaned)) {
+            const scheme = cleaned.split(':')[0].toLowerCase();
             return {
                 shouldBlock: true,
                 matchedScheme: scheme,
-                reason: `Blocked untrusted access to internal browser/extension resource "${trimmed}"`
+                reason: `Blocked untrusted access to internal browser/extension resource "${targetUrl.trim()}"`
             };
         }
     }
@@ -373,9 +468,8 @@ export function computeHexHammingDistance(hexHashA, hexHashB) {
 export function computeHashSimilarity(hexHashA, hexHashB) {
     const cleanA = String(hexHashA ?? '').trim().toLowerCase().replace(/^0x/, '');
     const cleanB = String(hexHashB ?? '').trim().toLowerCase().replace(/^0x/, '');
-    const totalBits = Math.max(cleanA.length, cleanB.length) * 4;
-    if (totalBits === 0) return 0;
     const dist = computeHexHammingDistance(cleanA, cleanB);
+    const totalBits = Math.max(cleanA.length, cleanB.length) * 4;
     return Number((((totalBits - dist) / totalBits) * 100).toFixed(2));
 }
 
@@ -439,8 +533,10 @@ export class CanvasWebglConsistencyLedger {
     constructor(options = {}) {
         this.profileId = String(options.profileId || 'default-profile');
         this.ledgerPath = options.ledgerPath || null;
-        this.maxHammingDistance =
+        const parsedMax =
             options.maxHammingDistance !== undefined ? Number(options.maxHammingDistance) : 0;
+        this.maxHammingDistance =
+            Number.isFinite(parsedMax) && parsedMax >= 0 ? Math.floor(parsedMax) : 0;
         this.skipHosts = [...DEFAULT_CANVAS_SKIP_HOSTS, ...(options.skipHosts || [])];
         this.entries = new Map();
         this.driftAlerts = [];
@@ -501,7 +597,13 @@ export class CanvasWebglConsistencyLedger {
         const width = Number(observation.width ?? 300);
         const height = Number(observation.height ?? 150);
         const drewText = observation.drewText ? String(observation.drewText) : '';
-        const observedHash = String(observation.hash || '').trim().toLowerCase();
+        const observedHash = String(observation.hash ?? '')
+            .trim()
+            .toLowerCase()
+            .replace(/^0x/, '');
+        if (!observedHash || !/^[0-9a-f]+$/.test(observedHash)) {
+            throw new Error(`Invalid hexadecimal fingerprint hash in recordOrVerify: "${observation.hash}"`);
+        }
 
         if (kind === 'canvas' && shouldSkipCanvasNoiseForHost(domain, this.skipHosts)) {
             return {
@@ -645,7 +747,11 @@ export function validateOsAndBrowserVersionMatch(params = {}) {
 
     let actualMajor = null;
     if (params.browserVersion !== undefined && params.browserVersion !== null) {
-        const m = String(params.browserVersion).match(/(\d{2,3})/);
+        const rawVer = String(params.browserVersion);
+        const m =
+            rawVer.match(/\b(?:Firefox|FxiOS|Chrome|CriOS|Chromium|Edg|Version)\/(\d{2,3})\b/i) ||
+            rawVer.match(/\brv:(\d{2,3})(?:\.\d+)?/i) ||
+            rawVer.match(/(\d{2,3})/);
         if (m) actualMajor = Number(m[1]);
     }
 
