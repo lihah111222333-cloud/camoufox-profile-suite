@@ -306,21 +306,39 @@ export async function collectBrowserFingerprint(page) {
             }
         };
 
-        const inspectMethod = (proto, prop) => {
+        const inspectMethod = (proto, prop, expectedLength = null) => {
             try {
                 const desc = Object.getOwnPropertyDescriptor(proto, prop);
                 if (!desc || typeof desc.value !== 'function') {
-                    return { exists: Boolean(desc), isMethod: false, source: null, isNative: false };
+                    return {
+                        exists: Boolean(desc),
+                        isMethod: false,
+                        source: null,
+                        name: null,
+                        length: null,
+                        isNative: false
+                    };
                 }
                 const source = fnToString.call(desc.value);
+                const nameMatches = desc.value.name === prop;
+                const lengthMatches = expectedLength === null || desc.value.length === expectedLength;
                 return {
                     exists: true,
                     isMethod: true,
                     source,
-                    isNative: nativeCodeRegex.test(source) && desc.value.name === prop
+                    name: desc.value.name,
+                    length: desc.value.length,
+                    isNative: nativeCodeRegex.test(source) && nameMatches && lengthMatches
                 };
             } catch (err) {
-                return { exists: false, isMethod: false, source: String(err), isNative: false };
+                return {
+                    exists: false,
+                    isMethod: false,
+                    source: String(err),
+                    name: null,
+                    length: null,
+                    isNative: false
+                };
             }
         };
 
@@ -347,14 +365,26 @@ export async function collectBrowserFingerprint(page) {
             webdriverGetter: inspectGetter(navProto, 'webdriver'),
             platformGetter: inspectGetter(navProto, 'platform'),
             hardwareConcurrencyGetter: inspectGetter(navProto, 'hardwareConcurrency'),
+            performanceNow:
+                typeof Performance !== 'undefined' && Performance.prototype
+                    ? inspectMethod(Performance.prototype, 'now', 0)
+                    : { exists: false, isMethod: false, source: null, name: null, length: null, isNative: false },
             webglGetParameter:
                 typeof WebGLRenderingContext !== 'undefined'
-                    ? inspectMethod(WebGLRenderingContext.prototype, 'getParameter')
-                    : { exists: false, isMethod: false, source: null, isNative: false },
+                    ? inspectMethod(WebGLRenderingContext.prototype, 'getParameter', 1)
+                    : { exists: false, isMethod: false, source: null, name: null, length: null, isNative: false },
             webgl2GetParameter:
                 typeof WebGL2RenderingContext !== 'undefined'
-                    ? inspectMethod(WebGL2RenderingContext.prototype, 'getParameter')
-                    : { exists: false, isMethod: false, source: null, isNative: false }
+                    ? inspectMethod(WebGL2RenderingContext.prototype, 'getParameter', 1)
+                    : { exists: false, isMethod: false, source: null, name: null, length: null, isNative: false },
+            webglReadPixels:
+                typeof WebGLRenderingContext !== 'undefined'
+                    ? inspectMethod(WebGLRenderingContext.prototype, 'readPixels', 7)
+                    : { exists: false, isMethod: false, source: null, name: null, length: null, isNative: false },
+            webglDrawArrays:
+                typeof WebGLRenderingContext !== 'undefined'
+                    ? inspectMethod(WebGLRenderingContext.prototype, 'drawArrays', 3)
+                    : { exists: false, isMethod: false, source: null, name: null, length: null, isNative: false }
         };
 
         const navigatorInfo = {
@@ -1064,6 +1094,18 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
             proto.webgl2GetParameter && proto.webgl2GetParameter.exists !== false
                 ? Boolean(proto.webgl2GetParameter.isNative)
                 : true;
+        const performanceNowOk =
+            proto.performanceNow && proto.performanceNow.exists !== false
+                ? Boolean(proto.performanceNow.isNative)
+                : true;
+        const webglReadPixelsOk =
+            proto.webglReadPixels && proto.webglReadPixels.exists !== false
+                ? Boolean(proto.webglReadPixels.isNative)
+                : true;
+        const webglDrawArraysOk =
+            proto.webglDrawArrays && proto.webglDrawArrays.exists !== false
+                ? Boolean(proto.webglDrawArrays.isNative)
+                : true;
         const gettersNative =
             Boolean(proto.toStringIntact) &&
             Boolean(proto.userAgentGetter?.isNative) &&
@@ -1071,7 +1113,10 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
             platformGetterOk &&
             hcGetterOk &&
             Boolean(proto.webglGetParameter?.isNative) &&
-            webgl2GetterOk;
+            webgl2GetterOk &&
+            performanceNowOk &&
+            webglReadPixelsOk &&
+            webglDrawArraysOk;
 
         const issues = [];
         if (!webdriverClean) issues.push(`navigator.webdriver=${String(nav.webdriver)}`);
@@ -1090,6 +1135,15 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
         }
         if (!webgl2GetterOk) {
             issues.push('WebGL2RenderingContext.prototype.getParameter is not [native code]');
+        }
+        if (!performanceNowOk) {
+            issues.push('Performance.prototype.now is not [native code] or has tampered name/length');
+        }
+        if (!webglReadPixelsOk) {
+            issues.push('WebGLRenderingContext.prototype.readPixels is not [native code] or has tampered name/length');
+        }
+        if (!webglDrawArraysOk) {
+            issues.push('WebGLRenderingContext.prototype.drawArrays is not [native code] or has tampered name/length');
         }
 
         const passed = webdriverClean && noOwnOverrides && gettersNative;
@@ -1922,14 +1976,33 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
     {
         const skuValidation = validateHardwareModelSpec(telemetry, targetOs);
         const gpuPerfValidation = validateGpuPerformanceScalingCoherence(telemetry);
-        const combinedIssues = [...skuValidation.issues, ...gpuPerfValidation.issues];
+        const osVersion = telemetry.hardwareProfile?.osVersion || telemetry.osVersion || null;
+        const cpuModel =
+            telemetry.hardwareProfile?.cpuModel ||
+            telemetry.cpu?.model ||
+            skuValidation.matchedSku ||
+            null;
+        const versionFloorValidation =
+            osVersion || cpuModel
+                ? validateOsAndBrowserVersionMatch({
+                      os: targetOs || expectedOs || 'windows',
+                      osVersion,
+                      browserVersion: nav.userAgent || telemetry.browserVersion || null,
+                      cpuModel
+                  })
+                : { passed: true, issues: [] };
+        const combinedIssues = [
+            ...skuValidation.issues,
+            ...gpuPerfValidation.issues,
+            ...versionFloorValidation.issues
+        ];
         const passed = combinedIssues.length === 0;
         const skuDesc = skuValidation.matchedSku ? ` [${skuValidation.matchedSku}]` : '';
         checks.push({
             name: 'exact-hardware-sku-model-coherence',
             passed,
             details: passed
-                ? `Exact hardware model parameters${skuDesc} (CPU cores/threads, GPU SKU, RAM capacity, SSD storage tier, panel form-factor, WebGL limits, and Host-Weighted GPU performance scaling) are 100% coherent`
+                ? `Exact hardware model parameters${skuDesc} (CPU cores/threads, GPU SKU, RAM capacity, SSD storage tier, panel form-factor, WebGL limits, OS/browser version floor, and Host-Weighted GPU performance scaling) are 100% coherent`
                 : combinedIssues.join('; ')
         });
     }
@@ -2339,18 +2412,42 @@ export function evaluateWireToDomCoherence(domTelemetry, trafficEventsOrSummary,
  *   timestamp: string
  * }>}
  */
-export async function auditProfileCoherence(page, expectedOs) {
-    const normalizedOs = normalizeTargetOs(expectedOs);
+export async function auditProfileCoherence(page, expectedOs, options = {}) {
+    const opts =
+        expectedOs && typeof expectedOs === 'object'
+            ? expectedOs
+            : options && typeof options === 'object'
+              ? options
+              : {};
+    const rawExpectedOs =
+        expectedOs && typeof expectedOs === 'object'
+            ? expectedOs.expectedOs || expectedOs.os || null
+            : expectedOs;
+    const normalizedOs = normalizeTargetOs(rawExpectedOs);
     logger.info('Running Camoufox in-browser fingerprint coherence audit...', {
-        expectedOs: normalizedOs || expectedOs || 'auto'
+        expectedOs: normalizedOs || rawExpectedOs || 'auto'
     });
 
-    const telemetry = await collectBrowserFingerprint(page);
-    const evaluation = evaluatePlatformCoherence(telemetry, normalizedOs || expectedOs);
+    const collectedTelemetry = await collectBrowserFingerprint(page);
+    const telemetry =
+        collectedTelemetry && typeof collectedTelemetry === 'object'
+            ? { ...collectedTelemetry }
+            : {};
+    if (opts.profileId && !telemetry.profileId) {
+        telemetry.profileId = opts.profileId;
+    }
+    if (!telemetry.hardwareProfile && opts.hardwareProfile && typeof opts.hardwareProfile === 'object') {
+        telemetry.hardwareProfile = { ...opts.hardwareProfile };
+    }
+    if (!telemetry.gpuPerformance && opts.gpuPerformance && typeof opts.gpuPerformance === 'object') {
+        telemetry.gpuPerformance = { ...opts.gpuPerformance };
+    }
+
+    const evaluation = evaluatePlatformCoherence(telemetry, normalizedOs || rawExpectedOs);
     const report = {
         passed: evaluation.passed,
         score: evaluation.score,
-        expectedOs: normalizedOs || expectedOs || null,
+        expectedOs: normalizedOs || rawExpectedOs || null,
         checks: evaluation.checks,
         telemetry,
         timestamp: new Date().toISOString()

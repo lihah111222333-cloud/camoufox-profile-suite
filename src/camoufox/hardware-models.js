@@ -777,6 +777,40 @@ export const OEM_DEVICE_MODEL_CATALOG = Object.freeze({
         aspectRatio3by2: true,
         allowedOs: Object.freeze(['win'])
     }),
+    'Surface Laptop 7th Edition (Snapdragon X Elite)': Object.freeze({
+        model: 'Surface Laptop 7th Edition (Snapdragon X Elite)',
+        brand: 'Microsoft',
+        cpuVendor: 'qualcomm',
+        allowedCores: Object.freeze([10, 12]),
+        igpuOnly: true,
+        gpuPattern: /Adreno(?:\(TM\))?\s+X1-(?:85|45)|Qualcomm\(R\)\s+Adreno/i,
+        allowedRamGb: Object.freeze([16, 32, 64]),
+        allowedStorageGb: Object.freeze([256, 512, 1024]),
+        aspectRatio3by2: true,
+        allowedOs: Object.freeze(['win'])
+    }),
+    'ASUS Zenbook S 14 (Lunar Lake)': Object.freeze({
+        model: 'ASUS Zenbook S 14 (Lunar Lake)',
+        brand: 'ASUS',
+        cpuVendor: 'intel',
+        allowedCores: Object.freeze([8]),
+        igpuOnly: true,
+        gpuPattern: /Intel\(R\)\s+Arc\(TM\)\s+(?:140V\s+|130V\s+)?Graphics/i,
+        allowedRamGb: Object.freeze([16, 32]),
+        allowedStorageGb: Object.freeze([512, 1024, 2048]),
+        allowedOs: Object.freeze(['win', 'lin'])
+    }),
+    'ThinkPad T480 (Intel i5-8250U)': Object.freeze({
+        model: 'ThinkPad T480 (Intel i5-8250U)',
+        brand: 'Lenovo',
+        cpuVendor: 'intel',
+        allowedCores: Object.freeze([4, 8]),
+        igpuOnly: true,
+        gpuPattern: /Intel\(R\)\s+UHD\s+Graphics\s+620/i,
+        allowedRamGb: Object.freeze([8, 16, 32]),
+        allowedStorageGb: Object.freeze([256, 512, 1024]),
+        allowedOs: Object.freeze(['win', 'lin'])
+    }),
     'Microsoft Surface Pro 9': Object.freeze({
         model: 'Microsoft Surface Pro 9',
         brand: 'Microsoft',
@@ -3058,6 +3092,13 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
                 issues.push(
                     `OEM device model "${oemDeviceSku.model}" requires an AMD Ryzen processor but hardwareProfile.cpuModel is "${cpuModel}"`
                 );
+            } else if (
+                oemDeviceSku.cpuVendor === 'qualcomm' &&
+                (lowerCpu.includes('intel') || lowerCpu.includes('amd') || lowerCpu.includes('ryzen') || lowerCpu.includes('apple'))
+            ) {
+                issues.push(
+                    `OEM device model "${oemDeviceSku.model}" requires a Qualcomm Snapdragon processor but hardwareProfile.cpuModel is "${cpuModel}"`
+                );
             }
         }
         if (!Number.isInteger(cores) || !oemDeviceSku.allowedCores.includes(cores)) {
@@ -3344,11 +3385,39 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
                 `Windows ANGLE Direct3D9 renderer "${renderer}" reports Direct3D11 shader model (vs_5_0/ps_5_0)`
             );
         }
+        if (/\b(?:Mesa|radeonsi|llvmpipe|softpipe)\b/i.test(renderer)) {
+            issues.push(
+                `Windows targetOs="win" cannot use Linux Mesa/Gallium OpenGL renderer "${renderer}"`
+            );
+        }
+    } else if ((targetOs === 'mac' || targetOs === 'lin') && renderer) {
+        if (/Direct3D(?:11|9)|D3D11|D3D9|vs_5_0|ps_5_0/i.test(renderer)) {
+            issues.push(
+                `Non-Windows targetOs="${targetOs}" cannot use Windows Direct3D ANGLE renderer "${renderer}"`
+            );
+        }
+        if (targetOs === 'mac' && /\b(?:Mesa|radeonsi|llvmpipe|softpipe)\b/i.test(renderer)) {
+            issues.push(
+                `macOS targetOs="mac" cannot use Linux Mesa/Gallium renderer "${renderer}"`
+            );
+        }
     }
 
     // =========================================================================
     // Rule H: GPU Model WebGL Parameter Limits Coherence
     // =========================================================================
+    if (Array.isArray(webgl.maxViewportDims) && webgl.maxViewportDims.length === 2) {
+        const [vpW, vpH] = webgl.maxViewportDims.map(Number);
+        if (!Number.isFinite(vpW) || !Number.isFinite(vpH) || vpW < 16384 || vpH < 16384 || vpW !== vpH) {
+            issues.push(
+                `WebGL MAX_VIEWPORT_DIMS=[${vpW}, ${vpH}] is invalid for desktop GPU hardware (expected square >= [16384, 16384])`
+            );
+        } else if (activeAppleSkuName && (vpW !== 16384 || vpH !== 16384)) {
+            issues.push(
+                `WebGL MAX_VIEWPORT_DIMS=[${vpW}, ${vpH}] contradicts Apple Silicon Metal limit [16384, 16384] for "${activeAppleSkuName}"`
+            );
+        }
+    }
     if (webgl.maxTextureSize !== undefined && webgl.maxTextureSize !== null) {
         const maxTex = Number(webgl.maxTextureSize);
         if ((activeAppleSkuName || pcGpuSku) && maxTex !== 16384) {

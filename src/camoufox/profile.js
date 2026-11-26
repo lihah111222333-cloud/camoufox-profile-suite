@@ -910,10 +910,36 @@ export class CamoufoxProfile {
     /**
      * Audit in-browser C++ fingerprint coherence on the active profile page
      */
-    async auditCoherence(expectedOs = null) {
+    async auditCoherence(expectedOs = null, options = {}) {
         const page = await this.getPage();
         const targetOs = expectedOs || this.metadata?.os || this.options?.os || 'windows';
-        this.coherenceReport = await auditProfileCoherence(page, targetOs);
+        this.coherenceReport = await auditProfileCoherence(page, targetOs, {
+            profileId: this.profileId,
+            ...options
+        });
+        if (
+            this.fingerprintLedger &&
+            typeof this.fingerprintLedger.recordOrVerify === 'function' &&
+            this.coherenceReport?.telemetry?.canvas2d?.fnv1aHash
+        ) {
+            try {
+                const pageUrl =
+                    typeof page?.url === 'function' ? page.url() : 'about:blank';
+                this.coherenceReport.canvasConsistency = this.fingerprintLedger.recordOrVerify({
+                    kind: 'canvas',
+                    url: pageUrl || 'about:blank',
+                    width: 240,
+                    height: 60,
+                    drewText: 'Camoufox Coherence 🦊 123.45',
+                    hash: this.coherenceReport.telemetry.canvas2d.fnv1aHash
+                });
+            } catch (ledgerErr) {
+                logger.debug('Could not record canvas2d hash in fingerprintLedger during auditCoherence', {
+                    profileId: this.profileId,
+                    error: ledgerErr.message
+                });
+            }
+        }
         if (this.trafficRecorder && this.coherenceReport?.telemetry) {
             this.coherenceReport.wireToDomCoherence = evaluateWireToDomCoherence(
                 this.coherenceReport.telemetry,
@@ -1072,6 +1098,8 @@ export class CamoufoxProfile {
             this.browser = null;
             this.context = null;
             this.page = null;
+            this.securityGuards = null;
+            this.gpuPerformanceScaler = null;
             logger.info('Camoufox profile stopped', { profileId: this.profileId });
             return stopped;
         } catch (error) {
@@ -1082,6 +1110,8 @@ export class CamoufoxProfile {
             this.browser = null;
             this.context = null;
             this.page = null;
+            this.securityGuards = null;
+            this.gpuPerformanceScaler = null;
             return false;
         }
     }

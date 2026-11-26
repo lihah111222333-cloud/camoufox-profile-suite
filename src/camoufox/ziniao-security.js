@@ -82,10 +82,17 @@ export function isLocalOrPrivateTarget(rawHost) {
         return { isLocalOrPrivate: false, scope: 'public' };
     }
 
-    // Normalize shorthand / hex / octal / integer IPv4 literals (e.g. "2130706433", "0x7f000001", "127.1")
-    if (/^(?:0x[0-9a-f]+|0[0-7]+|\d+|\d+\.(?:0x[0-9a-f]+|\d+)(?:\.(?:0x[0-9a-f]+|\d+))?)$/i.test(host)) {
+    // Normalize 1-to-4 segment hex / octal / integer IPv4 literals (e.g. "2130706433", "0x7f000001", "0177.0.0.1", "0x7f.1", "012.0.0.1")
+    if (/^(?:0x[0-9a-f]+|\d+)(?:\.(?:0x[0-9a-f]+|\d+)){0,3}$/i.test(host)) {
         try {
             host = new URL(`http://${host}`).hostname.toLowerCase().replace(/\.+$/, '');
+        } catch {
+            // Keep original host
+        }
+    } else if (host.includes(':')) {
+        // Canonicalize compressed/expanded IPv6 literals via WHATWG URL parser (e.g. "0::1" -> "::1", "::0001" -> "::1")
+        try {
+            host = new URL(`http://[${host}]`).hostname.toLowerCase().replace(/^\[|\]$/g, '');
         } catch {
             // Keep original host
         }
@@ -493,9 +500,10 @@ export function shouldSkipCanvasNoiseForHost(urlOrHost, customSkipHosts = []) {
     } else {
         hostname = hostname.split('/')[0].split(':')[0];
     }
+    hostname = hostname.replace(/\.+$/, '');
 
     const skipList = [...DEFAULT_CANVAS_SKIP_HOSTS, ...(customSkipHosts || [])].map((h) =>
-        String(h).trim().toLowerCase()
+        String(h).trim().toLowerCase().replace(/\.+$/, '')
     );
 
     return skipList.some((pattern) => hostname === pattern || hostname.endsWith(`.${pattern}`));
@@ -550,12 +558,12 @@ export class CanvasWebglConsistencyLedger {
         const raw = String(urlOrDomain || 'unknown').trim().toLowerCase();
         if (raw.includes('://')) {
             try {
-                return new URL(raw).hostname.toLowerCase();
+                return new URL(raw).hostname.toLowerCase().replace(/\.+$/, '');
             } catch {
-                return raw;
+                return raw.replace(/\.+$/, '');
             }
         }
-        return raw.split('/')[0].split(':')[0];
+        return raw.split('/')[0].split(':')[0].replace(/\.+$/, '');
     }
 
     buildEntryKey({ kind = 'canvas', domain, width = 300, height = 150, drewText = '' }) {
@@ -872,7 +880,10 @@ export function resolveGeoCoordinatesWithDeterministicJitter(profileId = 'defaul
     const metro = COUNTRY_METRO_COORDINATES_CATALOG[code] || COUNTRY_METRO_COORDINATES_CATALOG.US;
     const baseLat = Number.isFinite(options.baseLatitude) ? Number(options.baseLatitude) : metro.latitude;
     const baseLng = Number.isFinite(options.baseLongitude) ? Number(options.baseLongitude) : metro.longitude;
-    const radius = Number.isFinite(options.radiusDegrees) ? Number(options.radiusDegrees) : 0.015;
+    const radius =
+        Number.isFinite(options.radiusDegrees) && Number(options.radiusDegrees) >= 0
+            ? Math.min(5, Number(options.radiusDegrees))
+            : 0.015;
 
     const digest = crypto.createHash('md5').update(`${profileId}:geo:${code}`).digest();
     const u1 = digest.readUInt32BE(0) / 0xffffffff; // 0..1
@@ -881,8 +892,13 @@ export function resolveGeoCoordinatesWithDeterministicJitter(profileId = 'defaul
 
     const latOffset = (u1 * 2 - 1) * radius;
     const lngOffset = (u2 * 2 - 1) * radius;
-    const latitude = Number((baseLat + latOffset).toFixed(6));
-    const longitude = Number((baseLng + lngOffset).toFixed(6));
+    const clampedLat = Math.max(-90, Math.min(90, baseLat + latOffset));
+    let wrappedLng = baseLng + lngOffset;
+    if (wrappedLng > 180 || wrappedLng < -180) {
+        wrappedLng = ((((wrappedLng + 180) % 360) + 360) % 360) - 180;
+    }
+    const latitude = Number(clampedLat.toFixed(6));
+    const longitude = Number(wrappedLng.toFixed(6));
     const accuracy = Math.round(18 + u3 * 47); // 18m .. 65m realistic Wi-Fi geolocation accuracy
 
     return {
@@ -931,9 +947,25 @@ export async function attachZiniaoSecurityGuardsToContext(context, options = {})
     }
 
     const routeHandler = async (route, request) => {
-        const reqUrl = typeof request.url === 'function' ? request.url() : String(request.url || '');
-        const frame = typeof request.frame === 'function' ? request.frame() : null;
-        const initiatorUrl = frame && typeof frame.url === 'function' ? frame.url() : null;
+        const req =
+            request ||
+            (typeof route?.request === 'function' ? route.request() : route?.request) ||
+            {};
+        const reqUrl = typeof req.url === 'function' ? req.url() : String(req.url || '');
+        const method = typeof req.method === 'function' ? req.method() || 'GET' : String(req.method || 'GET');
+        const resourceType =
+            typeof req.resourceType === 'function'
+                ? req.resourceType() || 'other'
+                : String(req.resourceType || 'other');
+        let initiatorUrl = null;
+        try {
+            const frame = typeof req.frame === 'function' ? req.frame() : null;
+            if (frame && typeof frame.url === 'function') {
+                initiatorUrl = frame.url() || null;
+            }
+        } catch {
+            initiatorUrl = null;
+        }
 
         // 1. Check internal browser scheme probing
         const schemeEval = evaluateInternalSchemeAccess(reqUrl, {
@@ -946,12 +978,16 @@ export async function attachZiniaoSecurityGuardsToContext(context, options = {})
                 profileId,
                 initiatorUrl,
                 targetUrl: reqUrl,
+                method,
+                resourceType,
                 matchedScheme: schemeEval.matchedScheme,
                 reason: schemeEval.reason
             };
             blockedInternalSchemes.push(ev);
             if (typeof options.onBlockedAttempt === 'function') {
-                options.onBlockedAttempt(ev);
+                try {
+                    options.onBlockedAttempt(ev);
+                } catch {}
             }
             await route.abort('accessdenied');
             return;
@@ -971,6 +1007,8 @@ export async function attachZiniaoSecurityGuardsToContext(context, options = {})
                 profileId,
                 initiatorUrl,
                 targetUrl: reqUrl,
+                method,
+                resourceType,
                 host: portEval.host,
                 port: portEval.port,
                 scope: portEval.scope,
@@ -981,7 +1019,9 @@ export async function attachZiniaoSecurityGuardsToContext(context, options = {})
             };
             blockedPortScans.push(ev);
             if (typeof options.onBlockedAttempt === 'function') {
-                options.onBlockedAttempt(ev);
+                try {
+                    options.onBlockedAttempt(ev);
+                } catch {}
             }
             await route.abort('connectionrefused');
             return;

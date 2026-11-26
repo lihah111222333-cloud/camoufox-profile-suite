@@ -55,10 +55,25 @@ export const config = {
     },
     camoufox: {
         os: process.env.CAMOUFOX_OS || 'windows', // 'windows', 'macos', 'linux'
+        presetId: process.env.CAMOUFOX_PRESET_ID || process.env.CAMOUFOX_PRESET || null, // Optional exact SKU preset ID from USABLE_DEVICE_PRESET_CATALOG
+        country: process.env.CAMOUFOX_COUNTRY || null, // Optional ISO-3166 country code (e.g. 'US', 'GB', 'DE', 'JP', 'SG')
         headless: process.env.CAMOUFOX_HEADLESS === 'true' ? true : (process.env.CAMOUFOX_HEADLESS === 'virtual' ? 'virtual' : false),
         humanize: process.env.CAMOUFOX_HUMANIZE !== 'false', // Default: true
         geoip: process.env.CAMOUFOX_GEOIP !== 'false', // Default: true when proxy is used
         canvasNoise: process.env.CAMOUFOX_CANVAS_NOISE !== 'false', // Default: true for cross-OS isolation
+        enablePortScanProtection: process.env.CAMOUFOX_PORT_SCAN_PROTECTION !== 'false', // Default: true (Ziniao-absorbed localhost/RFC1918 LAN port-scan guard)
+        allowedLocalPorts: process.env.CAMOUFOX_ALLOWED_LOCAL_PORTS
+            ? process.env.CAMOUFOX_ALLOWED_LOCAL_PORTS.split(',')
+                  .map((p) => parseInt(p.trim(), 10))
+                  .filter((p) => Number.isInteger(p) && p >= 1 && p <= 65535)
+            : [],
+        enableGpuPerformanceScaling: process.env.CAMOUFOX_GPU_PERFORMANCE_SCALING !== 'false', // Default: true (Host-Mac-calibrated GPU performance weighting)
+        canvasSkipHosts: process.env.CAMOUFOX_CANVAS_SKIP_HOSTS
+            ? process.env.CAMOUFOX_CANVAS_SKIP_HOSTS.split(',')
+                  .map((h) => h.trim())
+                  .filter(Boolean)
+            : undefined,
+        maxHammingDistance: parseInt(process.env.CAMOUFOX_CANVAS_MAX_HAMMING_DISTANCE || '0', 10),
         storageDir: process.env.CAMOUFOX_STORAGE_DIR || path.resolve(__dirname, '../profiles'),
         recordTraffic: process.env.CAMOUFOX_RECORD_TRAFFIC !== 'false', // Default: true (pre-TLS Necko egress/ingress NDJSON + attribution)
         recordBodies: process.env.CAMOUFOX_RECORD_BODIES !== 'false', // Default: true (capture plaintext request/response payloads)

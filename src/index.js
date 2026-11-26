@@ -88,16 +88,26 @@ async function createAccount(accountNumber = null) {
             const camoufoxProxy = proxy ? proxyManager.getCamoufoxFormat(proxy) : null;
             profile = await createAndStartCamoufoxProfile(profileName, camoufoxProxy, {
                 os: config.camoufox?.os,
+                presetId: config.camoufox?.presetId,
+                country: config.camoufox?.country,
                 headless: config.camoufox?.headless,
                 humanize: config.camoufox?.humanize,
                 geoip: config.camoufox?.geoip,
                 canvas_noise: config.camoufox?.canvasNoise,
+                enablePortScanProtection: config.camoufox?.enablePortScanProtection,
+                allowedLocalPorts: config.camoufox?.allowedLocalPorts,
+                enableGpuPerformanceScaling: config.camoufox?.enableGpuPerformanceScaling,
+                canvasSkipHosts: config.camoufox?.canvasSkipHosts,
+                maxHammingDistance: config.camoufox?.maxHammingDistance,
                 profilesDir: config.camoufox?.storageDir,
                 accountId: accountNumber,
                 accountEmail: accountData.email,
                 recordTraffic: config.camoufox?.recordTraffic,
                 recordBodies: config.camoufox?.recordBodies,
+                recordWireLog: config.camoufox?.recordWireLog,
                 sslKeyLog: config.camoufox?.sslKeyLog,
+                neckoMozLog: config.camoufox?.neckoMozLog,
+                neckoMozLogModules: config.camoufox?.neckoMozLogModules,
                 recordHar: config.camoufox?.recordHar,
                 maxBodyBytes: config.camoufox?.maxBodyBytes
             });

@@ -1156,7 +1156,7 @@ export const USABLE_DEVICE_PRESET_CATALOG = Object.freeze([
         storageGb: 1024,
         architecture: 'arm',
         osVersion: '10.0.26100',
-        screen: Object.freeze({ width: 1920, height: 1080, availWidth: 1920, availHeight: 1032, colorDepth: 24, devicePixelRatio: 1.5 }),
+        screen: Object.freeze({ width: 1504, height: 1003, availWidth: 1504, availHeight: 955, colorDepth: 24, devicePixelRatio: 1.5 }),
         webgl: Object.freeze({
             unmaskedVendor: 'Google Inc. (Qualcomm)',
             unmaskedRenderer: 'ANGLE (Qualcomm, Qualcomm(R) Adreno(TM) X1-85 GPU Direct3D11 vs_5_0 ps_5_0, D3D11)',
@@ -1664,7 +1664,11 @@ export function resolveDeterministicDeviceProfile(profileId = 'camoufox-profile-
 
     let preset = null;
     if (options.presetId) {
-        preset = USABLE_DEVICE_PRESET_CATALOG.find((p) => p.presetId === options.presetId) || null;
+        const requestedId = String(options.presetId).trim();
+        preset =
+            USABLE_DEVICE_PRESET_CATALOG.find((p) => p.presetId === requestedId) ||
+            USABLE_DEVICE_PRESET_CATALOG.find((p) => p.presetId.startsWith(requestedId)) ||
+            null;
     }
     if (!preset) {
         const targetOs = normalizePresetOs(options.os || 'windows');

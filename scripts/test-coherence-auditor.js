@@ -3318,6 +3318,225 @@ const tests = [
             assert.ok(tAfterMap - tBeforeMap > 20);
             assert.match(Function.prototype.toString.call(MockGPUBuffer.prototype.mapAsync), /function mapAsync\(\)/);
         }
+    },
+    {
+        name: '89. 3-Subagent Deep Audit Hardening (Part 1): Function .name & .length Descriptor Preservation, Zero Extension Property Leak, Non-Timer Query Bypass, HTMLCanvasElement.toBlob & Check 1 GPU Hook Integrity',
+        fn: async () => {
+            const vm = await import('node:vm');
+            const weights = computeGpuPerformanceScalingWeights('Intel(R) UHD Graphics 620', {
+                profileId: 'deep_audit_gpu_descriptors'
+            });
+            const scriptSource = buildGpuPerformanceInitScript(weights);
+
+            let mockRealNow = 5000.0;
+            function MockPerformance() {}
+            MockPerformance.prototype.now = function now() {
+                return mockRealNow;
+            };
+            const perfInstance = new MockPerformance();
+            const MockDate = {
+                now: function now() {
+                    return Math.round(1700000000000 + mockRealNow);
+                }
+            };
+            const extObj = {
+                beginQueryEXT: function beginQueryEXT(target, query) {},
+                getQueryObjectEXT: function getQueryObjectEXT(query, pname) {
+                    return 10_000_000;
+                }
+            };
+            function MockWebGL2() {}
+            MockWebGL2.prototype.drawArrays = function drawArrays(mode, first, count) {};
+            MockWebGL2.prototype.readPixels = function readPixels(x, y, width, height, format, type, pixels) {};
+            MockWebGL2.prototype.beginQuery = function beginQuery(target, query) {};
+            MockWebGL2.prototype.getQueryParameter = function getQueryParameter(query, pname) {
+                return query && query._rawResult !== undefined ? query._rawResult : 10_000_000;
+            };
+            MockWebGL2.prototype.getExtension = function getExtension(name) {
+                return extObj;
+            };
+            function MockHTMLCanvasElement() {}
+            MockHTMLCanvasElement.prototype.toDataURL = function toDataURL(type, quality) {
+                mockRealNow += 3.0;
+                return 'data:image/png;base64,AA==';
+            };
+            MockHTMLCanvasElement.prototype.toBlob = function toBlob(callback, type, quality) {
+                mockRealNow += 3.0;
+                callback({ size: 128 });
+            };
+
+            const sandbox = {
+                Function,
+                Object,
+                Math,
+                WeakMap,
+                WeakSet,
+                Promise,
+                Performance: MockPerformance,
+                performance: perfInstance,
+                Date: MockDate,
+                WebGL2RenderingContext: MockWebGL2,
+                HTMLCanvasElement: MockHTMLCanvasElement
+            };
+            sandbox.globalThis = sandbox;
+            vm.createContext(sandbox);
+            vm.runInContext(scriptSource, sandbox);
+
+            // 1. Exact .name and .length preservation on hooked prototype methods
+            assert.equal(MockPerformance.prototype.now.name, 'now');
+            assert.equal(MockPerformance.prototype.now.length, 0);
+            assert.equal(MockWebGL2.prototype.drawArrays.name, 'drawArrays');
+            assert.equal(MockWebGL2.prototype.drawArrays.length, 3);
+            assert.equal(MockWebGL2.prototype.readPixels.name, 'readPixels');
+            assert.equal(MockWebGL2.prototype.readPixels.length, 7);
+            assert.equal(MockWebGL2.prototype.getQueryParameter.name, 'getQueryParameter');
+            assert.equal(MockWebGL2.prototype.getQueryParameter.length, 2);
+            assert.equal(MockHTMLCanvasElement.prototype.toBlob.name, 'toBlob');
+            assert.equal(MockHTMLCanvasElement.prototype.toBlob.length, 3);
+
+            // 2. Zero leaked internal properties (_camoufoxScaled / _camoufoxBeginScaled) on EXT_disjoint_timer_query object
+            const gl = new MockWebGL2();
+            const ext = gl.getExtension('EXT_disjoint_timer_query');
+            assert.deepEqual(Object.getOwnPropertyNames(ext).sort(), ['beginQueryEXT', 'getQueryObjectEXT']);
+            assert.equal(ext.getQueryObjectEXT.name, 'getQueryObjectEXT');
+            assert.equal(ext.getQueryObjectEXT.length, 2);
+
+            // 3. Non-timer WebGL2 occlusion query (ANY_SAMPLES_PASSED = 0x8C2F) is NOT scaled by getQueryParameter
+            const occlusionQuery = { _rawResult: 1 };
+            gl.beginQuery(0x8c2f, occlusionQuery);
+            assert.equal(gl.getQueryParameter(occlusionQuery, 0x8866), 1);
+
+            // Whereas TIME_ELAPSED_EXT (0x88BF) query IS scaled
+            const timerQuery = { _rawResult: 10_000_000 };
+            gl.beginQuery(0x88bf, timerQuery);
+            assert.ok(gl.getQueryParameter(timerQuery, 0x8866) > 150_000_000);
+
+            // 4. HTMLCanvasElement.prototype.toBlob scales pending draw burst
+            const canvas = new MockHTMLCanvasElement();
+            const t0 = perfInstance.now();
+            gl.drawArrays(4, 0, 1000);
+            let blobSize = 0;
+            canvas.toBlob((b) => {
+                blobSize = b.size;
+            });
+            const t1 = perfInstance.now();
+            assert.equal(blobSize, 128);
+            assert.ok(t1 - t0 > 30);
+
+            // 5. Check 1 (navigator-prototype-integrity) catches tampered performanceNow or webglReadPixels
+            const tamperedProto = buildCoherentTelemetry('windows');
+            tamperedProto.prototypeIntegrity.performanceNow = {
+                exists: true,
+                isMethod: true,
+                source: 'function () { return 0; }',
+                name: '',
+                length: 0,
+                isNative: false
+            };
+            const resTampered = evaluatePlatformCoherence(tamperedProto, 'windows');
+            assert.equal(resTampered.passed, false);
+            const check1 = findCheck(resTampered, 'navigator-prototype-integrity');
+            assert.equal(check1.passed, false);
+            assert.match(check1.details, /Performance\.prototype\.now is not \[native code\]/);
+        }
+    },
+    {
+        name: '90. 3-Subagent Deep Audit Hardening (Part 2): Full OEM Preset Catalog Backing, Cross-OS Rule G/H Enforcement, Check 16 Browser Version Floor, Octal IPv4 / Compressed IPv6 & Traffic Recorder Security Block',
+        fn: async () => {
+            const fs = await import('node:fs');
+            const os = await import('node:os');
+            const path = await import('node:path');
+            const { CamoufoxTrafficRecorder, verifyTrafficIntegrity } = await import(
+                '../src/camoufox/traffic-recorder.js'
+            );
+            const { queryProfileTraffic } = await import('../scripts/query-traffic-attribution.js');
+
+            // 1. Newly registered OEM device models in USABLE_DEVICE_PRESET_CATALOG match lookupOemDeviceSku
+            assert.ok(lookupOemDeviceSku('Surface Laptop 7th Edition (Snapdragon X Elite)'));
+            assert.ok(lookupOemDeviceSku('ASUS Zenbook S 14 (Lunar Lake)'));
+            assert.ok(lookupOemDeviceSku('ThinkPad T480 (Intel i5-8250U)'));
+
+            // Surface Laptop 7th Edition (Qualcomm only) rejects Intel CPU
+            const badSurface7 = buildCoherentTelemetry('windows');
+            badSurface7.navigator.hardwareConcurrency = 12;
+            badSurface7.hardwareProfile = {
+                deviceModel: 'Surface Laptop 7th Edition (Snapdragon X Elite)',
+                cpuModel: 'Intel Core i7-13700K',
+                ramGb: 16
+            };
+            const resSurface7 = validateHardwareModelSpec(badSurface7, 'windows');
+            assert.equal(resSurface7.passed, false);
+            assert.ok(resSurface7.issues.some((i) => i.includes('CPU vendor violation') || i.includes('cannot house desktop socket CPU')));
+
+            // 2. Rule G cross-OS renderer leak & Rule H MAX_VIEWPORT_DIMS tampering
+            const macWithD3d = buildCoherentTelemetry('macos');
+            macWithD3d.webgl.unmaskedRenderer =
+                'ANGLE (NVIDIA, NVIDIA GeForce RTX 4090 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            const resMacD3d = validateHardwareModelSpec(macWithD3d, 'macos');
+            assert.equal(resMacD3d.passed, false);
+            assert.ok(resMacD3d.issues.some((i) => i.includes('cannot use Windows Direct3D ANGLE renderer')));
+
+            const macBadViewport = buildCoherentTelemetry('macos');
+            macBadViewport.webgl.maxViewportDims = [32768, 32768]; // Apple Silicon Metal limit is [16384, 16384]
+            const resMacVp = validateHardwareModelSpec(macBadViewport, 'macos');
+            assert.equal(resMacVp.passed, false);
+            assert.ok(resMacVp.issues.some((i) => i.includes('MAX_VIEWPORT_DIMS=[32768, 32768] contradicts Apple Silicon Metal limit')));
+
+            // 3. Check 16 invokes validateOsAndBrowserVersionMatch (rejects Apple M5 Pro + macOS 26.1 with Firefox 115)
+            const m5OldFf = resolveDeterministicDeviceProfile('m5_old_ff_test', {
+                presetId: 'mac-mbp16-m5-pro-18c-64g',
+                firefoxVersion: '115.0'
+            });
+            const resM5OldFf = evaluatePlatformCoherence(m5OldFf.telemetry, 'macos');
+            assert.equal(resM5OldFf.passed, false);
+            const skuCheck = findCheck(resM5OldFf, 'exact-hardware-sku-model-coherence');
+            assert.equal(skuCheck.passed, false);
+            assert.match(skuCheck.details, /Browser engine version floor violation/);
+
+            // 4. 4-part octal/hex IPv4 ("0177.0.0.1", "012.0.0.1", "0x7f.0.0.1") & compressed IPv6 ("0::1", "::0001")
+            assert.equal(isLocalOrPrivateTarget('0177.0.0.1').scope, 'loopback');
+            assert.equal(isLocalOrPrivateTarget('012.0.0.1').scope, 'private-lan');
+            assert.equal(isLocalOrPrivateTarget('0x7f.0.0.1').scope, 'loopback');
+            assert.equal(isLocalOrPrivateTarget('0::1').scope, 'loopback');
+            assert.equal(isLocalOrPrivateTarget('::0001').scope, 'loopback');
+            assert.equal(shouldSkipCanvasNoiseForHost('https://www.figma.com./file/abc'), true);
+
+            // 5. CamoufoxTrafficRecorder.recordSecurityBlock & queryProfileTraffic wire dump integration
+            const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'camoufox-sec-block-'));
+            try {
+                const recorder = new CamoufoxTrafficRecorder({
+                    profileId: 'sec-block-profile',
+                    trafficDir: tmpDir
+                });
+                recorder.setStep('port-scan-defense-step');
+                const secRec = recorder.recordSecurityBlock({
+                    type: 'local-port-scan-probe',
+                    targetUrl: 'http://127.0.0.1:9222/json/version',
+                    host: '127.0.0.1',
+                    port: 9222,
+                    scope: 'loopback',
+                    service: 'Chrome DevTools Protocol (CDP)',
+                    category: 'automation-debugger',
+                    severity: 'critical',
+                    reason: 'Blocked local/intranet port-scan probe to 127.0.0.1:9222 (Chrome DevTools Protocol (CDP))'
+                });
+                assert.ok(secRec && secRec.correlationId);
+                await recorder.stop();
+
+                const integrity = verifyTrafficIntegrity(tmpDir);
+                assert.equal(integrity.valid, true);
+
+                const wireDumpRes = queryProfileTraffic({
+                    profileId: 'sec-block-profile',
+                    trafficDir: tmpDir,
+                    correlationId: secRec.correlationId
+                });
+                assert.equal(wireDumpRes.found, true);
+                assert.match(wireDumpRes.wireDump, /SECURITY BLOCK \[ZINIAO ACTIVE GUARD\]/);
+            } finally {
+                fs.rmSync(tmpDir, { recursive: true, force: true });
+            }
+        }
     }
 ];
 

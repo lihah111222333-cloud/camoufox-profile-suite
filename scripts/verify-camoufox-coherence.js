@@ -12,7 +12,11 @@ import { fileURLToPath } from 'url';
 import config from '../src/config.js';
 import { createAndStartProfile } from '../src/camoufox/profile.js';
 import { resolveCamoufoxModule } from '../src/camoufox/client.js';
-import { auditProfileCoherence, evaluatePlatformCoherence } from '../src/camoufox/coherence-auditor.js';
+import {
+    auditProfileCoherence,
+    evaluatePlatformCoherence,
+    computeGpuPerformanceScalingWeights
+} from '../src/camoufox/coherence-auditor.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -163,8 +167,11 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
             webdriverGetter: { exists: true, isGetter: true, source: 'function get webdriver() {\n    [native code]\n}', isNative: true },
             platformGetter: { exists: true, isGetter: true, source: 'function get platform() {\n    [native code]\n}', isNative: true },
             hardwareConcurrencyGetter: { exists: true, isGetter: true, source: 'function get hardwareConcurrency() {\n    [native code]\n}', isNative: true },
-            webglGetParameter: { exists: true, isMethod: true, source: 'function getParameter() {\n    [native code]\n}', isNative: true },
-            webgl2GetParameter: { exists: true, isMethod: true, source: 'function getParameter() {\n    [native code]\n}', isNative: true }
+            performanceNow: { exists: true, isMethod: true, source: 'function now() {\n    [native code]\n}', name: 'now', length: 0, isNative: true },
+            webglGetParameter: { exists: true, isMethod: true, source: 'function getParameter() {\n    [native code]\n}', name: 'getParameter', length: 1, isNative: true },
+            webgl2GetParameter: { exists: true, isMethod: true, source: 'function getParameter() {\n    [native code]\n}', name: 'getParameter', length: 1, isNative: true },
+            webglReadPixels: { exists: true, isMethod: true, source: 'function readPixels() {\n    [native code]\n}', name: 'readPixels', length: 7, isNative: true },
+            webglDrawArrays: { exists: true, isMethod: true, source: 'function drawArrays() {\n    [native code]\n}', name: 'drawArrays', length: 3, isNative: true }
         },
         worker: {
             supported: true,
@@ -307,6 +314,9 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
             }
         },
         hardwareProfile: p.hardwareProfile,
+        gpuPerformance: computeGpuPerformanceScalingWeights(p.webglRenderer, {
+            profileId: `diag-${targetOs}`
+        }),
         storageEstimate: {
             quotaBytes: 21474836480,
             usageBytes: 4096
@@ -499,8 +509,17 @@ async function runDiagnostic() {
         }
 
         console.log(`   Mode      : ${mode}`);
-        console.log(`   Coherent  : ${passed ? '✅ PASS' : '❌ FAIL'}`);
-        if (auditReport?.mismatches?.length > 0) {
+        console.log(`   Coherent  : ${passed ? '✅ PASS' : '❌ FAIL'} (${auditReport?.score ?? 0}/100, ${auditReport?.checks?.length ?? 0} checks)`);
+        const gpuPerf = auditReport?.telemetry?.gpuPerformance;
+        if (gpuPerf) {
+            console.log(
+                `   GPU Scale : Target="${gpuPerf.targetGpuSpec?.model || gpuPerf.targetGpuModel}" vs Host="${gpuPerf.hostBaseline?.hostChipModel || 'Host Mac'}" -> computeTimeMultiplier=${gpuPerf.computeTimeMultiplier}x`
+            );
+        }
+        const failedChecks = (auditReport?.checks || []).filter((c) => !c.passed);
+        if (failedChecks.length > 0) {
+            console.log(`   Issues    : ${failedChecks.map((c) => `${c.name}: ${c.details}`).join(' | ')}`);
+        } else if (auditReport?.mismatches?.length > 0) {
             console.log(`   Issues    : ${auditReport.mismatches.join(' | ')}`);
         } else if (auditReport?.issues?.length > 0) {
             console.log(`   Issues    : ${auditReport.issues.join(' | ')}`);

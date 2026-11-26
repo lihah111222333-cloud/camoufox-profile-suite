@@ -1246,12 +1246,31 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
 
     const cloak = (wrappedFn, origFn) => {
         try {
+            const nameDesc = Object.getOwnPropertyDescriptor(origFn, 'name');
+            if (nameDesc) {
+                Object.defineProperty(wrappedFn, 'name', nameDesc);
+            }
+            const lenDesc = Object.getOwnPropertyDescriptor(origFn, 'length');
+            if (lenDesc) {
+                Object.defineProperty(wrappedFn, 'length', lenDesc);
+            }
             const sourceStr = cloakedFns.has(origFn)
                 ? cloakedFns.get(origFn)
                 : nativeToString.call(origFn);
             cloakedFns.set(wrappedFn, sourceStr);
         } catch {}
         return wrappedFn;
+    };
+
+    const defineCloakedMethod = (targetObj, propName, wrappedFn, origFn) => {
+        const origDesc = Object.getOwnPropertyDescriptor(targetObj, propName);
+        cloak(wrappedFn, origFn);
+        Object.defineProperty(targetObj, propName, {
+            value: wrappedFn,
+            writable: origDesc ? Boolean(origDesc.writable) : true,
+            enumerable: origDesc ? Boolean(origDesc.enumerable) : true,
+            configurable: origDesc ? Boolean(origDesc.configurable) : true
+        });
     };
 
     const patchedToString = function toString() {
@@ -1348,7 +1367,9 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
 
     const hookedProtos = new WeakSet();
     const timerQueries = new WeakSet();
+    const nonTimerQueries = new WeakSet();
     const scaledQueryResults = new WeakMap();
+    const scaledExtObjects = new WeakSet();
 
     const hookWebGLPrototype = (proto) => {
         if (!proto || hookedProtos.has(proto)) return;
@@ -1363,12 +1384,7 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                     gpuBurstPendingDrawCalls += 1;
                     return origDraw.apply(this, args);
                 };
-                cloak(wrappedDraw, origDraw);
-                Object.defineProperty(proto, drawMethod, {
-                    value: wrappedDraw,
-                    writable: true,
-                    configurable: true
-                });
+                defineCloakedMethod(proto, drawMethod, wrappedDraw, origDraw);
             }
         }
 
@@ -1381,12 +1397,7 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                 }
                 return origFlush.apply(this, args);
             };
-            cloak(wrappedFlush, origFlush);
-            Object.defineProperty(proto, 'flush', {
-                value: wrappedFlush,
-                writable: true,
-                configurable: true
-            });
+            defineCloakedMethod(proto, 'flush', wrappedFlush, origFlush);
         }
 
         if (typeof proto.finish === 'function') {
@@ -1400,12 +1411,7 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                 activeGpuBurstMode = null;
                 return res;
             };
-            cloak(wrappedFinish, origFinish);
-            Object.defineProperty(proto, 'finish', {
-                value: wrappedFinish,
-                writable: true,
-                configurable: true
-            });
+            defineCloakedMethod(proto, 'finish', wrappedFinish, origFinish);
         }
 
         if (typeof proto.clientWaitSync === 'function') {
@@ -1419,12 +1425,7 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                 activeGpuBurstMode = null;
                 return res;
             };
-            cloak(wrappedWaitSync, origWaitSync);
-            Object.defineProperty(proto, 'clientWaitSync', {
-                value: wrappedWaitSync,
-                writable: true,
-                configurable: true
-            });
+            defineCloakedMethod(proto, 'clientWaitSync', wrappedWaitSync, origWaitSync);
         }
 
         if (typeof proto.readPixels === 'function') {
@@ -1438,12 +1439,7 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                 activeGpuBurstMode = null;
                 return res;
             };
-            cloak(wrappedReadPixels, origReadPixels);
-            Object.defineProperty(proto, 'readPixels', {
-                value: wrappedReadPixels,
-                writable: true,
-                configurable: true
-            });
+            defineCloakedMethod(proto, 'readPixels', wrappedReadPixels, origReadPixels);
         }
 
         // Track WebGL2 TIME_ELAPSED_EXT (0x88BF) queries via beginQuery
@@ -1454,18 +1450,15 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                     scaledQueryResults.delete(query);
                     if (target === 0x88BF) {
                         timerQueries.add(query);
+                        nonTimerQueries.delete(query);
                     } else {
                         timerQueries.delete(query);
+                        nonTimerQueries.add(query);
                     }
                 }
                 return origBeginQuery.call(this, target, query);
             };
-            cloak(wrappedBeginQuery, origBeginQuery);
-            Object.defineProperty(proto, 'beginQuery', {
-                value: wrappedBeginQuery,
-                writable: true,
-                configurable: true
-            });
+            defineCloakedMethod(proto, 'beginQuery', wrappedBeginQuery, origBeginQuery);
         }
 
         // Hook WebGL2 hardware timer queries (TIME_ELAPSED_EXT = 0x88BF, QUERY_RESULT = 0x8866)
@@ -1475,8 +1468,9 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                 const val = origGetQueryParam.call(this, query, pname);
                 if (pname === 0x8866 && typeof val === 'number' && val > 0) {
                     const isKnownNonTimer =
-                        query && typeof query === 'object' && query.target && query.target !== 0x88BF;
-                    if (!isKnownNonTimer && (!timerQueries.size || timerQueries.has(query))) {
+                        (query && typeof query === 'object' && nonTimerQueries.has(query)) ||
+                        (query && typeof query === 'object' && query.target && query.target !== 0x88BF);
+                    if (!isKnownNonTimer) {
                         if (query && typeof query === 'object' && scaledQueryResults.has(query)) {
                             return scaledQueryResults.get(query);
                         }
@@ -1492,12 +1486,7 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                 }
                 return val;
             };
-            cloak(wrappedGetQueryParam, origGetQueryParam);
-            Object.defineProperty(proto, 'getQueryParameter', {
-                value: wrappedGetQueryParam,
-                writable: true,
-                configurable: true
-            });
+            defineCloakedMethod(proto, 'getQueryParameter', wrappedGetQueryParam, origGetQueryParam);
         }
 
         // Hook getExtension('EXT_disjoint_timer_query')
@@ -1505,30 +1494,29 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
             const origGetExt = proto.getExtension;
             const wrappedGetExt = function (name) {
                 const ext = origGetExt.call(this, name);
-                if (ext && typeof name === 'string' && /disjoint_timer_query/i.test(name)) {
-                    if (typeof ext.beginQueryEXT === 'function' && !ext._camoufoxBeginScaled) {
-                        const origBeginExt = ext.beginQueryEXT.bind(ext);
+                if (ext && typeof name === 'string' && /disjoint_timer_query/i.test(name) && !scaledExtObjects.has(ext)) {
+                    scaledExtObjects.add(ext);
+                    if (typeof ext.beginQueryEXT === 'function') {
+                        const origBeginExt = ext.beginQueryEXT;
                         const wrappedBeginExt = function (target, query) {
                             if (query && typeof query === 'object') {
                                 scaledQueryResults.delete(query);
                                 if (target === 0x88BF) {
                                     timerQueries.add(query);
+                                    nonTimerQueries.delete(query);
+                                } else {
+                                    timerQueries.delete(query);
+                                    nonTimerQueries.add(query);
                                 }
                             }
-                            return origBeginExt(target, query);
+                            return origBeginExt.call(this, target, query);
                         };
-                        cloak(wrappedBeginExt, ext.beginQueryEXT);
-                        Object.defineProperty(ext, 'beginQueryEXT', {
-                            value: wrappedBeginExt,
-                            writable: true,
-                            configurable: true
-                        });
-                        Object.defineProperty(ext, '_camoufoxBeginScaled', { value: true, enumerable: false });
+                        defineCloakedMethod(ext, 'beginQueryEXT', wrappedBeginExt, origBeginExt);
                     }
-                    if (typeof ext.getQueryObjectEXT === 'function' && !ext._camoufoxScaled) {
-                        const origGetQueryObj = ext.getQueryObjectEXT.bind(ext);
+                    if (typeof ext.getQueryObjectEXT === 'function') {
+                        const origGetQueryObj = ext.getQueryObjectEXT;
                         const wrappedGetQueryObj = function (query, pname) {
-                            const val = origGetQueryObj(query, pname);
+                            const val = origGetQueryObj.call(this, query, pname);
                             if (pname === 0x8866 && typeof val === 'number' && val > 0) {
                                 if (query && typeof query === 'object' && scaledQueryResults.has(query)) {
                                     return scaledQueryResults.get(query);
@@ -1544,23 +1532,12 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                             }
                             return val;
                         };
-                        cloak(wrappedGetQueryObj, ext.getQueryObjectEXT);
-                        Object.defineProperty(ext, 'getQueryObjectEXT', {
-                            value: wrappedGetQueryObj,
-                            writable: true,
-                            configurable: true
-                        });
-                        Object.defineProperty(ext, '_camoufoxScaled', { value: true, enumerable: false });
+                        defineCloakedMethod(ext, 'getQueryObjectEXT', wrappedGetQueryObj, origGetQueryObj);
                     }
                 }
                 return ext;
             };
-            cloak(wrappedGetExt, origGetExt);
-            Object.defineProperty(proto, 'getExtension', {
-                value: wrappedGetExt,
-                writable: true,
-                configurable: true
-            });
+            defineCloakedMethod(proto, 'getExtension', wrappedGetExt, origGetExt);
         }
     };
 
@@ -1571,27 +1548,42 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
         hookWebGLPrototype(WebGL2RenderingContext.prototype);
     }
 
-    // Hook HTMLCanvasElement.prototype.toDataURL & OffscreenCanvas.prototype.convertToBlob for pending GPU bursts
-    if (typeof HTMLCanvasElement !== 'undefined' && HTMLCanvasElement.prototype && typeof HTMLCanvasElement.prototype.toDataURL === 'function') {
-        const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-        const wrappedToDataURL = function (...args) {
-            if (gpuBurstPendingDrawCalls > 0) {
-                advanceVirtualClock();
-                activeGpuBurstMode = 'fill';
-                const res = origToDataURL.apply(this, args);
-                advanceVirtualClock();
-                gpuBurstPendingDrawCalls = 0;
-                activeGpuBurstMode = null;
-                return res;
-            }
-            return origToDataURL.apply(this, args);
-        };
-        cloak(wrappedToDataURL, origToDataURL);
-        Object.defineProperty(HTMLCanvasElement.prototype, 'toDataURL', {
-            value: wrappedToDataURL,
-            writable: true,
-            configurable: true
-        });
+    // Hook HTMLCanvasElement.prototype.toDataURL, toBlob & OffscreenCanvas.prototype.convertToBlob for pending GPU bursts
+    if (typeof HTMLCanvasElement !== 'undefined' && HTMLCanvasElement.prototype) {
+        if (typeof HTMLCanvasElement.prototype.toDataURL === 'function') {
+            const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+            const wrappedToDataURL = function (...args) {
+                if (gpuBurstPendingDrawCalls > 0) {
+                    advanceVirtualClock();
+                    activeGpuBurstMode = 'fill';
+                    const res = origToDataURL.apply(this, args);
+                    advanceVirtualClock();
+                    gpuBurstPendingDrawCalls = 0;
+                    activeGpuBurstMode = null;
+                    return res;
+                }
+                return origToDataURL.apply(this, args);
+            };
+            defineCloakedMethod(HTMLCanvasElement.prototype, 'toDataURL', wrappedToDataURL, origToDataURL);
+        }
+        if (typeof HTMLCanvasElement.prototype.toBlob === 'function') {
+            const origToBlob = HTMLCanvasElement.prototype.toBlob;
+            const wrappedToBlob = function (callback, ...rest) {
+                if (gpuBurstPendingDrawCalls > 0 && typeof callback === 'function') {
+                    advanceVirtualClock();
+                    activeGpuBurstMode = 'fill';
+                    const wrappedCb = function (blob) {
+                        advanceVirtualClock();
+                        gpuBurstPendingDrawCalls = 0;
+                        activeGpuBurstMode = null;
+                        return callback.call(this, blob);
+                    };
+                    return origToBlob.call(this, wrappedCb, ...rest);
+                }
+                return origToBlob.call(this, callback, ...rest);
+            };
+            defineCloakedMethod(HTMLCanvasElement.prototype, 'toBlob', wrappedToBlob, origToBlob);
+        }
     }
 
     if (typeof OffscreenCanvas !== 'undefined' && OffscreenCanvas.prototype && typeof OffscreenCanvas.prototype.convertToBlob === 'function') {
@@ -1608,12 +1600,7 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
             }
             return origConvertToBlob.apply(this, args);
         };
-        cloak(wrappedConvertToBlob, origConvertToBlob);
-        Object.defineProperty(OffscreenCanvas.prototype, 'convertToBlob', {
-            value: wrappedConvertToBlob,
-            writable: true,
-            configurable: true
-        });
+        defineCloakedMethod(OffscreenCanvas.prototype, 'convertToBlob', wrappedConvertToBlob, origConvertToBlob);
     }
 
     // Hook WebGPU GPUQueue.prototype.onSubmittedWorkDone & GPUBuffer.prototype.mapAsync
@@ -1627,12 +1614,7 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                 activeGpuBurstMode = null;
             });
         };
-        cloak(wrappedWorkDone, origWorkDone);
-        Object.defineProperty(GPUQueue.prototype, 'onSubmittedWorkDone', {
-            value: wrappedWorkDone,
-            writable: true,
-            configurable: true
-        });
+        defineCloakedMethod(GPUQueue.prototype, 'onSubmittedWorkDone', wrappedWorkDone, origWorkDone);
     }
 
     if (typeof GPUBuffer !== 'undefined' && GPUBuffer.prototype && typeof GPUBuffer.prototype.mapAsync === 'function') {
@@ -1645,12 +1627,7 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                 activeGpuBurstMode = null;
             });
         };
-        cloak(wrappedMapAsync, origMapAsync);
-        Object.defineProperty(GPUBuffer.prototype, 'mapAsync', {
-            value: wrappedMapAsync,
-            writable: true,
-            configurable: true
-        });
+        defineCloakedMethod(GPUBuffer.prototype, 'mapAsync', wrappedMapAsync, origMapAsync);
     }
 })();`;
 }

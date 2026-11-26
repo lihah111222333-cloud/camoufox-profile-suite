@@ -971,6 +971,11 @@ export async function startProfile(profileId, options = {}) {
     }
 
     const startPromise = (async () => {
+        let browser = null;
+        let context = null;
+        let ownsBrowser = false;
+        let securityGuards = null;
+        let trafficRecorder = null;
         try {
             const profilesDir = options.profilesDir || DEFAULT_PROFILES_DIR;
             let metadata = await getProfile(profileId, { profilesDir });
@@ -1075,10 +1080,6 @@ export async function startProfile(profileId, options = {}) {
             const launchFn = camoufoxMod.AsyncCamoufox || camoufoxMod.Camoufox;
             const newContextFn = camoufoxMod.AsyncNewContext || camoufoxMod.NewContext;
 
-            let browser = null;
-            let context = null;
-            let ownsBrowser = false;
-
             if (useSharedBrowser) {
                 browser = await getOrCreateSharedBrowser({
                     os: targetOs,
@@ -1167,13 +1168,44 @@ export async function startProfile(profileId, options = {}) {
                 skipHosts: mergedOptions.securityPolicy?.canvasSkipHosts
             });
 
-            let securityGuards = null;
-            if (options.enablePortScanProtection || mergedOptions.enablePortScanProtection) {
+            const shouldAttachSecurityGuards =
+                options.enablePortScanProtection !== false &&
+                mergedOptions.enablePortScanProtection !== false &&
+                mergedOptions.securityPolicy?.portScanProtection?.enabled !== false;
+            if (shouldAttachSecurityGuards) {
+                const customOnBlockedAttempt =
+                    options.onBlockedAttempt ?? mergedOptions.onBlockedAttempt;
                 securityGuards = await attachZiniaoSecurityGuardsToContext(context, {
                     profileId,
                     portScanProtection: mergedOptions.securityPolicy?.portScanProtection,
                     allowedExtensionIds: options.allowedExtensionIds ?? mergedOptions.allowedExtensionIds,
-                    onBlockedAttempt: options.onBlockedAttempt ?? mergedOptions.onBlockedAttempt
+                    onBlockedAttempt: (blockedEvent) => {
+                        logger.warn('Ziniao security guard blocked suspicious browser probe', {
+                            profileId,
+                            type: blockedEvent?.type,
+                            targetUrl: blockedEvent?.targetUrl,
+                            initiatorUrl: blockedEvent?.initiatorUrl,
+                            reason: blockedEvent?.reason,
+                            port: blockedEvent?.port ?? null,
+                            service: blockedEvent?.service ?? null
+                        });
+                        if (trafficRecorder) {
+                            try {
+                                if (typeof trafficRecorder.recordSecurityBlock === 'function') {
+                                    trafficRecorder.recordSecurityBlock(blockedEvent);
+                                } else if (typeof trafficRecorder.recordTriggerAction === 'function') {
+                                    trafficRecorder.recordTriggerAction(
+                                        `security.${blockedEvent?.type || 'blocked-probe'}`,
+                                        blockedEvent?.targetUrl || null,
+                                        blockedEvent
+                                    );
+                                }
+                            } catch {}
+                        }
+                        if (typeof customOnBlockedAttempt === 'function') {
+                            customOnBlockedAttempt(blockedEvent);
+                        }
+                    }
                 });
             }
 
@@ -1195,7 +1227,6 @@ export async function startProfile(profileId, options = {}) {
             const existingPages = context.pages();
             const page = existingPages.length > 0 ? existingPages[0] : await context.newPage();
 
-            let trafficRecorder = null;
             if (recordTraffic) {
                 trafficRecorder = new CamoufoxTrafficRecorder({
                     profileId,
@@ -1251,6 +1282,18 @@ export async function startProfile(profileId, options = {}) {
 
             return session;
         } catch (error) {
+            if (trafficRecorder && typeof trafficRecorder.stop === 'function') {
+                await trafficRecorder.stop().catch(() => {});
+            }
+            if (securityGuards && typeof securityGuards.detach === 'function') {
+                await securityGuards.detach().catch(() => {});
+            }
+            if (context && typeof context.close === 'function') {
+                await context.close().catch(() => {});
+            }
+            if (ownsBrowser && browser && typeof browser.close === 'function') {
+                await browser.close().catch(() => {});
+            }
             logger.error('Error starting Camoufox profile', {
                 profileId,
                 error: error.message

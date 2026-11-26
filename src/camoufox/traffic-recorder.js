@@ -2050,6 +2050,25 @@ export class CamoufoxTrafficRecorder {
                         triggerBucket.correlationIdsSet.add(ev.correlationId);
                     }
                 }
+            } else if (ev.type === 'security-block') {
+                this.totals.failedRequests += 1;
+                const parsedUrl = parseUrlComponents(ev.url || ev.targetUrl || '');
+                const effectiveTrigger = ev.triggerAction || null;
+                const stepBucket = this._ensureStepRecord(stepName, stepIndex);
+                stepBucket.failedRequests += 1;
+                stepBucket.domainsSet.add(parsedUrl.host);
+
+                const domainBucket = this._ensureDomainRecord(parsedUrl.host);
+                domainBucket.failedRequests += 1;
+
+                const triggerBucket = this._ensureTriggerActionRecord(effectiveTrigger);
+                if (triggerBucket) {
+                    triggerBucket.failedRequests += 1;
+                    triggerBucket.domainsSet.add(parsedUrl.host);
+                    if (ev.correlationId) {
+                        triggerBucket.correlationIdsSet.add(ev.correlationId);
+                    }
+                }
             } else if (ev.type === 'ws-egress' || ev.type === 'ws-ingress') {
                 const parsedUrl = parseUrlComponents(ev.url || '');
                 const bytes = Number(ev.payloadBytes) || 0;
@@ -2907,6 +2926,98 @@ export class CamoufoxTrafficRecorder {
             payloadFile: anomaly.payloadFile ?? null,
             ...(anomaly.matchedSignals ? { matchedSignals: anomaly.matchedSignals } : {})
         });
+    }
+
+    /**
+     * Record a blocked security probe from Ziniao-absorbed active security guards
+     * (`local-port-scan-probe` or `internal-scheme-probe`) into the tamper-evident
+     * NDJSON event chain, pre-TLS wire log, and anomalies ledger.
+     *
+     * @param {object} blockEvent
+     * @returns {object | null}
+     */
+    recordSecurityBlock(blockEvent = {}) {
+        if (this.stopped || !blockEvent || typeof blockEvent !== 'object') {
+            return null;
+        }
+        const seq = this._nextSeq();
+        const correlationId = blockEvent.correlationId || `sec-${this.traceIdShort}-${seq}`;
+        const rawUrl = String(blockEvent.targetUrl || blockEvent.url || '');
+        const redactedUrl = redactUrlSecrets(rawUrl);
+        const parsedUrl = parseUrlComponents(redactedUrl);
+        const blockType = String(blockEvent.type || 'security-probe');
+        const method = String(blockEvent.method || 'GET');
+        const reason = String(blockEvent.reason || `Blocked ${blockType} to ${redactedUrl}`);
+        const severity = String(blockEvent.severity || 'critical');
+        const triggerSnapshot = this.getActiveTriggerSnapshot();
+        const attributionSnapshot = this.getAttributionSnapshot();
+
+        this.totals.failedRequests += 1;
+        const stepBucket = this._ensureStepRecord(
+            attributionSnapshot.actionStep,
+            attributionSnapshot.stepIndex
+        );
+        stepBucket.failedRequests += 1;
+        stepBucket.domainsSet.add(parsedUrl.host);
+
+        const domainBucket = this._ensureDomainRecord(parsedUrl.host);
+        domainBucket.failedRequests += 1;
+
+        const triggerBucket = this._ensureTriggerActionRecord(triggerSnapshot);
+        if (triggerBucket) {
+            triggerBucket.failedRequests += 1;
+            triggerBucket.domainsSet.add(parsedUrl.host);
+            triggerBucket.correlationIdsSet.add(correlationId);
+        }
+
+        const record = {
+            seq,
+            type: 'security-block',
+            eventType: 'security-block',
+            direction: 'internal',
+            stage: 'ziniao-active-guard',
+            blockType,
+            timestamp: blockEvent.timestamp || new Date().toISOString(),
+            epochMs: Date.now(),
+            correlationId,
+            attribution: attributionSnapshot,
+            triggerAction: triggerSnapshot,
+            method,
+            url: redactedUrl,
+            host: blockEvent.host || parsedUrl.host,
+            port: blockEvent.port ?? null,
+            scope: blockEvent.scope || null,
+            service: blockEvent.service || null,
+            category: blockEvent.category || null,
+            matchedScheme: blockEvent.matchedScheme || null,
+            initiatorUrl: blockEvent.initiatorUrl ? redactUrlSecrets(String(blockEvent.initiatorUrl)) : null,
+            severity,
+            reason,
+            failureText: reason
+        };
+
+        this._appendNdjsonEvent(record);
+        this._appendWireLogBlock([
+            '================================================================================',
+            `!!! SECURITY-BLOCK [ZINIAO ACTIVE GUARD] [seq=${seq}] [corr=${correlationId}] ${record.timestamp}`,
+            `[ATTRIBUTION] profile=${this.attribution.profileId} step=${this.attribution.actionStep}(#${this.attribution.stepIndex})`,
+            `[BLOCK-DETAIL] type=${blockType} severity=${severity} target="${redactedUrl}" reason="${reason}"`,
+            ''
+        ].join('\n'));
+
+        this._recordAnomaly({
+            timestamp: record.timestamp,
+            correlationId,
+            actionStep: this.attribution.actionStep,
+            triggerAction: triggerSnapshot,
+            type: `security-block:${blockType}`,
+            severity,
+            method,
+            url: redactedUrl,
+            failureText: reason
+        });
+
+        return record;
     }
 
     /**

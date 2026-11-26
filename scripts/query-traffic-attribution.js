@@ -696,12 +696,13 @@ export function reconstructTransactionWireDump({
     const ingress = corrEvents.find((e) => e.type === 'ingress') || null;
     const finished = corrEvents.find((e) => e.type === 'request-finished') || null;
     const failed = corrEvents.find((e) => e.type === 'request-failed') || null;
+    const securityBlock = corrEvents.find((e) => e.type === 'security-block') || null;
     const wsEvents = corrEvents.filter((e) => typeof e.type === 'string' && e.type.startsWith('ws-'));
 
     const matchingAnomalies = anomalies.filter((a) => a && a.correlationId === correlationId);
     const redirectChain = buildRedirectChain(correlationId, events);
 
-    const primaryEvent = egress || ingress || failed || finished || wsEvents[0] || null;
+    const primaryEvent = egress || ingress || failed || securityBlock || finished || wsEvents[0] || null;
     const attribution = primaryEvent?.attribution || null;
     const actionStep = extractActionStep(primaryEvent) || 'unknown';
     const stepIndex = attribution?.stepIndex ?? primaryEvent?.stepIndex ?? 0;
@@ -833,6 +834,13 @@ export function reconstructTransactionWireDump({
         );
     }
 
+    if (securityBlock) {
+        lines.push('--------------------------------------------------------------------------------');
+        lines.push(
+            `!!! SECURITY BLOCK [ZINIAO ACTIVE GUARD] [${correlationId}] type=${securityBlock.blockType || 'probe'} reason="${securityBlock.reason || securityBlock.failureText || ''}"`
+        );
+    }
+
     if (wsEvents.length > 0) {
         lines.push('--------------------------------------------------------------------------------');
         lines.push(`=== WEBSOCKET FRAMES [${correlationId}] (${wsEvents.length} events) ===`);
@@ -851,7 +859,7 @@ export function reconstructTransactionWireDump({
         profileId,
         trafficDir,
         correlationId,
-        found: Boolean(egress || ingress || failed || finished || wsEvents.length > 0),
+        found: Boolean(egress || ingress || failed || securityBlock || finished || wsEvents.length > 0),
         actionStep,
         stepIndex,
         triggerAction,
@@ -931,9 +939,9 @@ function buildTransactionsList(events) {
                 tx.status = ev.status;
             }
             tx.durationMs = ev.durationMs ?? tx.durationMs;
-        } else if (ev.type === 'request-failed') {
+        } else if (ev.type === 'request-failed' || ev.type === 'security-block') {
             tx.failed = ev;
-            tx.failureText = ev.failureText || null;
+            tx.failureText = ev.reason || ev.failureText || 'SECURITY_BLOCK';
             tx.durationMs = ev.durationMs ?? tx.durationMs;
         }
     }
