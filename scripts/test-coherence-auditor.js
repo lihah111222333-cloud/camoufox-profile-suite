@@ -3942,6 +3942,223 @@ const tests = [
                 fs.rmSync(tmpDir, { recursive: true, force: true });
             }
         }
+    },
+    {
+        name: '95. Round-4 Ultra-Deep Audit (Part 1): Error Stack-Trace Hygiene on Thrown WebIDL Exceptions, Synchronous Receiver Throw Burst-State Rollback, Cross-Realm Iframe Function.prototype Inheritance, WebGPU Limits Check 16 & Rule F Ultrabook + Gaming GPU Rejection',
+        fn: async () => {
+            const vm = await import('node:vm');
+            const baseline = collectHostMacPerformanceBaseline();
+            const uhd620Weights = computeGpuPerformanceScalingWeights('Intel(R) UHD Graphics 620', {
+                profileId: 'round4-uhd620',
+                hostBaseline: baseline
+            });
+
+            let realClock = 1000;
+            const sandbox = {
+                performance: {},
+                Performance: function Performance() {},
+                Date,
+                Proxy,
+                Reflect,
+                WebGLRenderingContext: function WebGLRenderingContext() {}
+            };
+            sandbox.Performance.prototype = {
+                now() {
+                    if (this !== sandbox.performance) {
+                        throw new TypeError("'now' called on an object that does not implement interface Performance.");
+                    }
+                    return realClock;
+                }
+            };
+            Object.setPrototypeOf(sandbox.performance, sandbox.Performance.prototype);
+            sandbox.WebGLRenderingContext.prototype = {
+                finish() {
+                    if (!(this instanceof sandbox.WebGLRenderingContext)) {
+                        throw new TypeError("'finish' called on an object that does not implement interface WebGLRenderingContext.");
+                    }
+                }
+            };
+            sandbox.globalThis = sandbox;
+
+            const script = buildGpuPerformanceInitScript(uhd620Weights);
+            vm.runInNewContext(script, sandbox);
+
+            // 1. Error stack trace hygiene when Performance.prototype.now.call({}) throws
+            let caughtStack = '';
+            try {
+                sandbox.Performance.prototype.now.call({});
+            } catch (err) {
+                caughtStack = String(err.stack || '');
+            }
+            assert.ok(caughtStack.length > 0);
+            assert.equal(
+                /createNativeMethodWrapper|patchedPerfNow|sanitizeThrownError/.test(caughtStack),
+                false,
+                `Leaked internal wrapper frame in stack: ${caughtStack}`
+            );
+
+            // 2. Synchronous WebIDL receiver throw on gl.finish.call({}) does NOT leave activeGpuBurstMode stuck
+            assert.throws(() => sandbox.WebGLRenderingContext.prototype.finish.call({}));
+            const tBefore = sandbox.performance.now();
+            realClock += 10;
+            const tAfter = sandbox.performance.now();
+            // Since finish.call({}) threw before any GPU work, elapsed time must be ~10ms (not dilated 26x to 260ms!)
+            assert.ok(
+                tAfter - tBefore < 20,
+                `Expected un-dilated 10ms after failed finish.call({}), got ${tAfter - tBefore}ms`
+            );
+
+            // 3. Check 16 catches WebGPU limits mismatch (e.g. UHD 620 claiming 4GB maxBufferSize instead of 1GB)
+            const uhdPreset = resolveDeterministicDeviceProfile('round4-webgpu-lim', {
+                os: 'linux',
+                presetId: 'lin-laptop-i5-8250u-uhd620-16g'
+            });
+            assert.equal(uhdPreset.telemetry.webgpu.limits.maxBufferSize, 1073741824);
+            assert.equal(uhdPreset.telemetry.webgpu.limits.maxComputeWorkgroupSizeX, 512);
+
+            const tamperedLimits = structuredClone(uhdPreset.telemetry);
+            tamperedLimits.webgpu.limits.maxBufferSize = 4294967296;
+            const resLimits = evaluatePlatformCoherence(tamperedLimits, 'linux');
+            assert.equal(resLimits.passed, false);
+            assert.match(
+                findCheck(resLimits, 'exact-hardware-sku-model-coherence').details,
+                /WebGPU maxBufferSize mismatch/
+            );
+
+            // 4. Rule F Check 4 rejects 15W Ultrabook CPU (i5-8250U) paired with 175W RTX 4090 Laptop GPU
+            const ultrabookWith4090 = buildCoherentTelemetry('windows');
+            ultrabookWith4090.navigator.hardwareConcurrency = 8;
+            ultrabookWith4090.worker.hardwareConcurrency = 8;
+            ultrabookWith4090.iframeParity.hardwareConcurrency = 8;
+            ultrabookWith4090.webgl.unmaskedVendor = 'Google Inc. (NVIDIA)';
+            ultrabookWith4090.webgl.unmaskedRenderer =
+                'ANGLE (NVIDIA, NVIDIA GeForce RTX 4090 Laptop GPU Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            ultrabookWith4090.hardwareProfile = {
+                cpuModel: 'Intel Core i5-8250U',
+                gpuModel: 'NVIDIA GeForce RTX 4090 Laptop GPU',
+                ramGb: 16,
+                vramGb: 16,
+                storageGb: 512
+            };
+            const resUltra4090 = validateHardwareModelSpec(ultrabookWith4090, 'windows');
+            assert.equal(resUltra4090.passed, false);
+            assert.ok(
+                resUltra4090.issues.some((i) =>
+                    /Low-power Ultrabook CPU SKU.*cannot be paired with high-TDP gaming laptop discrete GPU/.test(i)
+                )
+            );
+        }
+    },
+    {
+        name: '96. Round-4 Ultra-Deep Audit (Part 2): In-Browser WebRTC RTCPeerConnection ICE Port-Scan Sanitizer, Shared-Browser Multi-Profile Isolation, --status=0 Security-Block Query & Crash-Replay HTTP 429 / Proxy Failure Deduplication',
+        fn: async () => {
+            const vm = await import('node:vm');
+            const fs = await import('node:fs');
+            const os = await import('node:os');
+            const path = await import('node:path');
+            const { sanitizeRtcConfigurationIceServers, buildZiniaoWebRtcSecurityInitScript } =
+                await import('../src/camoufox/ziniao-security.js');
+            const { attachBrowserCompatibility } = await import('../src/camoufox/profile.js');
+            const { CamoufoxTrafficRecorder } = await import('../src/camoufox/traffic-recorder.js');
+            const { queryProfileTraffic } = await import('./query-traffic-attribution.js');
+
+            // 1. Node-side sanitizeRtcConfigurationIceServers & in-browser buildZiniaoWebRtcSecurityInitScript
+            const blockedIceEvents = [];
+            const sanitized = sanitizeRtcConfigurationIceServers(
+                {
+                    iceServers: [
+                        { urls: ['stun:127.0.0.1:9222', 'stun:stun.l.google.com:19302'] },
+                        { urls: 'turn:192.168.1.1:3478' }
+                    ]
+                },
+                {
+                    profileId: 'webrtc-sec-test',
+                    onBlockedAttempt: (ev) => blockedIceEvents.push(ev)
+                }
+            );
+            assert.equal(sanitized.iceServers.length, 1);
+            assert.deepEqual(sanitized.iceServers[0].urls, ['stun:stun.l.google.com:19302']);
+            assert.equal(blockedIceEvents.length, 2);
+
+            let capturedRtcConfig = null;
+            function MockRTCPeerConnection(cfg) {
+                capturedRtcConfig = cfg;
+            }
+            MockRTCPeerConnection.prototype.setConfiguration = function setConfiguration(cfg) {
+                capturedRtcConfig = cfg;
+            };
+            const rtcSandbox = {
+                Function,
+                Object,
+                Proxy,
+                Reflect,
+                URL,
+                Set,
+                WeakMap,
+                RTCPeerConnection: MockRTCPeerConnection
+            };
+            rtcSandbox.globalThis = rtcSandbox;
+            vm.runInNewContext(
+                buildZiniaoWebRtcSecurityInitScript({ profileId: 'webrtc-vm' }),
+                rtcSandbox
+            );
+            const pc = new rtcSandbox.RTCPeerConnection({
+                iceServers: [
+                    { urls: 'stun:127.0.0.1:9222' },
+                    { urls: ['turn:10.0.0.1:3478', 'stun:stun.cloudflare.com:3478'] }
+                ]
+            });
+            assert.ok(pc instanceof rtcSandbox.RTCPeerConnection);
+            assert.equal(capturedRtcConfig.iceServers.length, 1);
+            assert.deepEqual(capturedRtcConfig.iceServers[0].urls, ['stun:stun.cloudflare.com:3478']);
+
+            // 2. Shared-browser multi-profile isolation in attachBrowserCompatibility
+            const pageA = { url: () => 'https://a.example.com' };
+            const pageB = { url: () => 'https://b.example.com' };
+            const ctxA = { pages: () => [pageA], newPage: async () => pageA };
+            const ctxB = { pages: () => [pageB], newPage: async () => pageB };
+            const sharedRawBrowser = {
+                contexts: () => [ctxA, ctxB],
+                newPage: async () => pageA,
+                isConnected: () => true
+            };
+            const profA = { profileId: 'prof-a', context: ctxA };
+            const profB = { profileId: 'prof-b', context: ctxB };
+            const browserViewA = attachBrowserCompatibility(sharedRawBrowser, profA);
+            const browserViewB = attachBrowserCompatibility(sharedRawBrowser, profB);
+            const pagesA = await browserViewA.pages();
+            const pagesB = await browserViewB.pages();
+            assert.equal(pagesA[0].url(), 'https://a.example.com');
+            assert.equal(pagesB[0].url(), 'https://b.example.com');
+
+            // 3. queryProfileTraffic({ status: 0 }) matches security-block & crash replay deduplicates anomalies
+            const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'camoufox-round4-traffic-'));
+            try {
+                const rec = new CamoufoxTrafficRecorder({
+                    profileId: 'round4-traffic',
+                    trafficDir: tmpDir
+                });
+                const secEv = rec.recordSecurityBlock({
+                    type: 'local-port-scan-probe',
+                    targetUrl: 'http://127.0.0.1:6379/info',
+                    host: '127.0.0.1',
+                    port: 6379,
+                    reason: 'Blocked Redis probe'
+                });
+                await rec.stop();
+
+                const statusZeroRes = queryProfileTraffic({
+                    profileId: 'round4-traffic',
+                    trafficDir: tmpDir,
+                    status: 0
+                });
+                assert.equal(statusZeroRes.transactions.length, 1);
+                assert.equal(statusZeroRes.transactions[0].correlationId, secEv.correlationId);
+                assert.equal(statusZeroRes.anomalies.length, 1);
+            } finally {
+                fs.rmSync(tmpDir, { recursive: true, force: true });
+            }
+        }
     }
 ];
 

@@ -753,77 +753,174 @@ export function attachBrowserCompatibility(browser, profile = null) {
         return browser;
     }
 
-    const resolvePrimaryContext = () => {
-        if (profile?.context) {
-            return profile.context;
+    const rawBrowser = browser._camoufoxRawBrowser || browser;
+    const isBrowserLikeProfile =
+        profile === rawBrowser ||
+        profile === browser ||
+        (profile &&
+            !profile.context &&
+            typeof profile.contexts === 'function' &&
+            typeof profile.pages !== 'function');
+    const effectiveProfile = isBrowserLikeProfile ? null : profile;
+
+    const extractContextFromProfile = (prof) => {
+        if (!prof) return null;
+        if (prof.context) return prof.context;
+        if (typeof prof.pages === 'function' && typeof prof.newPage === 'function') {
+            return prof;
         }
-        if (
-            profile &&
-            typeof profile.pages === 'function' &&
-            typeof profile.newPage === 'function'
-        ) {
-            return profile;
-        }
-        const contexts = typeof browser.contexts === 'function' ? browser.contexts() : [];
-        return contexts[0] || null;
+        return null;
     };
 
-    if (!browser._camoufoxPagesWrapped) {
-        browser.pages = async () => {
-            const primaryContext = resolvePrimaryContext();
-            if (primaryContext && typeof primaryContext.pages === 'function') {
-                return primaryContext
-                    .pages()
-                    .map((p) => attachPageCompatibility(p, primaryContext, profile || browser));
-            }
-            const contexts = typeof browser.contexts === 'function' ? browser.contexts() : [];
-            return contexts.flatMap((ctx) =>
-                ctx.pages().map((p) => attachPageCompatibility(p, ctx, profile || browser))
-            );
-        };
-        Object.defineProperty(browser, '_camoufoxPagesWrapped', {
-            value: true,
-            enumerable: false,
-            configurable: true
-        });
-    }
+    const isContextUsable = (ctx) =>
+        Boolean(ctx && (typeof ctx.isClosed !== 'function' || !ctx.isClosed()));
 
-    if (!browser._camoufoxNewPageWrapped) {
+    const createScopedMethods = (boundProfile) => {
+        const resolvePrimaryContext = () => {
+            const prof = boundProfile || rawBrowser._camoufoxBoundProfile || null;
+            const explicitCtx = extractContextFromProfile(prof);
+            if (isContextUsable(explicitCtx)) {
+                return explicitCtx;
+            }
+            const contexts =
+                typeof rawBrowser.contexts === 'function' ? rawBrowser.contexts() : [];
+            return contexts.find((ctx) => isContextUsable(ctx)) || contexts[0] || null;
+        };
+
         const originalBrowserNewPage =
-            typeof browser.newPage === 'function' ? browser.newPage.bind(browser) : null;
+            typeof rawBrowser._camoufoxOriginalNewPage === 'function'
+                ? rawBrowser._camoufoxOriginalNewPage
+                : typeof rawBrowser.newPage === 'function'
+                  ? rawBrowser.newPage.bind(rawBrowser)
+                  : null;
 
-        browser.newPage = async (...args) => {
-            const primaryContext = resolvePrimaryContext();
-            if (primaryContext && typeof primaryContext.newPage === 'function') {
-                const page = await primaryContext.newPage(...args);
-                return attachPageCompatibility(page, primaryContext, profile || browser);
+        return {
+            pages: async () => {
+                const prof = boundProfile || rawBrowser._camoufoxBoundProfile || null;
+                const primaryContext = resolvePrimaryContext();
+                if (primaryContext && typeof primaryContext.pages === 'function') {
+                    return primaryContext
+                        .pages()
+                        .map((p) => attachPageCompatibility(p, primaryContext, prof || rawBrowser));
+                }
+                const contexts =
+                    typeof rawBrowser.contexts === 'function' ? rawBrowser.contexts() : [];
+                return contexts.flatMap((ctx) =>
+                    ctx.pages().map((p) => attachPageCompatibility(p, ctx, prof || rawBrowser))
+                );
+            },
+            newPage: async (...args) => {
+                const prof = boundProfile || rawBrowser._camoufoxBoundProfile || null;
+                const primaryContext = resolvePrimaryContext();
+                if (primaryContext && typeof primaryContext.newPage === 'function') {
+                    const page = await primaryContext.newPage(...args);
+                    return attachPageCompatibility(page, primaryContext, prof || rawBrowser);
+                }
+                if (originalBrowserNewPage) {
+                    const page = await originalBrowserNewPage(...args);
+                    return attachPageCompatibility(
+                        page,
+                        page?.context?.() || null,
+                        prof || rawBrowser
+                    );
+                }
+                throw new Error('No active Playwright context available to create a new page');
+            },
+            disconnect: async () => {
+                const prof = boundProfile || rawBrowser._camoufoxBoundProfile || null;
+                if (prof && typeof prof.saveStorageState === 'function') {
+                    await prof.saveStorageState();
+                }
             }
-            if (originalBrowserNewPage) {
-                const page = await originalBrowserNewPage(...args);
-                return attachPageCompatibility(page, page?.context?.() || null, profile || browser);
-            }
-            throw new Error('No active Playwright context available to create a new page');
         };
-        Object.defineProperty(browser, '_camoufoxNewPageWrapped', {
+    };
+
+    if (!rawBrowser._camoufoxOriginalNewPage && typeof rawBrowser.newPage === 'function') {
+        Object.defineProperty(rawBrowser, '_camoufoxOriginalNewPage', {
+            value: rawBrowser.newPage.bind(rawBrowser),
+            enumerable: false,
+            configurable: true
+        });
+    }
+
+    if (!rawBrowser._camoufoxProfileViews) {
+        Object.defineProperty(rawBrowser, '_camoufoxProfileViews', {
+            value: new WeakMap(),
+            enumerable: false,
+            configurable: true
+        });
+    }
+
+    const currentBound = rawBrowser._camoufoxBoundProfile;
+    const currentBoundCtx = extractContextFromProfile(currentBound);
+    if (
+        effectiveProfile &&
+        (!currentBound || currentBound === effectiveProfile || !isContextUsable(currentBoundCtx))
+    ) {
+        Object.defineProperty(rawBrowser, '_camoufoxBoundProfile', {
+            value: effectiveProfile,
+            enumerable: false,
+            configurable: true,
+            writable: true
+        });
+    }
+
+    if (!rawBrowser._camoufoxPagesWrapped) {
+        const rootMethods = createScopedMethods(null);
+        rawBrowser.pages = rootMethods.pages;
+        rawBrowser.newPage = rootMethods.newPage;
+        if (typeof rawBrowser.disconnect !== 'function') {
+            rawBrowser.disconnect = rootMethods.disconnect;
+        }
+        if (typeof rawBrowser.isConnected !== 'function') {
+            rawBrowser.isConnected = () => true;
+        }
+        Object.defineProperty(rawBrowser, '_camoufoxPagesWrapped', {
+            value: true,
+            enumerable: false,
+            configurable: true
+        });
+        Object.defineProperty(rawBrowser, '_camoufoxNewPageWrapped', {
             value: true,
             enumerable: false,
             configurable: true
         });
     }
 
-    if (typeof browser.disconnect !== 'function') {
-        browser.disconnect = async () => {
-            if (profile && typeof profile.saveStorageState === 'function') {
-                await profile.saveStorageState();
-            }
-        };
+    if (!effectiveProfile || rawBrowser._camoufoxBoundProfile === effectiveProfile) {
+        return browser._camoufoxBoundProfile === effectiveProfile ? browser : rawBrowser;
     }
 
-    if (typeof browser.isConnected !== 'function') {
-        browser.isConnected = () => true;
+    const targetCtx = extractContextFromProfile(effectiveProfile);
+    const cacheKey =
+        typeof effectiveProfile === 'object' && effectiveProfile !== null
+            ? effectiveProfile
+            : targetCtx;
+    if (cacheKey && rawBrowser._camoufoxProfileViews.has(cacheKey)) {
+        return rawBrowser._camoufoxProfileViews.get(cacheKey);
     }
 
-    return browser;
+    const scopedMethods = createScopedMethods(effectiveProfile);
+    const scopedBrowser = new Proxy(rawBrowser, {
+        get(target, prop, receiver) {
+            if (prop === 'pages') return scopedMethods.pages;
+            if (prop === 'newPage') return scopedMethods.newPage;
+            if (prop === 'disconnect') return scopedMethods.disconnect;
+            if (prop === '_camoufoxBoundProfile') return effectiveProfile;
+            if (prop === '_camoufoxRawBrowser') return rawBrowser;
+            const val = Reflect.get(target, prop, receiver);
+            return typeof val === 'function' ? val.bind(target) : val;
+        }
+    });
+
+    if (cacheKey) {
+        rawBrowser._camoufoxProfileViews.set(cacheKey, scopedBrowser);
+        if (targetCtx && targetCtx !== cacheKey) {
+            rawBrowser._camoufoxProfileViews.set(targetCtx, scopedBrowser);
+        }
+    }
+
+    return scopedBrowser;
 }
 
 export class CamoufoxProfile {
@@ -965,25 +1062,69 @@ export class CamoufoxProfile {
         });
         if (
             this.fingerprintLedger &&
-            typeof this.fingerprintLedger.recordOrVerify === 'function' &&
-            this.coherenceReport?.telemetry?.canvas2d?.fnv1aHash
+            typeof this.fingerprintLedger.recordOrVerify === 'function'
         ) {
-            try {
-                const pageUrl =
-                    typeof page?.url === 'function' ? page.url() : 'about:blank';
-                this.coherenceReport.canvasConsistency = this.fingerprintLedger.recordOrVerify({
-                    kind: 'canvas',
-                    url: pageUrl || 'about:blank',
-                    width: 240,
-                    height: 60,
-                    drewText: 'Camoufox Coherence 🦊 123.45',
-                    hash: this.coherenceReport.telemetry.canvas2d.fnv1aHash
-                });
-            } catch (ledgerErr) {
-                logger.debug('Could not record canvas2d hash in fingerprintLedger during auditCoherence', {
-                    profileId: this.profileId,
-                    error: ledgerErr.message
-                });
+            const pageUrl =
+                typeof page?.url === 'function' ? page.url() : 'about:blank';
+            if (this.coherenceReport?.telemetry?.canvas2d?.fnv1aHash) {
+                try {
+                    this.coherenceReport.canvasConsistency = this.fingerprintLedger.recordOrVerify({
+                        kind: 'canvas',
+                        url: pageUrl || 'about:blank',
+                        width: 240,
+                        height: 60,
+                        drewText: 'Camoufox Coherence 🦊 123.45',
+                        hash: this.coherenceReport.telemetry.canvas2d.fnv1aHash
+                    });
+                } catch (ledgerErr) {
+                    logger.debug('Could not record canvas2d hash in fingerprintLedger during auditCoherence', {
+                        profileId: this.profileId,
+                        error: ledgerErr.message
+                    });
+                }
+            }
+            const webglInfo = this.coherenceReport?.telemetry?.webgl;
+            if (webglInfo && (webglInfo.fnv1aHash || webglInfo.unmaskedRenderer || webglInfo.renderer)) {
+                try {
+                    let webglHash = webglInfo.fnv1aHash;
+                    if (!webglHash || !/^[0-9a-f]+$/i.test(String(webglHash))) {
+                        const sig = [
+                            webglInfo.unmaskedVendor || webglInfo.vendor || '',
+                            webglInfo.unmaskedRenderer || webglInfo.renderer || '',
+                            webglInfo.version || '',
+                            webglInfo.shadingLanguageVersion || '',
+                            webglInfo.maxTextureSize ?? '',
+                            webglInfo.extensionsCount ?? ''
+                        ].join('|');
+                        let hHigh = 0x811c9dc5;
+                        let hLow = 0xcbf29ce4;
+                        for (let i = 0; i < sig.length; i++) {
+                            const b = sig.charCodeAt(i) & 0xff;
+                            hHigh ^= b;
+                            hHigh = Math.imul(hHigh, 0x01000193) >>> 0;
+                            if ((i & 1) === 1) {
+                                hLow ^= b;
+                                hLow = Math.imul(hLow, 0x01000193) >>> 0;
+                            }
+                        }
+                        webglHash =
+                            hHigh.toString(16).padStart(8, '0') +
+                            hLow.toString(16).padStart(8, '0');
+                    }
+                    this.coherenceReport.webglConsistency = this.fingerprintLedger.recordOrVerify({
+                        kind: 'webgl',
+                        url: pageUrl || 'about:blank',
+                        width: 64,
+                        height: 64,
+                        drewText: webglInfo.unmaskedRenderer || webglInfo.renderer || '',
+                        hash: webglHash
+                    });
+                } catch (ledgerErr) {
+                    logger.debug('Could not record webgl hash in fingerprintLedger during auditCoherence', {
+                        profileId: this.profileId,
+                        error: ledgerErr.message
+                    });
+                }
             }
         }
         if (this.trafficRecorder && this.coherenceReport?.telemetry) {

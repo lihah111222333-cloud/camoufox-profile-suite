@@ -1989,6 +1989,32 @@ export class CamoufoxTrafficRecorder {
                     parsedUrl,
                     status
                 });
+
+                if (status === 401 || status === 403 || status === 429 || status >= 500) {
+                    const severity =
+                        status === 429 || status === 403 || status >= 500 ? 'high' : 'medium';
+                    const typeLabel =
+                        status === 429
+                            ? 'http-429-rate-limit'
+                            : status === 403
+                              ? 'http-403-forbidden'
+                              : status === 401
+                                ? 'http-401-unauthorized'
+                                : `http-${status}-server-error`;
+                    this._recordAnomaly({
+                        timestamp: ev.timestamp,
+                        correlationId: ev.correlationId || null,
+                        actionStep: effectiveStepName,
+                        triggerAction: effectiveTrigger,
+                        type: typeLabel,
+                        severity,
+                        method: ev.method || 'GET',
+                        url: ev.url || null,
+                        status,
+                        failureText: statusText || `HTTP ${status}`,
+                        payloadFile: ev.payloadFile || null
+                    });
+                }
             } else if (ev.type === 'request-finished') {
                 const parsedUrl = parseUrlComponents(ev.url || '');
                 const domainBucket = this._ensureDomainRecord(parsedUrl.host);
@@ -2057,17 +2083,24 @@ export class CamoufoxTrafficRecorder {
                         triggerBucket.correlationIdsSet.add(ev.correlationId);
                     }
                 }
+                const failureText = ev.failureText || 'UNKNOWN_NETWORK_FAILURE';
+                const isProxyOrTlsFailure =
+                    /proxy|tunnel|ssl|tls|cert|ns_error_proxy|ns_error_net_timeout|ns_error_connection_refused|timed?\s*out/i.test(
+                        failureText
+                    );
                 this._recordAnomaly({
                     timestamp: ev.timestamp,
                     correlationId: ev.correlationId || null,
                     actionStep: effectiveStepName,
                     triggerAction: effectiveTrigger,
-                    type: 'network-request-failed',
-                    severity: 'high',
+                    type: isProxyOrTlsFailure
+                        ? 'network-proxy-or-tls-failure'
+                        : 'network-request-failed',
+                    severity: isProxyOrTlsFailure ? 'high' : 'medium',
                     method: ev.method || null,
                     url: ev.url || null,
                     status: null,
-                    failureText: ev.failureText || 'UNKNOWN_ERROR'
+                    failureText
                 });
             } else if (ev.type === 'security-block') {
                 this.totals.failedRequests += 1;

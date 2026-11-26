@@ -2037,7 +2037,7 @@ export const PC_GPU_SKU_CATALOG = Object.freeze([
     // --- NVIDIA Desktop GPUs ---
     Object.freeze({
         id: 'NVIDIA GeForce RTX 4090',
-        pattern: /RTX\s*4090/i,
+        pattern: /RTX\s*4090(?!.*\b(?:Laptop|Mobile|Max-Q)\b)/i,
         vendor: 'nvidia',
         pciVendorId: '0x10de',
         angleVendor: 'NVIDIA',
@@ -2054,7 +2054,7 @@ export const PC_GPU_SKU_CATALOG = Object.freeze([
     }),
     Object.freeze({
         id: 'NVIDIA GeForce RTX 4080',
-        pattern: /RTX\s*4080/i,
+        pattern: /RTX\s*4080(?!.*\b(?:Laptop|Mobile|Max-Q)\b)/i,
         vendor: 'nvidia',
         pciVendorId: '0x10de',
         angleVendor: 'NVIDIA',
@@ -2071,7 +2071,7 @@ export const PC_GPU_SKU_CATALOG = Object.freeze([
     }),
     Object.freeze({
         id: 'NVIDIA GeForce RTX 4070',
-        pattern: /RTX\s*4070/i,
+        pattern: /RTX\s*4070(?!.*\b(?:Laptop|Mobile|Max-Q)\b)/i,
         vendor: 'nvidia',
         pciVendorId: '0x10de',
         angleVendor: 'NVIDIA',
@@ -2088,7 +2088,7 @@ export const PC_GPU_SKU_CATALOG = Object.freeze([
     }),
     Object.freeze({
         id: 'NVIDIA GeForce RTX 4060',
-        pattern: /RTX\s*4060/i,
+        pattern: /RTX\s*4060(?!.*\b(?:Laptop|Mobile|Max-Q)\b)/i,
         vendor: 'nvidia',
         pciVendorId: '0x10de',
         angleVendor: 'NVIDIA',
@@ -2105,7 +2105,7 @@ export const PC_GPU_SKU_CATALOG = Object.freeze([
     }),
     Object.freeze({
         id: 'NVIDIA GeForce RTX 3090',
-        pattern: /RTX\s*3090/i,
+        pattern: /RTX\s*3090(?!.*\b(?:Laptop|Mobile|Max-Q)\b)/i,
         vendor: 'nvidia',
         pciVendorId: '0x10de',
         angleVendor: 'NVIDIA',
@@ -2122,7 +2122,7 @@ export const PC_GPU_SKU_CATALOG = Object.freeze([
     }),
     Object.freeze({
         id: 'NVIDIA GeForce RTX 3080',
-        pattern: /RTX\s*3080/i,
+        pattern: /RTX\s*3080(?!.*\b(?:Laptop|Mobile|Max-Q)\b)/i,
         vendor: 'nvidia',
         pciVendorId: '0x10de',
         angleVendor: 'NVIDIA',
@@ -2139,7 +2139,7 @@ export const PC_GPU_SKU_CATALOG = Object.freeze([
     }),
     Object.freeze({
         id: 'NVIDIA GeForce RTX 3070',
-        pattern: /RTX\s*3070/i,
+        pattern: /RTX\s*3070(?!.*\b(?:Laptop|Mobile|Max-Q)\b)/i,
         vendor: 'nvidia',
         pciVendorId: '0x10de',
         angleVendor: 'NVIDIA',
@@ -2156,7 +2156,7 @@ export const PC_GPU_SKU_CATALOG = Object.freeze([
     }),
     Object.freeze({
         id: 'NVIDIA GeForce RTX 3060',
-        pattern: /RTX\s*3060/i,
+        pattern: /RTX\s*3060(?!.*\b(?:Laptop|Mobile|Max-Q)\b)/i,
         vendor: 'nvidia',
         pciVendorId: '0x10de',
         angleVendor: 'NVIDIA',
@@ -3220,11 +3220,11 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
             );
         }
 
-        // Check 4: Desktop CPU vs Mobile-only GPU / Mobile Laptop CPU vs Desktop-only GPU
+        // Check 4: Desktop CPU vs Mobile-only GPU / Mobile Laptop CPU vs Desktop-only or High-TDP Gaming GPU
         if (pcCpuSku.formFactor === 'desktop' && renderer) {
             const isMobileOnlyGpu =
                 pcGpuSku?.formFactor === 'laptop' ||
-                /Laptop\s+GPU|Max-Q|\b(?:610M|660M|680M|740M|760M|780M|880M|890M)\b|Iris\(TM\)\s+Plus\s+Graphics\s+6[45]\d|UHD\s+Graphics\s+620/i.test(
+                /Laptop\s+GPU|\bMobile\b|Max-Q|\b(?:610M|660M|680M|740M|760M|780M|880M|890M|[567]\d00M)\b|Arc\(TM\)\s+1[34]0V|Iris\(TM\)\s+Plus\s+Graphics\s+6[45]\d|UHD\s+Graphics\s+620/i.test(
                     renderer
                 );
             if (isMobileOnlyGpu) {
@@ -3235,6 +3235,14 @@ export function validateHardwareModelSpec(telemetry, targetOs = null) {
         } else if (pcCpuSku.formFactor === 'mobile-ultrabook' && pcGpuSku?.formFactor === 'desktop') {
             issues.push(
                 `Low-power Ultrabook CPU SKU "${pcCpuSku.model}" cannot be paired with full-size desktop discrete GPU "${renderer}"`
+            );
+        } else if (
+            pcCpuSku.formFactor === 'mobile-ultrabook' &&
+            ((pcGpuSku?.formFactor === 'laptop' && pcGpuSku?.isIntegrated === false) ||
+                /RTX\s*(?:30[6789]0|40[56789]0)/i.test(renderer))
+        ) {
+            issues.push(
+                `Low-power Ultrabook CPU SKU "${pcCpuSku.model}" (15W-28W U/P/V-series) cannot be paired with high-TDP gaming laptop discrete GPU "${renderer}"`
             );
         } else if (pcCpuSku.formFactor === 'mobile-h' && pcGpuSku?.formFactor === 'desktop') {
             issues.push(

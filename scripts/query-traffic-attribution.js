@@ -440,7 +440,13 @@ function recordMatchesFilters(
     }
 
     if (filters.status !== null && filters.status !== undefined && filters.status !== '') {
-        let statusCandidate = record.status;
+        let statusCandidate =
+            record.status !== null && record.status !== undefined
+                ? record.status
+                : record.type === 'security-block' ||
+                    (typeof record.type === 'string' && record.type.startsWith('security-block:'))
+                  ? 0
+                  : null;
         if (
             (statusCandidate === null || statusCandidate === undefined) &&
             useTransactionStatusFallback &&
@@ -1502,6 +1508,8 @@ export function queryProfileTraffic(options = {}) {
         if (!ev || !ev.correlationId) continue;
         if (typeof ev.status === 'number') {
             txStatusByCorrelation.set(ev.correlationId, ev.status);
+        } else if (ev.type === 'security-block' && !txStatusByCorrelation.has(ev.correlationId)) {
+            txStatusByCorrelation.set(ev.correlationId, 0);
         }
         const trig = extractTriggerAction(ev);
         if (trig && !txTriggerByCorrelation.has(ev.correlationId)) {

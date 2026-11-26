@@ -1072,16 +1072,384 @@ export function resolveGeoCoordinatesWithDeterministicJitter(profileId = 'defaul
  *   detach: () => Promise<void>
  * }>}
  */
+/**
+ * Sanitize a WebRTC `RTCConfiguration` object by stripping localhost, loopback, link-local,
+ * and private-LAN `stun:` / `stuns:` / `turn:` / `turns:` ICE server URLs before Gecko's
+ * C++ `nICEr` stack can open UDP/TCP port-scan sockets.
+ *
+ * Supports `urls: string`, `urls: string[]`, and legacy `url: string` per W3C WebRTC spec.
+ *
+ * @param {object} rtcConfig
+ * @param {{
+ *   profileId?: string,
+ *   initiatorUrl?: string | null,
+ *   enabled?: boolean,
+ *   allowedPorts?: number[],
+ *   allowSameOriginLocalDev?: boolean,
+ *   allowedExtensionIds?: string[],
+ *   onBlockedAttempt?: (event: object) => void
+ * }} [options]
+ * @returns {object}
+ */
+export function sanitizeRtcConfigurationIceServers(rtcConfig, options = {}) {
+    if (!rtcConfig || typeof rtcConfig !== 'object') {
+        return rtcConfig;
+    }
+    const enabled = options.enabled !== undefined ? Boolean(options.enabled) : true;
+    if (!enabled || !Array.isArray(rtcConfig.iceServers)) {
+        return { ...rtcConfig };
+    }
+
+    const profileId = String(options.profileId || 'default-profile');
+    const initiatorUrl = options.initiatorUrl || null;
+    const blockedProbes = [];
+
+    const checkIceCandidateUrl = (rawUrl) => {
+        if (typeof rawUrl !== 'string' || !rawUrl.trim()) {
+            return false;
+        }
+        const schemeEval = evaluateInternalSchemeAccess(rawUrl, {
+            allowedExtensionIds: options.allowedExtensionIds
+        });
+        if (schemeEval.shouldBlock) {
+            const ev = {
+                type: 'internal-scheme-probe',
+                timestamp: new Date().toISOString(),
+                profileId,
+                initiatorUrl,
+                targetUrl: rawUrl,
+                method: 'ICE',
+                resourceType: 'webrtc',
+                matchedScheme: schemeEval.matchedScheme,
+                reason: schemeEval.reason
+            };
+            blockedProbes.push(ev);
+            if (typeof options.onBlockedAttempt === 'function') {
+                try {
+                    options.onBlockedAttempt(ev);
+                } catch {}
+            }
+            return false;
+        }
+
+        const portEval = evaluatePortScanRequest(rawUrl, {
+            initiatorUrl,
+            enabled: true,
+            allowedPorts: options.allowedPorts || [],
+            allowSameOriginLocalDev: options.allowSameOriginLocalDev ?? false
+        });
+        if (portEval.shouldBlock) {
+            const ev = {
+                type: 'local-port-scan-probe',
+                timestamp: new Date().toISOString(),
+                profileId,
+                initiatorUrl,
+                targetUrl: rawUrl,
+                method: 'ICE',
+                resourceType: 'webrtc',
+                host: portEval.host,
+                port: portEval.port,
+                scope: portEval.scope,
+                service: portEval.service,
+                category: portEval.category,
+                severity: portEval.severity,
+                reason: portEval.reason
+            };
+            blockedProbes.push(ev);
+            if (typeof options.onBlockedAttempt === 'function') {
+                try {
+                    options.onBlockedAttempt(ev);
+                } catch {}
+            }
+            return false;
+        }
+
+        return true;
+    };
+
+    const sanitizedIceServers = [];
+    for (const server of rtcConfig.iceServers) {
+        if (!server || typeof server !== 'object') {
+            continue;
+        }
+        const nextServer = { ...server };
+
+        if (Array.isArray(server.urls)) {
+            const keptUrls = server.urls.filter((u) => typeof u === 'string' && checkIceCandidateUrl(u));
+            if (keptUrls.length > 0) {
+                nextServer.urls = keptUrls;
+            } else {
+                delete nextServer.urls;
+            }
+        } else if (typeof server.urls === 'string') {
+            if (checkIceCandidateUrl(server.urls)) {
+                nextServer.urls = server.urls;
+            } else {
+                delete nextServer.urls;
+            }
+        }
+
+        if (typeof server.url === 'string') {
+            if (checkIceCandidateUrl(server.url)) {
+                nextServer.url = server.url;
+            } else {
+                delete nextServer.url;
+            }
+        }
+
+        const hasValidUrls =
+            Array.isArray(nextServer.urls)
+                ? nextServer.urls.length > 0
+                : typeof nextServer.urls === 'string' && nextServer.urls.length > 0;
+        const hasValidUrl = typeof nextServer.url === 'string' && nextServer.url.length > 0;
+
+        if (hasValidUrls || hasValidUrl) {
+            sanitizedIceServers.push(nextServer);
+        }
+    }
+
+    const sanitizedConfig = {
+        ...rtcConfig,
+        iceServers: sanitizedIceServers
+    };
+    Object.defineProperty(sanitizedConfig, 'blockedProbes', {
+        value: blockedProbes,
+        enumerable: false,
+        configurable: true
+    });
+    return sanitizedConfig;
+}
+
+/**
+ * Build a self-contained in-browser initialization script that wraps `RTCPeerConnection`
+ * and `RTCPeerConnection.prototype.setConfiguration` with `Function.prototype.toString`
+ * cloaking so local/private `stun:`/`stuns:`/`turn:`/`turns:` ICE server probes are stripped
+ * before Gecko's C++ `nICEr` stack opens local UDP/TCP sockets.
+ *
+ * @param {{
+ *   profileId?: string,
+ *   enabled?: boolean,
+ *   allowedPorts?: number[],
+ *   allowSameOriginLocalDev?: boolean
+ * }} [options]
+ * @returns {string}
+ */
+export function buildZiniaoWebRtcSecurityInitScript(options = {}) {
+    const cfgPayload = JSON.stringify({
+        profileId: String(options.profileId || 'default-profile'),
+        enabled: options.enabled !== undefined ? Boolean(options.enabled) : true,
+        allowedPorts: Array.isArray(options.allowedPorts)
+            ? options.allowedPorts.map(Number).filter(Number.isFinite)
+            : [],
+        allowSameOriginLocalDev: Boolean(options.allowSameOriginLocalDev)
+    });
+
+    return `(() => {
+    'use strict';
+    const CFG = ${cfgPayload};
+    if (!CFG.enabled) return;
+
+    const allowedPortSet = new Set(CFG.allowedPorts || []);
+    const nativeToString = Function.prototype.toString;
+    const cloakedFns = new WeakMap();
+
+    const createNativeMethodWrapper = (methodName, impl) =>
+        ({
+            [methodName](...args) {
+                return impl.apply(this, args);
+            }
+        })[methodName];
+
+    const cloak = (wrappedFn, origFn) => {
+        try {
+            const nameDesc = Object.getOwnPropertyDescriptor(origFn, 'name');
+            if (nameDesc) Object.defineProperty(wrappedFn, 'name', nameDesc);
+            const lenDesc = Object.getOwnPropertyDescriptor(origFn, 'length');
+            if (lenDesc) Object.defineProperty(wrappedFn, 'length', lenDesc);
+            const src = cloakedFns.has(origFn) ? cloakedFns.get(origFn) : nativeToString.call(origFn);
+            cloakedFns.set(wrappedFn, src);
+        } catch {}
+        return wrappedFn;
+    };
+
+    const defineCloakedMethod = (targetObj, propName, wrappedFn, origFn) => {
+        if (!targetObj) return;
+        const origDesc = Object.getOwnPropertyDescriptor(targetObj, propName);
+        cloak(wrappedFn, origFn);
+        Object.defineProperty(targetObj, propName, {
+            value: wrappedFn,
+            writable: origDesc ? Boolean(origDesc.writable) : true,
+            enumerable: origDesc ? Boolean(origDesc.enumerable) : false,
+            configurable: origDesc ? Boolean(origDesc.configurable) : true
+        });
+    };
+
+    const isLocalOrPrivateHost = (rawHost) => {
+        if (!rawHost || typeof rawHost !== 'string') return false;
+        let host = rawHost
+            .replace(/^[\\u0000-\\u0020]+|[\\u0000-\\u0020]+$/g, '')
+            .replace(/[\\t\\r\\n]/g, '')
+            .toLowerCase()
+            .replace(/^\\[|\\]$/g, '')
+            .replace(/%.*$/, '')
+            .replace(/\\.+$/, '');
+        if (!host) return false;
+        if (host === '::1' || host === '::' || host === 'localhost' || host.endsWith('.localhost') || host === 'ip6-localhost' || host === 'ip6-loopback') {
+            return true;
+        }
+        if (host === 'local' || host === 'lan' || host === 'internal' || host.endsWith('.local') || host.endsWith('.lan') || host.endsWith('.internal') || host.endsWith('.home.arpa') || host.endsWith('.svc') || host.endsWith('.nip.io') || host.endsWith('.sslip.io') || host === 'localtest.me' || host.endsWith('.localtest.me') || host === 'lvh.me' || host.endsWith('.lvh.me')) {
+            return true;
+        }
+        if (/^fe[89ab][0-9a-f]:/i.test(host) || /^(?:fc|fd)[0-9a-f]{2}:/i.test(host) || /^2002:/i.test(host) || /^64:ff9b:/i.test(host) || /ffff:/i.test(host)) {
+            return true;
+        }
+        const ipv4 = host.match(/^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$/);
+        if (ipv4) {
+            const a = Number(ipv4[1]);
+            const b = Number(ipv4[2]);
+            if (a === 127 || a === 0 || (a === 169 && b === 254) || a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) || (a === 100 && b >= 64 && b <= 127) || (a === 198 && (b === 18 || b === 19))) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    const shouldAllowIceUrl = (rawUrl) => {
+        if (typeof rawUrl !== 'string') return false;
+        let cleaned = rawUrl.replace(/^[\\u0000-\\u0020]+|[\\u0000-\\u0020]+$/g, '').replace(/[\\t\\r\\n]/g, '');
+        if (!cleaned) return false;
+        let proto = 'stun:';
+        let normalized = cleaned;
+        if (/^(?:stuns?|turns?):/i.test(normalized)) {
+            proto = normalized.split(':')[0].toLowerCase() + ':';
+            normalized = 'http://' + normalized.replace(/^(?:stuns?|turns?):(?:\\/\\/)?/i, '');
+        }
+        let host = '';
+        let port = proto === 'stuns:' || proto === 'turns:' ? 5349 : 3478;
+        if (typeof URL === 'function') {
+            try {
+                const parsed = new URL(normalized);
+                host = parsed.hostname.replace(/^\\[|\\]$/g, '');
+                if (parsed.port) port = Number(parsed.port);
+            } catch {
+                return false;
+            }
+        }
+        if (!isLocalOrPrivateHost(host)) return true;
+        if (allowedPortSet.has(port)) return true;
+        return false;
+    };
+
+    const sanitizeRtcConfig = (rtcConfig) => {
+        if (!rtcConfig || typeof rtcConfig !== 'object' || !Array.isArray(rtcConfig.iceServers)) {
+            return rtcConfig;
+        }
+        const sanitizedServers = [];
+        for (const server of rtcConfig.iceServers) {
+            if (!server || typeof server !== 'object') continue;
+            const nextServer = { ...server };
+            if (Array.isArray(server.urls)) {
+                const kept = server.urls.filter((u) => typeof u === 'string' && shouldAllowIceUrl(u));
+                if (kept.length > 0) nextServer.urls = kept;
+                else delete nextServer.urls;
+            } else if (typeof server.urls === 'string') {
+                if (shouldAllowIceUrl(server.urls)) nextServer.urls = server.urls;
+                else delete nextServer.urls;
+            }
+            if (typeof server.url === 'string') {
+                if (shouldAllowIceUrl(server.url)) nextServer.url = server.url;
+                else delete nextServer.url;
+            }
+            const hasUrls = Array.isArray(nextServer.urls) ? nextServer.urls.length > 0 : typeof nextServer.urls === 'string' && nextServer.urls.length > 0;
+            const hasUrl = typeof nextServer.url === 'string' && nextServer.url.length > 0;
+            if (hasUrls || hasUrl) sanitizedServers.push(nextServer);
+        }
+        return { ...rtcConfig, iceServers: sanitizedServers };
+    };
+
+    if (typeof Function !== 'undefined' && Function.prototype && typeof Function.prototype.toString === 'function') {
+        const origToStr = Function.prototype.toString;
+        const patchedToStr = createNativeMethodWrapper('toString', function () {
+            if (typeof this === 'function' && cloakedFns.has(this)) {
+                return cloakedFns.get(this);
+            }
+            return origToStr.call(this);
+        });
+        defineCloakedMethod(Function.prototype, 'toString', patchedToStr, origToStr);
+    }
+
+    for (const ctorName of ['RTCPeerConnection', 'mozRTCPeerConnection', 'webkitRTCPeerConnection']) {
+        const OrigRTC = globalThis[ctorName];
+        if (typeof OrigRTC !== 'function') continue;
+
+        if (OrigRTC.prototype && typeof OrigRTC.prototype.setConfiguration === 'function') {
+            const origSetConfig = OrigRTC.prototype.setConfiguration;
+            const wrappedSetConfig = createNativeMethodWrapper('setConfiguration', function (...args) {
+                if (args.length > 0 && args[0] && typeof args[0] === 'object') {
+                    const nextArgs = [...args];
+                    nextArgs[0] = sanitizeRtcConfig(args[0]);
+                    return origSetConfig.apply(this, nextArgs);
+                }
+                return origSetConfig.apply(this, args);
+            });
+            defineCloakedMethod(OrigRTC.prototype, 'setConfiguration', wrappedSetConfig, origSetConfig);
+        }
+
+        const ProxiedRTC = new Proxy(OrigRTC, {
+            construct(target, args, newTarget) {
+                if (args.length > 0 && args[0] && typeof args[0] === 'object') {
+                    const nextArgs = [...args];
+                    nextArgs[0] = sanitizeRtcConfig(args[0]);
+                    return Reflect.construct(target, nextArgs, newTarget);
+                }
+                return Reflect.construct(target, args, newTarget);
+            },
+            apply(target, thisArg, args) {
+                return Reflect.apply(target, thisArg, args);
+            }
+        });
+        cloakedFns.set(ProxiedRTC, nativeToString.call(OrigRTC));
+        if (OrigRTC.prototype) {
+            Object.defineProperty(OrigRTC.prototype, 'constructor', {
+                value: ProxiedRTC,
+                writable: true,
+                enumerable: false,
+                configurable: true
+            });
+        }
+        Object.defineProperty(globalThis, ctorName, {
+            value: ProxiedRTC,
+            writable: true,
+            enumerable: false,
+            configurable: true
+        });
+    }
+})();`;
+}
+
 export async function attachZiniaoSecurityGuardsToContext(context, options = {}) {
     const blockedPortScans = [];
     const blockedInternalSchemes = [];
     const profileId = String(options.profileId || 'default-profile');
     const portProtOpts = options.portScanProtection || {};
+    let webrtcInitScriptAttached = false;
+
+    if (context && typeof context.addInitScript === 'function' && portProtOpts.enabled !== false) {
+        const webrtcInitScript = buildZiniaoWebRtcSecurityInitScript({
+            profileId,
+            enabled: true,
+            allowedPorts: portProtOpts.allowedPorts || [],
+            allowSameOriginLocalDev: portProtOpts.allowSameOriginLocalDev ?? false
+        });
+        await context.addInitScript(webrtcInitScript);
+        webrtcInitScriptAttached = true;
+    }
 
     const getStats = () => ({
         profileId,
         portScanProtectionEnabled:
             portProtOpts.enabled !== undefined ? Boolean(portProtOpts.enabled) : true,
+        webrtcInitScriptAttached,
         blockedPortScanCount: blockedPortScans.length,
         blockedInternalSchemeCount: blockedInternalSchemes.length,
         blockedPortScans: [...blockedPortScans],
@@ -1211,5 +1579,7 @@ export default {
     CanvasWebglConsistencyLedger,
     validateOsAndBrowserVersionMatch,
     resolveGeoCoordinatesWithDeterministicJitter,
+    sanitizeRtcConfigurationIceServers,
+    buildZiniaoWebRtcSecurityInitScript,
     attachZiniaoSecurityGuardsToContext
 };

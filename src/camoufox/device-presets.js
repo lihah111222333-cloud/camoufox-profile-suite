@@ -44,6 +44,8 @@ import {
     CanvasWebglConsistencyLedger,
     validateOsAndBrowserVersionMatch,
     resolveGeoCoordinatesWithDeterministicJitter,
+    sanitizeRtcConfigurationIceServers,
+    buildZiniaoWebRtcSecurityInitScript,
     attachZiniaoSecurityGuardsToContext
 } from './ziniao-security.js';
 import {
@@ -73,6 +75,8 @@ export {
     CanvasWebglConsistencyLedger,
     validateOsAndBrowserVersionMatch,
     resolveGeoCoordinatesWithDeterministicJitter,
+    sanitizeRtcConfigurationIceServers,
+    buildZiniaoWebRtcSecurityInitScript,
     attachZiniaoSecurityGuardsToContext,
     GPU_PERFORMANCE_SPEC_CATALOG,
     lookupGpuPerformanceSpec,
@@ -1839,7 +1843,11 @@ export function resolveDeterministicDeviceProfile(profileId = 'camoufox-profile-
     const webgpuObj = {
         available: preset.webgpuAvailable !== undefined ? preset.webgpuAvailable : normOs !== 'linux',
         requestAdapterNative: true,
-        adapterInfo: preset.webgl.GPUAdapterInfo
+        adapterInfo: preset.webgl.GPUAdapterInfo,
+        limits: {
+            maxBufferSize: gpuPerformance.targetGpuSpec.webgpuMaxBufferSize,
+            maxComputeWorkgroupSizeX: gpuPerformance.targetGpuSpec.webgpuMaxComputeWorkgroupSizeX
+        }
     };
 
     const hardwareProfile = {
@@ -2345,6 +2353,12 @@ export function sanitizeAdsPowerProfileToCoherentPreset(rawAdsPowerProfile = {})
             profileId
         });
         healedProfile.telemetry.gpuPerformance = healedProfile.gpuPerformance;
+        healedProfile.telemetry.webgpu.limits = {
+            maxBufferSize: healedProfile.gpuPerformance.targetGpuSpec.webgpuMaxBufferSize,
+            maxComputeWorkgroupSizeX:
+                healedProfile.gpuPerformance.targetGpuSpec.webgpuMaxComputeWorkgroupSizeX
+        };
+        healedProfile.webgpu = healedProfile.telemetry.webgpu;
 
         return {
             healedPresetId: healedProfile.presetId,

@@ -57,6 +57,8 @@ import {
     CanvasWebglConsistencyLedger,
     validateOsAndBrowserVersionMatch,
     resolveGeoCoordinatesWithDeterministicJitter,
+    sanitizeRtcConfigurationIceServers,
+    buildZiniaoWebRtcSecurityInitScript,
     attachZiniaoSecurityGuardsToContext,
     GPU_PERFORMANCE_SPEC_CATALOG,
     lookupGpuPerformanceSpec,
@@ -115,6 +117,8 @@ export {
     CanvasWebglConsistencyLedger,
     validateOsAndBrowserVersionMatch,
     resolveGeoCoordinatesWithDeterministicJitter,
+    sanitizeRtcConfigurationIceServers,
+    buildZiniaoWebRtcSecurityInitScript,
     attachZiniaoSecurityGuardsToContext,
     GPU_PERFORMANCE_SPEC_CATALOG,
     lookupGpuPerformanceSpec,
@@ -840,6 +844,12 @@ export async function collectBrowserFingerprint(page) {
                 if (!cw || !cw.navigator || !cw.screen) {
                     return { ok: false, error: 'iframe.contentWindow or navigator/screen unavailable' };
                 }
+                const ifrFnToString =
+                    cw.Function &&
+                    cw.Function.prototype &&
+                    typeof cw.Function.prototype.toString === 'function'
+                        ? cw.Function.prototype.toString
+                        : fnToString;
                 const ifrNav = cw.navigator;
                 const ifrScr = cw.screen;
                 const ifrNavProto = Object.getPrototypeOf(ifrNav);
@@ -852,13 +862,56 @@ export async function collectBrowserFingerprint(page) {
                 const userAgentGetterNative = Boolean(
                     uaGetterDesc &&
                         typeof uaGetterDesc.get === 'function' &&
-                        nativeCodeRegex.test(fnToString.call(uaGetterDesc.get))
+                        nativeCodeRegex.test(ifrFnToString.call(uaGetterDesc.get))
                 );
                 const webdriverGetterNative = Boolean(
                     wdGetterDesc &&
                         typeof wdGetterDesc.get === 'function' &&
-                        nativeCodeRegex.test(fnToString.call(wdGetterDesc.get))
+                        nativeCodeRegex.test(ifrFnToString.call(wdGetterDesc.get))
                 );
+                let crossRealmToStringNative = true;
+                try {
+                    const parentTargets = [
+                        typeof Function !== 'undefined' && Function.prototype
+                            ? Function.prototype.toString
+                            : null,
+                        typeof Performance !== 'undefined' && Performance.prototype
+                            ? Performance.prototype.now
+                            : null,
+                        typeof Date !== 'undefined' ? Date.now : null,
+                        typeof WebGLRenderingContext !== 'undefined' && WebGLRenderingContext.prototype
+                            ? WebGLRenderingContext.prototype.readPixels
+                            : null
+                    ].filter((fn) => typeof fn === 'function');
+                    crossRealmToStringNative = parentTargets.every((fn) =>
+                        nativeCodeRegex.test(ifrFnToString.call(fn))
+                    );
+                } catch {
+                    crossRealmToStringNative = false;
+                }
+                let cwPerformanceNowNative = true;
+                let performanceNowDriftMs = 0;
+                try {
+                    if (
+                        cw.Performance &&
+                        cw.Performance.prototype &&
+                        typeof cw.Performance.prototype.now === 'function'
+                    ) {
+                        cwPerformanceNowNative = nativeCodeRegex.test(
+                            ifrFnToString.call(cw.Performance.prototype.now)
+                        );
+                    }
+                    if (
+                        cw.performance &&
+                        typeof cw.performance.now === 'function' &&
+                        typeof performance !== 'undefined' &&
+                        typeof performance.now === 'function'
+                    ) {
+                        const mainNow = performance.now();
+                        const ifrNow = cw.performance.now();
+                        performanceNowDriftMs = Math.abs(ifrNow - mainNow);
+                    }
+                } catch {}
                 return {
                     ok: true,
                     userAgent: ifrNav.userAgent,
@@ -873,7 +926,10 @@ export async function collectBrowserFingerprint(page) {
                     colorDepth: ifrScr.colorDepth,
                     pixelDepth: ifrScr.pixelDepth,
                     userAgentGetterNative,
-                    webdriverGetterNative
+                    webdriverGetterNative,
+                    crossRealmToStringNative,
+                    cwPerformanceNowNative,
+                    performanceNowDriftMs
                 };
             } catch (err) {
                 return { ok: false, error: String(err) };
@@ -1834,6 +1890,24 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
                 if (iframeParity.webdriverGetterNative === false) {
                     issues.push('iframe Navigator.prototype.webdriver getter is not [native code]');
                 }
+                if (iframeParity.crossRealmToStringNative === false) {
+                    issues.push(
+                        'iframe cross-realm Function.prototype.toString leaked non-native wrapper source on parent window methods'
+                    );
+                }
+                if (iframeParity.cwPerformanceNowNative === false) {
+                    issues.push('iframe Performance.prototype.now is not [native code]');
+                }
+                if (
+                    iframeParity.performanceNowDriftMs !== undefined &&
+                    iframeParity.performanceNowDriftMs !== null &&
+                    (!Number.isFinite(Number(iframeParity.performanceNowDriftMs)) ||
+                        Number(iframeParity.performanceNowDriftMs) > 25)
+                ) {
+                    issues.push(
+                        `iframe performance.now() desynchronized from main window by ${Number(iframeParity.performanceNowDriftMs).toFixed(2)}ms`
+                    );
+                }
             }
         }
 
@@ -2540,6 +2614,8 @@ export default {
     CanvasWebglConsistencyLedger,
     validateOsAndBrowserVersionMatch,
     resolveGeoCoordinatesWithDeterministicJitter,
+    sanitizeRtcConfigurationIceServers,
+    buildZiniaoWebRtcSecurityInitScript,
     attachZiniaoSecurityGuardsToContext,
     GPU_PERFORMANCE_SPEC_CATALOG,
     lookupGpuPerformanceSpec,

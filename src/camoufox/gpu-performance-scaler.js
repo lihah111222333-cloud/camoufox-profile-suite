@@ -1303,12 +1303,35 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
     const nativeToString = Function.prototype.toString;
     const cloakedFns = new WeakMap();
 
+    const sanitizeThrownError = (err) => {
+        try {
+            if (!err || (typeof err !== 'object' && typeof err !== 'function') || typeof err.stack !== 'string') {
+                return err;
+            }
+            const rawLines = err.stack.split('\\n');
+            const internalPattern =
+                /sanitizeThrownError|createNative(?:Method|Getter)Wrapper|defineCloaked(?:Method|Getter)|patched(?:ToString|PerfNow|DateNow)|iframePatched(?:ToString|PerfNow|DateNow)|wrapped(?:Raf|Draw|Flush|Finish|WaitSync|ReadPixels|BeginQuery|GetQueryParam|GetExt|BeginExt|QueryCounter|GetQueryObj|ExtDraw|ToDataURL|ToBlob|ConvertToBlob|WorkDone|MapAsync|Getter)|hookSameOriginIframeRealm|advanceVirtualClock/i;
+            const cleanedLines = rawLines.filter((line) => !internalPattern.test(line));
+            Object.defineProperty(err, 'stack', {
+                value: cleanedLines.join('\\n'),
+                writable: true,
+                enumerable: false,
+                configurable: true
+            });
+        } catch {}
+        return err;
+    };
+
     // Concise method syntax produces non-constructor functions with no own .prototype property
     // ('prototype' in fn === false, new fn() throws TypeError), matching native C++ WebIDL methods.
     const createNativeMethodWrapper = (methodName, impl) =>
         ({
             [methodName](...args) {
-                return impl.apply(this, args);
+                try {
+                    return impl.apply(this, args);
+                } catch (err) {
+                    throw sanitizeThrownError(err);
+                }
             }
         })[methodName];
 
@@ -1316,7 +1339,11 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
         Object.getOwnPropertyDescriptor(
             {
                 get [propName]() {
-                    return impl.call(this);
+                    try {
+                        return impl.call(this);
+                    } catch (err) {
+                        throw sanitizeThrownError(err);
+                    }
                 }
             },
             propName
@@ -1324,6 +1351,10 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
 
     const cloak = (wrappedFn, origFn) => {
         try {
+            const origProto = Object.getPrototypeOf(origFn);
+            if (origProto && Object.getPrototypeOf(wrappedFn) !== origProto) {
+                Object.setPrototypeOf(wrappedFn, origProto);
+            }
             const nameDesc = Object.getOwnPropertyDescriptor(origFn, 'name');
             if (nameDesc) {
                 Object.defineProperty(wrappedFn, 'name', nameDesc);
@@ -1557,9 +1588,10 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                 const origDraw = proto[drawMethod];
                 const wrappedDraw = createNativeMethodWrapper(drawMethod, function (...args) {
                     advanceVirtualClock();
+                    const res = origDraw.apply(this, args);
                     activeGpuBurstMode = 'shader';
                     gpuBurstPendingDrawCalls += 1;
-                    return origDraw.apply(this, args);
+                    return res;
                 });
                 defineCloakedMethod(proto, drawMethod, wrappedDraw, origDraw);
             }
@@ -1569,10 +1601,11 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
             const origFlush = proto.flush;
             const wrappedFlush = createNativeMethodWrapper('flush', function (...args) {
                 advanceVirtualClock();
+                const res = origFlush.apply(this, args);
                 if (gpuBurstPendingDrawCalls > 0) {
                     activeGpuBurstMode = 'shader';
                 }
-                return origFlush.apply(this, args);
+                return res;
             });
             defineCloakedMethod(proto, 'flush', wrappedFlush, origFlush);
         }
@@ -1581,12 +1614,18 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
             const origFinish = proto.finish;
             const wrappedFinish = createNativeMethodWrapper('finish', function (...args) {
                 advanceVirtualClock();
+                const prevMode = activeGpuBurstMode;
                 activeGpuBurstMode = 'shader';
-                const res = origFinish.apply(this, args);
-                advanceVirtualClock();
-                gpuBurstPendingDrawCalls = 0;
-                activeGpuBurstMode = null;
-                return res;
+                try {
+                    const res = origFinish.apply(this, args);
+                    advanceVirtualClock();
+                    gpuBurstPendingDrawCalls = 0;
+                    activeGpuBurstMode = null;
+                    return res;
+                } catch (err) {
+                    activeGpuBurstMode = prevMode;
+                    throw err;
+                }
             });
             defineCloakedMethod(proto, 'finish', wrappedFinish, origFinish);
         }
@@ -1595,12 +1634,18 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
             const origWaitSync = proto.clientWaitSync;
             const wrappedWaitSync = createNativeMethodWrapper('clientWaitSync', function (...args) {
                 advanceVirtualClock();
+                const prevMode = activeGpuBurstMode;
                 activeGpuBurstMode = 'shader';
-                const res = origWaitSync.apply(this, args);
-                advanceVirtualClock();
-                gpuBurstPendingDrawCalls = 0;
-                activeGpuBurstMode = null;
-                return res;
+                try {
+                    const res = origWaitSync.apply(this, args);
+                    advanceVirtualClock();
+                    gpuBurstPendingDrawCalls = 0;
+                    activeGpuBurstMode = null;
+                    return res;
+                } catch (err) {
+                    activeGpuBurstMode = prevMode;
+                    throw err;
+                }
             });
             defineCloakedMethod(proto, 'clientWaitSync', wrappedWaitSync, origWaitSync);
         }
@@ -1609,12 +1654,18 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
             const origReadPixels = proto.readPixels;
             const wrappedReadPixels = createNativeMethodWrapper('readPixels', function (...args) {
                 advanceVirtualClock();
+                const prevMode = activeGpuBurstMode;
                 activeGpuBurstMode = gpuBurstPendingDrawCalls > 0 ? 'shader' : 'readPixels';
-                const res = origReadPixels.apply(this, args);
-                advanceVirtualClock();
-                gpuBurstPendingDrawCalls = 0;
-                activeGpuBurstMode = null;
-                return res;
+                try {
+                    const res = origReadPixels.apply(this, args);
+                    advanceVirtualClock();
+                    gpuBurstPendingDrawCalls = 0;
+                    activeGpuBurstMode = null;
+                    return res;
+                } catch (err) {
+                    activeGpuBurstMode = prevMode;
+                    throw err;
+                }
             });
             defineCloakedMethod(proto, 'readPixels', wrappedReadPixels, origReadPixels);
         }
@@ -1906,7 +1957,23 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
                 defineCloakedMethod(win.Performance.prototype, 'now', iframePatchedPerfNow, iframeOrigPerfNow);
             }
             if (win.Date && typeof win.Date.now === 'function') {
-                defineCloakedMethod(win.Date, 'now', patchedDateNow, win.Date.now);
+                const iframeOrigDateNow = win.Date.now;
+                const iframePatchedDateNow = createNativeMethodWrapper('now', function () {
+                    return patchedDateNow();
+                });
+                defineCloakedMethod(win.Date, 'now', iframePatchedDateNow, iframeOrigDateNow);
+            }
+            if (win.GPUSupportedLimits && win.GPUSupportedLimits.prototype) {
+                defineCloakedGetter(
+                    win.GPUSupportedLimits.prototype,
+                    'maxBufferSize',
+                    () => CFG.webgpuMaxBufferSize
+                );
+                defineCloakedGetter(
+                    win.GPUSupportedLimits.prototype,
+                    'maxComputeWorkgroupSizeX',
+                    () => CFG.webgpuMaxComputeWorkgroupSizeX
+                );
             }
             if (win.WebGLRenderingContext && win.WebGLRenderingContext.prototype) {
                 hookWebGLPrototype(win.WebGLRenderingContext.prototype);
@@ -1920,6 +1987,12 @@ export function buildGpuPerformanceInitScript(scalingWeights) {
     if (typeof HTMLIFrameElement !== 'undefined' && HTMLIFrameElement.prototype) {
         defineCloakedGetter(HTMLIFrameElement.prototype, 'contentWindow', function (cw) {
             return hookSameOriginIframeRealm(cw);
+        });
+        defineCloakedGetter(HTMLIFrameElement.prototype, 'contentDocument', function (cd) {
+            if (cd && cd.defaultView) {
+                hookSameOriginIframeRealm(cd.defaultView);
+            }
+            return cd;
         });
     }
 })();`;
@@ -2096,6 +2169,37 @@ export function validateGpuPerformanceScalingCoherence(telemetry) {
                 `GPU computeTimeMultiplier mismatch for "${targetSpec.model}": reported ${reportedMult} vs expected ${expectedMult} (host ${hostBase.hostFp32Tflops} TFLOPS / target ${targetSpec.fp32Tflops} TFLOPS)`
             );
         }
+    }
+
+    // 5. Verify WebGPU GPUSupportedLimits (maxBufferSize, maxComputeWorkgroupSizeX) match target GPU SKU
+    const reportedMaxBuf =
+        telemetry.webgpu?.limits?.maxBufferSize ??
+        inBrowserState?.webgpuMaxBufferSize ??
+        activePerf.webgpuMaxBufferSize;
+    if (
+        reportedMaxBuf !== undefined &&
+        reportedMaxBuf !== null &&
+        targetSpec.webgpuMaxBufferSize &&
+        Number(reportedMaxBuf) !== targetSpec.webgpuMaxBufferSize
+    ) {
+        issues.push(
+            `WebGPU maxBufferSize mismatch for "${targetSpec.model}": reported ${reportedMaxBuf} vs expected ${targetSpec.webgpuMaxBufferSize}`
+        );
+    }
+
+    const reportedMaxWgX =
+        telemetry.webgpu?.limits?.maxComputeWorkgroupSizeX ??
+        inBrowserState?.webgpuMaxComputeWorkgroupSizeX ??
+        activePerf.webgpuMaxComputeWorkgroupSizeX;
+    if (
+        reportedMaxWgX !== undefined &&
+        reportedMaxWgX !== null &&
+        targetSpec.webgpuMaxComputeWorkgroupSizeX &&
+        Number(reportedMaxWgX) !== targetSpec.webgpuMaxComputeWorkgroupSizeX
+    ) {
+        issues.push(
+            `WebGPU maxComputeWorkgroupSizeX mismatch for "${targetSpec.model}": reported ${reportedMaxWgX} vs expected ${targetSpec.webgpuMaxComputeWorkgroupSizeX}`
+        );
     }
 
     return {
