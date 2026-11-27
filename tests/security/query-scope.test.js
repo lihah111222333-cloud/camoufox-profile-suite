@@ -47,8 +47,8 @@ test('queries, listing, and HAR export use the selected directory ID', { skip: !
 
     const profiles = listTrafficProfiles(profilesDir);
     assert.deepEqual(profiles.map((profile) => profile.profileId).sort(), ['fixture-east', 'fixture-west']);
-    assert.equal(queryProfileTraffic({ profilesDir, profile: 'fixture-west' }).trafficDir, trafficDir);
-    const byLabel = queryProfileTraffic({ profilesDir, profile: 'Old West Profile' });
+    assert.equal(queryProfileTraffic({ profilesDir, profile: 'fixture-west', includeLocalPaths: true }).trafficDir, trafficDir);
+    const byLabel = queryProfileTraffic({ profilesDir, profile: 'Old West Profile', includeLocalPaths: true });
     assert.equal(byLabel.trafficDir, trafficDir);
     assert.equal(byLabel.profileId, 'fixture-west');
     assert.equal(byLabel.session.profileId, 'fixture-west');
@@ -59,7 +59,7 @@ test('queries, listing, and HAR export use the selected directory ID', { skip: !
     assert.equal(archive.entryCount, 1);
 
     const explicitDir = writeProfile(root, 'operator-capture', events);
-    const explicit = queryProfileTraffic({ profilesDir, trafficDir: explicitDir });
+    const explicit = queryProfileTraffic({ profilesDir, trafficDir: explicitDir, includeLocalPaths: true });
     assert.equal(explicit.profileDir, path.join(root, 'operator-capture'));
     assert.equal(explicit.transactionsCount, 1);
 
@@ -124,7 +124,7 @@ test('filtered totals and groups describe selected traffic and omit the unscoped
                 : { status })
         }));
     const trafficDir = writeProfile(profilesDir, 'fixture', [
-        ...transaction('selected', 'reports.example', 'show', '#show', 403),
+        ...transaction('selected', 'reports.example', 'show', '#show', '403'),
         ...transaction('wrong-status', 'reports.example', 'show', '#show', 200),
         ...transaction('wrong-domain', 'excluded.example', 'excluded-step', '#other', 500)
     ]);
@@ -152,6 +152,10 @@ test('filtered totals and groups describe selected traffic and omit the unscoped
     assert.equal(report.byActionStep.show.requests, 1);
     assert.equal(report.byDomain['reports.example'].responses, 1);
     assert.deepEqual(report.byTriggerAction['selected-action'].statusCounts, { 403: 1 });
+    assert.deepEqual(report.events.map(({ type }) => type), ['egress', 'ingress']);
+    assert.equal(report.transactions.length, 1);
+    assert.ok(report.transactions[0].egress);
+    assert.ok(report.transactions[0].ingress);
     assert.equal(report.neckoMozLog, null);
     assert.doesNotMatch(JSON.stringify(report), /excluded|wrong-status/);
     assert.equal(queryProfileTraffic({ ...options, anomaliesOnly: true }).totals.totalRequests, 1);
@@ -374,6 +378,8 @@ test('resumed capture counts and classifies new ledger events before an index re
     assert.equal(stale.totals.totalRequests, 3);
     assert.equal(staleList.totals.totalResponses, 3);
     assert.equal(stale.totals.totalEgressBytes, undefined);
+    assert.equal(stale.byDomain['reports.example'].requests, 3);
+    assert.equal(stale.byActionStep.init.responses, 3);
     assert.deepEqual(anomalies(stale), [
         ['http-401-unauthorized', 'medium'], ['http-500-server-error', 'high'], ['websocket-error', 'medium']
     ]);
@@ -480,4 +486,140 @@ test('the CLI escapes display controls while preserving generated report lines',
     }
     const machine = JSON.parse(run('--profile=fixture', '--correlation=sample-1', '--json'));
     assert.equal(machine.actionStep, 'phase one\nphase two');
+});
+
+test('query filters match archived values and mask them in JSON reports', { skip: !supported }, (t) => {
+    const { profilesDir } = fixture(t);
+    const step = 'Review fixture.operator@example.test';
+    const events = sample('fixture', 'https://reports.example/item').map((event) => ({ ...event, actionStep: step }));
+    writeProfile(profilesDir, 'fixture', events);
+    const run = (...flags) => spawnSync(process.execPath,
+        [cliPath, '--profiles-dir=' + profilesDir, '--profile=fixture', '--step=' + step, '--json', ...flags],
+        { encoding: 'utf8' });
+
+    const ordinary = run();
+    assert.equal(ordinary.status, 0, ordinary.stderr);
+    assert.equal(JSON.parse(ordinary.stdout).eventsCount, 2);
+    assert.equal(JSON.parse(ordinary.stdout).filters.step, 'Review [REDACTED]');
+    assert.doesNotMatch(ordinary.stdout, /fixture\.operator@example\.test/);
+    const anomalyReport = run('--anomalies-only');
+    assert.equal(anomalyReport.status, 0, anomalyReport.stderr);
+    assert.equal(JSON.parse(anomalyReport.stdout).count, 1);
+    assert.doesNotMatch(anomalyReport.stdout, /fixture\.operator@example\.test/);
+});
+
+test('wire queries reject damaged ledger records and accept a complete final record without a newline', { skip: !supported }, (t) => {
+    const { profilesDir } = fixture(t);
+    const events = sample('fixture-item', 'https://reports.example/item');
+    const trafficDir = writeProfile(profilesDir, 'fixture', events);
+    const ledger = path.join(trafficDir, 'traffic.ndjson');
+    const rows = events.map((event) => JSON.stringify(event));
+    const args = [cliPath, '--profiles-dir=' + profilesDir, '--profile=fixture', '--correlation=fixture-item', '--json'];
+    const run = () => spawnSync(process.execPath, args, { encoding: 'utf8' });
+    for (const [badRow, explanation] of [['{"type":', 'Invalid JSON'], ['null', 'Expected an event object']]) {
+        fs.writeFileSync(ledger, [rows[0], badRow, rows[1], ''].join('\n'));
+        const result = run();
+        assert.equal(result.status, 1);
+        assert.equal(result.stdout, '');
+        assert.ok(result.stderr.includes('Line 2 of traffic.ndjson: ' + explanation));
+    }
+
+    fs.writeFileSync(ledger, rows.join('\n'));
+    const complete = run();
+    assert.equal(complete.status, 0, complete.stderr);
+    assert.equal(JSON.parse(complete.stdout).ingress.status, 403);
+});
+
+test('an invalid status filter leaves an existing HAR intact', { skip: !supported }, (t) => {
+    const { root, profilesDir } = fixture(t);
+    writeProfile(profilesDir, 'fixture', sample('fixture-item', 'https://reports.example/item'));
+    const target = path.join(root, 'existing.har');
+    const options = { profilesDir, profile: 'fixture', exportHar: target };
+    assert.equal(queryProfileTraffic(options).entryCount, 1);
+    const before = fs.readFileSync(target);
+    const result = spawnSync(process.execPath, [
+        cliPath, '--profiles-dir=' + profilesDir, '--profile=fixture', '--export-har=' + target, '--status=4x', '--json'
+    ], { encoding: 'utf8' });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /status filter/i);
+    assert.equal(result.stdout, '');
+    assert.deepEqual(fs.readFileSync(target), before);
+});
+
+test('a literal profile directory takes precedence over a colliding legacy alias', { skip: !supported }, (t) => {
+    const { profilesDir } = fixture(t);
+    const alias = 'profile-legacy-1710000000000';
+    const legacy = 'Gmail_fixture_1710000000000';
+    writeProfile(profilesDir, alias, sample('direct', 'https://reports.example/direct'));
+    writeProfile(profilesDir, legacy, sample('legacy', 'https://reports.example/legacy'));
+    const select = (profile) => queryProfileTraffic({ profilesDir, profile }).transactions[0].correlationId;
+    assert.equal(select(alias), 'direct');
+    assert.equal(select(legacy), 'legacy');
+    fs.rmSync(path.join(profilesDir, alias), { recursive: true });
+    assert.equal(select(alias), 'legacy');
+});
+
+test('wire reports an integrity omission for a legacy attachment with a length mismatch', { skip: !supported }, (t) => {
+    const { profilesDir } = fixture(t);
+    const [egress] = sample('fixture-item', 'https://reports.example/item');
+    const body = '{"count":27}';
+    const payloadFile = 'payloads/note.json';
+    const trafficDir = writeProfile(profilesDir, 'fixture', [{
+        ...egress,
+        headers: { 'Content-Type': 'application/json' },
+        recordBodies: true,
+        payloadFile,
+        postDataBytes: Buffer.byteLength(body)
+    }], { recordBodies: true });
+    const payload = path.join(trafficDir, payloadFile);
+    fs.mkdirSync(path.dirname(payload));
+    fs.writeFileSync(payload, body);
+    const read = () => queryProfileTraffic({ profilesDir, profile: 'fixture', correlationId: 'fixture-item' });
+    assert.equal(read().requestPayload, body);
+
+    fs.writeFileSync(payload, '{"count":2}');
+    const broken = read();
+    assert.equal(broken.requestPayload, null);
+    assert.equal(broken.requestPayloadOmittedReason, 'payload-integrity');
+    assert.match(formatCliReport(broken), /Request attachment failed integrity verification/);
+});
+
+test('wire reports when a recording stopped at its event limit', { skip: !supported }, async (t) => {
+    const { profilesDir } = fixture(t);
+    const recorder = new CamoufoxTrafficRecorder({
+        profilesDir, profileId: 'fixture', maxCaptureEvents: 1,
+        recordWireLog: false, sslKeyLog: false, neckoMozLog: false
+    });
+    const context = new EventEmitter();
+    recorder.attachContext(context);
+    const request = { url: () => 'https://reports.example/item', method: () => 'GET' };
+    context.emit('request', request);
+    await Promise.all([...recorder.pendingTasks]);
+    context.emit('response', { request: () => request, url: request.url, status: () => 200 });
+    const summary = await recorder.stop();
+    assert.equal(summary.captureLimits.stoppedReason, 'event-limit');
+    const options = { profilesDir, profile: 'fixture' };
+    const [egress] = queryProfileTraffic(options).events;
+    const wire = queryProfileTraffic({ ...options, correlation: egress.correlationId });
+    assert.equal(wire.ingress, null);
+    assert.deepEqual(wire.captureLimits, { stoppedReason: 'event-limit' });
+    assert.match(formatCliReport(wire), /Capture stopped.*event-limit/);
+});
+
+test('query reports the wire name from integrity metadata and supports the old default', { skip: !supported }, (t) => {
+    const { root, profilesDir } = fixture(t);
+    const trafficDir = writeProfile(profilesDir, 'fixture', sample('fixture-item', 'https://reports.example/item'));
+    const legacy = path.join(trafficDir, 'pre-tls-wire.log');
+    const custom = path.join(trafficDir, 'custom-wire.log');
+    fs.writeFileSync(legacy, 'default artifact');
+    fs.writeFileSync(custom, 'custom artifact');
+    const name = () => path.basename(queryProfileTraffic({ profilesDir, profile: 'fixture' }).artifacts.preTlsWireLogPath);
+    assert.equal(name(), 'pre-tls-wire.log');
+
+    fs.writeFileSync(path.join(trafficDir, 'attribution-index.json'), JSON.stringify({
+        integrity: { preTlsWireLogFile: 'custom-wire.log' },
+        artifacts: { preTlsWireLogPath: path.join(root, 'unrelated.log') }
+    }));
+    assert.equal(name(), 'custom-wire.log');
+    assert.equal(path.basename(listTrafficProfiles(profilesDir)[0].artifacts.preTlsWireLogPath), 'custom-wire.log');
 });

@@ -296,3 +296,155 @@ test('HAR charges repeated URL query values to the serialized byte limit', { ski
     });
     assert.equal(fs.existsSync(outputPath), false);
 });
+
+
+test('HAR verifies the indexed ledger before replacing a prior archive', { skip: !supported }, async (t) => {
+    const { trafficDir, ledgerPath, indexPath, outputPath } = fixture(t);
+    const recorder = new CamoufoxTrafficRecorder({
+        trafficDir, trustedLocal: true, recordWireLog: false
+    });
+    const context = new EventEmitter();
+    recorder.attachContext(context);
+    await recorder.flushSummary();
+    const initialIndex = fs.readFileSync(indexPath);
+    for (const suffix of ['first', 'second']) {
+        context.emit('request', { method: () => 'GET', url: () => 'https://fixture.example/' + suffix });
+    }
+    await recorder.stop();
+    const completedIndex = fs.readFileSync(indexPath);
+    const completedLedger = fs.readFileSync(ledgerPath, 'utf8');
+
+    fs.writeFileSync(indexPath, initialIndex);
+    fs.writeFileSync(ledgerPath, completedLedger + '{"type":');
+    const recovered = exportTrafficToHar(trafficDir, outputPath);
+    assert.equal(recovered.entryCount, 2);
+    const previous = fs.readFileSync(outputPath);
+
+    fs.writeFileSync(indexPath, completedIndex);
+    fs.writeFileSync(ledgerPath, completedLedger.split('\n', 1)[0] + '\n');
+    assert.throws(() => exportTrafficToHar(trafficDir, outputPath), {
+        code: 'ERR_CAPTURE_INTEGRITY', message: /event count mismatch/i
+    });
+    assert.deepEqual(fs.readFileSync(outputPath), previous);
+
+    fs.unlinkSync(ledgerPath);
+    assert.throws(() => exportTrafficToHar(trafficDir, outputPath), { code: 'ERR_CAPTURE_INTEGRITY' });
+    assert.deepEqual(fs.readFileSync(outputPath), previous);
+});
+
+test('length-only legacy attachment evidence is checked before HAR and wire projection', { skip: !supported }, (t) => {
+    const { trafficDir, ledgerPath, indexPath, payloadsDir, outputPath } = fixture(t);
+    const events = transaction('length-only');
+    const payloadFile = 'payloads/body.json';
+    const attachment = path.join(payloadsDir, 'body.json');
+    const body = '{"count":1001}';
+    Object.assign(events[0], {
+        payloadFile, mimeType: 'application/json', recordBodies: true, postDataBytes: Buffer.byteLength(body)
+    });
+    fs.writeFileSync(indexPath, JSON.stringify({ session: { recordBodies: true, traceId: 'fixture-trace' } }));
+    fs.writeFileSync(attachment, body);
+    writeLedger(ledgerPath, events);
+    assert.equal(exportTrafficToHar(trafficDir, outputPath).log.entries[0].request.postData.text, body);
+    const previous = fs.readFileSync(outputPath);
+    fs.writeFileSync(attachment, '{"count":7}');
+    assert.throws(() => exportTrafficToHar(trafficDir, outputPath), { code: 'ERR_CAPTURE_INTEGRITY' });
+    assert.deepEqual(fs.readFileSync(outputPath), previous);
+    const wire = queryProfileTraffic({ trafficDir, correlationId: 'length-only' });
+    assert.equal(wire.requestPayload, null);
+    assert.equal(wire.requestPayloadOmittedReason, 'payload-integrity');
+
+    fs.unlinkSync(attachment);
+    assert.throws(() => exportTrafficToHar(trafficDir, outputPath), { code: 'ERR_CAPTURE_INTEGRITY' });
+    assert.deepEqual(fs.readFileSync(outputPath), previous);
+});
+
+test('HAR separates identical steps across traces and reports a selected trace that reached its limit', {
+    skip: !supported
+}, async (t) => {
+    const { trafficDir, outputPath } = fixture(t);
+    const record = async (traceId, host) => {
+        const recorder = new CamoufoxTrafficRecorder({
+            trafficDir, traceId, trustedLocal: true, recordWireLog: false, maxCaptureEvents: 2
+        });
+        const context = new EventEmitter();
+        recorder.attachContext(context);
+        const request = { method: () => 'GET', url: () => 'https://' + host + '/notes' };
+        context.emit('request', request);
+        await recorder.flushSummary();
+        if (traceId === 'later-trace') {
+            context.emit('response', { request: () => request, url: request.url, status: () => 200 });
+        }
+        await recorder.stop();
+        return recorder;
+    };
+    await record('earlier-trace', 'earlier.example');
+    const later = await record('later-trace', 'later.example');
+    const { log } = exportTrafficToHar(trafficDir, outputPath);
+    assert.equal(log.entries.length, 2);
+    assert.equal(log.pages.length, 2);
+    assert.notEqual(log.entries[0].pageref, log.entries[1].pageref);
+    for (const entry of log.entries) {
+        assert.equal(log.pages.find((page) => page.id === entry.pageref).startedDateTime, entry.startedDateTime);
+    }
+    const limit = { stoppedReason: 'event-limit' };
+    assert.deepEqual(log._captureLimits, limit);
+    assert.deepEqual(later.buildHarArchive().log._captureLimits, limit);
+
+    const filtered = (domain) => queryProfileTraffic({ trafficDir, domain, exportHar: outputPath }).log;
+    assert.equal(filtered('earlier.example')._captureLimits, undefined);
+    assert.deepEqual(filtered('later.example')._captureLimits, limit);
+});
+
+test('HAR represents measured zeros, unknown or compressed sizes, and observed receive time', {
+    skip: !supported
+}, async (t) => {
+    const { trafficDir, outputPath } = fixture(t);
+    const recorder = new CamoufoxTrafficRecorder({ trafficDir, trustedLocal: true, recordWireLog: false });
+    const context = new EventEmitter();
+    recorder.attachContext(context);
+    const send = (suffix, status, headers, sizes, timing) => {
+        const request = {
+            method: () => 'POST', url: () => 'https://fixture.example/' + suffix,
+            sizes: () => sizes, timing: () => timing
+        };
+        context.emit('request', request);
+        context.emit('response', { request: () => request, url: request.url, status: () => status, headers: () => headers });
+        context.emit('requestfinished', request);
+    };
+    send('unknown', 200, {});
+    send('empty', 204, {}, { requestBodySize: 0, responseBodySize: 0 });
+    send('compressed', 200, { 'Content-Encoding': 'gzip' }, { requestBodySize: 0, responseBodySize: 37 },
+        { requestStart: 1, responseStart: 8, responseEnd: 13 });
+    await recorder.stop();
+
+    const { entries } = exportTrafficToHar(trafficDir, outputPath).log;
+    const sizes = (entry) => [entry.request.bodySize, entry.response.bodySize, entry.response.content.size];
+    assert.deepEqual(sizes(entries[0]), [-1, -1, -1]);
+    assert.deepEqual(entries[0].timings._unmeasured, ['send', 'wait', 'receive']);
+    assert.deepEqual(sizes(entries[1]), [0, 0, 0]);
+    assert.deepEqual(sizes(entries[2]), [0, 37, -1]);
+    assert.deepEqual([entries[2].time, entries[2].timings.wait, entries[2].timings.receive], [12, 7, 5]);
+    assert.deepEqual(entries[2].timings._unmeasured, ['send']);
+});
+
+test('legacy response attribution supplies missing HAR step and trigger before filtering', { skip: !supported }, (t) => {
+    const { trafficDir, ledgerPath, outputPath } = fixture(t);
+    const [egress, ingress] = transaction('legacy-attribution', { status: 200 });
+    egress.attribution = { traceId: 'fixture-trace' };
+    egress.triggerAction = null;
+    ingress.attribution = {
+        traceId: 'fixture-trace', actionStep: 'observed-step', stepIndex: 4,
+        triggerAction: { actionType: 'click', target: '#observed' }
+    };
+    ingress.triggerAction = null;
+    writeLedger(ledgerPath, [egress, ingress]);
+    const selected = queryProfileTraffic({ trafficDir, step: 'observed-step', trigger: '#observed', exportHar: outputPath });
+    assert.equal(selected.entryCount, 1);
+    const { _attribution: attribution, response } = selected.log.entries[0];
+    assert.equal(response.status, 200);
+    assert.equal(attribution.actionStep, 'observed-step');
+    assert.equal(attribution.stepIndex, 4);
+    assert.equal(attribution.triggerAction.target, '#observed');
+    const full = queryProfileTraffic({ trafficDir, exportHar: outputPath });
+    assert.deepEqual(full.log.entries[0]._attribution, attribution);
+});

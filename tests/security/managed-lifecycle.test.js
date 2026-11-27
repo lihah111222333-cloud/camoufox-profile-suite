@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -327,6 +327,39 @@ test('borrowed sessions close only manager-created pages before each disconnect'
     }
 });
 
+test('borrowed sessions retain the connection until a failed owned page close can be retried', async t => {
+    const sandbox = await fixture(t);
+    const { default: state } = await sandbox.load('src/fixture.cjs');
+    t.mock.method(globalThis, 'setTimeout', callback => queueMicrotask(callback));
+    state.existingPages = [{
+        isClosed: () => false,
+        async close() { assert.fail('An existing page must stay open'); }
+    }];
+    for (const service of ['gpmlogin', 'dolphin']) {
+        const { default: Profile } = await sandbox.load(`src/${service}/profile.js`);
+        const address = 'wss://borrowed-controller.invalid/devtools/browser/supplied';
+        const profile = await new Profile(service + '-existing', address).start();
+        const owned = profile.page;
+        const close = owned.close.bind(owned);
+        let attempts = 0;
+        owned.close = async () => {
+            if (++attempts === 1) throw new Error('Fixture page is temporarily busy');
+            await close();
+        };
+        state.events.length = 0;
+
+        assert.equal(await profile.stop(), false);
+        assert.equal(owned.isClosed(), false);
+        assert.deepEqual(state.events.map(([event]) => event), ['warn']);
+        await assert.rejects(profile.start(), /Borrowed browser cleanup is incomplete/);
+
+        assert.equal(await profile.stop(), false);
+        assert.equal(attempts, 2);
+        assert.equal(owned.isClosed(), true);
+        assert.deepEqual(state.events.map(([event]) => event), ['warn', 'close-page', 'disconnect']);
+    }
+});
+
 test('cancelling after page creation closes the owned borrowed page while still attached', async t => {
     const sandbox = await fixture(t);
     const { default: state } = await sandbox.load('src/fixture.cjs');
@@ -373,7 +406,7 @@ test('managed stop waits for an in-flight start and coalesces shutdown requests'
     assert.equal(profile.remoteDebuggingAddress, null);
 });
 
-test('GPM deletion reuses confirmed closure until restart and stays deleted after confirmation', async t => {
+test('GPM deletion requires its own stop confirmation and stays deleted after confirmation', async t => {
     const sandbox = await fixture(t);
     const { default: state } = await sandbox.load('src/fixture.cjs');
     t.mock.method(globalThis, 'setTimeout', callback => queueMicrotask(callback));
@@ -388,12 +421,17 @@ test('GPM deletion reuses confirmed closure until restart and stays deleted afte
     cancellation.abort(new Error('fixture cancelled before launch'));
     await assert.rejects(cancelledRestart, /cancelled before launch/);
     state.deleteOK = true;
+    await assert.rejects(profile.delete(), { profileCleanup: 'stop-unconfirmed' });
+    assert.deepEqual(state.events.filter(([action]) => action === 'stop' || action === 'delete'), [
+        ['stop', id], ['delete', id]
+    ]);
+    await profile.start();
     assert.equal(await profile.delete(), true);
     assert.equal(await profile.delete(), true);
     assert.equal(await profile.stop(), true);
     await assert.rejects(profile.start(), /has been deleted/);
     assert.deepEqual(state.events.filter(([action]) => action === 'stop' || action === 'delete'), [
-        ['stop', id], ['delete', id], ['delete', id]
+        ['stop', id], ['delete', id], ['stop', id], ['delete', id]
     ]);
 
     const restarted = await new Profile('gpmlogin-restart').start();
@@ -432,9 +470,15 @@ test('Dolphin recycling requires confirmed closure and only dispatches once per 
     state.recycleOK = true;
     const stopped = await new Profile('dolphin-stopped').start();
     assert.equal(await stopped.stop(), true);
+    await assert.rejects(stopped.recycle(), { profileCleanup: 'stop-unconfirmed' });
+    assert.deepEqual(state.events.filter(([, affected]) => affected === stopped.profileId), [
+        ['start', stopped.profileId], ['stop', stopped.profileId]
+    ]);
+    await stopped.start();
     assert.equal(await stopped.recycle(), true);
     assert.equal(await stopped.recycle(), true);
     assert.deepEqual(state.events.filter(([, affected]) => affected === stopped.profileId), [
+        ['start', stopped.profileId], ['stop', stopped.profileId],
         ['start', stopped.profileId], ['stop', stopped.profileId], ['recycle', stopped.profileId]
     ]);
 });
@@ -551,6 +595,24 @@ test('Both executable entry points handle help, version, and unknown arguments b
     }
 });
 
+test('symbolic links to the source CLI preserve version output and invalid-count status', {
+    skip: process.platform === 'win32'
+}, async t => {
+    const sandbox = await fixture(t);
+    await symlink('src/index.js', path.join(sandbox.root, 'cli-link.js'), 'file');
+    await symlink('.', path.join(sandbox.root, 'checkout-link'), 'dir');
+
+    for (const entry of ['cli-link.js', 'checkout-link/src/index.js']) {
+        const version = sandbox.run([entry, '--version']);
+        assert.equal(version.status, 0, version.stderr);
+        assert.equal(version.stdout.trim(), '1.2.3');
+        const invalid = sandbox.run([entry, '--accounts=0']);
+        assert.equal(invalid.status, 1, invalid.stderr);
+        assert.match(invalid.stderr, /--accounts must be an integer/);
+        assert.equal(invalid.stdout, '');
+    }
+});
+
 test('both CLI entry points stop the owned browser and leave queued tasks undispatched on a signal', async t => {
     for (const [entry, signal, status, phase] of [
         ['src/index.js', 'SIGINT', 130, 'active'],
@@ -597,11 +659,39 @@ test('CLI reports unconfirmed shutdown while preserving an already saved account
     assert.equal(result.success, true);
     assert.equal(result.profileId, 'gpmlogin-fixture');
     assert.equal(result.profileCleanup, 'stop-unconfirmed');
+    assert.match(completed.stderr, /results\.json/);
+    assert.ok(completed.stderr.includes('resultId ' + result.resultId + ' (stop-unconfirmed)'));
     const summary = JSON.parse(await readFile(path.join(sandbox.root, 'summary.json')));
     assert.equal(summary.results.length, 1);
     assert.equal(summary.results[0].profileCleanup, 'stop-unconfirmed');
     assert.equal(summary.results[0].profileId, result.profileId);
     assert.equal(summary.results[0].profileType, 'GPM Login');
+});
+
+test('CLI warns about existing pending results with stable locations before replacing the summary', async t => {
+    const sandbox = await fixture(t);
+    const filename = path.join(sandbox.root, 'results.json');
+    const pending = {
+        success: true, resultId: '068fd614-aceb-46c0-90b9-8b329991e448',
+        profileId: 'older-private-profile', profileCleanup: 'pending'
+    };
+    const legacy = { success: false, profileId: 'legacy-private-profile', profileCleanup: 'stop-unconfirmed' };
+    await writeFile(filename, JSON.stringify([pending, legacy]));
+    await writeFile(path.join(sandbox.root, 'summary.json'), JSON.stringify({ results: [pending, legacy] }));
+
+    const completed = sandbox.run(['bin/gmail-account-creator.js'], { LOG_LEVEL: 'ERROR' });
+    assert.equal(completed.status, 0, completed.stderr);
+    assert.match(completed.stderr, /results\.json/);
+    assert.ok(completed.stderr.includes('entry 1 (resultId ' + pending.resultId + ') (pending)'));
+    assert.match(completed.stderr, /entry 2 \(stop-unconfirmed\)/);
+    assert.doesNotMatch(completed.stderr, /older-private-profile|legacy-private-profile/);
+    const [kept, keptLegacy, current] = JSON.parse(await readFile(filename));
+    assert.deepEqual(kept, pending);
+    assert.equal(keptLegacy.profileCleanup, 'stop-unconfirmed');
+    assert.equal(current.profileCleanup, 'stopped');
+    const summary = JSON.parse(await readFile(path.join(sandbox.root, 'summary.json')));
+    assert.equal(summary.results.length, 1);
+    assert.equal(summary.results[0].profileCleanup, 'stopped');
 });
 
 test('CLI persists an allocated profile ID when initialization and shutdown are unconfirmed', async t => {
@@ -664,15 +754,16 @@ test('CLI retains every unconfirmed profile when one task prevents the run summa
 test('CLI counts manual handoffs separately and gives continuation guidance only after confirmed shutdown', async t => {
     const guidance = 'Continue signup manually in a trusted browser you control.';
     for (const stopOK of [true, false]) {
-        const sandbox = await fixture(t);
+        const sandbox = await fixture(t, { productionLogger: true });
         const completed = sandbox.run(['bin/gmail-account-creator.js'], {
             FIXTURE_CONSUMER_OUTCOME: 'manual',
-            FIXTURE_STOP_OK: String(stopOK)
+            FIXTURE_STOP_OK: String(stopOK),
+            LOG_LEVEL: 'ERROR'
         });
         assert.equal(completed.status, stopOK ? 0 : 1, completed.stderr);
-        const events = completed.stdout.trim().split('\n').map(line => JSON.parse(line));
-        const stopIndex = events.findIndex(([event]) => event === 'stop');
-        const handoffIndex = events.findIndex(([event, message]) => event === 'warn' && message === guidance);
+        const lines = completed.stdout.trim().split('\n');
+        const stopIndex = lines.findIndex(line => line.startsWith('["stop",'));
+        const handoffIndex = lines.indexOf(guidance);
         assert.ok(stopIndex >= 0);
         if (stopOK) {
             assert.ok(handoffIndex > stopIndex);
@@ -688,6 +779,26 @@ test('CLI counts manual handoffs separately and gives continuation guidance only
         assert.equal(summary.results[0].errorCode, 'MANUAL_SIGNUP_REQUIRED');
         assert.equal(summary.results[0].errorStage, 'password');
         assert.equal(summary.results[0].profileCleanup, stopOK ? 'stopped' : 'stop-unconfirmed');
+    }
+});
+
+test('programmatic manual handoff reports the persisted cleanup outcome', async t => {
+    for (const stopOK of [true, false]) {
+        const sandbox = await fixture(t);
+        const expected = stopOK ? 'stopped' : 'stop-unconfirmed';
+        const completed = sandbox.run(['--input-type=module', '-e', `
+            import assert from 'node:assert/strict';
+            import app from './src/index.js';
+            await assert.rejects(app.createAccount(), {
+                code: 'MANUAL_SIGNUP_REQUIRED',
+                stage: 'password',
+                profileCleanup: ${JSON.stringify(expected)}
+            });
+        `], { FIXTURE_CONSUMER_OUTCOME: 'manual', FIXTURE_STOP_OK: String(stopOK) });
+        assert.equal(completed.status, 0, completed.stderr);
+        const [result] = JSON.parse(await readFile(path.join(sandbox.root, 'results.json')));
+        assert.equal(result.profileCleanup, expected);
+        assert.equal(result.success, false);
     }
 });
 
@@ -768,4 +879,26 @@ test('routine logs redact identity and startup details in console and file outpu
         assert.match(output, /Profile started.*GPM Login/);
         assert.doesNotMatch(output, /fixture-controller-id|fixture-account-title|Fixture Account Name|example\.invalid|\/fixture\/private|Fixture Physical/);
     }
+});
+
+test('a long-running logger writes each entry to its UTC date file', async t => {
+    const sandbox = await fixture(t, { productionLogger: true });
+    const completed = sandbox.run(['--input-type=module', '-e', `
+        let now = '2026-01-01T23:59:59.990Z';
+        const SystemDate = Date;
+        globalThis.Date = class extends SystemDate {
+            constructor(...args) { super(...(args.length ? args : [now])); }
+        };
+        const { default: logger } = await import('./src/utils/logger.js');
+        logger.info('Before midnight');
+        now = '2026-01-02T00:00:00.010Z';
+        logger.info('After midnight');
+    `]);
+    assert.equal(completed.status, 0, completed.stderr);
+    const logs = path.join(sandbox.root, 'logs');
+    assert.deepEqual((await readdir(logs)).sort(), ['app-2026-01-01.log', 'app-2026-01-02.log']);
+    assert.equal(await readFile(path.join(logs, 'app-2026-01-01.log'), 'utf8'),
+        '[2026-01-01T23:59:59.990Z] [INFO] Before midnight\n');
+    assert.equal(await readFile(path.join(logs, 'app-2026-01-02.log'), 'utf8'),
+        '[2026-01-02T00:00:00.010Z] [INFO] After midnight\n');
 });

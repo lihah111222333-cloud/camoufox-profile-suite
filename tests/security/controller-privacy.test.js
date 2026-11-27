@@ -68,7 +68,7 @@ async function loadControllers(t, overrides = {}, stateEnvironment) {
         assert.ok(responses.length, 'Unexpected controller request');
         const response = responses.shift();
         if (response instanceof Error) throw response;
-        return response;
+        return { status: 200, ...response };
     }
     globalThis[fixtureKey] = {
         create(defaults) {
@@ -462,6 +462,122 @@ test('controller failures disclose only a safe operation, status and known codes
     assert.match(diagnostics, /"status":502/);
     assert.match(diagnostics, /CERT_HAS_EXPIRED/);
     for (const secret of [syntheticKey, proxy.username, proxy.password]) assert.ok(!diagnostics.includes(secret));
+});
+
+test('controller detail reads require a matching JSON profile', async t => {
+    const { gpm, dolphin, responses } = await loadControllers(t);
+    for (const response of [
+        { data: '<html>Controller sign-in</html>' },
+        { data: {} },
+        { data: { id: 'another-profile' } },
+        { data: { id: 'fixture', success: false } },
+        { status: 202, data: { id: 'fixture' } }
+    ]) {
+        responses.push(response, response);
+        await assert.rejects(gpm.getProfile('fixture'), /invalid profile response/);
+        await assert.rejects(dolphin.getProfile('fixture'), /invalid profile response/);
+    }
+
+    responses.push(
+        { data: { success: true, data: { id: 'fixture', success: false } } },
+        { data: { id: 'fixture', code: 50200, message: 'Access denied' } }
+    );
+    await assert.rejects(gpm.getProfile('fixture'), /invalid profile response/);
+    await assert.rejects(dolphin.getProfile('fixture'), /invalid profile response/);
+
+    const profile = { id: 'fixture', title: 'Fixture' };
+    responses.push({ data: JSON.stringify({ success: true, data: profile }) }, { data: JSON.stringify(profile) });
+    assert.deepEqual(await gpm.getProfile('fixture'), profile);
+    assert.deepEqual(await dolphin.getProfile('fixture'), profile);
+    assert.deepEqual(responses, []);
+});
+
+test('Dolphin proxy writes accept only a confirmed response', async t => {
+    const { dolphin, requests, responses } = await loadControllers(t);
+    const invalid = [
+        { data: '<html>Controller sign-in</html>' },
+        { data: {} },
+        { data: { success: false } },
+        { data: { success: true, code: 50200, message: 'Access denied' } },
+        { status: 202, data: { success: true } }
+    ];
+    for (const response of invalid) {
+        responses.push(response);
+        await assert.rejects(dolphin.updateProfileProxy('fixture', proxy), /did not confirm the proxy update/);
+    }
+    responses.push({ data: '' }, { data: { success: true } });
+    assert.equal((await dolphin.updateProfileProxy('fixture', proxy)).success, true);
+    assert.equal((await dolphin.updateProfileProxy('fixture', proxy)).success, true);
+    assert.equal(requests.length, invalid.length + 2);
+    assert.deepEqual(responses, []);
+});
+
+test('Dolphin only returns a complete folder list when pagination supports it', async t => {
+    const { dolphin, requests, responses } = await loadControllers(t, { DOLPHIN_FOLDER_ID: '' });
+    const first = { id: 'first-folder', name: 'First' };
+    const target = { id: 'second-folder', name: 'Target' };
+    const full = Array.from({ length: 100 }, (_, i) => ({ id: 'folder-' + i }));
+    const takePages = () => requests.splice(0).map(request => request.data.page);
+
+    responses.push({ data: [first] });
+    assert.deepEqual(await dolphin.getAllFolders(), [first]);
+    assert.deepEqual(takePages(), [1]);
+
+    for (const data of [full, { list: [first], totalNum: 2 }, { data: [first], pageSize: '1' }]) {
+        responses.push({ data });
+        await assert.rejects(dolphin.getOrCreateFolder('Target'), /did not confirm that the folder list is complete/);
+        assert.deepEqual(takePages(), [1]);
+    }
+
+    responses.push({ data: { list: [first], total: '2' } }, { data: { folders: [target], total: 2 } });
+    assert.equal(await dolphin.findFolderByName('Target'), 'second-folder');
+    assert.deepEqual(takePages(), [1, 2]);
+
+    responses.push({ data: { list: [first], total: 2 } }, { data: [target] });
+    assert.deepEqual(await dolphin.getAllFolders(), [first, target]);
+    assert.deepEqual(takePages(), [1, 2]);
+
+    for (const second of [
+        { list: [], total: 2 },
+        { list: [target], total: 1 },
+        { list: [first], total: 2 }
+    ]) {
+        responses.push({ data: { list: [first], total: 2 } }, { data: second });
+        await assert.rejects(dolphin.getAllFolders(), /inconsistent folder pagination|duplicate folder IDs/);
+        assert.deepEqual(takePages(), [1, 2]);
+    }
+    for (const data of [{ code: 50200, message: 'Access denied', list: [] }, { list: [null] }]) {
+        responses.push({ data });
+        await assert.rejects(dolphin.getFolderList(), /invalid folder list/);
+    }
+    assert.deepEqual(responses, []);
+});
+
+test('Dolphin takes configured authorization for profiles and writes once', async t => {
+    for (const authorization of [syntheticKey, 'Bearer ' + syntheticKey]) {
+        await t.test(authorization.startsWith('Bearer') ? 'explicit Bearer' : 'raw', async t => {
+            const { dolphin, requests, responses } = await loadControllers(t, { DOLPHIN_API_KEY: authorization });
+            responses.push(
+                { data: { list: [] } },
+                { data: { id: 'fixture' } },
+                rejectedResponse(401, { success: false })
+            );
+            assert.deepEqual(await dolphin.getFolderList(), { list: [] });
+            assert.equal((await dolphin.getProfile('fixture')).id, 'fixture');
+            await assert.rejects(dolphin.updateProfileProxy('fixture', proxy), { status: 401 });
+            assert.deepEqual(requests.map(request => request.options.headers.Authorization),
+                [authorization, authorization, authorization]);
+            assert.deepEqual(responses, []);
+        });
+    }
+});
+
+test('Dolphin folder reads do not substitute an explicit authorization scheme', async t => {
+    const authorization = 'bearer ' + syntheticKey;
+    const { dolphin, requests, responses } = await loadControllers(t, { DOLPHIN_API_KEY: authorization });
+    responses.push(rejectedResponse(401, { success: false }));
+    await assert.rejects(dolphin.getFolderList(), { status: 401 });
+    assert.deepEqual(requests.map(request => request.options.headers.Authorization), [authorization]);
 });
 
 test('Dolphin folder command reports configured status and escapes folder fields', async t => {

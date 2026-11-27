@@ -108,8 +108,7 @@ export GMAIL_CREATOR_STATE_DIR="$HOME/.local/state/gmail-account-creator"
   umask 077
   mkdir -p "$GMAIL_CREATOR_STATE_DIR/config" &&
     set -C &&
-    cat .env.example > "$GMAIL_CREATOR_STATE_DIR/.env" &&
-    : > "$GMAIL_CREATOR_STATE_DIR/config/proxies.txt"
+    cat .env.example > "$GMAIL_CREATOR_STATE_DIR/.env"
 )
 ```
 
@@ -133,7 +132,7 @@ export GMAIL_CREATOR_STATE_DIR="$HOME/.local/state/gmail-account-creator"
 
 ### 3) إعداد البروكسيات
 
-الملف هو `config/proxies.txt` داخل مجلد الحالة.
+الملف هو `config/proxies.txt` داخل مجلد الحالة. لاستخدام قائمة قديمة، انقل ملفها إلى مجلد الحالة أو اضبط `GMAIL_CREATOR_LEGACY_DIR` على مجلد التثبيت القديم واترك ملف القائمة في مجلد الحالة غير موجود. تأخذ القائمة الحالية الأولوية حتى إذا كانت فارغة أو تحتوي على تعليقات فقط.
 
 - سطر لكل بروكسي.  
 - الصيغة: `ip:port` أو `ip:port:username:password`  
@@ -542,11 +541,17 @@ flowchart TD
 npm install @code-root/gmail-account-creator
 ```
 
-تشغيل عبر `npx` أو الأمر العام بعد التثبيت الشامل:
+بعد التثبيت المحلي، شغّل الأمر من داخل المشروع.
 
 ```bash
-npx @code-root/gmail-account-creator
-gmail-account-creator
+npm exec -- gmail-account-creator --help
+```
+
+ثبّت الحزمة تثبيتًا عامًا لاستخدام الأمر من مسار `PATH` الخاص بالطرفية.
+
+```bash
+npm install --global @code-root/gmail-account-creator
+gmail-account-creator --help
 ```
 
 ### النشر التلقائي

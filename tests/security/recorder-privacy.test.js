@@ -369,6 +369,50 @@ test('opted-in requests project complete JSON and forms while authentication and
     assertAbsent(recorder, ['private-json-marker', 'private-form-marker', 'private-auth-marker', 'private-ws-marker']);
 });
 
+test('body-preserving redirects retain the source request body restriction', async (t) => {
+    const { recorder, context } = fixture(t, { recordBodies: true, neckoMozLog: false });
+    const origin = 'https://fixture.invalid';
+    const body = '{"count":4,"label":"synthetic-body"}';
+    const reads = [];
+    const upload = (route, previous) => request(origin + route, { 'Content-Type': 'application/json' }, {
+        redirectedFrom: () => previous ?? null,
+        postDataBuffer: () => {
+            reads.push(route);
+            return Buffer.from(body);
+        }
+    });
+    const authentication = upload('/auth');
+    const firstHop = upload('/step-one', authentication);
+    const nextHop = upload('/step-two', firstHop);
+    const lateHop = upload('/late', upload('/sign-in'));
+    const ordinary = upload('/ordinary');
+    const ordinaryHop = upload('/plain-redirect', ordinary);
+    for (const [req, status] of [[authentication, 307], [firstHop, 308], [nextHop, 200], [ordinary, 307],
+        [ordinaryHop, 200], [lateHop, 200]]) {
+        context.emit('request', req);
+        context.emit('response', response(req, {}, { status: () => status }));
+    }
+    await recorder.stop();
+
+    assert.deepEqual(reads.sort(), ['/ordinary', '/plain-redirect']);
+    const ledger = events(recorder);
+    const { log } = recorder.exportHar();
+    for (const req of [authentication, firstHop, nextHop, lateHop, ordinary, ordinaryHop]) {
+        const event = ledger.find((row) => row.type === 'egress' && row.url === req.url());
+        const entry = log.entries.find((row) => row.request.url === req.url());
+        const bodyAllowed = req === ordinary || req === ordinaryHop;
+        const expected = bodyAllowed ? '{"count":4}' : '';
+        assert.equal(entry.request.postData?.text ?? '', expected);
+        assert.equal(Boolean(event.payloadFile), bodyAllowed);
+        if (bodyAllowed) {
+            assert.equal(fs.readFileSync(path.join(recorder.trafficDir, event.payloadFile), 'utf8'), body);
+        } else {
+            assert.equal(event.bodyPreview, null);
+        }
+    }
+    assertAbsent(recorder, ['synthetic-body']);
+});
+
 test('reopened wire applies current header, URL, trigger and body rules to accepted legacy events', async (t) => {
     const traceId = 'legacy-wire-fixture';
     const archivedEmail = 'archived-candidate@example.test';

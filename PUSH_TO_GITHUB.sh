@@ -49,19 +49,33 @@ fi
 
 node scripts/check-distribution.mjs index || exit 1
 
-# عمل commit
-echo "💾 عمل commit..."
-echo "💾 Creating commit..."
-git commit -m "Initial commit: Gmail Account Creator with GPM Login
+if git diff --cached --quiet --; then
+    git rev-parse --verify --quiet 'HEAD^{commit}' > /dev/null || {
+        echo "❌ لا يوجد التزام حالي أو تغييرات جاهزة للالتزام." >&2
+        echo "❌ No existing commit or staged changes to prepare." >&2
+        exit 1
+    }
+    echo "✅ لا توجد تغييرات جاهزة للالتزام. الالتزام الحالي جاهز."
+    echo "✅ No staged changes. The existing commit is ready."
+else
+    diff_status=$?
+    if [[ $diff_status -ne 1 ]]; then
+        exit "$diff_status"
+    fi
+
+    echo "💾 عمل commit..."
+    echo "💾 Creating commit..."
+    git -c user.useConfigOnly=true commit -m "Initial commit: Gmail Account Creator with GPM Login
 
 - Migrated from GoLogin to GPM Login
 - Added realistic Android User-Agent generation
 - Improved proxy handling and validation
 - Added comprehensive error handling" || exit 1
 
-echo ""
-echo "✅ تم عمل commit بنجاح!"
-echo "✅ Commit created successfully!"
+    echo ""
+    echo "✅ تم عمل commit بنجاح!"
+    echo "✅ Commit created successfully!"
+fi
 echo ""
 echo "📝 الخطوات التالية:"
 echo "📝 Next steps:"

@@ -6,15 +6,31 @@ The app keeps `.env`, the optional `.emv`, `config/proxies.txt`, `results.json`,
 
 The app can read legacy configuration and import sanitized history when the corresponding state files are missing. A source checkout uses its root as the legacy directory. To adopt configuration and history from another installation, set `GMAIL_CREATOR_LEGACY_DIR` to its absolute path in the shell environment before launch. Existing state outputs take precedence. Original files and logs stay in place. Startup reports invalid history and keeps the original file available for review. Set `CAMOUFOX_STORAGE_DIR` to the absolute path of an existing profile store to keep using it.
 
+Within the selected configuration directory, settings supplied by the launch environment take precedence over `.env`. An empty `PROFILE_SERVICE` is treated as unset. If the service is still unset, `.emv` can supply fallback settings. Once a service is selected, `.emv` can supply a missing GoLogin key. Applications and direct SDK callers use the same profile storage and deployment network configuration.
+
 Concurrent runs append to `results.json`. `summary.json` holds the latest completed run. If a write times out while another process owns the lock, stop all writers sharing this state directory before inspecting a stranded `results.json.lock` or `summary.json.lock`.
 
 `ACCOUNTS_COUNT` and `THREADS_COUNT` accept positive safe integers in decimal notation. Both default to 1. Concurrency is capped at the requested account count. Explicit `--accounts=N` / `-a=N` and `--threads=N` / `-t=N` take precedence over the environment values.
+
+### Recovering local locks
+
+Use separate state and profile directories for different machines or PID namespaces. A lock created in the same system boot and PID namespace can be recovered after a hostname change when the owner has exited. This uses local boot information on Linux and macOS when available. The app also understands earlier lock formats and retains its hostname and PID checks. Locks from a different hostname with unavailable or different boot information are kept for operator review.
+
+If a lock's owner cannot be verified, stop and verify that all writers on every machine using that directory have exited. If any writer may still be active, leave the directory in place and start in separate state and profile directories. Once all writers have stopped, make a private backup before moving the affected lock directory to a private archive outside the live store. Preserve the entire lock, including any staged snapshot, together with the committed output for review. Account output locks sit beside `results.json` and `summary.json`. A profile lease sits under `.camoufox-leases~` and a capture writer lease sits beside its capture directory.
+
+### Running an older version
+
+Before switching versions, stop all writers and retain a private copy of the newer state and profile store, including stranded locks and staged snapshots. Start the older version with `GMAIL_CREATOR_STATE_DIR` set to a separate private directory. Set `GMAIL_CREATOR_LEGACY_DIR` explicitly to an empty private directory or a copy of the compatible pre-upgrade history. When supplying an explicit `CAMOUFOX_STORAGE_DIR`, point it to a separate directory or a copy of a compatible pre-upgrade profile store. Otherwise use the version-specific default profile directory under its state directory.
+
+Some older versions rewrite existing outputs at startup and can remove newer cleanup states or error categories. They can also reject newer lock markers and snapshots left by an interrupted writer. Use the originating or a compatible newer version with a preserved copy to investigate its interrupted write. Resume the newer version with its original state directory and retain any results recorded during the rollback separately.
 
 ## Browser controller connection
 
 GPM Login and Dolphin Anty REST API requests require HTTPS with certificate and hostname verification. If the API certificate uses a private CA, set `NODE_EXTRA_CA_CERTS` to the CA's PEM file before starting Node.
 
 For a controller that serves HTTP on a dedicated host where you trust every local user and process, set `GPM_TRUSTED_HTTP_API_URL` or `DOLPHIN_TRUSTED_HTTP_API_URL` to the matching `GPM_API_URL` or `DOLPHIN_API_URL` base. Include the exact port and any base path, and use a numeric loopback address such as `127.0.0.1` or `[::1]`. This HTTP mode relies on the host's isolation. Use verified HTTPS on a shared host.
+
+Set `DOLPHIN_API_KEY` to the complete Authorization header value for the configured endpoint. Use `Bearer <token>` when the controller requires Bearer authentication, or the raw key when it requires the raw value. Every Dolphin request starts with that configured value. Folder reads retain a compatibility attempt with Bearer after HTTP 401 for a raw key. Use the complete Authorization value to configure profile access.
 
 `DOLPHIN_FOLDER_ID` selects the destination folder directly. If it is unset, the client looks for a folder named `gmail-accounts` and tries to create it if missing. If the folder cannot be selected or created, profile creation stops. Run `npm run list-folders` to see the available IDs.
 
@@ -88,9 +104,13 @@ CAMOUFOX_RECORD_HAR=false
 CAMOUFOX_TRAFFIC_MAX_BODY_BYTES=5242880
 ```
 
+Recording switches accept exactly `true` or `false`. `CAMOUFOX_TRAFFIC_MAX_BODY_BYTES` accepts a positive safe integer in decimal notation. Omit a setting to use its default. Invalid explicit settings stop startup before capture begins.
+
 In a deployment that forces browser traffic through a controlled proxy, `CAMOUFOX_PORT_SCAN_MODE=managed-proxy` checks the selected profile proxy against `CAMOUFOX_MANAGED_EGRESS_ORIGIN`. Set the origin to the operator's existing proxy scheme, host and explicit port, without credentials. The proxy owns the policy for the resolved destination IP on every connection, including redirected requests. Its ACL must be verified at the proxy. The `transport` setting requires verified enforcement and stops if the launcher cannot provide it.
 
-Startup requires a valid proxy inventory with at least one entry by default. If you intend Camoufox in `url-only` mode to use the system's public egress when the inventory is empty, set `CAMOUFOX_ALLOW_DIRECT=true`. `TEST_PROXY=false` disables the optional proxy preflight. Managed proxy mode always requires its configured proxy.
+The CLI requires a valid proxy inventory with at least one entry by default. For an explicitly direct Camoufox CLI deployment in `url-only` mode with an empty inventory, set `CAMOUFOX_ALLOW_DIRECT=true`. Managed proxy mode always requires its configured proxy. A current `config/proxies.txt` takes precedence over the legacy file even if the current file is empty or contains only comments.
+
+`TEST_PROXY` controls the optional TCP preflight in the standalone GoLogin profile factory. The Camoufox, GPM Login and Dolphin Anty CLI startup paths rely on the proxy inventory and do not use this setting.
 
 The recorder defaults to metadata. Enabling `CAMOUFOX_RECORD_BODIES` stores eligible raw attachments under the profile's private `traffic/payloads/` directory. Redacted wire and HAR views can include a restricted set of fields from eligible complete structured bodies. Reconstruct older wire data through the attribution CLI and review exported data before sharing it. Keep raw attachments, native TLS keys and native Necko logs private.
 

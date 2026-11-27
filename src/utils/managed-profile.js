@@ -20,6 +20,7 @@ export default class ManagedProfile {
     #deleted = false;
     #ownedPages = new Set();
     #openingPage = null;
+    #borrowedCleanupBrowser = null;
 
     constructor(profileId, client, addressField, address, startBrowser) {
         Object.defineProperty(this, 'profileId', {
@@ -44,6 +45,7 @@ export default class ManagedProfile {
         if (this.#deleting) throw new Error('Managed profile deletion is in progress');
         if (this.#recycling) throw new Error('Managed profile recycling has been requested');
         if (this.#starting) return this.#starting;
+        if (this.#borrowedCleanupBrowser) throw new Error('Borrowed browser cleanup is incomplete. Retry stop before reconnecting.');
         if (this.browser) return this;
 
         const cancellation = new AbortController();
@@ -98,7 +100,7 @@ export default class ManagedProfile {
     }
 
     async #detachBrowser() {
-        const browser = this.browser;
+        const browser = this.#borrowedCleanupBrowser ?? this.browser;
         this.browser = null;
         this.page = null;
         this[this.#addressField] = null;
@@ -107,14 +109,20 @@ export default class ManagedProfile {
         for (const page of this.#ownedPages) {
             try {
                 if (!page.isClosed()) await page.close();
+                this.#ownedPages.delete(page);
             } catch {
                 logger.warn('Could not close a page opened by the profile manager', { profileId: this.profileId });
             }
+        }
+        if (!this.#client) {
+            this.#borrowedCleanupBrowser = browser;
+            if (this.#ownedPages.size) return;
         }
         this.#ownedPages.clear();
 
         try {
             await browser?.disconnect();
+            this.#borrowedCleanupBrowser = null;
         } catch {
             logger.warn('Could not detach the managed browser connection', { profileId: this.profileId });
         }
@@ -143,6 +151,16 @@ export default class ManagedProfile {
         return this.#stopping;
     }
 
+    async #stopBeforeCleanup() {
+        // An earlier stop cannot attest to the state of a browser reopened by another operator.
+        if (this.#stopConfirmed) {
+            throw cleanupError(this.profileId, 'stop-unconfirmed', 'Managed profile shutdown confirmation is stale. Check the profile in its controller.');
+        }
+        if (await this.stop() !== true) {
+            throw cleanupError(this.profileId, 'stop-unconfirmed', 'Managed profile shutdown unconfirmed');
+        }
+    }
+
     delete() {
         this.#deleting ??= this.#delete().finally(() => {
             this.#deleting = null;
@@ -154,9 +172,7 @@ export default class ManagedProfile {
         if (!this.#client) throw new Error('Profile deletion requires a bound REST controller');
         if (this.#recycling) throw new Error('Managed profile recycling has been requested');
         if (this.#deleted) return true;
-        if (await this.stop() !== true) {
-            throw cleanupError(this.profileId, 'stop-unconfirmed', 'Managed profile shutdown unconfirmed');
-        }
+        await this.#stopBeforeCleanup();
         let cause;
         try {
             if (await this.#client.deleteProfile(this.profileId) === true) {
@@ -180,9 +196,7 @@ export default class ManagedProfile {
         if (!this.#client) throw new Error('Profile recycling requires a bound REST controller');
         if (typeof this.#client.recycleProfile !== 'function') throw new Error('Controller does not support profile recycling');
         if (this.#deleting || this.#deleted) throw new Error('Managed profile deletion has been requested');
-        if (await this.stop() !== true) {
-            throw cleanupError(this.profileId, 'stop-unconfirmed', 'Managed profile shutdown unconfirmed');
-        }
+        await this.#stopBeforeCleanup();
         this.#recycleDispatched = true;
         let cause;
         try {

@@ -694,6 +694,47 @@ test('commit helper excludes state directory aliases on a case-insensitive volum
     assert.ok(blocked.stderr.includes(privateFile));
 });
 
+test('commit helper prepares a clean branch without creating a new commit', {
+    skip: process.platform === 'win32'
+}, (t) => {
+    const { git, prepareCommit } = temporaryRepository(t);
+    assert.equal(git('add', '.').status, 0);
+    const initial = git(
+        '-c', 'user.name=Local Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'Reviewed source'
+    );
+    assert.equal(initial.status, 0, initial.stderr);
+    const head = git('rev-parse', 'HEAD').stdout;
+
+    const prepared = prepareCommit('y\n');
+    assert.equal(prepared.status, 0, prepared.stderr || prepared.stdout);
+    assert.match(prepared.stdout, /No staged changes/);
+    assert.match(prepared.stdout, /expected_origin=/);
+    assert.equal(git('rev-parse', 'HEAD').stdout, head);
+    assert.equal(git('status', '--porcelain').stdout, '');
+    assert.equal(git('remote').stdout, '');
+});
+
+test('commit helper requires explicit Git identity for a new commit', {
+    skip: process.platform === 'win32'
+}, (t) => {
+    const { git, prepareCommit, env } = temporaryRepository(t);
+    env.EMAIL = 'fixture@local-host.invalid';
+    assert.equal(git('config', 'user.name', 'Local Fixture').status, 0);
+
+    const rejected = prepareCommit('y\n');
+    assert.equal(rejected.status, 1, rejected.stderr || rejected.stdout);
+    assert.match(rejected.stderr, /auto-detection is disabled/);
+    assert.doesNotMatch(rejected.stderr, /fixture@local-host\.invalid/);
+    assert.notEqual(git('rev-parse', '--verify', '--quiet', 'HEAD').status, 0);
+
+    assert.equal(git('config', 'user.email', 'fixture@example.test').status, 0);
+    const committed = prepareCommit('y\n');
+    assert.equal(committed.status, 0, committed.stderr || committed.stdout);
+    const identities = git('show', '-s', '--format=%ae%n%ce');
+    assert.equal(identities.stdout.trim(), 'fixture@example.test\nfixture@example.test');
+    assert.equal(git('config', '--get', 'user.useConfigOnly').status, 1);
+});
+
 test('the GitHub setup command stops after a failed preflight or an existing origin', {
     skip: process.platform === 'win32'
 }, (t) => {

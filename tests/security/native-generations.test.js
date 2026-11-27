@@ -6,11 +6,12 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
-    setCamoufoxModule, startProfile, stopAllActiveProfiles, stopProfile, unregisterProcessCleanupHooks
+    createProfile, rollbackCreatedProfile, setCamoufoxModule, startProfile, stopAllActiveProfiles,
+    stopProfile, unregisterProcessCleanupHooks
 } from '../../src/camoufox/client.js';
 import { CamoufoxTrafficRecorder, verifyTrafficIntegrity } from '../../src/camoufox/traffic-recorder.js';
 
-function mockLauncher(launches = []) {
+function mockLauncher(launches = [], browsers = []) {
     return {
         async Camoufox(options) {
             launches.push(options);
@@ -18,6 +19,10 @@ function mockLauncher(launches = []) {
             let context;
             const browser = Object.assign(new EventEmitter(), {
                 isConnected: () => connected,
+                disconnect() {
+                    connected = false;
+                    browser.emit('disconnected');
+                },
                 async close() {
                     connected = false;
                     await context?.close();
@@ -44,6 +49,7 @@ function mockLauncher(launches = []) {
                     return context;
                 }
             });
+            browsers.push(browser);
             return browser;
         }
     };
@@ -52,7 +58,8 @@ function mockLauncher(launches = []) {
 function managedFixture(t) {
     const profilesDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'native-generation-'));
     const launches = [];
-    setCamoufoxModule(mockLauncher(launches));
+    const browsers = [];
+    setCamoufoxModule(mockLauncher(launches, browsers));
     t.after(async () => {
         await stopAllActiveProfiles();
         unregisterProcessCleanupHooks();
@@ -74,7 +81,7 @@ function managedFixture(t) {
     };
     const open = (overrides = {}) => startProfile(profileId, { ...options, ...overrides });
     const stop = () => stopProfile(profileId, options);
-    return { open, stop, launches, options, profileId };
+    return { open, stop, launches, browsers, options, profileId };
 }
 
 test('managed startup verifies closed native generations before browser launch and preserves them through rotation', async (t) => {
@@ -290,7 +297,7 @@ test('an explicit stop recovers a marked HAR after a process exits with publicat
     assert.equal(fs.existsSync(scratch), false);
 });
 
-test('only an owned legacy HAR scratch is removed on profile startup', async (t) => {
+test('legacy HAR scratch stays intact when publication cannot be established', async (t) => {
     const { open, stop, options, profileId } = managedFixture(t);
     const { trafficPaths } = await open({ ...HAR_ONLY, recordHar: false });
     assert.equal(await stop(), true);
@@ -315,8 +322,193 @@ test('only an owned legacy HAR scratch is removed on profile startup', async (t)
     fs.unlinkSync(path.join(owned, 'attribution-index.json'));
 
     await open({ ...HAR_ONLY, recordHar: false });
-    assert.equal(fs.existsSync(owned), false);
+    assert.equal(fs.existsSync(owned), true);
     assert.equal(fs.existsSync(other), true);
     assert.equal(fs.existsSync(unknown), true);
     assert.equal(await stop(), true);
+});
+
+test('a HAR-only checkpoint recovers recorded events from a previous process before its first stop', async (t) => {
+    const { open, stop, options, profileId, launches } = managedFixture(t);
+    const clientModule = new URL('../../src/camoufox/client.js', import.meta.url).href;
+    const profileDir = path.join(options.profilesDir, profileId);
+    const harPath = path.join(profileDir, 'traffic', 'interrupted.har');
+    const scratch = path.join(profileDir, '.native', '~har-scratch');
+    const ledgerPath = path.join(scratch, 'traffic.ndjson');
+    const child = `
+        import assert from 'node:assert/strict';
+        import { EventEmitter } from 'node:events';
+        import fs from 'node:fs';
+        import { setCamoufoxModule, startProfile } from ${JSON.stringify(clientModule)};
+        const mockLauncher = ${mockLauncher.toString()};
+        const observeSyntheticRequest = ${observeSyntheticRequest.toString()};
+        setCamoufoxModule(mockLauncher());
+        const session = await startProfile(${JSON.stringify(profileId)}, ${JSON.stringify({
+            ...options, ...HAR_ONLY, contextOptions: { recordHar: { path: harPath } }
+        })});
+        observeSyntheticRequest(session);
+        const path = ${JSON.stringify(ledgerPath)};
+        for (let attempt = 0; attempt < 50; attempt += 1) {
+            if (fs.existsSync(path) && fs.readFileSync(path, 'utf8').trim().split('\\n').length === 3) break;
+            await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        assert.equal(fs.readFileSync(path, 'utf8').trim().split('\\n').length, 3);
+    `;
+    execFileSync(process.execPath, ['--input-type=module', '-e', child], { timeout: 10000 });
+
+    const indexPath = path.join(scratch, 'attribution-index.json');
+    const originalIndex = fs.readFileSync(indexPath, 'utf8');
+    const index = JSON.parse(originalIndex);
+    assert.equal(index.harRecovery.ready, true);
+    assert.equal(index.harRecovery.finalized, false);
+    assert.equal(index.integrity.eventCount, 0);
+    const original = fs.readFileSync(ledgerPath);
+    await assert.rejects(open({ recordHar: false }), { code: 'ERR_CAMOUFOX_HAR_EXPORT_PENDING' });
+    assert.deepEqual(fs.readFileSync(ledgerPath), original);
+    assert.equal(launches.length, 0);
+
+    index.harRecovery.storageGeneration = 'unrelated-generation';
+    fs.writeFileSync(indexPath, JSON.stringify(index));
+    assert.equal(await stop(), false);
+    assert.equal(fs.existsSync(harPath), false);
+    assert.deepEqual(fs.readFileSync(ledgerPath), original);
+
+    fs.writeFileSync(indexPath, originalIndex);
+    assert.equal(await stop(), true);
+    const [entry] = JSON.parse(fs.readFileSync(harPath, 'utf8')).log.entries;
+    assert.equal(entry.request.url, 'https://fixture.invalid/resource');
+    assert.equal(entry.response.status, 204);
+    assert.equal(fs.existsSync(scratch), false);
+});
+
+test('a nonempty pre-upgrade scratch without a checkpoint is retained for unknown ownership', async (t) => {
+    const { open, stop, options, profileId } = managedFixture(t);
+    await open({ ...HAR_ONLY, recordHar: false });
+    assert.equal(await stop(), true);
+    const scratch = path.join(options.profilesDir, profileId, '.native', '~har-scratch');
+    const recorder = new CamoufoxTrafficRecorder({ profileId, trafficDir: scratch, recordWireLog: false });
+    recorder.setStep('synthetic legacy HAR activity');
+    await recorder.stop();
+    fs.unlinkSync(path.join(scratch, 'attribution-index.json'));
+
+    const ledger = path.join(scratch, 'traffic.ndjson');
+    const original = fs.readFileSync(ledger);
+    await assert.rejects(open(HAR_ONLY), { code: 'ERR_CAMOUFOX_HAR_EXPORT_PENDING' });
+    assert.equal(await stop(), false);
+    assert.deepEqual(fs.readFileSync(ledger), original);
+});
+
+test('failure before profile readiness leaves the previous HAR bytes intact', async (t) => {
+    const { open, stop, options, profileId } = managedFixture(t);
+    const session = await open(HAR_ONLY);
+    observeSyntheticRequest(session);
+    assert.equal(await stop(), true);
+    const { harPath } = session.trafficPaths;
+    const previous = fs.readFileSync(harPath);
+    assert.equal(JSON.parse(previous).log.entries.length, 1);
+    await assert.rejects(startProfile(profileId, { ...options, ...HAR_ONLY }, undefined, {
+        beforeReady() { throw new Error('Synthetic startup check failed'); }
+    }), /Synthetic startup check failed/);
+    assert.deepEqual(fs.readFileSync(harPath), previous);
+    await open(HAR_ONLY);
+    assert.equal(await stop(), true);
+});
+
+test('active and pending profiles validate requested HAR destinations and formats before reuse', async (t) => {
+    const { open, stop, options, profileId } = managedFixture(t);
+    const harDir = path.join(options.profilesDir, profileId, 'traffic');
+    const first = path.join(harDir, 'first.har');
+    const second = path.join(harDir, 'second.har');
+    const harSettings = (recordHar) => ({ ...HAR_ONLY, contextOptions: { recordHar } });
+    const pending = open(harSettings({ path: first }));
+    await assert.rejects(open(harSettings({ path: second })), /changing the HAR destination/);
+    const session = await pending;
+    assert.equal(await open(harSettings({ path: first, mode: 'full' })), session);
+    await assert.rejects(open(harSettings({ path: second })), /changing the HAR destination/);
+    await assert.rejects(open(harSettings({ path: first, mode: 'minimal' })), /minimal mode/);
+    await assert.rejects(open(harSettings({ path: first, urlFilter: '*' })), /native URL filters/);
+    observeSyntheticRequest(session);
+    assert.equal(await stop(), true);
+    assert.equal(JSON.parse(fs.readFileSync(first, 'utf8')).log.entries.length, 1);
+    assert.equal(fs.existsSync(second), false);
+});
+
+test('a Necko log above the parsing limit stays private and does not block shutdown or restart', async (t) => {
+    const { open, stop } = managedFixture(t);
+    const session = await open();
+    const { trafficDir, neckoMozLogPath, attributionIndexPath } = session.trafficPaths;
+    const limit = 128 * 1024 * 1024;
+    fs.truncateSync(neckoMozLogPath, limit + 1);
+
+    assert.equal(await stop(), true);
+    assert.equal(fs.statSync(neckoMozLogPath).size, limit + 1);
+    const index = JSON.parse(fs.readFileSync(attributionIndexPath, 'utf8'));
+    assert.equal(index.neckoMozLog.diagnosticsOmitted, 'size-limit');
+    assert.equal(index.integrity.nativeArtifacts.neckoMozLog.hashedBytes, limit);
+    const verified = verifyTrafficIntegrity(trafficDir, { nativeDir: path.dirname(neckoMozLogPath) });
+    assert.equal(verified.valid, true);
+    assert.deepEqual(verified.unverifiedNativeArtifacts, [path.basename(neckoMozLogPath)]);
+
+    await open({ neckoMozLog: false });
+    assert.equal(await stop(), true);
+    assert.equal(fs.statSync(neckoMozLogPath).size, limit + 1);
+});
+
+test('Necko child files are included in the manifest and checked with the parent', async (t) => {
+    const { open, stop } = managedFixture(t);
+    const session = await open();
+    const { trafficDir, neckoMozLogPath, attributionIndexPath } = session.trafficPaths;
+    const child = neckoMozLogPath + '.child-1';
+    const nativeDir = path.dirname(neckoMozLogPath);
+    fs.writeFileSync(child, 'http request [\nGET /test HTTP/1.1\nHost: fixture.invalid\n]\n', { mode: 0o644 });
+    assert.equal(await stop(), true);
+
+    const index = JSON.parse(fs.readFileSync(attributionIndexPath, 'utf8'));
+    assert.equal(index.neckoMozLog.requestBlockCount, 1);
+    assert.equal(index.integrity.nativeArtifacts.neckoMozLog.children[0].file, path.basename(child));
+    assert.equal(verifyTrafficIntegrity(trafficDir, { nativeDir }).valid, true);
+    const extra = neckoMozLogPath + '.child-2';
+    fs.writeFileSync(extra, 'independent synthetic child log\n', { mode: 0o600 });
+    assert.deepEqual(verifyTrafficIntegrity(trafficDir, { nativeDir }).unverifiedNativeArtifacts, [path.basename(extra)]);
+    fs.unlinkSync(child);
+    const missing = verifyTrafficIntegrity(trafficDir, { nativeDir });
+    assert.equal(missing.valid, false);
+    assert.ok(missing.errors.includes(`Missing ${path.basename(child)} on disk`));
+});
+
+test('transport loss keeps the raw native generation unsealed and allows a fresh generation', async (t) => {
+    const { open, stop, browsers } = managedFixture(t);
+    const first = await open();
+    const { neckoMozLogPath, trafficDir, attributionIndexPath } = first.trafficPaths;
+    const nativeDir = path.dirname(neckoMozLogPath);
+    fs.appendFileSync(neckoMozLogPath, 'native event before loss\n');
+    browsers[0].disconnect();
+    assert.equal(await stop(), false);
+    const index = JSON.parse(fs.readFileSync(attributionIndexPath, 'utf8'));
+    assert.equal(index.integrity.nativeArtifacts.neckoMozLog.closed, false);
+
+    fs.appendFileSync(neckoMozLogPath, 'native event after transport loss\n');
+    const evidence = verifyTrafficIntegrity(trafficDir, { nativeDir });
+    assert.equal(evidence.valid, true);
+    assert.deepEqual(evidence.unverifiedNativeArtifacts, [path.basename(neckoMozLogPath)]);
+    const next = await open();
+    assert.notEqual(next.trafficPaths.neckoMozLogPath, neckoMozLogPath);
+    assert.equal(await stop(), true);
+    assert.match(fs.readFileSync(neckoMozLogPath, 'utf8'), /after transport loss/);
+});
+
+test('startup rollback preserves native evidence when physical exit is unconfirmed', async (t) => {
+    const { options, profileId, browsers } = managedFixture(t);
+    const created = await createProfile('fixture', null, { ...options, profileId });
+    const nativeFile = path.join(created.profileDir, '.native', 'necko-pre-tls.moz_log');
+    await assert.rejects(startProfile(profileId, options, undefined, {
+        createdProfile: created,
+        beforeReady() {
+            fs.appendFileSync(nativeFile, 'synthetic native data before startup disconnect\n');
+            browsers[0].disconnect();
+            throw new Error('Synthetic startup disconnected');
+        }
+    }), /Synthetic startup disconnected/);
+    assert.equal(await rollbackCreatedProfile(created), 'delete-unconfirmed');
+    assert.match(fs.readFileSync(nativeFile, 'utf8'), /before startup disconnect/);
 });

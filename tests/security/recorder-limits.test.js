@@ -236,7 +236,14 @@ test('attachment rollback keeps only files whose ledger event was fully written'
                 if (typeof data === 'string' && data.startsWith('{"type":"egress"')) {
                     write(file, data.slice(0, complete ? -1 : 11), ...args);
                     if (mode === 'reader-failed') {
-                        fs.readSync = () => { throw new Error('synthetic read fault'); };
+                        const ledger = fs.statSync(recorder.trafficNdjsonPath, { bigint: true });
+                        fs.readSync = (fd, ...args) => {
+                            const file = fs.fstatSync(fd, { bigint: true });
+                            if (file.dev === ledger.dev && file.ino === ledger.ino) {
+                                throw new Error('synthetic read fault');
+                            }
+                            return read(fd, ...args);
+                        };
                     }
                     throw new Error('synthetic append fault');
                 }

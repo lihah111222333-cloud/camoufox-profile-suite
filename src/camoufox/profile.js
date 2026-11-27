@@ -4,6 +4,7 @@
  */
 
 import path from 'node:path';
+import { Script } from 'node:vm';
 import logger from '../utils/logger.js';
 import camoufoxClient, {
     rollbackCreatedProfile, validateCamoufoxNetworkPolicy, waitForCamoufoxStartup
@@ -23,18 +24,21 @@ const WAIT_UNTIL_MAP = {
 
 /**
  * Normalize Puppeteer-style navigation options (`networkidle2` / `networkidle0`) for Playwright.
+ * Playwright accepts a single lifecycle condition, so reject waits requiring multiple conditions.
  */
 export function normalizeNavigationOptions(options) {
     if (!options || typeof options !== 'object') {
         return options;
     }
     const normalized = { ...options };
+    if (Array.isArray(normalized.waitUntil)) {
+        if (normalized.waitUntil.length > 1) {
+            throw new TypeError('Camoufox navigation supports only one waitUntil condition');
+        }
+        normalized.waitUntil = normalized.waitUntil[0] || 'load';
+    }
     if (typeof normalized.waitUntil === 'string') {
         normalized.waitUntil = WAIT_UNTIL_MAP[normalized.waitUntil] || normalized.waitUntil;
-    } else if (Array.isArray(normalized.waitUntil)) {
-        normalized.waitUntil = normalized.waitUntil[0]
-            ? WAIT_UNTIL_MAP[normalized.waitUntil[0]] || normalized.waitUntil[0]
-            : 'load';
     }
     return normalized;
 }
@@ -105,13 +109,30 @@ function cookieMatchesScope(cookie, { name, domain, url, path, partitionKey, _cr
     return url.pathname.startsWith(cookie.path.endsWith('/') ? cookie.path : `${cookie.path}/`);
 }
 
+/**
+ * The adapter serializes standalone functions and arrows. Check the same expression
+ * used by the backend without running the callback or registering an initializer.
+ */
+function evaluationFunctionSource(pageFunction) {
+    const message = 'Camoufox evaluation requires a serializable standalone function or arrow function';
+    if (typeof pageFunction !== 'function') throw new TypeError(message);
+    const source = Function.prototype.toString.call(pageFunction);
+    if (/^class(?=\s|\{|\/)/.test(source)) throw new TypeError(message);
+    try {
+        new Script(`(${source})`);
+    } catch {
+        throw new TypeError(message);
+    }
+    return source;
+}
+
 function wrapMultiArgEvaluate(originalEvaluate, decorateResult = null) {
     return async (pageFunction, ...args) => {
         let result;
-        if (args.length <= 1 || typeof pageFunction !== 'function') {
+        if (args.length <= 1) {
             result = await originalEvaluate(pageFunction, args[0]);
         } else {
-            const fnSource = pageFunction.toString();
+            const fnSource = evaluationFunctionSource(pageFunction);
             result = await originalEvaluate(
                 ([serializedFn, serializedArgs]) => {
                     // eslint-disable-next-line no-new-func
@@ -255,10 +276,10 @@ export function attachElementHandleCompatibility(handle, owner = null, targetHin
     if (typeof handle.evaluate === 'function') {
         const originalEvaluate = handle.evaluate.bind(handle);
         handle.evaluate = async (pageFunction, ...args) => {
-            if (args.length <= 1 || typeof pageFunction !== 'function') {
+            if (args.length <= 1) {
                 return originalEvaluate(pageFunction, args[0]);
             }
-            const fnSource = pageFunction.toString();
+            const fnSource = evaluationFunctionSource(pageFunction);
             return originalEvaluate(
                 (el, [serializedFn, serializedArgs]) => {
                     // eslint-disable-next-line no-new-func
@@ -274,10 +295,10 @@ export function attachElementHandleCompatibility(handle, owner = null, targetHin
         const originalEvaluateHandle = handle.evaluateHandle.bind(handle);
         handle.evaluateHandle = async (pageFunction, ...args) => {
             let res;
-            if (args.length <= 1 || typeof pageFunction !== 'function') {
+            if (args.length <= 1) {
                 res = await originalEvaluateHandle(pageFunction, args[0]);
             } else {
-                const fnSource = pageFunction.toString();
+                const fnSource = evaluationFunctionSource(pageFunction);
                 res = await originalEvaluateHandle(
                     (el, [serializedFn, serializedArgs]) => {
                         // eslint-disable-next-line no-new-func
@@ -358,8 +379,8 @@ export function attachFrameCompatibility(frame, page = null) {
 
     if (typeof frame.$ === 'function') {
         const originalQuery = frame.$.bind(frame);
-        frame.$ = async (selector) =>
-            attachElementHandleCompatibility(await originalQuery(selector), frame, selector);
+        frame.$ = async (selector, options) =>
+            attachElementHandleCompatibility(await originalQuery(selector, options), frame, selector);
     }
 
     if (typeof frame.$$ === 'function') {
@@ -544,6 +565,9 @@ export function attachPageCompatibility(page, context = null, profile = null) {
                 throw new Error('The browser backend does not support page-scoped initializers');
             }
 
+            if (typeof pageFunction === 'function' && args.length <= 1) {
+                evaluationFunctionSource(pageFunction);
+            }
             return wrapMultiArgEvaluate(page.addInitScript.bind(page))(pageFunction, ...args);
         };
     }
@@ -551,14 +575,16 @@ export function attachPageCompatibility(page, context = null, profile = null) {
     // Puppeteer page.setViewport({ width, height }) & page.viewport()
     if (typeof page.setViewport !== 'function') {
         page.setViewport = async (viewport) => {
-            if (!viewport || typeof viewport !== 'object') {
-                return;
+            const { width, height } = viewport ?? {};
+            if (!Number.isInteger(width) || width <= 0 || !Number.isInteger(height) || height <= 0) {
+                throw new TypeError('Camoufox requires positive integer viewport width and height');
             }
-            const { width, height } = viewport;
-            page._camoufoxViewport = { ...viewport };
-            if (typeof page.setViewportSize === 'function' && width && height) {
-                await page.setViewportSize({ width, height });
+            if (typeof page.setViewportSize !== 'function') {
+                throw new Error('The browser backend does not support viewport resizing');
             }
+            const requestedViewport = { ...viewport, width, height };
+            await page.setViewportSize({ width, height });
+            page._camoufoxViewport = requestedViewport;
         };
     }
 
@@ -583,15 +609,9 @@ export function attachPageCompatibility(page, context = null, profile = null) {
                 !/Chrome\/\d+|Chromium\/\d+|Edg\/\d+/i.test(uaString);
 
             if (!isFirefoxCoherent) {
-                page._lastBlockedUserAgent = uaString;
-                logger.warn(
-                    'Blocked non-Firefox page.setUserAgent() on Camoufox to preserve Firefox C++ fingerprint coherence',
-                    { userAgent: uaString }
-                );
+                logger.warn('Blocked non-Firefox page.setUserAgent() on Camoufox');
                 if (options?.strict === true) {
-                    throw new Error(
-                        `Refusing to set non-Firefox User-Agent on Camoufox: ${uaString}`
-                    );
+                    throw new Error('Refusing to set non-Firefox User-Agent on Camoufox');
                 }
                 return {
                     applied: false,
@@ -600,10 +620,7 @@ export function attachPageCompatibility(page, context = null, profile = null) {
                 };
             }
 
-            logger.debug(
-                'Ignoring runtime page.setUserAgent() on Camoufox; User-Agent is managed at the C++ BrowserForge layer',
-                { userAgent: uaString }
-            );
+            logger.debug('Ignored page.setUserAgent() because Camoufox manages the User-Agent');
             return {
                 applied: false,
                 blocked: false,
@@ -679,11 +696,20 @@ export function attachPageCompatibility(page, context = null, profile = null) {
                             delete copy.sameSite;
                         }
                     }
+                    if (copy.path != null && (typeof copy.path !== 'string' || !copy.path.startsWith('/'))) {
+                        throw new TypeError('Cookie path must begin with /');
+                    }
                     if (copy.domain) {
                         delete copy.url;
                         if (!copy.path) {
                             copy.path = '/';
                         }
+                    } else if (copy.path != null) {
+                        const scopedUrl = parseCookieUrl(copy.url || currentUrl);
+                        if (!scopedUrl) throw new TypeError('Cookie path requires an HTTP(S) URL or a domain');
+                        copy.domain = scopedUrl.hostname;
+                        if (scopedUrl.protocol === 'https:') copy.secure = true;
+                        delete copy.url;
                     } else {
                         if (!copy.url && currentUrl && /^https?:\/\//i.test(currentUrl)) {
                             copy.url = currentUrl;
@@ -991,92 +1017,39 @@ export class CamoufoxProfile {
     }
 
     async #auditSession(session, expectedOs = null, options = {}, signal) {
-        const { page, browser, metadata, fingerprintLedger, trafficRecorder, trafficPaths } = session;
+        const { page, browser, metadata, trafficRecorder, trafficPaths } = session;
         const targetOs = expectedOs || metadata?.os || this.options?.os || 'windows';
-        const report = await waitForCamoufoxStartup(auditProfileCoherence(page, targetOs, {
+        const includeTelemetry = options?.includeTelemetry === true;
+        const { telemetry, ...report } = await waitForCamoufoxStartup(auditProfileCoherence(page, targetOs, {
             profileId: this.profileId,
             hardwareProfile: metadata?.hardwareProfile || undefined,
-            ...options
+            ...options,
+            includeTelemetry: includeTelemetry || Boolean(trafficRecorder)
         }), signal);
         signal?.throwIfAborted();
         if (browser?.isConnected() === false) throw new Error('Camoufox profile closed during its audit');
-        if (typeof fingerprintLedger?.recordOrVerify === 'function') {
-            const pageUrl =
-                typeof page?.url === 'function' ? page.url() : 'about:blank';
-            if (report?.telemetry?.canvas2d?.fnv1aHash) {
+
+        if (trafficRecorder && telemetry) {
+            const traceId = trafficRecorder.traceId;
+            let events = [];
+            let captureIssue = null;
+            if (typeof traceId === 'string' && traceId.trim()) {
                 try {
-                    report.canvasConsistency = fingerprintLedger.recordOrVerify({
-                        kind: 'canvas',
-                        url: pageUrl || 'about:blank',
-                        width: 240,
-                        height: 60,
-                        drewText: 'Camoufox Coherence 🦊 123.45',
-                        hash: report.telemetry.canvas2d.fnv1aHash
-                    });
-                } catch (ledgerErr) {
-                    logger.debug('Could not record canvas2d hash in fingerprintLedger during auditCoherence', {
-                        profileId: this.profileId,
-                        error: ledgerErr.message
-                    });
+                    events = trafficPaths?.trafficDir
+                        ? readCoherenceCaptureEvents(trafficPaths.trafficDir, { trustedLocal: true })
+                        : trafficRecorder;
+                } catch (error) {
+                    captureIssue = error.code === 'ERR_COHERENCE_CAPTURE_INVALID' ? 'invalid-capture-record' : 'unreadable-capture';
                 }
+            } else {
+                captureIssue = 'unknown-active-trace';
             }
-            const webglInfo = report?.telemetry?.webgl;
-            if (webglInfo && (webglInfo.fnv1aHash || webglInfo.unmaskedRenderer || webglInfo.renderer)) {
-                try {
-                    let webglHash = webglInfo.fnv1aHash;
-                    if (!webglHash || !/^[0-9a-f]+$/i.test(String(webglHash))) {
-                        const sig = [
-                            webglInfo.unmaskedVendor || webglInfo.vendor || '',
-                            webglInfo.unmaskedRenderer || webglInfo.renderer || '',
-                            webglInfo.version || '',
-                            webglInfo.shadingLanguageVersion || '',
-                            webglInfo.maxTextureSize ?? '',
-                            webglInfo.extensionsCount ?? ''
-                        ].join('|');
-                        let hHigh = 0x811c9dc5;
-                        let hLow = 0xcbf29ce4;
-                        for (let i = 0; i < sig.length; i++) {
-                            const b = sig.charCodeAt(i) & 0xff;
-                            hHigh ^= b;
-                            hHigh = Math.imul(hHigh, 0x01000193) >>> 0;
-                            if ((i & 1) === 1) {
-                                hLow ^= b;
-                                hLow = Math.imul(hLow, 0x01000193) >>> 0;
-                            }
-                        }
-                        webglHash =
-                            hHigh.toString(16).padStart(8, '0') +
-                            hLow.toString(16).padStart(8, '0');
-                    }
-                    report.webglConsistency = fingerprintLedger.recordOrVerify({
-                        kind: 'webgl',
-                        url: pageUrl || 'about:blank',
-                        width: 64,
-                        height: 64,
-                        drewText: webglInfo.unmaskedRenderer || webglInfo.renderer || '',
-                        hash: webglHash
-                    });
-                } catch (ledgerErr) {
-                    logger.debug('Could not record webgl hash in fingerprintLedger during auditCoherence', {
-                        profileId: this.profileId,
-                        error: ledgerErr.message
-                    });
-                }
-            }
-        }
-        if (trafficRecorder && report?.telemetry) {
-            const events = trafficPaths?.trafficDir
-                ? readCoherenceCaptureEvents(trafficPaths.trafficDir, { trustedLocal: true })
-                : [];
-            const wireToDomCoherence = evaluateWireToDomCoherence(
-                report.telemetry,
-                events.length > 0 ? events : trafficRecorder,
-                targetOs
-            );
+            const wireToDomCoherence = evaluateWireToDomCoherence(telemetry, events, targetOs, { traceId });
+            if (captureIssue) wireToDomCoherence.captureIssue = captureIssue;
             const { passed, status, score } = summarizeCoherenceChecks([...report.checks, ...wireToDomCoherence.checks]);
             Object.assign(report, { wireToDomCoherence, passed, status, score });
         }
-        return report;
+        return { ...report, telemetry: includeTelemetry ? telemetry : null };
     }
 
     /**
@@ -1181,14 +1154,13 @@ export class CamoufoxProfile {
      */
     async getPage() {
         const context = await this.getContext();
-        if (!this.page || (typeof this.page.isClosed === 'function' && this.page.isClosed())) {
-            const pages = context.pages();
-            const page = pages[0] || await context.newPage();
-            if (this.context !== context || !this.#lifecycle?.canReuse()) {
-                throw new Error('Camoufox profile closed while opening a page');
-            }
-            this.page = attachPageCompatibility(page, context, this);
+        const lifecycle = this.#lifecycle;
+        if (!context || !lifecycle?.canReuse()) throw new Error('Camoufox profile closed while opening a page');
+        const page = await lifecycle.getPage();
+        if (this.context !== context || this.#lifecycle !== lifecycle || !lifecycle.canReuse()) {
+            throw new Error('Camoufox profile closed while opening a page');
         }
+        this.page = attachPageCompatibility(page, context, this);
         return this.page;
     }
 

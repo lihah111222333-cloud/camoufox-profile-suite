@@ -1297,7 +1297,7 @@ async function runTests() {
                 const context = await profile.getContext();
 
                 // 1) Navigate to /steps/signup/name and run detectGmailPage(page)
-                await page.goto('https://accounts.google.com/lifecycle/steps/signup/name');
+                await page.goto('https://accounts.google.com/steps/signup/name');
                 const detectedSignup = await detectGmailPage(page);
                 assert.equal(detectedSignup.type, 'SIGN_UP_FORM');
                 assert.equal(

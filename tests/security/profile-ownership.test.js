@@ -84,7 +84,7 @@ function runOwnerProcess(operation, profilesDir) {
         import assert from 'node:assert/strict';
         import fs from 'node:fs';
         import {
-            deleteProfile, saveProfileStorageState, setCamoufoxModule, startProfile
+            deleteProfile, saveProfileStorageState, setCamoufoxModule, startProfile, stopProfile
         } from ${JSON.stringify(new URL('../../src/camoufox/client.js', import.meta.url).href)};
         const makeLauncher = ${mockLauncher.toString()};
         setCamoufoxModule(makeLauncher());
@@ -93,7 +93,10 @@ function runOwnerProcess(operation, profilesDir) {
         if (operation === 'check-exclusive') {
             const busy = { code: 'ERR_CAMOUFOX_PROFILE_BUSY' };
             await assert.rejects(startProfile('owner', options), busy);
+            assert.equal(await stopProfile('owner', options), false);
             await assert.rejects(deleteProfile('owner', options), busy);
+        } else if (operation === 'check-inactive') {
+            assert.equal(await stopProfile('owner', options), true);
         } else if (operation === 'abandon-har') {
             await startProfile('owner', { ...options, recordHar: true });
         } else {
@@ -225,6 +228,21 @@ test('new-profile factory rejects an occupied ID and inactive snapshots need a r
     assert.equal(await startProfile('fixture', options), session);
 });
 
+test('loading a missing snapshot leaves the store untouched', async (t) => {
+    const options = setup(t);
+    const missingRoot = path.join(options.profilesDir, 'new-store');
+    assert.equal(loadStorageState('fixture', missingRoot), null);
+    assert.equal(fs.existsSync(missingRoot), false);
+
+    assert.equal(loadStorageState('fixture', options.profilesDir), null);
+    const created = await createProfile('fixture', null, { ...options, profileId: 'fixture' });
+    assert.equal(loadStorageState('fixture', options.profilesDir), created.storageStatePath);
+
+    fs.unlinkSync(created.storageStatePath);
+    assert.equal(loadStorageState('fixture', options.profilesDir), null);
+    assert.equal(fs.existsSync(created.storageStatePath), false);
+});
+
 test('a legacy profile can start after snapshot repair and routine reads preserve damaged bytes', async (t) => {
     let launches = 0;
     const options = setup(t, () => { launches += 1; });
@@ -277,6 +295,7 @@ test('another local process cannot start or delete an active profile and dead ow
     assert.equal(active.browser.isConnected(), true);
 
     assert.equal(await stopProfile('owner', first), true);
+    runOwnerProcess('check-inactive', alias);
     assert.equal(await deleteProfile('owner', first), true);
     assert.equal(await getProfile('owner', first), null);
     const replacement = await createProfile('replacement', null, { ...first, profileId: 'owner' });

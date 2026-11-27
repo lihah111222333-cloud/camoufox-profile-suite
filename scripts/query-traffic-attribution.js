@@ -32,7 +32,9 @@ import { getDefaultProfilesDirectory } from '../src/utils/state-paths.js';
 import { loadApplicationEnvironment } from '../src/utils/private-env.js';
 import { CookieLineage } from '../src/camoufox/cookie-lineage.js';
 import { readCaptureFile } from '../src/camoufox/capture-io.js';
-import { capturePolicyAllowsBody, readCaptureExportIndex } from '../src/camoufox/capture-export-policy.js';
+import {
+    captureEventTraceId, capturePolicyAllowsBody, readCaptureExportIndex
+} from '../src/camoufox/capture-export-policy.js';
 import {
     inspectProfileDirectory, resolveProfileNativeDirectory, resolveProfilesRoot, validateProfileId
 } from '../src/camoufox/profile-storage.js';
@@ -52,6 +54,7 @@ import {
     classifyTrafficLifecycleAnomaly,
     trafficAnomalyKey,
     securityBlockAnomaly,
+    getCaptureWireLogFileName,
     readCaptureExportBody,
     redactDiagnosticMetadata,
     redactDiagnosticText,
@@ -253,7 +256,9 @@ function* iterateNdjsonEvents(filePath, { trustedLocal = false, maxBytes, maxRec
     });
     if (!bytes) return;
     let start = 0;
+    let lineNumber = 0;
     while (start < bytes.length) {
+        lineNumber += 1;
         const newline = bytes.indexOf(0x0a, start);
         const end = newline === -1 ? bytes.length : newline;
         if (end - start > maxRecordBytes) {
@@ -266,8 +271,10 @@ function* iterateNdjsonEvents(filePath, { trustedLocal = false, maxBytes, maxRec
         try {
             event = JSON.parse(line);
         } catch {
-            // A malformed record does not provide a usable event.
-            continue;
+            throw new Error('Line ' + lineNumber + ' of traffic.ndjson: Invalid JSON');
+        }
+        if (!event || typeof event !== 'object' || Array.isArray(event)) {
+            throw new Error('Line ' + lineNumber + ' of traffic.ndjson: Expected an event object');
         }
         yield event;
     }
@@ -362,6 +369,11 @@ function parsedUrlHost(record) {
     }
 }
 
+function observedStatus(value) {
+    const status = typeof value === 'string' && value.trim() ? Number(value) : value;
+    return Number.isFinite(status) ? status : null;
+}
+
 /**
  * Check if a numeric HTTP status code matches a filter like `429`, `403`, `4xx`, `5xx`, `200`.
  *
@@ -373,11 +385,8 @@ export function matchesStatusFilter(statusValue, statusFilter) {
     if (statusFilter === null || statusFilter === undefined || statusFilter === '') {
         return true;
     }
-    if (statusValue === null || statusValue === undefined) {
-        return false;
-    }
-    const numericStatus = Number(statusValue);
-    if (!Number.isFinite(numericStatus)) {
+    const numericStatus = observedStatus(statusValue);
+    if (numericStatus === null) {
         return false;
     }
 
@@ -430,6 +439,10 @@ export function matchesTriggerFilter(triggerAction, triggerFilter) {
     );
 }
 
+function transactionKey(record) {
+    return record?.correlationId ? JSON.stringify([captureEventTraceId(record), record.correlationId]) : null;
+}
+
 /**
  * Check if a record matches all active filter criteria (`step`, `trigger`, `domain`, `status`, `correlation`).
  *
@@ -456,6 +469,7 @@ function recordMatchesFilters(
         }
     }
 
+    const txKey = transactionKey(record);
     if (filters.step) {
         const stepName = extractActionStep(record);
         if (!stepName || stepName !== String(filters.step)) {
@@ -471,7 +485,7 @@ function recordMatchesFilters(
                       actionId: record.triggerActionId || null,
                       target: record.triggerTarget || null
                   }
-                : txTriggerByCorrelation?.get(record.correlationId));
+                : txTriggerByCorrelation?.get(txKey));
         if (!matchesTriggerFilter(triggerAction, filters.trigger)) {
             return false;
         }
@@ -485,7 +499,7 @@ function recordMatchesFilters(
     if (filters.platform) {
         const targetPlatform = String(filters.platform).trim().toLowerCase();
         const matched = platformCorrelations
-            ? platformCorrelations.has(record.correlationId)
+            ? platformCorrelations.has(txKey)
             : String(record.platform || '').toLowerCase() === targetPlatform;
         if (!matched) return false;
     }
@@ -501,11 +515,9 @@ function recordMatchesFilters(
         if (
             (statusCandidate === null || statusCandidate === undefined) &&
             useTransactionStatusFallback &&
-            record.correlationId &&
-            txStatusByCorrelation &&
-            txStatusByCorrelation.has(record.correlationId)
+            txKey !== null
         ) {
-            statusCandidate = txStatusByCorrelation.get(record.correlationId);
+            statusCandidate = txStatusByCorrelation?.get(txKey);
         }
         if (!matchesStatusFilter(statusCandidate, filters.status)) {
             return false;
@@ -551,7 +563,7 @@ function resolveProfileTrafficPaths(profilesDir, selector) {
     }
 
     const isLegacyAlias = /^profile-legacy-\d{13}(?:-\d{1,8})?$/.test(id || '');
-    if (id && !isLegacyAlias) {
+    if (id) {
         const direct = inspectProfileTrafficPaths(profilesDir, id);
         if (direct) return direct;
     }
@@ -581,7 +593,8 @@ function resolveProfileTrafficPaths(profilesDir, selector) {
 
 function ledgerAnomaly(event) {
     const { type } = event;
-    if (type === 'security-block') return securityBlockAnomaly(event);
+    const traceId = captureEventTraceId(event);
+    if (type === 'security-block') return { ...securityBlockAnomaly(event), traceId };
     const classification = classifyTrafficLifecycleAnomaly(event);
     if (!classification) return null;
 
@@ -589,6 +602,7 @@ function ledgerAnomaly(event) {
     return {
         timestamp: event.timestamp,
         correlationId: event.correlationId || null,
+        traceId,
         actionStep: extractActionStep(event),
         triggerAction: extractTriggerAction(event),
         ...classification,
@@ -652,16 +666,18 @@ function summarizeCapture(events, indexData, ledgerExists) {
     if (staleIndex) {
         indexWarnings.push('The capture index is out of sync with the traffic ledger. The report uses ledger counts.');
     }
+    const withoutTrace = ({ traceId, ...anomaly }) => anomaly;
     if (indexData && (indexedAnomalies || securityBlocks.length) &&
-        !isDeepStrictEqual(indexedAnomalies?.filter(isSecurityBlock), securityBlocks)) {
+        !isDeepStrictEqual(indexedAnomalies?.filter(isSecurityBlock).map(withoutTrace), securityBlocks.map(withoutTrace))) {
         indexWarnings.push('Security block anomalies in the capture index differ from the traffic ledger. The report uses the ledger.');
     }
+    const observedKeys = new Set(observedAnomalies.map(anomalyKey));
     const otherAnomalies = checkpoint == null || checkpointMatches
-        ? indexedAnomalies?.filter((anomaly) => !isSecurityBlock(anomaly)) ?? []
+        ? indexedAnomalies?.filter((anomaly) => !isSecurityBlock(anomaly) && !observedKeys.has(anomalyKey(anomaly))) ?? []
         : [];
-    const anomalyKeys = new Set(otherAnomalies.map(anomalyKey));
+    const anomalyKeys = new Set();
     for (const anomaly of observedAnomalies) {
-        const key = anomalyKey(anomaly);
+        const key = JSON.stringify([anomaly.traceId, anomalyKey(anomaly)]);
         if (anomalyKeys.has(key)) continue;
         anomalyKeys.add(key);
         otherAnomalies.push(anomaly);
@@ -694,7 +710,7 @@ function summarizeFilteredTraffic(events, txTriggerByCorrelation) {
     for (const event of events) {
         if (!countTrafficEvent(event, totals)) continue;
         const step = redactDiagnosticText(extractActionStep(event));
-        const trigger = extractTriggerAction(event) ?? txTriggerByCorrelation.get(event.correlationId);
+        const trigger = extractTriggerAction(event) ?? txTriggerByCorrelation.get(transactionKey(event));
         const actionId = redactDiagnosticText(trigger?.actionId);
         countGroup(steps, step, event);
         countGroup(domains, parsedUrlHost(event), event);
@@ -713,13 +729,29 @@ function summarizeFilteredTraffic(events, txTriggerByCorrelation) {
     };
 }
 
+function reportLocation({ profileId, profileDir, trafficDir }, includeLocalPaths) {
+    return {
+        profileId: redactProfileId(profileId),
+        ...(includeLocalPaths === true && { profileDir, trafficDir })
+    };
+}
+
+function reportArtifactPaths(artifacts, includeLocalPaths) {
+    if (includeLocalPaths === true) return artifacts;
+    return Object.fromEntries(Object.entries(artifacts).map(([field, file]) => [
+        field, file == null ? null : redactDiagnosticText(path.basename(file))
+    ]));
+}
+
 /**
- * List and summarize all profiles under `profilesDir` that contain a `traffic/` directory.
+ * List and summarize all profiles under the given directory that contain traffic.
  *
  * @param {string} profilesDir
+ * @param {object} [options]
+ * @param {boolean} [options.includeLocalPaths=false] Include exact locations in private output.
  * @returns {Array<object>}
  */
-export function listTrafficProfiles(profilesDir) {
+export function listTrafficProfiles(profilesDir, { includeLocalPaths = false } = {}) {
     const resolvedDir = resolveProfilesRoot(resolveProfilesDir(profilesDir));
     const summaries = [];
 
@@ -727,40 +759,41 @@ export function listTrafficProfiles(profilesDir) {
         const attributionIndexPath = path.join(trafficDir, 'attribution-index.json');
         const trafficNdjsonPath = path.join(trafficDir, 'traffic.ndjson');
         const sslKeyLogPath = path.join(trafficDir, 'sslkeylog.txt');
-        const preTlsWireLogPath = path.join(trafficDir, 'pre-tls-wire.log');
 
         const indexData = readJsonSafe(attributionIndexPath);
+        const preTlsWireLogPath = path.join(trafficDir, getCaptureWireLogFileName(indexData?.integrity));
         const ledgerExists = fs.existsSync(trafficNdjsonPath);
         const { totals, anomalies, indexWarnings, steps, domains, triggers } =
             summarizeCapture(iterateNdjsonEvents(trafficNdjsonPath), indexData, ledgerExists);
         const session = shareableRecord(indexData?.session || {});
 
+        const location = reportLocation({ profileId, profileDir, trafficDir }, includeLocalPaths);
         summaries.push({
-            profileId,
-            profileDir,
-            trafficDir,
-            accountId: session.accountId ?? null,
-            accountEmail: session.accountEmail ?? null,
-            os: session.os ?? null,
-            proxyServer: session.proxyServer ?? null,
-            startedAt: session.startedAt ?? null,
-            endedAt: session.endedAt ?? null,
-            totals,
-            anomalyCount: anomalies.length,
-            indexWarnings,
-            steps: [...steps].map(redactDiagnosticText),
-            domains: [...domains],
-            triggers: [...triggers],
-            artifacts: {
+            ...redactDiagnosticMetadata({
+                accountId: session.accountId ?? null,
+                accountEmail: session.accountEmail ?? null,
+                os: session.os ?? null,
+                proxyServer: session.proxyServer ?? null,
+                startedAt: session.startedAt ?? null,
+                endedAt: session.endedAt ?? null,
+                totals,
+                anomalyCount: anomalies.length,
+                indexWarnings,
+                steps: [...steps].map(redactDiagnosticText),
+                domains: [...domains],
+                triggers: [...triggers]
+            }),
+            ...location,
+            artifacts: reportArtifactPaths({
                 trafficNdjsonPath: ledgerExists ? trafficNdjsonPath : null,
                 attributionIndexPath: fs.existsSync(attributionIndexPath) ? attributionIndexPath : null,
                 sslKeyLogPath: fs.existsSync(sslKeyLogPath) ? sslKeyLogPath : null,
                 preTlsWireLogPath: fs.existsSync(preTlsWireLogPath) ? preTlsWireLogPath : null
-            }
+            }, includeLocalPaths)
         });
     }
 
-    return summaries.map(redactDiagnosticMetadata);
+    return summaries;
 }
 
 function shareableRecord(record, { body, url = record?.url, recordBodies = true } = {}) {
@@ -895,6 +928,7 @@ function buildRedirectChain(correlationId, events) {
  * @param {Array<object>} params.events
  * @param {Array<object>} [params.anomalies=[]]
  * @param {boolean} [params.recordBodies] - Set false to omit bodies permitted by the capture policy.
+ * @param {boolean} [params.includeLocalPaths=false] Include exact locations in private output.
  * @returns {object}
  */
 export function reconstructTransactionWireDump({
@@ -905,6 +939,7 @@ export function reconstructTransactionWireDump({
     anomalies = [],
     recordBodies,
     trustedLocal = false,
+    includeLocalPaths = false,
     [WIRE_EXPORT_INDEX]: suppliedIndex
 }) {
     const { bodyPolicy, indexData } = suppliedIndex ?? (
@@ -913,6 +948,10 @@ export function reconstructTransactionWireDump({
             : readCaptureExportIndex(trafficDir, { recordBodies, trustedLocal })
     );
     const corrEvents = events.filter((e) => e && e.correlationId === correlationId);
+    const traceId = captureEventTraceId(corrEvents[0]);
+    if (corrEvents.some((event) => captureEventTraceId(event) !== traceId)) {
+        throw new Error('Correlation ID matches multiple recording sessions in the selected traffic capture');
+    }
     const request = corrEvents.find((e) => e.type === 'egress') || null;
     const response = corrEvents.find((e) => e.type === 'ingress') || null;
     const requestUrl = request?.url || response?.url;
@@ -935,9 +974,10 @@ export function reconstructTransactionWireDump({
     const wsEvents = corrEvents.filter((e) => typeof e.type === 'string' && e.type.startsWith('ws-'))
         .map((event) => project(event));
 
-    const matchingAnomalies = anomalies.filter((a) => a && a.correlationId === correlationId)
-        .map((anomaly) => project(anomaly));
-    const redirectChain = buildRedirectChain(correlationId, events);
+    const matchingAnomalies = anomalies.filter((a) =>
+        a && a.correlationId === correlationId && captureEventTraceId(a) === traceId
+    ).map((anomaly) => project(anomaly));
+    const redirectChain = buildRedirectChain(correlationId, events.filter((event) => captureEventTraceId(event) === traceId));
 
     const primaryEvent = egress || ingress || failed || securityBlock || finished || wsEvents[0] || null;
     const attribution = primaryEvent?.attribution || null;
@@ -952,8 +992,14 @@ export function reconstructTransactionWireDump({
 
     const requestPayload = reqBody.text;
     const responsePayload = resBody.text;
+    const stoppedReason = indexData?.captureLimits?.stoppedReason;
+    const indexTraceId = indexData?.session?.traceId ?? null;
+    const captureLimits = primaryEvent && traceId === indexTraceId &&
+        ['event-limit', 'storage-limit', 'pending-event-limit'].includes(stoppedReason)
+        ? { stoppedReason }
+        : null;
 
-    const publicLocation = redactDiagnosticMetadata({ profileId, trafficDir });
+    const publicLocation = reportLocation({ profileId, trafficDir }, includeLocalPaths);
     const durationMs = finished?.durationMs ?? failed?.durationMs ?? null;
     const timing = finished?.timing ?? null;
     const sizes = finished?.sizes ?? null;
@@ -1008,6 +1054,7 @@ export function reconstructTransactionWireDump({
         );
     }
 
+    if (captureLimits) lines.push('Capture stopped  : ' + stoppedReason);
     for (const [kind, event, body] of [['Request', egress, reqBody], ['Response', ingress, resBody]]) {
         if (event?.payloadStorage?.status === 'failed') lines.push(kind + ' attachment write failed');
         if (event?.payloadStorage?.status === 'omitted') lines.push(kind + ' attachment omitted by storage limit');
@@ -1106,6 +1153,7 @@ export function reconstructTransactionWireDump({
     return {
         mode: 'wire-dump',
         bodyPolicyReason: bodyPolicy.reason,
+        ...(captureLimits && { captureLimits }),
         ...publicLocation,
         correlationId,
         found: Boolean(primaryEvent),
@@ -1141,25 +1189,31 @@ export function reconstructTransactionWireDump({
  * Group matching NDJSON events into correlated transaction summaries.
  *
  * @param {Array<object>} events
+ * @param {function(object): object} project
  * @returns {Array<object>}
  */
-function buildTransactionsList(events) {
+function buildTransactionsList(events, project) {
     const txMap = new Map();
 
-    for (const ev of events) {
-        if (!ev || !ev.correlationId) continue;
+    for (const event of events) {
+        const txKey = transactionKey(event);
+        if (txKey === null) continue;
         if (
-            ev.type !== 'egress' &&
-            ev.type !== 'ingress' &&
-            ev.type !== 'request-finished' &&
-            ev.type !== 'request-failed' &&
-            ev.type !== 'security-block'
+            event.type !== 'egress' &&
+            event.type !== 'ingress' &&
+            event.type !== 'request-finished' &&
+            event.type !== 'request-failed' &&
+            event.type !== 'security-block'
         ) {
             continue;
         }
-        if (!txMap.has(ev.correlationId)) {
-            txMap.set(ev.correlationId, {
+
+        // Group before projecting the recorded identities.
+        const ev = project(event);
+        if (!txMap.has(txKey)) {
+            txMap.set(txKey, {
                 correlationId: ev.correlationId,
+                traceId: captureEventTraceId(ev),
                 method: ev.method || null,
                 url: ev.url || null,
                 host: extractHost(ev) || null,
@@ -1181,7 +1235,7 @@ function buildTransactionsList(events) {
                 securityBlock: null
             });
         }
-        const tx = txMap.get(ev.correlationId);
+        const tx = txMap.get(txKey);
         if (!tx.method && ev.method) tx.method = ev.method;
         if (!tx.url && ev.url) tx.url = ev.url;
         if (!tx.host) tx.host = extractHost(ev) || null;
@@ -1265,6 +1319,7 @@ function buildPlatformSignaturesFromEvents(events = []) {
             signatures.push({
                 timestamp: ev.timestamp || null,
                 correlationId: ev.correlationId || null,
+                traceId: captureEventTraceId(ev),
                 actionStep,
                 stepIndex,
                 triggerActionId: triggerAction?.actionId || null,
@@ -1293,7 +1348,8 @@ function buildPlatformSignaturesFromEvents(events = []) {
  * @param {string} [options.profilesDir]
  * @param {string} [options.profile]
  * @param {string} [options.profileId]
- * @param {string} [options.trafficDir]
+ * @param {string} [options.trafficDir] Explicit capture directory. A profile selector must match its directory ID or standalone recording identity.
+ * @param {boolean} [options.includeLocalPaths=false] Include exact locations in private output.
  * @param {string} [options.step]
  * @param {string} [options.actionStep]
  * @param {string} [options.trigger]
@@ -1318,6 +1374,7 @@ export function queryProfileTraffic(options = {}) {
     const requestedRoot = resolveProfilesDir(options.profilesDir);
     const profilesDir = options.trafficDir ? requestedRoot : resolveProfilesRoot(requestedRoot);
     const trustedLocal = options.trustedLocal === true;
+    const includeLocalPaths = options.includeLocalPaths === true;
     const verifyResolvedCapture = ({ profileDir, trafficDir }) => {
         if (options.trafficDir) {
             return verifyTrafficIntegrity(trafficDir, { nativeDir: options.nativeDir, trustedLocal });
@@ -1365,6 +1422,14 @@ export function queryProfileTraffic(options = {}) {
         const context = options.exportHar ? 'HAR export' : 'Query';
         throw new Error(`${context} filter values must be nonempty`);
     }
+    if (filters.status != null &&
+        ((typeof filters.status !== 'string' && typeof filters.status !== 'number') ||
+            !/^(?:0|[1-5](?:[0-9]{2}|xx))$/i.test(String(filters.status).trim()))) {
+        throw new Error('Status filter must be an HTTP status code, a class like 4xx, or 0 for blocked requests');
+    }
+    const publicFilters = Object.fromEntries(Object.entries(filters).map(([name, value]) => [
+        name, typeof value === 'string' ? redactDiagnosticText(value) : value
+    ]));
     const hasEventFilters = Boolean(filters.step || filters.trigger || filters.domain || filters.status != null);
     if (options.exportHar &&
         (options.verifyIntegrity || filters.anomaliesOnly || cookiesRequested || signaturesRequested || platformFilter)) {
@@ -1399,10 +1464,10 @@ export function queryProfileTraffic(options = {}) {
         !signaturesRequested &&
         !platformFilter
     ) {
-        const profiles = listTrafficProfiles(profilesDir);
+        const profiles = listTrafficProfiles(profilesDir, { includeLocalPaths });
         return {
             mode: 'list-profiles',
-            profilesDir: redactDiagnosticText(profilesDir),
+            ...(includeLocalPaths && { profilesDir }),
             count: profiles.length,
             profiles
         };
@@ -1410,11 +1475,26 @@ export function queryProfileTraffic(options = {}) {
 
     let resolvedPaths = null;
     let selectedEvents;
+    let standaloneIndex;
     if (options.trafficDir) {
         const trafficDir = path.resolve(options.trafficDir);
         const profileDir = path.dirname(trafficDir);
+        const managed = path.basename(trafficDir) === 'traffic' &&
+            resolveProfilesRoot(path.dirname(profileDir)) === resolveProfilesRoot(profilesDir);
+        let profileId = path.basename(profileDir);
+        if (!managed) {
+            standaloneIndex = readCaptureExportIndex(trafficDir, { trustedLocal, recordBodies: options.recordBodies });
+            try {
+                profileId = validateProfileId(standaloneIndex.indexData?.session?.profileId);
+            } catch {
+                profileId = null;
+            }
+        }
+        if (targetProfileId !== null && validateProfileId(targetProfileId) !== profileId) {
+            throw new Error('Selected profile ID does not match the explicit traffic directory');
+        }
         resolvedPaths = {
-            profileId: targetProfileId ?? path.basename(profileDir),
+            profileId: profileId ?? 'standalone-capture',
             profileDir,
             trafficDir
         };
@@ -1449,11 +1529,10 @@ export function queryProfileTraffic(options = {}) {
         } else if (candidates.length > 1) {
             const perProfile = candidates.map((cand) => {
                 const check = verifyResolvedCapture(cand);
-                return structuredClone(redactDiagnosticMetadata({
-                    profileId: cand.profileId,
-                    trafficDir: cand.trafficDir,
-                    ...check
-                }));
+                return {
+                    ...reportLocation(cand, includeLocalPaths),
+                    ...structuredClone(redactDiagnosticMetadata(check))
+                };
             });
             const allValid = perProfile.every((p) => p.valid);
             const totalEvents = perProfile.reduce((acc, p) => acc + p.eventCount, 0);
@@ -1464,7 +1543,7 @@ export function queryProfileTraffic(options = {}) {
             return {
                 mode: 'verify-integrity',
                 profileId: 'all-profiles',
-                profilesDir: redactDiagnosticText(profilesDir),
+                ...(includeLocalPaths && { profilesDir }),
                 valid: allValid,
                 scope: perProfile.every((profile) => profile.scope === 'profile') ? 'profile' : 'capture',
                 unverifiedNativeArtifacts: perProfile.flatMap((profile) =>
@@ -1497,13 +1576,11 @@ export function queryProfileTraffic(options = {}) {
         throw new Error(`Correlation ID "${correlationId}" not found in traffic captures`);
     }
     if (!resolvedPaths || (options.trafficDir && !fs.existsSync(resolvedPaths.trafficDir))) {
-        throw new Error(
-            `Traffic directory not found for profile "${targetProfileId || correlationId || 'unknown'}" in ${profilesDir}`
-        );
+        throw new Error('Traffic directory not found for the selected profile');
     }
 
     const { profileId, trafficDir } = resolvedPaths;
-    const publicLocation = redactDiagnosticMetadata(resolvedPaths);
+    const publicLocation = reportLocation(resolvedPaths, includeLocalPaths);
 
     if (options.verifyIntegrity) {
         const integrityResult = structuredClone(redactDiagnosticMetadata(verifyResolvedCapture(resolvedPaths)));
@@ -1531,8 +1608,7 @@ export function queryProfileTraffic(options = {}) {
         return {
             mode: 'export-har',
             ...publicLocation,
-            harPath: redactDiagnosticText(harResult.harPath),
-            outputPath: redactDiagnosticText(harResult.outputPath),
+            ...reportArtifactPaths({ harPath: harResult.harPath, outputPath: harResult.outputPath }, includeLocalPaths),
             entryCount: harResult.entryCount,
             entriesCount: harResult.entriesCount,
             pageCount: harResult.pageCount,
@@ -1544,33 +1620,39 @@ export function queryProfileTraffic(options = {}) {
     const trafficNdjsonPath = path.join(trafficDir, 'traffic.ndjson');
     const attributionIndexPath = path.join(trafficDir, 'attribution-index.json');
     const sslKeyLogPath = path.join(trafficDir, 'sslkeylog.txt');
-    const preTlsWireLogPath = path.join(trafficDir, 'pre-tls-wire.log');
     const neckoMozLogPath = path.join(trafficDir, 'necko-pre-tls.moz_log');
 
     const allEvents = selectedEvents ?? readNdjsonEvents(trafficNdjsonPath, { trustedLocal });
-    const { indexData, bodyPolicy } = readCaptureExportIndex(trafficDir, {
+    const { indexData, bodyPolicy } = standaloneIndex ?? readCaptureExportIndex(trafficDir, {
         recordBodies: options.recordBodies, trustedLocal
     });
 
     // Associate request observations with the response status of their transaction.
     const txStatusByCorrelation = new Map();
     const txTriggerByCorrelation = new Map();
+    const traceByCorrelation = new Map();
     for (const ev of allEvents) {
-        if (!ev || !ev.correlationId) continue;
-        if (typeof ev.status === 'number') {
-            txStatusByCorrelation.set(ev.correlationId, ev.status);
-        } else if (ev.type === 'security-block' && !txStatusByCorrelation.has(ev.correlationId)) {
-            txStatusByCorrelation.set(ev.correlationId, 0);
+        const txKey = transactionKey(ev);
+        if (txKey === null) continue;
+        const traceId = captureEventTraceId(ev);
+        if (!traceByCorrelation.has(ev.correlationId)) traceByCorrelation.set(ev.correlationId, traceId);
+        else if (traceByCorrelation.get(ev.correlationId) !== traceId) traceByCorrelation.set(ev.correlationId, undefined);
+
+        const status = observedStatus(ev.status);
+        if (status !== null) {
+            txStatusByCorrelation.set(txKey, status);
+        } else if (ev.type === 'security-block' && !txStatusByCorrelation.has(txKey)) {
+            txStatusByCorrelation.set(txKey, 0);
         }
         const trigger = extractTriggerAction(ev);
-        if (trigger && !txTriggerByCorrelation.has(ev.correlationId)) {
-            txTriggerByCorrelation.set(ev.correlationId, trigger);
+        if (trigger && !txTriggerByCorrelation.has(txKey)) {
+            txTriggerByCorrelation.set(txKey, trigger);
         }
     }
     const allPlatformSignatures = !cookiesRequested || platformFilter ? buildPlatformSignaturesFromEvents(allEvents) : [];
     const platformCorrelations = platformFilter ? new Set(allPlatformSignatures
         .filter((signature) => signature.correlationId && String(signature.platform || '').toLowerCase() === platformFilter)
-        .map((signature) => signature.correlationId)) : null;
+        .map(transactionKey)) : null;
     const matchesTransactionFilters = (record) => recordMatchesFilters(record, filters, txStatusByCorrelation, {
         useTransactionStatusFallback: true, txTriggerByCorrelation, platformCorrelations
     });
@@ -1578,12 +1660,12 @@ export function queryProfileTraffic(options = {}) {
     const requestUrls = new Map();
     for (const event of allEvents) {
         if (event?.type === 'egress' && event.correlationId && capturePolicyAllowsBody(bodyPolicy, event)) {
-            requestUrls.set(event.correlationId, event.url);
+            requestUrls.set(transactionKey(event), event.url);
         }
     }
     const project = (record) => shareableRecord(record, {
         recordBodies: capturePolicyAllowsBody(bodyPolicy, record),
-        url: requestUrls.get(record?.correlationId) ?? record?.url
+        url: requestUrls.get(transactionKey(record)) ?? record?.url
     });
 
     if (cookiesRequested) {
@@ -1605,7 +1687,7 @@ export function queryProfileTraffic(options = {}) {
             mode: 'cookies',
             privacy: 'private',
             ...publicLocation,
-            filters,
+            filters: publicFilters,
             cookieName: cookieNameFilter,
             found: cookies.length > 0,
             count: cookies.length,
@@ -1632,7 +1714,7 @@ export function queryProfileTraffic(options = {}) {
         return {
             mode: 'signatures',
             ...publicLocation,
-            filters,
+            filters: publicFilters,
             platform: platformFilter,
             found: filteredSignatures.length > 0,
             count: filteredSignatures.length,
@@ -1650,10 +1732,13 @@ export function queryProfileTraffic(options = {}) {
     const ledgerExists = fs.existsSync(trafficNdjsonPath);
     const { summaryIndex, totals: captureTotals, anomalies, indexWarnings } =
         summarizeCapture(allEvents, indexData, ledgerExists);
-    const rawAnomalies = anomalies.map((anomaly) => ({
-        ...anomaly,
-        triggerAction: anomaly.triggerAction || txTriggerByCorrelation.get(anomaly.correlationId) || null
-    })).sort((a, b) => String(a.timestamp ?? '').localeCompare(String(b.timestamp ?? '')));
+    const rawAnomalies = anomalies.flatMap((anomaly) => {
+        const hasTrace = Object.hasOwn(anomaly, 'traceId') || anomaly.attribution?.traceId != null;
+        const traceId = hasTrace ? captureEventTraceId(anomaly) : traceByCorrelation.get(anomaly.correlationId);
+        if (traceId === undefined && traceByCorrelation.has(anomaly.correlationId)) return [];
+        const scoped = traceId == null ? anomaly : { ...anomaly, traceId };
+        return [{ ...scoped, triggerAction: scoped.triggerAction || txTriggerByCorrelation.get(transactionKey(scoped)) || null }];
+    }).sort((a, b) => String(a.timestamp ?? '').localeCompare(String(b.timestamp ?? '')));
 
     // Mode 1: Wire dump / correlationId reconstruction
     if (correlationId) {
@@ -1665,6 +1750,7 @@ export function queryProfileTraffic(options = {}) {
                 events: allEvents,
                 anomalies: rawAnomalies,
                 trustedLocal,
+                includeLocalPaths,
                 [WIRE_EXPORT_INDEX]: { bodyPolicy, indexData }
             }),
             indexWarnings
@@ -1687,7 +1773,7 @@ export function queryProfileTraffic(options = {}) {
             mode: 'anomalies',
             bodyPolicyReason: bodyPolicy.reason,
             ...publicLocation,
-            filters,
+            filters: publicFilters,
             session,
             totals,
             count: filteredAnomalies.length,
@@ -1697,39 +1783,41 @@ export function queryProfileTraffic(options = {}) {
         };
     }
 
-    const filteredEvents = allEvents.filter((event) =>
-        recordMatchesFilters(event, filters, txStatusByCorrelation, {
-            useTransactionStatusFallback: false,
-            platformCorrelations
-        })
-    ).map(project);
-    const transactions = buildTransactionsList(eventsForTransactions.map(project));
+    const filteredEvents = eventsForTransactions.map(project);
+    const transactions = buildTransactionsList(eventsForTransactions, project);
+    const indexGroups = scopedSummary ? {} : (summaryIndex ?? {});
+    const ledgerGroups = scopedSummary ?? (
+        indexGroups.byActionStep && indexGroups.byTriggerAction && indexGroups.byDomain
+            ? {}
+            : summarizeFilteredTraffic(eventsForTransactions, txTriggerByCorrelation)
+    );
+    const preTlsWireLogPath = path.join(trafficDir, getCaptureWireLogFileName(indexData?.integrity));
 
     return {
         mode: 'profile-query',
         bodyPolicyReason: bodyPolicy.reason,
         ...publicLocation,
-        filters,
+        filters: publicFilters,
         session,
-        artifacts: redactDiagnosticMetadata({
+        artifacts: reportArtifactPaths({
             trafficNdjsonPath: ledgerExists ? trafficNdjsonPath : null,
             attributionIndexPath: fs.existsSync(attributionIndexPath) ? attributionIndexPath : null,
             sslKeyLogPath: fs.existsSync(sslKeyLogPath) ? sslKeyLogPath : null,
             preTlsWireLogPath: fs.existsSync(preTlsWireLogPath) ? preTlsWireLogPath : null,
             neckoMozLogPath: fs.existsSync(neckoMozLogPath) ? neckoMozLogPath : null
-        }),
+        }, includeLocalPaths),
         totals,
-        byActionStep: scopedSummary?.byActionStep ?? Object.fromEntries(
-            Object.entries(summaryIndex?.byActionStep || {}).map(([name, stats]) => [
+        byActionStep: indexGroups.byActionStep
+            ? Object.fromEntries(Object.entries(indexGroups.byActionStep).map(([name, stats]) => [
                 redactDiagnosticText(name), redactDiagnosticMetadata(stats)
-            ])
-        ),
-        byTriggerAction: scopedSummary?.byTriggerAction ?? Object.fromEntries(
-            Object.entries(summaryIndex?.byTriggerAction || {}).map(([id, stats]) => [
+            ]))
+            : ledgerGroups.byActionStep,
+        byTriggerAction: indexGroups.byTriggerAction
+            ? Object.fromEntries(Object.entries(indexGroups.byTriggerAction).map(([id, stats]) => [
                 id, redactTriggerAction(redactDiagnosticMetadata(stats))
-            ])
-        ),
-        byDomain: scopedSummary?.byDomain ?? summaryIndex?.byDomain ?? {},
+            ]))
+            : ledgerGroups.byTriggerAction,
+        byDomain: indexGroups.byDomain ?? ledgerGroups.byDomain,
         cookieLineage: buildCookieLineageFromEvents(eventsForTransactions),
         platformSignatures: {
             totalDetected: filteredSignatures.length,
@@ -1821,11 +1909,14 @@ export function formatCliReport(result) {
         if (result.log?._bodyPolicy?.reason) {
             lines.push(`   Body export omitted (${result.log._bodyPolicy.reason})`);
         }
+        if (result.log?._captureLimits?.stoppedReason) {
+            lines.push('   Capture stopped (' + result.log._captureLimits.stoppedReason + ')');
+        }
         return joinTerminalLines(lines);
     }
 
     if (result.mode === 'list-profiles') {
-        lines.push(`📂 Profiles Directory: ${result.profilesDir}`);
+        if (result.profilesDir) lines.push(`📂 Profiles Directory: ${result.profilesDir}`);
         lines.push(`Found ${result.count} profile(s) with recorded pre-TLS traffic:`);
         for (const p of result.profiles) {
             lines.push(
@@ -2027,7 +2118,11 @@ if (isMainModule) {
     try {
         process.exitCode = runCli(process.argv.slice(2));
     } catch (err) {
-        console.error(`Error: ${escapeTerminalText(redactDiagnosticText(err.message))}`);
+        const systemCode = typeof err?.errno === 'number' && /^E[A-Z0-9_]+$/.test(err.code) ? ' (' + err.code + ')' : '';
+        const message = err?.path || err?.dest
+            ? 'Could not read or write the local traffic capture' + systemCode
+            : redactDiagnosticText(err.message);
+        console.error(`Error: ${escapeTerminalText(message)}`);
         process.exitCode = 1;
     }
 }

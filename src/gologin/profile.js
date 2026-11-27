@@ -6,15 +6,18 @@
 import { GologinApi } from 'gologin';
 import logger from '../utils/logger.js';
 import { requireControllerProfileId } from '../utils/controller-id.js';
-import { GoLoginClient, getGoLoginApiKey } from './client.js';
+import { GoLoginClient, getGoLoginApiKey, isGoLoginWriteRejected } from './client.js';
 import config from '../config.js';
 
 const launchTimeout = 120000;
 const browserOperationTimeout = 10000;
+const compensateFailedStart = Symbol('compensateFailedStart');
+const internallyBoundSession = Symbol('internallyBoundSession');
 
 function bindGoLoginSession() {
     const token = getGoLoginApiKey();
     return {
+        [internallyBoundSession]: true,
         client: new GoLoginClient(token),
         createSdk: () => {
             try {
@@ -54,6 +57,7 @@ function cleanupError(profileId, profileCleanup, message, cause) {
 class GoLoginProfile {
     #profileId;
     #gologinApi;
+    #ownsSdk = false;
     #session;
     #startController;
     #starting;
@@ -63,7 +67,7 @@ class GoLoginProfile {
     #stopping;
     #stoppingSdk;
     #deleting;
-    #deleteAttempted = false;
+    #deleteUnconfirmed = false;
     #deleted = false;
     #needsCleanup = false;
     #stopConfirmed = false;
@@ -86,14 +90,19 @@ class GoLoginProfile {
 
     start() {
         if (this.#deleted || this.#deleting) return Promise.reject(new Error('GoLogin profile is being deleted or was deleted'));
-        if (this.#deleteAttempted) return Promise.reject(new Error('GoLogin profile deletion is unconfirmed'));
+        if (this.#deleteUnconfirmed) return Promise.reject(new Error('GoLogin profile deletion is unconfirmed'));
         if (this.#stopping) return Promise.reject(new Error('GoLogin profile shutdown is in progress'));
         if (this.#starting) return this.#starting;
         if (this.browser) return Promise.resolve(this);
-        if (this.#needsCleanup || this.#stoppingSdk) {
+        if (this.#needsCleanup || this.#launching || this.#stoppingSdk) {
             return Promise.reject(new Error('GoLogin profile shutdown is unconfirmed'));
         }
 
+        try {
+            if (!this.#gologinApi) this.#session ??= bindGoLoginSession();
+        } catch (error) {
+            return Promise.reject(error);
+        }
         this.#startController = new AbortController();
         const { signal } = this.#startController;
         this.#starting = Promise.resolve().then(() => this.#startBrowser(signal)).finally(() => {
@@ -105,9 +114,11 @@ class GoLoginProfile {
 
     async #startBrowser(signal) {
         signal.throwIfAborted();
-        if (!this.#gologinApi) this.#session ??= bindGoLoginSession();
         try {
-            this.#gologinApi ??= this.#session.createSdk();
+            if (!this.#gologinApi) {
+                this.#gologinApi = this.#session.createSdk();
+                this.#ownsSdk = this.#session[internallyBoundSession] === true;
+            }
 
             const browser = await this.#launchBrowser(signal);
             signal.throwIfAborted();
@@ -132,25 +143,26 @@ class GoLoginProfile {
     }
 
     #launchBrowser(signal) {
-        let abandoned = false;
-        this.#launching = Promise.resolve().then(async () => {
+        const launching = Promise.resolve().then(async () => {
             signal.throwIfAborted();
             this.#needsCleanup = true;
             this.#stopConfirmed = false;
             const result = await this.#gologinApi.launch({ profileId: String(this.profileId), cloud: true });
             this.#ownedBrowser = result?.browser;
-            if (abandoned) {
-                if (!await this.#closeBrowser()) {
-                    logger.error('Could not close a late GoLogin browser', { profileId: this.profileId });
-                }
-                return;
-            }
             return this.#ownedBrowser;
-        }).finally(() => {
-            this.#launching = null;
         });
-        return waitFor(this.#launching, launchTimeout, 'GoLogin browser launch timed out', signal, () => {
-            abandoned = true;
+        this.#launching = launching;
+        return waitFor(launching, launchTimeout, 'GoLogin browser launch timed out', signal, () => {
+            if (this.#launching !== launching) return;
+            // Keep shutdown ownership until the SDK call and the late cleanup both settle.
+            this.#launching = launching.catch(() => {}).then(() => this.#stopBrowser()).then(stopped => {
+                if (!stopped) logger.warn('GoLogin late launch cleanup is unconfirmed', { profileId: this.profileId });
+                return stopped;
+            }).catch(() => false).finally(() => {
+                this.#launching = null;
+            });
+        }).finally(() => {
+            if (this.#launching === launching) this.#launching = null;
         });
     }
 
@@ -170,7 +182,7 @@ class GoLoginProfile {
         this.#closing ??= Promise.resolve().then(() => browser.close()).then(result => {
             if (result === false) return false;
             this.#ownedBrowser = null;
-            if (typeof this.#gologinApi?.stop !== 'function') this.#stopConfirmed = true;
+            if (!this.#ownsSdk || typeof this.#gologinApi?.stop !== 'function') this.#stopConfirmed = true;
             return true;
         }, () => false).finally(() => {
             this.#closing = null;
@@ -179,13 +191,11 @@ class GoLoginProfile {
     }
 
     async #stopBrowser() {
-        if (this.#launching) return false;
         this.browser = null;
         this.page = null;
-        if (!this.#needsCleanup && !this.#gologinApi && this.#session) return true;
+        if (!this.#needsCleanup) return this.#stopConfirmed;
         const closed = await this.#closeBrowser();
-        if (!this.#stopConfirmed && typeof this.#gologinApi?.stop === 'function') {
-            this.#needsCleanup = true;
+        if (this.#ownsSdk && !this.#stopConfirmed && typeof this.#gologinApi?.stop === 'function') {
             this.#stoppingSdk ??= Promise.resolve().then(() => this.#gologinApi.stop()).then(result => {
                 this.#stopConfirmed = result !== false;
             }, () => {}).finally(() => {
@@ -202,7 +212,7 @@ class GoLoginProfile {
         this.#stopping ??= Promise.resolve().then(async () => {
             this.#startController?.abort(new GoLoginWaitError('GoLogin startup interrupted by shutdown'));
             await this.#starting?.catch(() => {});
-            const stopped = await this.#stopBrowser();
+            const stopped = !this.#launching && await this.#stopBrowser();
             if (stopped) logger.info('GoLogin profile stopped', { profileId: this.profileId });
             else logger.warn('GoLogin session stop could not be confirmed', { profileId: this.profileId });
             return stopped;
@@ -212,33 +222,53 @@ class GoLoginProfile {
         return this.#stopping;
     }
 
-    delete() {
+    delete(mode) {
         if (this.#deleted) return Promise.resolve(true);
-        this.#deleting ??= this.#deleteProfile().finally(() => {
+        if (this.#deleting) return this.#deleting;
+        if (this.#deleteUnconfirmed) {
+            return Promise.reject(cleanupError(this.profileId, 'delete-unconfirmed', 'GoLogin profile deletion is unconfirmed'));
+        }
+        if (this.#gologinApi && !this.#session) {
+            return Promise.reject(new Error('Deleting an externally managed GoLogin profile requires a bound REST credential'));
+        }
+        try {
+            this.#session ??= bindGoLoginSession();
+        } catch (error) {
+            return Promise.reject(error);
+        }
+        this.#deleting = Promise.resolve().then(() => this.#deleteProfile(mode === compensateFailedStart)).finally(() => {
             this.#deleting = null;
         });
         return this.#deleting;
     }
 
-    async #deleteProfile() {
-        if (this.#deleteAttempted) {
-            throw cleanupError(this.profileId, 'delete-unconfirmed', 'GoLogin profile deletion is unconfirmed');
-        }
-        if (this.#gologinApi && !this.#session) {
-            throw new Error('Deleting an externally managed GoLogin profile requires a bound REST credential');
-        }
-        if (await this.stop() !== true) {
+    async #deleteProfile(compensate) {
+        if (this.#starting || this.#needsCleanup) await this.stop();
+        if (this.#needsCleanup) {
+            if (compensate && this.#launching) {
+                // The factory owns this allocation. Continue only after a confirmed stop and before any DELETE.
+                void this.#launching.then(async stopped => {
+                    if (stopped !== true) return;
+                    await this.#deleting?.catch(() => {});
+                    await this.delete();
+                }).catch(error => {
+                    logger.warn('GoLogin late launch profile deletion failed', {
+                        profileId: this.profileId, profileCleanup: error.profileCleanup ?? 'delete-unconfirmed'
+                    });
+                });
+            }
             throw cleanupError(this.profileId, 'stop-unconfirmed', 'GoLogin profile shutdown is unconfirmed');
         }
         let deleted;
         try {
-            this.#session ??= bindGoLoginSession();
-            this.#deleteAttempted = true;
             deleted = await this.#session.client.deleteProfile(this.profileId);
-        } catch {
-            // The caller can reconcile the profile by ID using the original tenant.
+        } catch (error) {
+            if (isGoLoginWriteRejected(error)) {
+                throw cleanupError(this.profileId, 'delete-rejected', 'GoLogin profile deletion was rejected');
+            }
         }
         if (deleted !== true) {
+            this.#deleteUnconfirmed = true;
             throw cleanupError(this.profileId, 'delete-unconfirmed', 'GoLogin profile deletion is unconfirmed');
         }
         this.#deleted = true;
@@ -267,7 +297,7 @@ export async function createAndStartProfile(name, proxy = null) {
         if (!profile) throw error;
         let profileCleanup = 'deleted';
         try {
-            await profile.delete();
+            await profile.delete(compensateFailedStart);
         } catch (cleanup) {
             profileCleanup = cleanup.profileCleanup ?? 'stop-unconfirmed';
         }

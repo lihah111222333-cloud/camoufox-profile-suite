@@ -354,9 +354,6 @@ function createSyntheticPage(targetOs) {
  */
 function checkEnvironment() {
     const envStatus = {
-        nodeVersion: process.version,
-        hostPlatform: process.platform,
-        hostArch: process.arch,
         camoufoxSdkInstalled: isCamoufoxModuleResolvable(),
         playwrightCoreInstalled: false
     };
@@ -388,7 +385,9 @@ function runAdversarialNegativeControl() {
     tampered.webgl.unmaskedRenderer = 'Apple M2 Pro';
 
     const evaluation = evaluatePlatformCoherence(tampered, 'windows');
-    const failedNames = evaluation.checks.filter((c) => !c.passed).map((c) => c.name);
+    const failedNames = evaluation.checks
+        .filter((check) => !check.passed && check.status !== 'not-tested')
+        .map((check) => check.name);
     const expectedCatches = [
         'navigator-prototype-integrity',
         'dedicated-worker-parity',
@@ -404,6 +403,55 @@ function runAdversarialNegativeControl() {
         score: evaluation.score,
         failedChecks: failedNames
     };
+}
+
+async function auditLiveTarget(targetOs) {
+    let profilesDir = null;
+    let session = null;
+    let auditReport = null;
+    let unavailableReason = null;
+    let cleanupConfirmed = true;
+
+    try {
+        await import('../src/config.js');
+        const { createAndStartProfile } = await import('../src/camoufox/profile.js');
+        profilesDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'camoufox-diagnostic-profile-'));
+        session = await createAndStartProfile(`diag-${targetOs}-${Date.now()}`, null, {
+            os: targetOs,
+            profilesDir,
+            headless: true,
+            humanize: true,
+            recordTraffic: false,
+            recordHar: false,
+            sslKeyLog: false,
+            neckoMozLog: false
+        });
+
+        const page = await session.getPage();
+        auditReport = await auditProfileCoherence(page, targetOs);
+        unavailableReason = auditReport.reason ?? null;
+    } catch (error) {
+        unavailableReason = session ? 'Live browser evidence could not be collected' : 'Camoufox browser could not be started';
+        if (!session && error?.profileCleanup && error.profileCleanup !== 'deleted') cleanupConfirmed = false;
+    } finally {
+        if (session) {
+            try {
+                cleanupConfirmed = (await session.stop()) === true;
+            } catch {
+                cleanupConfirmed = false;
+            }
+        }
+        if (profilesDir && cleanupConfirmed) {
+            try {
+                fs.rmSync(profilesDir, { recursive: true, force: true });
+            } catch {
+                cleanupConfirmed = false;
+            }
+        }
+    }
+
+    const cleanupStatus = profilesDir ? (cleanupConfirmed ? 'removed' : 'unconfirmed') : null;
+    return { auditReport, unavailableReason, cleanupStatus };
 }
 
 /**
@@ -423,8 +471,6 @@ async function runDiagnostic() {
     console.log('================================================================================\n');
 
     const envStatus = checkEnvironment();
-    console.log(`📦 Node Version         : ${envStatus.nodeVersion}`);
-    console.log(`💻 Host Platform        : ${envStatus.hostPlatform} (${envStatus.hostArch})`);
     console.log(`📚 camoufox-js SDK      : ${envStatus.camoufoxSdkInstalled ? 'Resolvable' : 'Unavailable'}`);
     console.log(`🎭 playwright-core      : ${envStatus.playwrightCoreInstalled ? 'Resolvable' : 'Unavailable'}`);
     console.log(`🎯 Target OS Profiles   : ${osTargets.join(', ')}\n`);
@@ -441,45 +487,16 @@ async function runDiagnostic() {
         console.log(`--------------------------------------------------------------------------------`);
         console.log(`🔍 Auditing OS Target: [${targetOs.toUpperCase()}]`);
 
-        let session = null;
         let auditReport = null;
         let unavailableReason = null;
+        let cleanupStatus = null;
 
         if (forceDryRun) {
             auditReport = await auditProfileCoherence(createSyntheticPage(targetOs), targetOs);
         } else if (!envStatus.camoufoxSdkInstalled) {
             unavailableReason = 'Camoufox SDK is unavailable';
         } else {
-            try {
-                await import('../src/config.js');
-                const { createAndStartProfile } = await import('../src/camoufox/profile.js');
-                session = await createAndStartProfile(`diag-${targetOs}-${Date.now()}`, null, {
-                    os: targetOs,
-                    headless: true,
-                    humanize: true
-                });
-
-                const page = typeof session.getPage === 'function'
-                    ? await session.getPage()
-                    : (session.page || (session.context ? await session.context.newPage() : null));
-                if (!page) {
-                    throw new Error('Camoufox session started without an active Playwright Page or BrowserContext');
-                }
-                auditReport = await auditProfileCoherence(page, targetOs);
-                unavailableReason = auditReport.reason ?? null;
-            } catch {
-                unavailableReason = session ? 'Live browser evidence could not be collected' : 'Camoufox browser could not be started';
-            } finally {
-                if (session && typeof session.stop === 'function') {
-                    await session.stop().catch(() => {});
-                } else if (session && typeof session.close === 'function') {
-                    await session.close().catch(() => {});
-                } else if (session?.context && typeof session.context.close === 'function') {
-                    await session.context.close().catch(() => {});
-                } else if (session?.browser && typeof session.browser.close === 'function') {
-                    await session.browser.close().catch(() => {});
-                }
-            }
+            ({ auditReport, unavailableReason, cleanupStatus } = await auditLiveTarget(targetOs));
         }
 
         const status = auditReport?.status ?? 'not-tested';
@@ -493,6 +510,7 @@ async function runDiagnostic() {
         console.log(`   Mode      : ${mode}`);
         console.log(`   Result    : ${statusLabels[status]}${scoreSummary}`);
         if (unavailableReason) console.log(`   Reason    : ${unavailableReason}`);
+        if (cleanupStatus === 'unconfirmed') console.error('   Diagnostic profile cleanup could not be confirmed');
         const failedChecks = checks.filter((check) => !check.passed && check.status !== 'not-tested');
         if (failedChecks.length > 0) {
             console.log(`   Failed    : ${failedChecks.map((check) => check.name).join(', ')}`);
@@ -508,6 +526,7 @@ async function runDiagnostic() {
             status,
             passed,
             unavailableReason,
+            ...(cleanupStatus && { cleanupStatus }),
             auditReport
         });
     }
@@ -520,7 +539,8 @@ async function runDiagnostic() {
     }
 
     let overallStatus = 'passed';
-    if (negativeControl?.caughtAll === false || results.some(({ status }) => status === 'failed')) {
+    if (negativeControl?.caughtAll === false ||
+        results.some(({ status, cleanupStatus }) => status === 'failed' || cleanupStatus === 'unconfirmed')) {
         overallStatus = 'failed';
     } else if (results.every(({ status }) => status === 'not-tested')) {
         overallStatus = 'not-tested';
@@ -554,7 +574,10 @@ async function runDiagnostic() {
     }
 }
 
-runDiagnostic().catch(error => {
-    console.error('❌ Unexpected error during Camoufox coherence verification:', error);
-    process.exit(1);
+runDiagnostic().catch((error) => {
+    const rejectedDestination = error?.message === 'Capture export destination must be an ordinary file';
+    console.error(rejectedDestination
+        ? 'Capture export destination must be an ordinary file'
+        : 'Could not complete Camoufox coherence verification or write its diagnostic report');
+    process.exitCode = 1;
 });

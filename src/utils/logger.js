@@ -23,8 +23,6 @@ try {
     throw new Error('Could not secure the application log directory');
 }
 
-const logFile = path.join(LOG_DIR, `app-${new Date().toISOString().split('T')[0]}.log`);
-
 const REDACTED_FIELDS = new Set([
     'code', 'otp', 'otpcode', 'phonecode', 'verificationcode', 'lastcode',
     'password', 'passwd', 'proxypassword', 'passphrase', 'passcode',
@@ -87,8 +85,7 @@ function safeStringify(data) {
     }
 }
 
-function formatMessage(level, message, data = null) {
-    const timestamp = new Date().toISOString();
+function formatMessage(timestamp, level, message, data) {
     const dataStr = data ? ` | Data: ${safeStringify(data)}` : '';
     return `[${timestamp}] [${level}] ${message}${dataStr}\n`;
 }
@@ -101,7 +98,8 @@ function shouldLog(level) {
 function writeLog(level, message, data = null) {
     if (!shouldLog(level)) return;
 
-    const formatted = formatMessage(level, message, data);
+    const timestamp = new Date().toISOString();
+    const formatted = formatMessage(timestamp, level, message, data);
     
     // Console output
     const colors = {
@@ -115,6 +113,7 @@ function writeLog(level, message, data = null) {
 
     // File output
     try {
+        const logFile = path.join(LOG_DIR, `app-${timestamp.slice(0, 10)}.log`);
         appendPrivateFile(logFile, formatted, { requireOwner: true });
     } catch {
         console.error('Failed to write to the application log file');

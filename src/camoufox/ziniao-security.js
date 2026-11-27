@@ -651,10 +651,14 @@ export function isSoftwareRasterizerRenderer(renderer) {
  * consistent 64-bit hash within `maxHammingDistance`, detecting any cross-session GPU/font drift.
  */
 export class CanvasWebglConsistencyLedger {
+    #assertStorageOwner;
+    #loadFailed = false;
+
     /**
      * @param {{
      *   profileId: string,
      *   ledgerPath?: string | null,
+     *   assertStorageOwner?: () => void,
      *   maxHammingDistance?: number,
      *   skipHosts?: string[]
      * }} options
@@ -662,6 +666,10 @@ export class CanvasWebglConsistencyLedger {
     constructor(options = {}) {
         this.profileId = String(options.profileId || 'default-profile');
         this.ledgerPath = options.ledgerPath || null;
+        this.#assertStorageOwner = options.assertStorageOwner;
+        if (this.#assertStorageOwner) {
+            Object.defineProperty(this, 'ledgerPath', { writable: false, configurable: false });
+        }
         const parsedMax =
             options.maxHammingDistance !== undefined ? Number(options.maxHammingDistance) : 0;
         this.maxHammingDistance =
@@ -670,9 +678,11 @@ export class CanvasWebglConsistencyLedger {
         this.entries = new Map();
         this.driftAlerts = [];
 
-        if (this.ledgerPath && fs.existsSync(this.ledgerPath)) {
-            this.loadFromDisk();
-        }
+        if (this.ledgerPath) this.loadFromDisk();
+    }
+
+    get loadFailed() {
+        return this.#loadFailed;
     }
 
     static extractDomain(urlOrDomain) {
@@ -730,6 +740,7 @@ export class CanvasWebglConsistencyLedger {
      * }}
      */
     recordOrVerify(observation = {}) {
+        this.#assertWritableStorage();
         const domain = CanvasWebglConsistencyLedger.extractDomain(
             observation.domain || observation.url || 'unknown'
         );
@@ -775,8 +786,7 @@ export class CanvasWebglConsistencyLedger {
                 lastVerifiedAt: new Date().toISOString(),
                 verificationCount: 1
             };
-            this.entries.set(key, entry);
-            this.saveToDisk();
+            this.#commitObservation(entry);
             return {
                 status: 'recorded-initial',
                 key,
@@ -793,26 +803,24 @@ export class CanvasWebglConsistencyLedger {
         const similarityPct = computeHashSimilarity(existing.hash, observedHash);
         const driftDetected = hammingDistance > this.maxHammingDistance;
 
-        existing.lastVerifiedAt = new Date().toISOString();
-        existing.verificationCount += 1;
-
-        if (driftDetected) {
-            const alert = {
-                timestamp: existing.lastVerifiedAt,
-                profileId: this.profileId,
-                key,
-                kind,
-                domain,
-                expectedHash: existing.hash,
-                observedHash,
-                hammingDistance,
-                similarityPct,
-                maxAllowedDistance: this.maxHammingDistance
-            };
-            this.driftAlerts.push(alert);
-        }
-
-        this.saveToDisk();
+        const entry = {
+            ...existing,
+            lastVerifiedAt: new Date().toISOString(),
+            verificationCount: existing.verificationCount + 1
+        };
+        const alert = driftDetected ? {
+            timestamp: entry.lastVerifiedAt,
+            profileId: this.profileId,
+            key,
+            kind,
+            domain,
+            expectedHash: existing.hash,
+            observedHash,
+            hammingDistance,
+            similarityPct,
+            maxAllowedDistance: this.maxHammingDistance
+        } : null;
+        this.#commitObservation(entry, alert);
 
         return {
             status: driftDetected ? 'drift-detected' : 'consistent',
@@ -830,30 +838,39 @@ export class CanvasWebglConsistencyLedger {
         return {
             profileId: this.profileId,
             maxHammingDistance: this.maxHammingDistance,
-            totalEntries: this.entries.size,
-            driftAlertCount: this.driftAlerts.length,
+            ...(this.#loadFailed ? { loadFailed: true } : {}),
+            totalEntries: this.#loadFailed ? null : this.entries.size,
+            driftAlertCount: this.#loadFailed ? null : this.driftAlerts.length,
             domains: Array.from(new Set(Array.from(this.entries.values()).map((e) => e.domain))),
             driftAlerts: [...this.driftAlerts]
         };
     }
 
     loadFromDisk() {
-        if (!this.ledgerPath || !fs.existsSync(this.ledgerPath)) return false;
+        if (!this.ledgerPath) return false;
+        try {
+            this.#assertStorageOwner?.();
+        } catch {
+            return false;
+        }
+
         try {
             const raw = JSON.parse(readPrivateFile(this.ledgerPath));
-            if (Array.isArray(raw.entries)) {
-                this.entries.clear();
-                for (const item of raw.entries) {
-                    if (item && item.key) {
-                        this.entries.set(item.key, item);
-                    }
-                }
+            if (!Array.isArray(raw?.entries) ||
+                (raw.profileId !== undefined && raw.profileId !== this.profileId) ||
+                (raw.driftAlerts !== undefined && !Array.isArray(raw.driftAlerts)) ||
+                raw.entries.some((entry) => typeof entry?.key !== 'string' || !entry.key ||
+                    typeof entry.hash !== 'string' || !/^[0-9a-f]+$/i.test(entry.hash))) {
+                throw new Error('Invalid Camoufox fingerprint ledger');
             }
-            if (Array.isArray(raw.driftAlerts)) {
-                this.driftAlerts = raw.driftAlerts;
-            }
+            const entries = new Map(raw.entries.map((entry) => [entry.key, entry]));
+            if (entries.size !== raw.entries.length) throw new Error('Duplicate Camoufox fingerprint ledger entries');
+            this.entries = entries;
+            this.driftAlerts = raw.driftAlerts ?? [];
+            this.#loadFailed = false;
             return true;
-        } catch {
+        } catch (error) {
+            if (error.code !== 'ENOENT') this.#loadFailed = true;
             return false;
         }
     }
@@ -861,19 +878,44 @@ export class CanvasWebglConsistencyLedger {
     saveToDisk() {
         if (!this.ledgerPath) return false;
         try {
-            fs.mkdirSync(path.dirname(this.ledgerPath), { recursive: true, mode: 0o700 });
-            const payload = {
-                profileId: this.profileId,
-                maxHammingDistance: this.maxHammingDistance,
-                updatedAt: new Date().toISOString(),
-                entries: Array.from(this.entries.values()),
-                driftAlerts: this.driftAlerts
-            };
-            writePrivateFile(this.ledgerPath, JSON.stringify(payload, null, 2));
+            this.#assertWritableStorage();
+            this.#writeToDisk();
             return true;
         } catch {
             return false;
         }
+    }
+
+    #assertWritableStorage() {
+        this.#assertStorageOwner?.();
+        if (this.#loadFailed) {
+            throw Object.assign(new Error('Could not load Camoufox fingerprint ledger'), {
+                code: 'ERR_CAMOUFOX_FINGERPRINT_LEDGER_UNREADABLE'
+            });
+        }
+    }
+
+    #commitObservation(entry, alert = null) {
+        this.#writeToDisk(entry, alert);
+        this.entries.set(entry.key, entry);
+        if (alert) this.driftAlerts.push(alert);
+    }
+
+    #writeToDisk(entry = null, alert = null) {
+        if (!this.ledgerPath) return;
+        if (!this.#assertStorageOwner) {
+            fs.mkdirSync(path.dirname(this.ledgerPath), { recursive: true, mode: 0o700 });
+        }
+        const entries = Array.from(this.entries, ([key, stored]) => key === entry?.key ? entry : stored);
+        if (entry && !this.entries.has(entry.key)) entries.push(entry);
+        const payload = {
+            profileId: this.profileId,
+            maxHammingDistance: this.maxHammingDistance,
+            updatedAt: new Date().toISOString(),
+            entries,
+            driftAlerts: alert ? [...this.driftAlerts, alert] : this.driftAlerts
+        };
+        writePrivateFile(this.ledgerPath, JSON.stringify(payload, null, 2));
     }
 }
 

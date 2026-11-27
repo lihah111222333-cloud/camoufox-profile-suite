@@ -333,9 +333,13 @@ async function runTests() {
         waitUntil: 'networkidle',
         timeout: 5000
     });
-    assert.deepEqual(normalizeNavigationOptions({ waitUntil: ['networkidle0', 'load'] }), {
+    assert.deepEqual(normalizeNavigationOptions({ waitUntil: ['networkidle0'] }), {
         waitUntil: 'networkidle'
     });
+    assert.throws(
+        () => normalizeNavigationOptions({ waitUntil: ['networkidle0', 'load'] }),
+        /only one waitUntil condition/
+    );
     assert.deepEqual(normalizeWaitForOptions({ visible: true, timeout: 3000 }), {
         state: 'visible',
         timeout: 3000

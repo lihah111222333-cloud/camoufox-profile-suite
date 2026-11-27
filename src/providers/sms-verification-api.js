@@ -5,6 +5,11 @@
  */
 
 const SMS_VERIFY_API_URL = 'https://sms-verification-number.com/stubs/handler_api';
+const REQUEST_TIMEOUT_MS = 30000;
+const TERMINAL_ORDER_RECEIPTS = new Map([
+    ['6', 'ACCESS_ACTIVATION'],
+    ['8', 'ACCESS_CANCEL']
+]);
 
 // Order status constants
 const ORDER_STATUS = {
@@ -15,6 +20,7 @@ const ORDER_STATUS = {
 
 class SmsVerifyKeyError extends Error {}
 class SmsVerifyCanceledError extends Error {}
+class SmsVerifyEarlyCancelError extends Error {}
 
 // A receipt can require reconciliation even if the provider never returned an order ID.
 class SmsVerifyOrderError extends Error {
@@ -36,7 +42,45 @@ function unconfirmedPurchase(orderId = null) {
 }
 
 function isPriceRefusal(response) {
-    return typeof response === 'string' && response.startsWith('WRONG_MAX_PRICE:');
+    const prefix = 'WRONG_MAX_PRICE:';
+    if (typeof response !== 'string' || !response.startsWith(prefix)) return false;
+    const minimumPrice = parseAmount(response.slice(prefix.length));
+    return minimumPrice !== null && minimumPrice > 0;
+}
+
+function parseAmount(value) {
+    if (typeof value === 'string') {
+        if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(value.trim())) return null;
+        value = Number(value);
+    }
+    return Number.isFinite(value) ? value : null;
+}
+
+function exceedsPriceCap(value, amount, cap) {
+    if (cap === undefined) return false;
+    if (typeof value !== 'string' || amount !== cap) return amount > cap;
+
+    // A decimal string can round to the cap even when its exact value is higher.
+    const decimalParts = text => {
+        const [coefficient, exponent = '0'] = text.trim().toLowerCase().split('e');
+        const [whole, fraction = ''] = coefficient.replace(/^\+/, '').split('.');
+        const digits = (whole + fraction).replace(/^0+/, '');
+        return {
+            magnitude: digits.length - fraction.length + Number(exponent),
+            digits: digits.replace(/0+$/, '')
+        };
+    };
+    const price = decimalParts(value);
+    const limit = decimalParts(String(cap));
+    return price.magnitude > limit.magnitude ||
+        (price.magnitude === limit.magnitude && price.digits > limit.digits);
+}
+
+function isCurrency(value) {
+    if (value === undefined) return true; // Some V2 receipts omit the currency field.
+    if (typeof value === 'string' && /^(?:[a-z]{3}|crystals|dollars)$/i.test(value)) return true;
+    const code = typeof value === 'string' && /^\d{3}$/.test(value) ? Number(value) : value;
+    return Number.isInteger(code) && code > 0 && code <= 999;
 }
 
 function getApiKey() {
@@ -60,9 +104,15 @@ function getLang() {
  * @param {Object} params - Additional parameters
  * @returns {Promise<any>} Response data
  */
-async function makeRequest(action, params = {}) {
+async function makeRequest(action, params = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
     const apiKey = getApiKey();
     const isPurchase = action === 'getNumber' || action === 'getNumberV2';
+    const unconfirmed = () => isPurchase ? unconfirmedPurchase() : new SmsVerifyOrderError(
+        'SMS Verification order change is unconfirmed. Reconcile the order before ordering again.',
+        params.id,
+        'RECONCILIATION_REQUIRED'
+    );
+    let expectedReceipt;
     let requestUrl;
     let signal;
     try {
@@ -73,8 +123,9 @@ async function makeRequest(action, params = {}) {
                 url.searchParams.append(name, String(value));
             }
         }
+        if (action === 'setStatus') expectedReceipt = TERMINAL_ORDER_RECEIPTS.get(url.searchParams.get('status'));
         requestUrl = url.toString();
-        signal = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(30000) : undefined;
+        signal = AbortSignal.timeout(timeoutMs);
     } catch {
         throw new Error('SMS Verification API request could not be prepared');
     }
@@ -90,7 +141,7 @@ async function makeRequest(action, params = {}) {
         data = await response.text();
     } catch {
         // Transport errors can contain the key-bearing request URL.
-        if (isPurchase) throw unconfirmedPurchase();
+        if (isPurchase || expectedReceipt) throw unconfirmed();
         throw new Error('SMS Verification API request failed');
     }
 
@@ -100,9 +151,16 @@ async function makeRequest(action, params = {}) {
         // Keep string response format (e.g. ACCESS_NUMBER:..., BAD_KEY).
     }
 
-    const clientError = response.status >= 400 && response.status < 500;
-    if (data === 'BAD_KEY' && (!isPurchase || response.ok || clientError)) {
+    const clientError = response.status >= 400 && response.status < 500 && response.status !== 408;
+    const explicitReply = response.ok || clientError;
+    if (data === 'BAD_KEY' && (explicitReply || (!isPurchase && !expectedReceipt))) {
         throw new SmsVerifyKeyError('BAD_KEY');
+    }
+    if (expectedReceipt === 'ACCESS_CANCEL' && data === 'CANNOT_BEFORE_2_MIN' && explicitReply) {
+        throw new SmsVerifyEarlyCancelError('Cannot cancel before 2 minutes after ordering');
+    }
+    if (expectedReceipt && (response.status !== 200 || data !== expectedReceipt)) {
+        throw unconfirmed();
     }
 
     if (!response.ok) {
@@ -123,8 +181,9 @@ async function makeRequest(action, params = {}) {
  * @returns {Promise<number>} Current balance
  */
 export async function getSmsVerifyBalance() {
-    const balance = await makeRequest('getBalance');
-    return parseFloat(balance);
+    const balance = parseAmount(await makeRequest('getBalance'));
+    if (balance === null) throw new Error('SMS Verification API returned an invalid balance');
+    return balance;
 }
 
 /**
@@ -178,7 +237,7 @@ function parseOrderId(value) {
 }
 
 function isPhoneNumber(value) {
-    if (typeof value === 'string') return /^\+?\d+$/.test(value);
+    if (typeof value === 'string') return /^\+?\d+$/.test(value) && /[1-9]/.test(value);
     return Number.isSafeInteger(value) && value > 0;
 }
 
@@ -229,7 +288,8 @@ export async function buySmsVerifyNumber(service = 'fu', country = 16, operator 
  * @throws {SmsVerifyOrderError} An unconfirmed purchase requires reconciliation before ordering again.
  */
 export async function buySmsVerifyNumberV2(service = 'fu', country = 16, operator = 'any', options = {}) {
-    const response = await makeRequest('getNumberV2', numberOrderParams(service, country, operator, options));
+    const params = numberOrderParams(service, country, operator, options);
+    const response = await makeRequest('getNumberV2', params);
 
     if (typeof response === 'string') {
         if (response === 'NO_BALANCE') throw new Error('Insufficient balance');
@@ -240,8 +300,19 @@ export async function buySmsVerifyNumberV2(service = 'fu', country = 16, operato
     }
 
     if (!response || typeof response !== 'object' || Array.isArray(response)) throw unconfirmedPurchase();
+    const status = typeof response.status === 'string' ? response.status.trim() : '';
+    if (response.error || response.success === false ||
+        /^(?:error|failed|rejected|bad_key|no_balance|no_numbers)$/i.test(status)) {
+        throw unconfirmedPurchase();
+    }
     const id = parseOrderId(response.activationId);
     if (id === null || !isPhoneNumber(response.phoneNumber)) throw unconfirmedPurchase(id);
+
+    const price = parseAmount(response.activationCost);
+    if (price === null || price < 0 || !isCurrency(response.currency) ||
+        exceedsPriceCap(response.activationCost, price, params.maxPrice)) {
+        throw unconfirmedPurchase(id);
+    }
 
     return {
         id: response.activationId,
@@ -279,7 +350,11 @@ export async function getSmsVerifyOrderStatus(orderId) {
  * @returns {Promise<{status: string, code?: string}>}
  */
 export async function checkSmsVerifyOrder(orderId) {
-    const response = await makeRequest('getStatus', { id: orderId });
+    return readSmsVerifyOrder(orderId);
+}
+
+async function readSmsVerifyOrder(orderId, timeoutMs) {
+    const response = await makeRequest('getStatus', { id: orderId }, timeoutMs);
     const status = classifyOrderStatus(response);
     const code = status === 'RECEIVED' ? response.split(':')[1] : null;
     return { status, code };
@@ -287,11 +362,12 @@ export async function checkSmsVerifyOrder(orderId) {
 
 /**
  * Set order status
- * @param {number} orderId - Order ID
+ * @param {number|string} orderId - Positive safe integer order ID
  * @param {number} status - Status code: 3=retry SMS, 6=finish, 8=cancel
  * @returns {Promise<string>} Response
  */
 export async function setSmsVerifyStatus(orderId, status) {
+    if (parseOrderId(orderId) === null) throw new RangeError('Order ID must be a positive safe integer');
     const response = await makeRequest('setStatus', { id: orderId, status });
 
     if (response === 'CANNOT_BEFORE_2_MIN') {
@@ -308,12 +384,10 @@ export async function setSmsVerifyStatus(orderId, status) {
  */
 export async function cancelSmsVerifyOrder(orderId) {
     try {
-        const response = await setSmsVerifyStatus(orderId, 8);
-        return response === 'ACCESS_CANCEL';
+        await setSmsVerifyStatus(orderId, 8);
+        return true;
     } catch (error) {
-        if (error.message.includes('2 minutes')) {
-            return false;
-        }
+        if (error instanceof SmsVerifyEarlyCancelError) return false;
         throw error;
     }
 }
@@ -324,8 +398,8 @@ export async function cancelSmsVerifyOrder(orderId) {
  * @returns {Promise<boolean>} Success
  */
 export async function finishSmsVerifyOrder(orderId) {
-    const response = await setSmsVerifyStatus(orderId, 6);
-    return response === 'ACCESS_ACTIVATION';
+    await setSmsVerifyStatus(orderId, 6);
+    return true;
 }
 
 /**
@@ -366,19 +440,24 @@ export async function getSmsVerifyActivations(options = {}) {
  */
 export async function waitForSmsVerifyCode(orderId, maxWaitTime = 300000, checkInterval = 3000) {
     const startTime = performance.now();
+    const remainingTime = () => maxWaitTime - (performance.now() - startTime);
     let lastStatus = 'PENDING';
 
     console.log('Waiting for SMS...');
 
-    while (performance.now() - startTime < maxWaitTime) {
+    let remaining = remainingTime();
+    while (remaining > 0) {
         let result;
         try {
-            result = await checkSmsVerifyOrder(orderId);
+            result = await readSmsVerifyOrder(orderId, Math.min(REQUEST_TIMEOUT_MS, Math.ceil(remaining)));
         } catch (error) {
+            if (remainingTime() <= 0) break;
             if (error instanceof SmsVerifyKeyError) throw error;
             console.log('Retrying SMS status request');
         }
 
+        remaining = remainingTime();
+        if (remaining <= 0) break;
         if (result) {
             if (result.status !== lastStatus) {
                 console.log(`  Status: ${lastStatus} -> ${result.status}`);
@@ -392,7 +471,8 @@ export async function waitForSmsVerifyCode(orderId, maxWaitTime = 300000, checkI
             }
         }
 
-        await new Promise(resolve => setTimeout(resolve, checkInterval));
+        await new Promise(resolve => setTimeout(resolve, Math.min(checkInterval, Math.ceil(remaining))));
+        remaining = remainingTime();
     }
 
     throw new Error('Timeout waiting for SMS');

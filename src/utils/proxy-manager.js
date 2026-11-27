@@ -6,6 +6,7 @@
 import fs from 'fs';
 import path from 'path';
 import logger from './logger.js';
+import { parseProxyAddress } from './proxy-protocol.js';
 import { ensurePrivateDirectory, readPrivateFile } from './private-storage.js';
 import { ensureStateDirectory, LEGACY_DIRECTORY, PACKAGE_ROOT, STATE_DIRECTORY } from './state-paths.js';
 
@@ -92,65 +93,7 @@ class ProxyManager {
      * - `http://user:pass@host:port`, `https://...`, `socks5://...`
      */
     parseProxyLine(rawLine) {
-        if (!rawLine || typeof rawLine !== 'string') return null;
-        const line = rawLine.trim();
-        if (!line || line.startsWith('#')) return null;
-
-        const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(line);
-        const type = scheme?.[1].toLowerCase() ?? 'http';
-        const rest = scheme ? line.slice(scheme[0].length).trim() : line;
-        const colonForm = this._splitHostAndRemainder(rest);
-        const lastAt = rest.lastIndexOf('@');
-        if (lastAt !== -1) {
-            const destination = this._splitHostAndRemainder(rest.slice(lastAt + 1).replace(/\/+$/, ''));
-            if (destination && destination.extra.length === 0) {
-                // Both formats can recognize an endpoint. Require explicit credential encoding.
-                if (colonForm) return null;
-                const [username, ...password] = rest.slice(0, lastAt).split(':');
-                try {
-                    return {
-                        ip: destination.ip,
-                        port: destination.port,
-                        username: decodeURIComponent(username).trim(),
-                        password: decodeURIComponent(password.join(':')).trim(),
-                        type,
-                        raw: scheme ? line : `http://${line}`
-                    };
-                } catch {
-                    return null;
-                }
-            }
-        }
-
-        const endpoint = colonForm ?? (scheme ? this._splitHostAndRemainder(rest.replace(/\/+$/, '')) : null);
-        if (!endpoint) return null;
-        const { ip, port, extra: [username = '', ...password] } = endpoint;
-        return {
-            ip,
-            port,
-            username: username.trim(),
-            password: password.join(':').trim(),
-            type,
-            raw: line
-        };
-    }
-
-    _splitHostAndRemainder(input) {
-        const hostEnd = input.startsWith('[') ? input.indexOf(']') + 1 : input.indexOf(':');
-        if (hostEnd <= 0 || input[hostEnd] !== ':') return null;
-        const ip = input.slice(0, hostEnd).trim();
-        const [port, ...extra] = input.slice(hostEnd + 1).split(':');
-        const portNumber = Number(port);
-        if (!ip || /[\s\u0000-\u001f\u007f\\/?#@%]/.test(ip) ||
-            !/^\d+$/.test(port.trim()) || portNumber < 1 || portNumber > 65535) {
-            return null;
-        }
-        try {
-            new URL(`http://${ip}`);
-        } catch {
-            return null;
-        }
-        return { ip, port: String(portNumber), extra };
+        return parseProxyAddress(rawLine);
     }
 
     /**

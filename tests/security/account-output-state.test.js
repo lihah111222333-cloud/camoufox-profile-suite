@@ -8,7 +8,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import {
-    appendAccountResult, migrateExistingAccountOutputs, writeRunSummary
+    appendAccountResult, migrateExistingAccountOutputs, recordAccountCleanup, writeRunSummary
 } from '../../src/utils/account-results.js';
 import { describeProcessOwner, readProcessOwner } from '../../src/utils/process-owner.js';
 
@@ -214,6 +214,97 @@ test('finishing a write preserves unexpected content in the lock directory', (t)
     assert.deepEqual(readJson(output), [saved]);
 });
 
+test('locks recover an exited owner after a hostname change only with matching boot scope', {
+    skip: !['linux', 'darwin'].includes(process.platform)
+}, (t) => {
+    const root = fs.realpathSync.native(temporaryDirectory(t));
+    const profileModule = new URL('../../src/camoufox/profile-storage.js', import.meta.url).href;
+    const boot = 'd6cddc5a-ad8b-4e09-aa24-2204fbe92e3c';
+    const otherBoot = '6f7e401b-649d-4b65-b933-a79900f9228f';
+    const code = [
+        'import assert from "node:assert/strict";',
+        'import childProcess from "node:child_process";',
+        'import fs from "node:fs";',
+        'import os from "node:os";',
+        'import path from "node:path";',
+        'import { performance } from "node:perf_hooks";',
+        'const [root, profileModule, lockModule, hostname, boot, namespace, action] = process.argv.slice(1);',
+        'os.hostname = () => hostname;',
+        'const bootValue = () => {',
+        '    if (boot === "unavailable") throw new Error("fixture boot identity unavailable");',
+        '    return boot + "\\n";',
+        '};',
+        'if (process.platform === "linux") {',
+        '    const readlink = fs.readlinkSync;',
+        '    fs.readlinkSync = (file, ...args) => file === "/proc/self" ? String(process.pid)',
+        '        : file === "/proc/self/ns/pid" ? "pid:[" + namespace + "]" : readlink(file, ...args);',
+        '    const readFile = fs.readFileSync;',
+        '    fs.readFileSync = (file, ...args) => file === "/proc/sys/kernel/random/boot_id" ? bootValue()',
+        '        : readFile(file, ...args);',
+        '} else {',
+        '    childProcess.execFileSync = (file) => {',
+        '        if (file === "/usr/sbin/sysctl") return bootValue();',
+        '        assert.equal(file, "/bin/ps");',
+        '        return "Thu Nov 26 07:00:00 2026\\n";',
+        '    };',
+        '}',
+        'const { acquireProfileLease, releaseProfileLease } = await import(profileModule);',
+        'const { withAccountOutputLock } = await import(lockModule);',
+        'const location = { id: "fixture", profilesDir: root };',
+        'const output = path.join(root, "results.json");',
+        'if (action === "interrupt") {',
+        '    acquireProfileLease(location);',
+        '    withAccountOutputLock(output, (snapshot) => {',
+        '        fs.writeFileSync(snapshot, "[]", { flag: "wx", mode: 0o600 });',
+        '        process.exit(73);',
+        '    });',
+        '} else if (action === "recover") {',
+        '    releaseProfileLease(acquireProfileLease(location));',
+        '    assert.equal(withAccountOutputLock(output, () => "acquired"), "acquired");',
+        '} else {',
+        '    assert.throws(() => acquireProfileLease(location), {',
+        '        code: "ERR_CAMOUFOX_PROFILE_BUSY", message: /owner could not be verified/',
+        '    });',
+        '    let elapsed = 0;',
+        '    Object.defineProperty(performance, "now", { value: () => (elapsed += 5_001) });',
+        '    assert.throws(() => withAccountOutputLock(output, () => assert.fail("protected owner replaced")), {',
+        '        code: "ACCOUNT_OUTPUT_LOCK_FAILED", message: /owner could not be verified/',
+        '    });',
+        '}'
+    ].join('\n');
+    function run(hostname, session, action, namespace = '4026531836') {
+        const result = spawnSync(process.execPath, [
+            '--input-type=module', '--eval', code, root, profileModule, lockModule, hostname, session, namespace, action
+        ], { encoding: 'utf8', timeout: 8_000 });
+        assert.equal(result.status, action === 'interrupt' ? 73 : 0, result.stderr);
+        if (action === 'interrupt') assert.throws(() => process.kill(result.pid, 0), { code: 'ESRCH' });
+    }
+
+    const lock = path.join(root, 'results.json.lock');
+    const lease = path.join(root, '.camoufox-leases~', 'fixture');
+    const entries = () => [fs.readdirSync(lock).sort(), fs.readdirSync(lease).sort()];
+
+    run('before', boot, 'interrupt');
+    run('after', boot, 'recover');
+    assert.equal(fs.existsSync(lock), false);
+    assert.equal(fs.existsSync(lease), false);
+
+    run('before', boot, 'interrupt');
+    const prior = entries();
+    run('other-host', otherBoot, 'blocked');
+    if (process.platform === 'linux') run('before', boot, 'blocked', '4026531837');
+    assert.deepEqual(entries(), prior);
+    run('before', otherBoot, 'recover');
+
+    run('before', 'unavailable', 'interrupt');
+    const legacy = entries();
+    run('after', boot, 'blocked');
+    assert.deepEqual(entries(), legacy);
+    run('before', 'unavailable', 'recover');
+    assert.equal(fs.existsSync(lock), false);
+    assert.equal(fs.existsSync(lease), false);
+});
+
 test('output locks and profile leases distinguish a reused PID from an active owner', {
     skip: !['linux', 'darwin', 'freebsd', 'win32'].includes(process.platform)
 }, async (t) => {
@@ -377,6 +468,56 @@ test('legacy import preserves the original on failure and gives existing state p
     assert.equal(readJson(summary).stats.skipped, 2);
     migrateExistingAccountOutputs(results, summary, { legacyDirectory: legacy });
     assert.equal(readJson(results)[0].profileId, 'current');
+});
+
+test('legacy import removes candidate identity from unsuccessful attempts', (t) => {
+    const legacy = temporaryDirectory(t);
+    const state = temporaryDirectory(t);
+    const results = path.join(state, 'results.json');
+    const summary = path.join(state, 'summary.json');
+    const legacyResults = path.join(legacy, 'results.json');
+    const identity = {
+        email: 'fixture@example.invalid', firstName: 'Fixture', lastName: 'Person',
+        fullName: 'Fixture Person', username: 'fixture-person', phone: 'fixture-phone'
+    };
+    const attempt = { profileId: 'legacy-profile', profileType: 'GPM Login', orderId: 'fixture-order' };
+    const completed = { success: true, ...identity, ...attempt };
+    const unfinished = {
+        success: false, ...identity, ...attempt, profileCleanup: 'pending',
+        errorCode: 'MANUAL_SIGNUP_REQUIRED', errorStage: 'verification'
+    };
+    const original = JSON.stringify([completed, unfinished]);
+    fs.writeFileSync(legacyResults, original, { mode: 0o600 });
+
+    migrateExistingAccountOutputs(results, summary, { legacyDirectory: legacy });
+    assert.deepEqual(readJson(results), [
+        completed,
+        {
+            success: false, ...attempt, profileCleanup: 'pending',
+            error: 'Manual signup is required', errorCode: 'MANUAL_SIGNUP_REQUIRED', errorStage: 'verification'
+        }
+    ]);
+    assert.equal(fs.readFileSync(legacyResults, 'utf8'), original);
+});
+
+test('cleanup refuses an ambiguous result ID and preserves all imported records', (t) => {
+    const legacy = temporaryDirectory(t);
+    const state = temporaryDirectory(t);
+    const results = path.join(state, 'results.json');
+    const summary = path.join(state, 'summary.json');
+    const duplicateId = '068fd614-aceb-46c0-90b9-8b329991e448';
+    const first = { success: true, resultId: duplicateId, profileId: 'first', profileCleanup: 'pending' };
+    const second = { ...first, profileId: 'second' };
+    fs.writeFileSync(path.join(legacy, 'results.json'), JSON.stringify([first, second]));
+    migrateExistingAccountOutputs(results, summary, { legacyDirectory: legacy });
+    const original = fs.readFileSync(results, 'utf8');
+
+    assert.throws(() => recordAccountCleanup(results, duplicateId, 'stopped'), /More than one result/);
+    assert.equal(fs.readFileSync(results, 'utf8'), original);
+
+    const unique = appendAccountResult(results, { ...second });
+    recordAccountCleanup(results, unique.resultId, 'stopped');
+    assert.deepEqual(readJson(results).map(({ profileCleanup }) => profileCleanup), ['pending', 'pending', 'stopped']);
 });
 
 test('migration and append preserve invalid UTF-8 in current or legacy results', (t) => {

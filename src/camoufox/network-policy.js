@@ -1,3 +1,5 @@
+import { loadApplicationEnvironment } from '../utils/private-env.js';
+
 const managedBindings = new WeakSet();
 
 function managedEgressError(message) {
@@ -25,8 +27,8 @@ export function resolveNetworkPolicyMode(...policies) {
 }
 
 export function resolveConfiguredNetworkPolicyMode(...policies) {
-    const mode = process.env.CAMOUFOX_PORT_SCAN_MODE;
-    const configuredRestriction = mode && mode !== 'url-only' ? { mode } : undefined;
+    const { CAMOUFOX_PORT_SCAN_MODE: mode } = loadApplicationEnvironment();
+    const configuredRestriction = mode !== undefined && mode !== 'url-only' ? { mode } : undefined;
     return resolveNetworkPolicyMode(configuredRestriction, ...policies);
 }
 

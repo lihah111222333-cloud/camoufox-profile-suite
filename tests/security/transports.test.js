@@ -62,7 +62,7 @@ async function loadAdapters(t) {
         assert.ok(responses.length, 'Unexpected controller API or discovery request');
         const response = responses.shift();
         if (response instanceof Error) throw response;
-        return { data: response };
+        return { status: 200, data: response };
     }
     function axiosMethods(defaults) {
         return {
@@ -374,7 +374,7 @@ test('GPM and Dolphin control and proxy transport policies', async t => {
     const proxy = proxyManager.parseProxyLine('https://fixture-user:fixture-password@proxy.invalid:8443');
 
     await run('Dolphin retains parsed HTTPS through both proxy operations', async () => {
-        responses.push({ id: 'fixture' }, {});
+        responses.push({ id: 'fixture' }, '');
         await dolphin.createProfile('fixture', proxy);
         await dolphin.updateProfileProxy('fixture', proxy);
         const [create, update] = requests;
@@ -388,6 +388,21 @@ test('GPM and Dolphin control and proxy transport policies', async t => {
         }
         await assert.rejects(dolphin.createProfile('fixture', { ...proxy, protocol: 'http' }), /Conflicting proxy protocols/);
         assert.equal(requests.length, 2);
+    });
+
+    await run('GPM only sends credentials that round-trip in the compact proxy format', async () => {
+        for (const line of [
+            'http://fixture%3Auser:fixture-password@proxy.invalid:8080',
+            'http://fixture-user@proxy.invalid:8080'
+        ]) {
+            await assert.rejects(gpm.createProfile('fixture', proxyManager.parseProxyLine(line)), /GPM Login format/);
+        }
+        assert.equal(requests.length, 0);
+
+        responses.push({ id: 'fixture' });
+        const proxy = proxyManager.parseProxyLine('http://fixture-user:fixture%3Apassword@proxy.invalid:8080');
+        await gpm.createProfile('fixture', proxy);
+        assert.equal(requests[0].data.raw_proxy, 'proxy.invalid:8080:fixture-user:fixture:password');
     });
 
     await run('GPM and GoLogin reject unsupported HTTPS proxies before API or preflight I/O', async () => {

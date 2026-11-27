@@ -5,11 +5,12 @@ import { TextDecoder } from 'node:util';
 import { withAccountOutputLock } from './account-output-lock.js';
 import { readPrivateFile, writePrivateFile } from './private-storage.js';
 
+const ATTEMPT_FIELDS = ['orderId', 'profileId', 'profileType', 'proxyIP', 'profileIP', 'timestamp'];
 const SUMMARY_FIELDS = [
-    'email', 'firstName', 'lastName', 'fullName', 'username', 'phone', 'orderId',
-    'profileId', 'profileType', 'proxyIP', 'profileIP', 'timestamp'
+    'email', 'firstName', 'lastName', 'fullName', 'username', 'phone', ...ATTEMPT_FIELDS
 ];
 const RESULT_FIELDS = ['success', 'createdAt', ...SUMMARY_FIELDS];
+const UNSUCCESSFUL_RESULT_FIELDS = ['success', 'createdAt', ...ATTEMPT_FIELDS];
 const TRAFFIC_PATH_FIELDS = [
     'trafficDir', 'payloadsDir', 'preTlsWireLogPath', 'trafficNdjsonPath', 'attributionIndexPath', 'harPath'
 ];
@@ -24,13 +25,17 @@ const TELEMETRY_GROUPS = {
     ],
     fingerprintLedger: ['profileId', 'maxHammingDistance', 'totalEntries', 'driftAlertCount']
 };
-const PROFILE_CLEANUP = new Set([
-    'pending', 'stopped', 'stop-unconfirmed', 'deleted', 'delete-unconfirmed',
-    'allocation-unconfirmed', 'recycled', 'recycle-unconfirmed'
+const UNRESOLVED_PROFILE_CLEANUP = new Set([
+    'pending', 'allocation-unconfirmed', 'stop-unconfirmed', 'delete-unconfirmed', 'recycle-unconfirmed'
 ]);
+const PROFILE_CLEANUP = new Set(['stopped', 'deleted', 'recycled', ...UNRESOLVED_PROFILE_CLEANUP]);
 const RESULT_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const MANUAL_STAGES = new Set(['password', 'verification', 'recovery-email', 'untrusted-page', 'completion']);
 const outputDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+export function needsProfileCleanupReview(status) {
+    return UNRESOLVED_PROFILE_CLEANUP.has(status);
+}
 
 function pickScalars(source, fields) {
     const selected = {};
@@ -84,7 +89,7 @@ function assertAccountRecord(record, label) {
 function savedAccountRecord(record) {
     assertAccountRecord(record, 'results.json');
 
-    const selected = accountFields(record, RESULT_FIELDS);
+    const selected = accountFields(record, record.success ? RESULT_FIELDS : UNSUCCESSFUL_RESULT_FIELDS);
     if (typeof record.resultId === 'string' && RESULT_ID.test(record.resultId)) selected.resultId = record.resultId;
     if (PROFILE_CLEANUP.has(record.profileCleanup)) selected.profileCleanup = record.profileCleanup;
     if (selected.success === false) {
@@ -176,9 +181,10 @@ export function migrateExistingAccountOutputs(resultsFile, summaryFile, { legacy
         { filePath: summaryFile, label: 'Run summary file', project: projectSummary }
     ];
     const errors = [];
+    const cleanupReview = [];
     for (const { filePath, label, project } of outputs) {
         try {
-            withAccountOutputLock(filePath, (temporaryPath) => {
+            const projected = withAccountOutputLock(filePath, (temporaryPath) => {
                 const existing = readExistingOutput(filePath, label);
                 const legacy = !existing && legacyDirectory
                     ? readExistingOutput(path.join(legacyDirectory, path.basename(filePath)), label, { restrict: false })
@@ -186,11 +192,20 @@ export function migrateExistingAccountOutputs(resultsFile, summaryFile, { legacy
                 const source = existing || legacy;
                 if (!source) return;
 
-                const updated = JSON.stringify(project(source.data), null, 2);
+                const records = project(source.data);
+                const updated = JSON.stringify(records, null, 2);
                 if (!existing || existing.content !== updated) {
                     writePrivateFile(filePath, updated, { requireOwner: true, temporaryPath });
                 }
+                return records;
             });
+            if (filePath === resultsFile && projected) {
+                for (const [index, { resultId, profileCleanup }] of projected.entries()) {
+                    if (needsProfileCleanupReview(profileCleanup)) {
+                        cleanupReview.push({ entry: index + 1, resultId, profileCleanup });
+                    }
+                }
+            }
         } catch (error) {
             errors.push(error);
         }
@@ -198,6 +213,7 @@ export function migrateExistingAccountOutputs(resultsFile, summaryFile, { legacy
     if (errors.length) {
         throw new AggregateError(errors, errors.map((error) => error.message).join('\n'));
     }
+    return cleanupReview;
 }
 
 function updateResults(filePath, update) {
@@ -226,7 +242,9 @@ export function recordAccountCleanup(filePath, resultId, profileCleanup) {
         throw invalidOutput('Invalid profile cleanup outcome.');
     }
     return updateResults(filePath, (results) => {
-        const record = results.find((entry) => entry.resultId === resultId);
+        const matches = results.filter((entry) => entry.resultId === resultId);
+        if (matches.length > 1) throw invalidOutput('More than one result matches the cleanup ID in results.json.');
+        const [record] = matches;
         if (!record) throw invalidOutput('The result to update is missing from results.json.');
         record.profileCleanup = profileCleanup;
         return record;

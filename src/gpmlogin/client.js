@@ -16,6 +16,7 @@ import { profileIdPathComponent } from '../utils/controller-id.js';
 import {
     controllerAcknowledged,
     controllerErrorDetails,
+    controllerProfileMatches,
     controllerRejected,
     parseControllerPayload,
     profileAllocationUnconfirmed,
@@ -23,7 +24,7 @@ import {
     sendControllerProfileCreate,
     sendControllerRequest
 } from '../utils/controller-request.js';
-import { requireProxyProtocol } from '../utils/proxy-protocol.js';
+import { parseProxyAddress, parseProxyPort, requireProxyProtocol } from '../utils/proxy-protocol.js';
 
 const GPM_API_URL = config.gpmlogin.apiUrl;
 const controllerClient = axios.create(controllerRequestOptions);
@@ -355,22 +356,21 @@ export async function createProfile(profileName, proxy = null) {
             if (!proxy.ip || !proxy.port) {
                 throw new Error('Proxy host and port are required');
             }
-            let rawProxy = '';
-            
-            if (proxyType === 'socks5' || proxyType === 'socks') {
-                if (proxy.username && proxy.password) {
-                    rawProxy = `socks5://${proxy.ip}:${proxy.port}:${proxy.username}:${proxy.password}`;
-                } else {
-                    rawProxy = `socks5://${proxy.ip}:${proxy.port}`;
-                }
-            } else {
-                if (proxy.username && proxy.password) {
-                    rawProxy = `${proxy.ip}:${proxy.port}:${proxy.username}:${proxy.password}`;
-                } else {
-                    rawProxy = `${proxy.ip}:${proxy.port}`;
-                }
+            const username = proxy.username ?? '';
+            const password = proxy.password ?? '';
+            const prefix = proxyType === 'http' ? '' : 'socks5://';
+            const endpoint = prefix + proxy.ip + ':' + proxy.port;
+            if (typeof username !== 'string' || typeof password !== 'string' ||
+                Boolean(username) !== Boolean(password) || /[\u0000-\u001f\u007f]/.test(username + password)) {
+                throw new Error('Proxy credentials cannot be represented in GPM Login format');
             }
-            
+
+            const rawProxy = username ? endpoint + ':' + username + ':' + password : endpoint;
+            const parsed = parseProxyAddress(rawProxy);
+            if (!parsed || parsed.ip !== proxy.ip || parsed.port !== parseProxyPort(proxy.port) ||
+                parsed.username !== username || parsed.password !== password) {
+                throw new Error('Proxy cannot be represented in GPM Login format');
+            }
             requestBody.raw_proxy = rawProxy;
             logger.info('Creating profile with proxy', { protocol: proxyType });
         }
@@ -538,8 +538,13 @@ export async function getProfile(profileId) {
         const response = await sendControllerRequest('GPM API get profile', () =>
             controllerClient.get(url, { timeout: 10000 })
         );
-        if (controllerRejected(response.data)) throw new Error('GPM API rejected the profile lookup');
-        return response.data?.data || response.data;
+        const payload = parseControllerPayload(response.data);
+        const profile = payload?.data ?? payload;
+        if (response.status !== 200 || controllerRejected(payload) || controllerRejected(profile) ||
+            !controllerProfileMatches(profile, profileId)) {
+            throw new Error('GPM API returned an invalid profile response');
+        }
+        return profile;
     } catch (error) {
         logger.error('GPM API get profile failed', controllerErrorDetails(error));
         throw error;

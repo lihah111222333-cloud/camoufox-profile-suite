@@ -1,9 +1,11 @@
+import { parseProxyAddress } from '../utils/proxy-protocol.js';
+
 const SESSION_TOKEN_FIELD =
     '(?:x[-_]?)?(?:csrf|xsrf)(?:[-_]?token)?|passport[-_]?csrf[-_]?token|(?:x[-_]?)?guest[-_]?token|ct0|lsd|x-fb-lsd';
 const AUTHORIZATION_HEADER = '(?:x-)?(?:proxy-)?authorization';
 const CREDENTIAL_FIELD =
     '(?:x[-_]?)?(?:(?:(?:auth(?:entication|orization)?|access|refresh|id|session|security|' +
-    'api|bearer|client|user|private|job|deploy)[-_]?)?token|(?:api|auth|access|subscription)[-_]?key|client[-_]?secret)';
+    'api|bearer|client|user|private|job|deploy)[-_]?)?token|(?:api|auth|access|subscription)[-_]?key|client[-_]?(?:secret|assertion)|code[-_]?verifier)';
 const SIGNATURE_FIELD = '(?:x[-_]?)?sig(?:nature)?|hmac';
 const CLOUD_SIGNATURE_FIELD =
     'x[-_](?:amz|goog|oss)[-_](?:signature|credential|security[-_]token)|x-amz-s3session-token';
@@ -34,6 +36,17 @@ const URL_HEADER_REGEX =
     /^(?::path|referer|referrer|origin|sec-websocket-origin|location|content-location|destination|.+[-_]ur[il])$/i;
 const URL_METADATA_KEY_REGEX = /(?:url|uri|href|referrer|referer|location|origin|destination)$/i;
 const AUTHORIZATION_HEADER_REGEX = new RegExp('^' + AUTHORIZATION_HEADER + '$', 'i');
+const INLINE_AUTHORIZATION_REGEX = new RegExp(
+    '([ \\t([{,;])(' + AUTHORIZATION_HEADER + '):[ \\t]*(' +
+    String.raw`(?:\[REDACTED\]|"(?:\\[^\r\n]|[^"\\\r\n])*(?:"|(?=\r?\n|$))|'(?:\\[^\r\n]|[^'\\\r\n])*(?:'|(?=\r?\n|$))|[^\r\n)\]}"'])*)`,
+    'gi'
+);
+const ABSOLUTE_FILE_PATH_PREFIX = String.raw`(?:[a-z]:[\\/]|\\\\|\/(?!\/))`;
+const DIAGNOSTIC_FILE_PATH_REGEX = new RegExp(
+    String.raw`(\b(?:access|chmod|chown|copyfile|directory|file|lstat|mkdir|open|path|read(?:file|link)?|realpath|rename|rmdir|scandir|stat|symlink|unlink|write(?:file)?)[ \t]+|[ \t]+->[ \t]+)` +
+    '(?:(["\'])' + ABSOLUTE_FILE_PATH_PREFIX + String.raw`[^\r\n]*?(?:\2|(?=\r?\n|$))|` +
+    ABSOLUTE_FILE_PATH_PREFIX + String.raw`[^\s"'<>()[\]{},;]+)`, 'gi'
+);
 const LINK_HEADER_REGEX = /^link$/i;
 const REFRESH_HEADER_REGEX = /^refresh$/i;
 const LINK_COMPONENT_REGEX =
@@ -59,8 +72,12 @@ const ENCODED_EMAIL_SYNTAX_REGEX = /@[^@\s]*%/;
 const MAX_URL_BYTES = 64 * 1024;
 const MAX_NESTED_URL_DEPTH = 4;
 const MAX_URL_DECODING_PASSES = 4;
-const ACCOUNT_FIELD_REGEX =
-    /^(?:(?:account[-_]?)?e[-_]?mail(?:[-_]?address)?|(?:account[-_]?)?user[-_]?name|(?:first|last|full|given|family|display|profile)[-_]?name)$/i;
+const ACCOUNT_FIELD_REGEX = new RegExp(
+    '^(?:(?:(?:account|recovery)[-_]?)?e[-_]?mail(?:[-_]?address)?|(?:account[-_]?)?user[-_]?name|' +
+    '(?:first|last|full|given|family|display|profile)[-_]?name|' +
+    '(?:(?:account|recovery)[-_]?)?(?:phone(?:[-_]?number)?|mobile[-_]?number)|' +
+    'birth[-_]?(?:date|day)|date[-_]?of[-_]?birth)$', 'i'
+);
 // Start at a token boundary so a long ordinary value is scanned once.
 const EMAIL_REGEX =
     /(?<![\p{L}\p{N}\p{M}._%+-])[\p{L}\p{N}\p{M}._%+-]+(?:@|%40)[\p{L}\p{N}\p{M}-]+(?:\.[\p{L}\p{N}\p{M}-]+)+/giu;
@@ -68,7 +85,6 @@ const LEGACY_PROFILE_REGEX = /\bGmail_[a-z\d._-]{1,80}?_(\d{13})(?:_(\d{1,8}))?(
 const LEGACY_MASK_REGEX = /\[REDACTED:[a-f\d]{8}\]|%5BREDACTED%3A[a-f\d]{8}%5D/gi;
 const PROXY_SCHEMES = new Set(['http', 'https', 'socks4', 'socks5', 'socks5h']);
 const PROXY_HOST_PATTERN = String.raw`(\[[a-f\d:.]+\]|[^%/?#:@\\\s]+)`;
-const PROXY_COMPACT_REGEX = new RegExp('^' + PROXY_HOST_PATTERN + ':[ \\t]*(\\d+)[ \\t]*:', 'i');
 const PROXY_ENDPOINT_REGEX = new RegExp('^' + PROXY_HOST_PATTERN + '(?::(\\d+))?$', 'i');
 
 function redactDiagnosticIdentity(text) {
@@ -88,15 +104,9 @@ export function redactProxyUrl(proxyInput) {
     let explicitPort;
     let protocol = 'http';
     if (typeof raw === 'string') {
-        address = raw.trim();
-        const prefix = /^([a-z][a-z\d+.-]*):\/\//i.exec(address);
-        if (prefix) {
-            protocol = prefix[1].toLowerCase();
-            address = address.slice(prefix[0].length);
-        }
-        const compact = PROXY_COMPACT_REGEX.exec(address);
-        [, address, explicitPort] = compact ||
-            PROXY_ENDPOINT_REGEX.exec(address.split(/[/?#]/, 1)[0].split('@').at(-1)) || [];
+        const endpoint = parseProxyAddress(raw, { endpointOnly: true });
+        if (!endpoint) return null;
+        ({ ip: address, port: explicitPort, type: protocol } = endpoint);
     } else if (descriptor) {
         address = descriptor.ip || descriptor.host;
         if (typeof address !== 'string') return null;
@@ -179,23 +189,40 @@ function redactParameters(parameters, depth) {
     }).join('&');
 }
 
+function redactUrlPathIdentity(path) {
+    if (!path.includes('%')) return redactDiagnosticIdentity(path);
+    return path.split('/').map((segment) => {
+        let decoded = segment;
+        for (let pass = 0; pass < MAX_URL_DECODING_PASSES && decoded.includes('%'); pass += 1) {
+            try {
+                decoded = decodeURIComponent(decoded);
+            } catch {
+                break;
+            }
+            if (redactDiagnosticIdentity(decoded) !== decoded) return MASK;
+        }
+        return redactDiagnosticIdentity(segment);
+    }).join('/');
+}
+
 function redactUrl(value, depth) {
     if (exceedsUrlLimit(value)) return MASK;
     const privateUrl = PRIVATE_URL_PREFIX_REGEX.exec(value);
     if (privateUrl) return privateUrl[1] + MASK;
 
     // Strip userinfo while preserving the original form of absolute and relative references.
-    const url = redactDiagnosticIdentity(value.replace(/^(\s*(?:[a-z][a-z\d+.-]*:)?\/\/)[^/?#]*@/i, '$1'))
+    const url = value.replace(/^(\s*(?:[a-z][a-z\d+.-]*:)?\/\/)[^/?#]*@/i, '$1')
         .replace(LEGACY_MASK_REGEX, MASK);
     const fragmentStart = url.indexOf('#');
     const beforeFragment = fragmentStart < 0 ? url : url.slice(0, fragmentStart);
     const queryStart = beforeFragment.indexOf('?');
     const base = queryStart < 0
-        ? beforeFragment
-        : beforeFragment.slice(0, queryStart + 1) + redactParameters(beforeFragment.slice(queryStart + 1), depth);
+        ? redactUrlPathIdentity(beforeFragment)
+        : redactUrlPathIdentity(beforeFragment.slice(0, queryStart)) + '?' +
+            redactParameters(redactDiagnosticIdentity(beforeFragment.slice(queryStart + 1)), depth);
     if (fragmentStart < 0) return exceedsUrlLimit(base) ? MASK : base;
 
-    const fragment = url.slice(fragmentStart + 1);
+    const fragment = redactDiagnosticIdentity(url.slice(fragmentStart + 1));
     const fragmentQueryStart = fragment.indexOf('?');
     const sanitizedFragment = fragmentQueryStart < 0
         ? redactParameters(fragment, depth)
@@ -263,6 +290,10 @@ export function redactDiagnosticText(rawText) {
                 }
                 return line;
             })
+        .replace(INLINE_AUTHORIZATION_REGEX,
+            (_, prefix, name, value) => prefix + name + ': ' + redactCredentialHeader(name, value))
+        .replace(DIAGNOSTIC_FILE_PATH_REGEX,
+            (_, prefix, quote = '') => prefix + quote + MASK + quote)
         .replace(QUOTED_PRIVATE_URL_REGEX, (_, quote, url) => quote + redactUrlSecrets(url) + quote)
         .replace(URL_REFERENCE_REGEX, redactUrlReference)
         .replace(LEGACY_MASK_REGEX, MASK);

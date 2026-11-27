@@ -118,6 +118,26 @@ test('URL identity masking inspects decoded free-text parameters and preserves o
     assert.equal(new URL(redactUrlSecrets('https://fixture.invalid/find?q=' + encodedDomain)).searchParams.get('q'), mask);
 });
 
+test('percent-encoded identity is removed from URL paths without rewriting other segments', () => {
+    const email = 'synthetic%2Ereader%40person%2Einvalid';
+    const route = 'https://fixture.invalid/folder/' + email + '/notes%2Ejson?view=compact';
+    const redacted = 'https://fixture.invalid/folder/' + mask + '/notes%2Ejson?view=compact';
+    assert.equal(redactUrlSecrets(route), redacted);
+    assert.equal(redactUrlSecrets(redacted), redacted);
+    assert.equal(redactDiagnosticText('Failed to navigate to ' + route), 'Failed to navigate to ' + redacted);
+});
+
+test('inline authentication and absolute paths in file errors are removed from diagnostics', () => {
+    const original = "Request failed (pRoXy-AuThOrIzAtIoN: Bearer synthetic-inline). " +
+        "ENOENT: copyfile '/Users/fixture-operator/Two Words.json' -> 'C:\\Fixture\\Two Words.json'";
+    const expected = "Request failed (pRoXy-AuThOrIzAtIoN: Bearer " + mask + "). " +
+        "ENOENT: copyfile '" + mask + "' -> '" + mask + "'";
+    assert.equal(redactDiagnosticText(original), expected);
+    assert.equal(redactDiagnosticText(expected), expected);
+    assert.equal(redactDiagnosticText('Could not open /opt/fixture-account/log.txt'), 'Could not open ' + mask);
+    assert.equal(redactDiagnosticText('GET /notes/part%2Ejson'), 'GET /notes/part%2Ejson');
+});
+
 const diagnosticUrl = 'https://fixture.invalid/collection(review)?token=' + fixtureToken;
 const localFileUrl = 'file:///Users/fixture-operator/Documents/fixture-local-document.pdf';
 
@@ -245,7 +265,8 @@ test('proxy descriptors project only the recognized endpoint', () => {
         ['https://fixture-proxy-user:fixture-proxy-password@proxy.example.test:443/path?q=fixture-proxy-query',
             'https://proxy.example.test:443'],
         ['fixture-proxy-user:fixture-proxy-password@proxy.example.test:8080', 'http://proxy.example.test:8080'],
-        ['proxy.example.test:invalid:fixture-proxy-unknown', null]
+        ['proxy.example.test:invalid:fixture-proxy-unknown', null],
+        ['https://fixture-proxy-user:1234:fixture-proxy-password@proxy.example.test:8443/path', null]
     ];
     for (const [raw, expected] of fixtures) assert.equal(redactProxyUrl(raw), expected);
 });
@@ -419,6 +440,59 @@ test('stored and exported traffic omit private URL and signature metadata', asyn
         for (const marker of [encodedQueryEmail, 'fixture.reader@department.invalid', 'fixture-operator',
             'fixture-local-document', fixtureToken, fixtureSignature]) {
             assert.ok(!saved.includes(marker), path.basename(file));
+        }
+    }
+});
+
+test('new captures and shared reports omit private query, action and failure details', async (t) => {
+    const root = directory(t);
+    const recorder = new CamoufoxTrafficRecorder({
+        profileDir: root, harPath: path.join(root, 'traffic.har'), recordBodies: false
+    });
+    const transport = new EventEmitter();
+    recorder.attachContext(transport);
+    const frame = { url: () => 'https://fixture.invalid/' };
+    const fields = {
+        ReCoVeRyPhOnE: ['+12025550149', '+12025550150'],
+        birthdate: '1990-01-02',
+        ClIeNt_AsSeRtIoN: 'synthetic-assertion',
+        code_verifier: 'synthetic-verifier'
+    };
+    const params = new URLSearchParams();
+    for (const [name, value] of Object.entries(fields)) {
+        for (const item of [].concat(value)) params.append(name, item);
+    }
+    params.set('view', 'compact');
+    recorder.recordTriggerAction('locator.click', '#fixture', { details: [fields] }, frame);
+    const request = {
+        frame: () => frame,
+        url: () => 'https://fixture.invalid/contact/synthetic%40person%2Einvalid?' + params,
+        method: () => 'GET',
+        headers: () => ({}),
+        failure: () => ({ errorText: "Request failed (Authorization: Bearer synthetic-inline). " +
+            "ENOENT: open '/Users/fixture-operator/Two Words.json'" })
+    };
+    transport.emit('request', request);
+    transport.emit('requestfailed', request);
+    await recorder.stop();
+
+    const { log } = recorder.exportHar();
+    const [entry] = log.entries;
+    assert.equal(new URL(entry.request.url).pathname, '/contact/' + mask);
+    for (const name of Object.keys(fields)) {
+        const expected = [].concat(fields[name]).map(() => mask);
+        assert.deepEqual(new URL(entry.request.url).searchParams.getAll(name), expected);
+        assert.equal(entry._attribution.triggerAction.metadata.details[0][name], mask);
+    }
+    assert.equal(new URL(entry.request.url).searchParams.get('view'), 'compact');
+    const wire = queryProfileTraffic({ trafficDir: recorder.trafficDir, correlation: entry._attribution.correlationId });
+    const profile = queryProfileTraffic({ trafficDir: recorder.trafficDir });
+    assert.equal(wire.failed.failureText, "Request failed (Authorization: Bearer " + mask + "). ENOENT: open '" + mask + "'");
+    for (const report of [log, wire, profile, fs.readFileSync(recorder.trafficNdjsonPath, 'utf8')]) {
+        const output = JSON.stringify(report);
+        for (const value of [...Object.values(fields).flat(), 'synthetic-inline', 'fixture-operator',
+            'synthetic%40person%2Einvalid', 'synthetic@person.invalid']) {
+            assert.ok(!output.includes(value), 'private fixture value survived projection');
         }
     }
 });

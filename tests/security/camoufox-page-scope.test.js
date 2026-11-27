@@ -59,6 +59,32 @@ test('page cookie reads require at least one eligible HTTP(S) URL', async () => 
     assert.deepEqual(calls, Array(2).fill(['https://shop.example.test/settings']));
 });
 
+test('cookie writes retain an explicit path for a URL-derived host', async () => {
+    const writes = [];
+    const page = attachPageCompatibility({ url: () => 'https://shop.example.test/main/current' }, {
+        async addCookies(cookies) { writes.push(cookies); }
+    });
+    await page.setCookie(
+        { name: 'exact', value: 'sample', url: 'https://one.example.test/elsewhere', path: '/settings' },
+        { name: 'current', value: 'sample', path: '/account/' },
+        { name: 'domain', value: 'sample', domain: '.example.test', path: '/settings/elsewhere' },
+        { name: 'default', value: 'sample', url: 'https://one.example.test/elsewhere' }
+    );
+    assert.deepEqual(writes, [[
+        { name: 'exact', value: 'sample', domain: 'one.example.test', path: '/settings', secure: true },
+        { name: 'current', value: 'sample', domain: 'shop.example.test', path: '/account/', secure: true },
+        { name: 'domain', value: 'sample', domain: '.example.test', path: '/settings/elsewhere' },
+        { name: 'default', value: 'sample', url: 'https://one.example.test/elsewhere' }
+    ]]);
+    for (const cookie of [
+        { url: 'https://one.example.test', path: 'settings' },
+        { url: 'file:///settings', path: '/settings' }
+    ]) {
+        await assert.rejects(page.setCookie({ name: 'invalid', value: 'sample', ...cookie }), /Cookie path/);
+    }
+    assert.equal(writes.length, 1);
+});
+
 test('cookie deletion expires exact matches while concurrent and unrelated cookie identities survive', async () => {
     const firstPartition = 'https://one.example.test';
     const secondPartition = 'https://two.example.test';

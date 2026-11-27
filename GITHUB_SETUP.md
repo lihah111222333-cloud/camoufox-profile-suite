@@ -16,6 +16,15 @@
 
 يفحص سكريبت الدفع الأول سجل أمثلة OpenAPI في الفرع قبل تجهيز الالتزام. إذا أبلغ عن أمثلة قديمة، نسّق مع مالك المستودع لمعالجة السجل قبل نقله إلى وجهة جديدة.
 
+إذا حصلت على المشروع من أرشيف مصدر بلا مستودع Git، نفّذ `git init` من جذر المشروع أولًا. عندما يحتاج المساعد إلى إنشاء التزام، اضبط الاسم والبريد الإلكتروني في إعدادات المستودع. استبدل القيم التالية باسمك وعنوان بريد توافق على ظهوره في سجل Git، مثل عنوان `noreply` من GitHub.
+
+```bash
+git config --local user.name "Your GitHub display name"
+git config --local user.email "YOUR_GITHUB_COMMIT_EMAIL"
+```
+
+بعد نجاح الفحص، يستخدم المساعد الالتزام الحالي إذا لم توجد تغييرات جاهزة للالتزام.
+
 ```bash
 expected_origin=https://github.com/YOUR_USERNAME/REPO_NAME.git
 bash PUSH_TO_GITHUB.sh &&
@@ -58,7 +67,6 @@ SMS_VERIFY_API_KEY=your_sms_verify_key_here
 ACCOUNTS_COUNT=1
 THREADS_COUNT=1
 LOG_LEVEL=info
-TEST_PROXY=true
 ```
 
 ### 5. تحديث README.md

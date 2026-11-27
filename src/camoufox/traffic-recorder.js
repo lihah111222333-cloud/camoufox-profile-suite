@@ -17,6 +17,7 @@ import crypto from 'crypto';
 import {
     appendPrivateFile, ensurePrivateDirectory, restrictPrivateFile, writePrivateFile
 } from '../utils/private-storage.js';
+import { getConfiguredProfilesDirectory } from '../utils/private-env.js';
 import { getDefaultProfilesDirectory } from '../utils/state-paths.js';
 import {
     hashCaptureFile, hashCapturePayload, listCaptureDirectory, listCapturePayloads, measureCapturePayload, readCaptureFile,
@@ -53,8 +54,6 @@ export {
     SENSITIVE_URL_PARAM_REGEX
 } from './traffic-redaction.js';
 
-const DEFAULT_PROFILES_DIR = getDefaultProfilesDirectory();
-
 const DEFAULT_MAX_INLINE_PREVIEW_BYTES = 4096;
 const DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024; // 5MB (5242880 bytes)
 const DEFAULT_MAX_CAPTURE_BYTES = 32 * 1024 * 1024;
@@ -77,6 +76,24 @@ const INTEGRITY_ARTIFACTS = {
     sslKeyLog: 'sslkeylog.txt',
     neckoMozLog: 'necko-pre-tls.moz_log'
 };
+const WIRE_EGRESS_SEPARATOR = '='.repeat(80);
+const WIRE_INGRESS_SEPARATOR = '-'.repeat(80);
+const WIRE_RESERVED_NAMES = new Set([
+    'traffic.ndjson', 'attribution-index.json', 'payloads', '.private',
+    INTEGRITY_ARTIFACTS.sslKeyLog, INTEGRITY_ARTIFACTS.neckoMozLog
+]);
+
+/** Select the capture-relative wire name. Older indexes used the fixed default. */
+export function getCaptureWireLogFileName(integrity) {
+    const name = integrity?.preTlsWireLogFile;
+    if (name === undefined) return INTEGRITY_ARTIFACTS.preTlsWireLog;
+    const unsafe = /[/\\:\x00-\x1f\x7f]/;
+    if (typeof name !== 'string' || !name || name === '.' || name === '..' ||
+        name.length > 255 || unsafe.test(name) || WIRE_RESERVED_NAMES.has(name.toLowerCase())) {
+        throw Object.assign(new Error('Invalid capture wire log file name'), { code: 'ERR_CAPTURE_UNSAFE' });
+    }
+    return name;
+}
 
 /**
  * Risk-control, challenge, and anti-bot signal patterns inspected across request URLs,
@@ -1225,19 +1242,24 @@ function readTrafficIndex(trafficDir, { optional = false, trustedLocal = false }
     return index;
 }
 
-function verifyLedgerCheckpoint(integrity, events, { allowLaterEvents = false } = {}) {
+function verifyLedgerCheckpoint(integrity, events, options) {
+    const checkpoint = events[integrity.eventCount - 1]?.eventHash;
+    verifyObservedLedgerCheckpoint(integrity, events.length, checkpoint, options);
+}
+
+function verifyObservedLedgerCheckpoint(integrity, observedCount, observedHead, { allowLaterEvents = false } = {}) {
     const { genesisHash, eventCount, chainHeadHash } = integrity;
     if (genesisHash !== undefined && genesisHash !== TRAFFIC_GENESIS_HASH) {
         throw new Error('Genesis hash mismatch in attribution-index.json');
     }
     if (
         !Number.isSafeInteger(eventCount) || eventCount < 0 ||
-        eventCount > events.length || (!allowLaterEvents && eventCount !== events.length)
+        eventCount > observedCount || (!allowLaterEvents && eventCount !== observedCount)
     ) {
         throw new Error('Event count mismatch between traffic.ndjson and attribution-index.json');
     }
-    const checkpoint = eventCount === 0 ? TRAFFIC_GENESIS_HASH : events[eventCount - 1].eventHash;
-    if (chainHeadHash !== checkpoint) {
+    const checkpoint = eventCount === 0 ? TRAFFIC_GENESIS_HASH : observedHead;
+    if (!isSha256(chainHeadHash) || chainHeadHash !== checkpoint) {
         throw new Error('Chain head hash mismatch between traffic.ndjson and attribution-index.json');
     }
 }
@@ -1408,28 +1430,55 @@ function profileNativeArtifactName(prefix, fileName) {
         /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(fileName.slice(rotationPrefix.length));
 }
 
+function isNeckoChildLog(parentFile, name) {
+    return typeof name === 'string' && name.startsWith(parentFile) &&
+        /^\.child-\d+(?:\.\d+)?$/.test(name.slice(parentFile.length));
+}
+
+function profileNativeLogNames(nativeDir, trustedLocal) {
+    if (!nativeDir) return [];
+    try {
+        return listCaptureDirectory(nativeDir, { trustedLocal })
+            .map(({ name }) => name)
+            .filter((name) => [INTEGRITY_ARTIFACTS.neckoMozLog, INTEGRITY_ARTIFACTS.sslKeyLog]
+                .some((base) => name === base || name.startsWith(base + '.')))
+            .sort();
+    } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        return [];
+    }
+}
+
 function validNativeGenerations(prefix, entry) {
     if (!entry || (entry.previous !== undefined && !Array.isArray(entry.previous))) return false;
     const names = new Set();
-    return [entry, ...(entry.previous ?? [])].every((generation) => {
-        const fileName = generation?.file ?? INTEGRITY_ARTIFACTS[prefix];
-        if (!profileNativeArtifactName(prefix, fileName) || names.has(fileName) ||
-            !isSha256(generation?.sha256) || !isByteCount(generation?.bytes) ||
-            (generation.closed !== undefined && typeof generation.closed !== 'boolean')) return false;
-        names.add(fileName);
+    const validFile = (artifact, name) => {
+        if (names.has(name) || !isSha256(artifact?.sha256) || !isByteCount(artifact?.bytes) ||
+            (artifact.hashedBytes !== undefined && (!isByteCount(artifact.hashedBytes) ||
+                artifact.hashedBytes >= artifact.bytes || artifact.hashedBytes > MAX_INTEGRITY_LOG_BYTES))) return false;
+        names.add(name);
         return true;
+    };
+    return [entry, ...(entry.previous ?? [])].every((generation) => {
+        const file = generation?.file ?? INTEGRITY_ARTIFACTS[prefix];
+        const children = generation?.children ?? [];
+        return profileNativeArtifactName(prefix, file) &&
+            (generation.closed === undefined || typeof generation.closed === 'boolean') &&
+            validFile(generation, file) && Array.isArray(children) &&
+            (prefix === 'neckoMozLog' || children.length === 0) &&
+            children.every((child) => isNeckoChildLog(file, child?.file) && validFile(child, child.file));
     });
 }
 
 function verifyArtifact(trafficDir, integrity, prefix, { describe, allowAppendedBytes = false, trustedLocal = false } = {}) {
-    const fileName = INTEGRITY_ARTIFACTS[prefix];
+    const isWire = prefix === 'preTlsWireLog';
+    const fileName = isWire ? getCaptureWireLogFileName(integrity) : INTEGRITY_ARTIFACTS[prefix];
     const digest = integrity[`${prefix}Sha256`];
     const bytes = integrity[`${prefix}Bytes`];
     const recordedFileName = integrity[`${prefix}File`];
     if (
-        recordedFileName !== undefined &&
-        recordedFileName !== fileName &&
-        (prefix === 'preTlsWireLog' || recordedFileName !== `.private/${fileName}`)
+        !isWire && recordedFileName !== undefined &&
+        recordedFileName !== fileName && recordedFileName !== `.private/${fileName}`
     ) {
         throw new Error(`Invalid capture file reference for ${fileName}`);
     }
@@ -1457,41 +1506,138 @@ function verifyArtifact(trafficDir, integrity, prefix, { describe, allowAppended
     return describe ? describe(file) : file;
 }
 
+function readNativeFileForSummary(nativeDir, file, options) {
+    try {
+        return readCaptureFile(nativeDir, file, options);
+    } catch (error) {
+        if (error.code !== 'ERR_CAPTURE_TOO_LARGE') throw error;
+        return null;
+    }
+}
+
+function omittedNativeSummary(describe, bytes) {
+    return { ...describe(null), exists: true, bytes, diagnosticsOmitted: 'size-limit' };
+}
+
+function captureNativeFile(nativeDir, file, trustedLocal, describe) {
+    const options = { trustedLocal, maxBytes: MAX_INTEGRITY_LOG_BYTES };
+    const raw = readNativeFileForSummary(nativeDir, file, options);
+    if (raw) {
+        const summary = describe(raw);
+        return { evidence: { file, sha256: summary.sha256, bytes: summary.bytes }, summary };
+    }
+    const hashedBytes = MAX_INTEGRITY_LOG_BYTES;
+    const { sha256, bytes } = hashCaptureFile(nativeDir, file, { ...options, prefixBytes: hashedBytes });
+    return {
+        evidence: { file, sha256, bytes, ...(hashedBytes < bytes ? { hashedBytes } : {}) },
+        summary: omittedNativeSummary(describe, bytes)
+    };
+}
+
+function summarizeNeckoWithChildren(summary, children) {
+    if (children.length === 0) return summary;
+    const reports = [summary, ...children.map((child) => child.summary)];
+    return {
+        ...summary,
+        ...Object.fromEntries(['lineCount', 'requestBlockCount', 'responseBlockCount',
+            'http2FrameCount', 'dnsLookupCount', 'socketEventCount']
+            .map((key) => [key, reports.reduce((total, report) => total + report[key], 0)])),
+        parsedRequests: reports.flatMap((report) => report.parsedRequests),
+        parsedResponses: reports.flatMap((report) => report.parsedResponses),
+        children: children.map(({ file, summary }) => ({
+            file, bytes: summary.bytes, diagnosticsOmitted: summary.diagnosticsOmitted ?? null
+        })),
+        ...(reports.some((report) => report.diagnosticsOmitted)
+            ? { diagnosticsOmitted: 'size-limit' } : {})
+    };
+}
+
+/** Only seal a suffix if it contains complete recorder wire blocks. */
+function verifyWireSuffix(trafficDir, fileName, checkpointBytes, trustedLocal) {
+    const bytes = readCaptureFile(trafficDir, fileName, {
+        optional: true, trustedLocal, maxBytes: MAX_INTEGRITY_LOG_BYTES
+    });
+    if (!bytes || bytes.length === checkpointBytes) return;
+
+    const incomplete = () => Object.assign(new Error('Unfinished wire block after the last checkpoint'), {
+        code: 'ERR_CAPTURE_INCOMPLETE_WIRE'
+    });
+    let offset = checkpointBytes;
+    if (offset > 0 && bytes[offset - 1] !== 0x0a) throw incomplete();
+    const nextLine = () => {
+        const newline = bytes.indexOf(0x0a, offset);
+        if (newline < 0) throw incomplete();
+        const line = bytes.toString('utf8', offset, newline);
+        offset = newline + 1;
+        return line;
+    };
+
+    while (offset < bytes.length) {
+        const separator = nextLine();
+        if (!separator) continue;
+        const heading = nextLine();
+        const security = heading.startsWith('!!! SECURITY-BLOCK ');
+        const egress = heading.startsWith('>>> EGRESS ') || heading.startsWith('>>> WS-EGRESS ');
+        const ingress = heading.startsWith('<<< INGRESS ') || heading.startsWith('<<< WS-INGRESS ');
+        if ((!egress && !ingress && !security) ||
+            separator !== (ingress ? WIRE_INGRESS_SEPARATOR : WIRE_EGRESS_SEPARATOR)) throw incomplete();
+        let line;
+        do {
+            line = nextLine();
+        } while (security ? !(line.startsWith('[BLOCK-DETAIL] ') && line.endsWith('"')) : line !== separator);
+    }
+}
+
 function verifyProfileNativeGenerations(index, nativeDir, { trustedLocal, check, descriptions = {} }) {
-    const unverified = [];
+    const unverified = new Set();
+    const declared = new Set();
     const artifacts = {};
     const summaries = {};
-    for (const [prefix, entry] of Object.entries(index?.integrity.nativeArtifacts ?? {})) {
-        const base = INTEGRITY_ARTIFACTS[prefix];
-        const verifyGeneration = (generation, describe) => {
-            const file = generation.file ?? base;
-            const closed = generation.closed ?? Boolean(index.session?.endedAt);
-            if (!nativeDir || !closed) unverified.push(file);
-            if (nativeDir) {
-                const summary = check(() => {
-                    const options = { trustedLocal, optional: true, maxBytes: MAX_INTEGRITY_LOG_BYTES };
-                    const raw = describe ? readCaptureFile(nativeDir, file, options) : null;
-                    const observed = describe
-                        ? raw && { sha256: hashPayload(closed ? raw : raw.subarray(0, generation.bytes)).sha256, bytes: raw.length }
-                        : hashCaptureFile(nativeDir, file, {
-                            ...options, prefixBytes: closed ? undefined : generation.bytes
-                        });
-                    if (!observed) throw new Error(`Missing ${file} on disk`);
-                    if (observed.sha256 !== generation.sha256) throw new Error(`${file} SHA-256 mismatch`);
-                    if (closed ? observed.bytes !== generation.bytes : observed.bytes < generation.bytes) {
-                        throw new Error(`${file} byte length mismatch`);
-                    }
-                    if (describe) return describe(raw);
-                });
-                if (summary) summaries[prefix] = summary;
+    const inspect = (evidence, file, closed, describe) => {
+        declared.add(file);
+        if (!nativeDir || !closed || evidence.hashedBytes !== undefined) unverified.add(file);
+        if (!nativeDir) return null;
+        return check(() => {
+            const options = { trustedLocal, optional: true, maxBytes: MAX_INTEGRITY_LOG_BYTES };
+            const prefixBytes = evidence.hashedBytes ?? (closed ? undefined : evidence.bytes);
+            const raw = describe && evidence.hashedBytes === undefined
+                ? readNativeFileForSummary(nativeDir, file, options) : null;
+            const observed = raw
+                ? { sha256: hashPayload(raw.subarray(0, prefixBytes)).sha256, bytes: raw.length }
+                : hashCaptureFile(nativeDir, file, { ...options, prefixBytes });
+            if (!observed) throw new Error(`Missing ${file} on disk`);
+            if (observed.sha256 !== evidence.sha256) throw new Error(`${file} SHA-256 mismatch`);
+            if (closed ? observed.bytes !== evidence.bytes : observed.bytes < evidence.bytes) {
+                throw new Error(`${file} byte length mismatch`);
             }
-            return { file, sha256: generation.sha256, bytes: generation.bytes, closed };
+            if (describe) return raw ? describe(raw) : omittedNativeSummary(describe, observed.bytes);
+        });
+    };
+
+    for (const [prefix, entry] of Object.entries(index?.integrity.nativeArtifacts ?? {})) {
+        const verifyGeneration = (generation, describe) => {
+            const { previous, ...evidence } = generation;
+            const file = evidence.file ?? INTEGRITY_ARTIFACTS[prefix];
+            const closed = evidence.closed ?? Boolean(index.session?.endedAt);
+            const summary = inspect(evidence, file, closed, describe);
+            const childReports = [];
+            for (const child of evidence.children ?? []) {
+                const childSummary = inspect(child, child.file, closed, describe);
+                if (childSummary) childReports.push({ file: child.file, summary: childSummary });
+            }
+            if (summary) summaries[prefix] = summarizeNeckoWithChildren(summary, childReports);
+            return { ...evidence, file, closed };
         };
         const generation = verifyGeneration(entry, descriptions[prefix]);
         const previous = (entry.previous ?? []).map((older) => verifyGeneration(older));
         artifacts[prefix] = { ...generation, ...(previous.length > 0 ? { previous } : {}) };
     }
-    return { artifacts, unverified, summaries };
+    if (nativeDir && Object.keys(descriptions).length > 0) {
+        for (const file of check(() => profileNativeLogNames(nativeDir, trustedLocal)) ?? []) {
+            if (!declared.has(file)) unverified.add(file);
+        }
+    }
+    return { artifacts, unverified: [...unverified], summaries };
 }
 
 function nextProfileNativePath(nativeDir, prefix, pathName, existing) {
@@ -1579,25 +1725,39 @@ export function acquireTrafficDirectoryLease(trafficDir) {
     }
 }
 
-/** Find the recorder-written ownership and export settings for HAR-only scratch data. */
-export function inspectHarScratch(trafficDir, profileId, harDirectory) {
+function recordedArtifactPath(trafficDir, reference) {
+    return typeof reference === 'string' && reference ? path.resolve(trafficDir, reference) : null;
+}
+
+/** Read recorder-written ownership and export settings from private HAR scratch data. */
+export function inspectHarScratch(trafficDir, profileId, harDirectory, storageGeneration) {
     const options = { optional: true, trustedLocal: true };
     try {
         const index = readTrafficIndex(trafficDir, options);
+        if (!index) return null;
+        const { session, artifacts, harRecovery } = index;
+        const ownsId = (id) => id === profileId || id === redactProfileId(profileId);
+        const harPath = recordedArtifactPath(trafficDir, artifacts?.harPath);
+        if (!ownsId(session?.profileId) || typeof session.traceId !== 'string' || !session.traceId ||
+            recordedArtifactPath(trafficDir, artifacts?.trafficNdjsonPath) !== path.join(trafficDir, 'traffic.ndjson') ||
+            !harPath || path.dirname(harPath) !== harDirectory || path.extname(harPath).toLowerCase() !== '.har') return null;
+        if (harRecovery !== undefined && (
+            !harRecovery || typeof harRecovery.storageGeneration !== 'string' ||
+            harRecovery.storageGeneration !== storageGeneration ||
+            typeof harRecovery.ready !== 'boolean' || typeof harRecovery.finalized !== 'boolean'
+        )) return null;
+
         const raw = readCaptureFile(trafficDir, 'traffic.ndjson', options);
         const { events } = parseTrafficLedger(raw, { recover: true });
-        if (!events.every((event) => event.attribution?.profileId === profileId)) return null;
+        if (!events.every((event) => ownsId(event.attribution?.profileId) &&
+            captureEventTraceId(event) === session.traceId)) return null;
         const payloads = new Set(events.map((event) => event.payloadFile));
         if (listCapturePayloads(trafficDir, options).some((file) => !payloads.has(file))) return null;
 
-        if (!index) return events.length ? {} : null;
-        const { session, artifacts } = index;
-        if (session?.profileId !== profileId || !session.traceId ||
-            artifacts?.trafficNdjsonPath !== path.join(trafficDir, 'traffic.ndjson') ||
-            typeof artifacts.harPath !== 'string' || path.dirname(artifacts.harPath) !== harDirectory ||
-            path.extname(artifacts.harPath).toLowerCase() !== '.har') return null;
-        verifyLedgerCheckpoint(index.integrity, events);
-        return { harPath: artifacts.harPath, recordBodies: session.recordBodies === true };
+        const phase = harRecovery?.ready === false ? 'unready' :
+            harRecovery?.finalized === false ? 'recording' : 'finalized';
+        verifyLedgerCheckpoint(index.integrity, events, { allowLaterEvents: phase === 'recording' });
+        return { harPath, recordBodies: session.recordBodies === true, phase };
     } catch {
         return null;
     }
@@ -1640,6 +1800,8 @@ export class CamoufoxTrafficRecorder {
     #finalizationError = null;
     #nativeLogsClosed = false;
     #nativeLogsAreClosed;
+    #nativeLogCheckpoint;
+    #harRecovery;
     #observationSequence = 0;
 
     /**
@@ -1668,17 +1830,20 @@ export class CamoufoxTrafficRecorder {
      * @param {string|null} [options.sslKeyLogPath=null]
      * @param {boolean} [options.neckoMozLog=false]
      * @param {string|null} [options.neckoMozLogPath=null]
-     * @param {function(): boolean} [options.nativeLogsAreClosed] Managed shutdown confirmation.
+     * @param {function(): (boolean|null)} [options.nativeLogsAreClosed] Managed shutdown confirmation. Null denotes disconnected with no native exit confirmation.
      * @param {string|null} [options.profileNativeDir=null]
      * @param {boolean} [options.trustedLocal=false]
      * @param {string|null} [options.harPath=null]
      */
     constructor(options = {}) {
         this.#nativeLogsAreClosed = options.nativeLogsAreClosed;
+        this.#harRecovery = options.harRecovery;
         const profileId = validateProfileId(options.profileId ?? 'default-profile');
         const requestedRoot = options.profilesDir
             ? path.resolve(options.profilesDir)
-            : DEFAULT_PROFILES_DIR;
+            : options.profileDir || options.trafficDir
+              ? getDefaultProfilesDirectory()
+              : getConfiguredProfilesDirectory();
         const location = !options.profileDir && !options.trafficDir
             ? locateProfile(profileId, requestedRoot, true)
             : null;
@@ -1708,9 +1873,12 @@ export class CamoufoxTrafficRecorder {
 
         this.payloadsDir = path.join(this.trafficDir, 'payloads');
         this.trafficNdjsonPath = path.join(this.trafficDir, 'traffic.ndjson');
-        this.preTlsWireLogPath = options.preTlsWireLogPath
-            ? path.resolve(options.preTlsWireLogPath)
-            : path.join(this.trafficDir, 'pre-tls-wire.log');
+        const configuredWirePath = options.preTlsWireLogPath
+            ? path.resolve(options.preTlsWireLogPath) : null;
+        this.preTlsWireLogPath = configuredWirePath ?? path.join(this.trafficDir, INTEGRITY_ARTIFACTS.preTlsWireLog);
+        this.preTlsWireLogFile = path.dirname(this.preTlsWireLogPath) === this.trafficDir
+            ? getCaptureWireLogFileName({ preTlsWireLogFile: path.basename(this.preTlsWireLogPath) })
+            : null;
         this.recordWireLog = options.recordWireLog !== false;
         const neckoMozLog = options.neckoMozLog ?? Boolean(options.neckoMozLogPath);
         const sslKeyLog = options.sslKeyLog ?? Boolean(options.sslKeyLogPath);
@@ -1766,7 +1934,7 @@ export class CamoufoxTrafficRecorder {
 
         this.attribution = {
             traceId: this.traceId,
-            profileId: this.profileId,
+            profileId: redactProfileId(this.profileId),
             accountId: options.accountId ?? null,
             os: options.os ? String(options.os).toLowerCase() : detectDefaultOs(),
             proxyServer: redactedProxy,
@@ -1794,7 +1962,7 @@ export class CamoufoxTrafficRecorder {
         this.ledgerWriteError = null;
         this.wireWriteError = null;
         this.priorArtifactIntegrity = null;
-        this.priorWireLog = false;
+        this.priorWireLogFile = null;
         this.profileNativeArtifacts = {};
 
         // Correlation & tracking stores
@@ -1802,6 +1970,7 @@ export class CamoufoxTrafficRecorder {
         this.requestAttributions = new WeakMap();
         this.requestTasks = new WeakMap();
         this.recordedRequests = new WeakSet();
+        this.completedRequests = new WeakSet();
         this.transactions = new Map();
         this.attachedContexts = new WeakSet();
         this.attachedPagesHttp = new WeakMap();
@@ -1843,24 +2012,16 @@ export class CamoufoxTrafficRecorder {
 
             this.resetTrafficOnStart = options.resetTrafficOnStart === true;
             if (this.resetTrafficOnStart) {
-                for (const artifactPath of [
+                for (const artifactPath of new Set([
                     this.trafficNdjsonPath,
                     this.preTlsWireLogPath,
                     this.attributionIndexPath
-                ]) {
-                    try {
-                        if (artifactPath && fs.existsSync(artifactPath)) {
-                            fs.rmSync(artifactPath, { force: true });
-                        }
-                    } catch {}
+                ])) {
+                    fs.rmSync(artifactPath, { force: true });
                 }
-                try {
-                    if (this.payloadsDir && fs.existsSync(this.payloadsDir)) {
-                        fs.rmSync(this.payloadsDir, { recursive: true, force: true });
-                    }
-                } catch {}
+                fs.rmSync(this.payloadsDir, { recursive: true, force: true });
             } else {
-                this._resumeExistingChainIfPresent();
+                this._resumeExistingChainIfPresent(configuredWirePath);
             }
             this.sslKeyLogPath = nextProfileNativePath(this.profileNativeDir, 'sslKeyLog', this.sslKeyLogPath,
                 this.profileNativeArtifacts.sslKeyLog);
@@ -1871,7 +2032,12 @@ export class CamoufoxTrafficRecorder {
 
             const previousWirePath = path.join(this.trafficDir, INTEGRITY_ARTIFACTS.preTlsWireLog);
             const wireFiles = new Map();
-            for (const wirePath of new Set([this.preTlsWireLogPath, previousWirePath])) {
+            for (const wirePath of new Set([
+                this.preTlsWireLogPath,
+                previousWirePath,
+                this.priorWireLogFile && path.join(this.trafficDir, this.priorWireLogFile)
+            ])) {
+                if (!wirePath) continue;
                 const stats = fs.lstatSync(wirePath, { bigint: true, throwIfNoEntry: false });
                 if (stats?.isFile()) wireFiles.set(`${stats.dev}:${stats.ino}`, Number(stats.size));
             }
@@ -1887,7 +2053,7 @@ export class CamoufoxTrafficRecorder {
      * Resume an existing persistent profile's SHA-256 tamper-evident event hash chain
      * across process restarts and self-heal any trailing truncated/crashed line in `traffic.ndjson`.
      */
-    _resumeExistingChainIfPresent() {
+    _resumeExistingChainIfPresent(configuredWirePath) {
         const trustedLocal = this.trustedLocal;
         const rawContent = readCaptureFile(this.trafficDir, 'traffic.ndjson', { optional: true, trustedLocal });
         const { events: validEvents, head, truncateTo } = parseTrafficLedger(rawContent, {
@@ -1910,10 +2076,27 @@ export class CamoufoxTrafficRecorder {
                     trustedLocal
                 });
                 if (artifact === 'preTlsWireLog' && verified) {
-                    this.priorWireLog = true;
+                    const fileName = getCaptureWireLogFileName(existingIndex.integrity);
+                    const checkpointBytes = existingIndex.integrity.preTlsWireLogBytes ?? verified.bytes;
+                    if (verified.bytes > checkpointBytes) {
+                        verifyWireSuffix(this.trafficDir, fileName, checkpointBytes, trustedLocal);
+                    }
+                    const recordedWirePath = path.join(this.trafficDir, fileName);
+                    if (this.recordWireLog && configuredWirePath && configuredWirePath !== recordedWirePath) {
+                        throw new Error('Configured wire log differs from the capture checkpoint');
+                    }
+                    this.priorWireLogFile = fileName;
+                    if (!configuredWirePath) {
+                        this.preTlsWireLogPath = recordedWirePath;
+                        this.preTlsWireLogFile = fileName;
+                    }
                 }
             }
             this.priorArtifactIntegrity = existingIndex.integrity;
+        }
+
+        if (!this.priorWireLogFile && this.recordWireLog && this.preTlsWireLogFile) {
+            verifyWireSuffix(this.trafficDir, this.preTlsWireLogFile, 0, trustedLocal);
         }
 
         let maxSeq = 0;
@@ -2242,8 +2425,9 @@ export class CamoufoxTrafficRecorder {
                     domainBucket.totalDurationMs += ev.durationMs;
                     domainBucket.completedWithDurationCount += 1;
                 }
-                const txSizes = txSizesByCorr.get(ev.correlationId);
-                if (txSizes && ev.sizes && typeof ev.sizes === 'object') {
+                if (ev.sizes && typeof ev.sizes === 'object') {
+                    const txSizes = txSizesByCorr.get(ev.correlationId) ?? { estimatedEgressBytes: 0, countedIngressBytes: 0 };
+                    if (ev.correlationId) txSizesByCorr.set(ev.correlationId, txSizes);
                     const txStep = txStepByCorr.get(ev.correlationId);
                     const stepBucket = this._ensureStepRecord(
                         txStep?.stepName || stepName,
@@ -2553,8 +2737,8 @@ export class CamoufoxTrafficRecorder {
         }
 
         if (partial.profileId !== undefined && partial.profileId !== null) {
-            this.attribution.profileId = String(partial.profileId);
-            this.profileId = this.attribution.profileId;
+            this.profileId = String(partial.profileId);
+            this.attribution.profileId = redactProfileId(this.profileId);
         }
         if (partial.accountId !== undefined) {
             this.attribution.accountId = partial.accountId ?? null;
@@ -3080,23 +3264,17 @@ export class CamoufoxTrafficRecorder {
 
         const seq = this._nextSeq();
         const correlationId = `corr-${this.correlationNamespace}-${seq}`;
-        let redirectedFromCorrelationId = null;
-
+        let parentRequest = null;
         try {
-            if (request && typeof request.redirectedFrom === 'function') {
-                const parentReq = request.redirectedFrom();
-                if (parentReq && this.requestCorrelationMap.has(parentReq)) {
-                    redirectedFromCorrelationId = this.requestCorrelationMap.get(parentReq).correlationId;
-                }
-            }
-        } catch {
-            redirectedFromCorrelationId = null;
-        }
+            parentRequest = request?.redirectedFrom?.() ?? null;
+        } catch {}
 
         const entry = {
             correlationId,
             seq,
-            redirectedFromCorrelationId
+            redirectedFromCorrelationId: this.requestCorrelationMap.get(parentRequest)?.correlationId ?? null,
+            redirectedFromAttribution: this.requestAttributions.get(parentRequest),
+            isRedirect: Boolean(parentRequest)
         };
 
         if (request && typeof request === 'object') {
@@ -3339,9 +3517,11 @@ export class CamoufoxTrafficRecorder {
         }
         this.attachedPagesWs.add(page);
 
-        const onWebSocket = (ws) => this._handleWebSocket(ws, page);
+        const socketDisposers = new Set();
+        const onWebSocket = (ws) => this._handleWebSocket(ws, socketDisposers);
         const clearTrigger = (frame) => this.activeFrameTriggers.delete(frame);
-        const clearPageTriggers = () => {
+        const onPageClose = () => {
+            for (const dispose of socketDisposers) dispose();
             clearTrigger(page);
             try { clearTrigger(page.mainFrame?.()); } catch {}
             try {
@@ -3352,7 +3532,7 @@ export class CamoufoxTrafficRecorder {
             ['websocket', onWebSocket],
             ['framenavigated', clearTrigger],
             ['framedetached', clearTrigger],
-            ['close', clearPageTriggers]
+            ['close', onPageClose]
         ]);
     }
 
@@ -3376,14 +3556,14 @@ export class CamoufoxTrafficRecorder {
             ? headersArray.map((h) => `${h.name}: ${h.value}`).join('\r\n')
             : '';
         return [
-            '================================================================================',
+            WIRE_EGRESS_SEPARATOR,
             `>>> EGRESS [PRE-TLS NECKO CHANNEL] [${timestamp}] [corr=${correlationId}] [step=${actionStep}] [trigger=${triggerSummary}]`,
             `${method} ${parsedUrl.pathname}${parsedUrl.search} HTTP/1.1`,
             `Host: ${parsedUrl.host}`,
             headersText,
             '',
             bodyPreview || '',
-            '================================================================================'
+            WIRE_EGRESS_SEPARATOR
         ].join('\n');
     }
 
@@ -3408,21 +3588,19 @@ export class CamoufoxTrafficRecorder {
             ? headersArray.map((h) => `${h.name}: ${h.value}`).join('\r\n')
             : '';
         return [
-            '--------------------------------------------------------------------------------',
+            WIRE_INGRESS_SEPARATOR,
             `<<< INGRESS [POST-TLS NECKO CHANNEL] [${timestamp}] [corr=${correlationId}] [step=${effectiveStepName}] [remote=${serverAddr?.ipAddress || 'unknown'}:${serverAddr?.port || ''}] [tls=${securityDetails?.protocol || 'plain'}]`,
             `HTTP/1.1 ${status} ${statusText}`,
             headersText,
             '',
             bodyPreview || '',
-            '--------------------------------------------------------------------------------'
+            WIRE_INGRESS_SEPARATOR
         ].join('\n');
     }
 
     _formatWebSocketWireBlock(event) {
         const egress = event.type === 'ws-egress';
-        const separator = egress
-            ? '================================================================================'
-            : '--------------------------------------------------------------------------------';
+        const separator = egress ? WIRE_EGRESS_SEPARATOR : WIRE_INGRESS_SEPARATOR;
         const direction = egress ? '>>> WS-EGRESS [PRE-TLS]' : '<<< WS-INGRESS [POST-TLS]';
         const actionStep = redactDiagnosticText(event.attribution?.actionStep || event.actionStep || 'init');
         const trigger = this._formatTriggerSummary(event.triggerAction ?? event.attribution?.triggerAction);
@@ -3444,7 +3622,7 @@ export class CamoufoxTrafficRecorder {
         const url = redactUrlSecrets(event.url);
         const reason = redactDiagnosticText(event.reason || event.failureText);
         return [
-            '================================================================================',
+            WIRE_EGRESS_SEPARATOR,
             `!!! SECURITY-BLOCK [ZINIAO ACTIVE GUARD] [seq=${event.seq}] [corr=${event.correlationId}] ${event.timestamp}`,
             `[ATTRIBUTION] profile=${profileId} step=${actionStep}(#${event.attribution?.stepIndex ?? 0})`,
             `[BLOCK-DETAIL] type=${blockType} severity=${severity} target="${url}" reason="${reason}"`,
@@ -3472,6 +3650,10 @@ export class CamoufoxTrafficRecorder {
             const matching = [];
             for (const [index, event] of events.entries()) {
                 if (event.correlationId === correlationId) matching.push({ index, event });
+            }
+            const traceId = captureEventTraceId(matching[0]?.event);
+            if (matching.some(({ event }) => captureEventTraceId(event) !== traceId)) {
+                return 'Correlation ID matches multiple recording sessions in the selected traffic capture';
             }
             const requestUrl = matching.find(({ event }) => event.type === 'egress')?.event.url;
             const { bodyPolicy } = readCaptureExportIndex(this.trafficDir, {
@@ -3534,18 +3716,38 @@ export class CamoufoxTrafficRecorder {
         }
     }
 
+    _redirectAllowsBody(request, method) {
+        const visited = new Set([request]);
+        try {
+            for (let source = request.redirectedFrom?.(); source; source = source.redirectedFrom?.()) {
+                if (visited.has(source)) return false;
+                visited.add(source);
+                // A redirect that switches to GET or HEAD drops the upload.
+                const sourceMethod = source.method?.();
+                if ((method === 'GET' || method === 'HEAD') && sourceMethod && sourceMethod !== method) return true;
+                if (!allowsTrafficBody(source.url?.())) return false;
+            }
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
     /**
      * Handle pre-TLS egress `request` event (`http-on-modify-request` in Firefox Necko).
      *
      * @param {object} request - Playwright Request
      */
-    async _handleRequest(request, { epochMs, observationSequence, attributionSnapshot, triggerSnapshot, frame }) {
+    async _handleRequest(request, { epochMs, observationSequence, attributionSnapshot: eventAttribution, triggerSnapshot: eventTrigger, frame }) {
         if (!request || this.recordedRequests.has(request)) return;
         this.recordedRequests.add(request);
 
         const timestamp = new Date(epochMs).toISOString();
-        const { correlationId, seq, redirectedFromCorrelationId } =
+        const { correlationId, seq, redirectedFromCorrelationId, redirectedFromAttribution, isRedirect } =
             this._resolveRequestCorrelation(request);
+        const attributionSnapshot = redirectedFromAttribution?.attributionSnapshot ?? eventAttribution;
+        const triggerSnapshot = isRedirect ? redirectedFromAttribution?.triggerSnapshot ?? null : eventTrigger;
+        this.requestAttributions.set(request, { attributionSnapshot, triggerSnapshot });
 
         let method = 'GET';
         let url = '';
@@ -3574,7 +3776,9 @@ export class CamoufoxTrafficRecorder {
 
         const bodyOmittedReason = !this.capturePayloads
             ? 'body-recording-disabled'
-            : (allowsTrafficBody(url) ? null : 'sensitive-or-unsupported-url');
+            : (allowsTrafficBody(url) && this._redirectAllowsBody(request, method)
+                ? null
+                : 'sensitive-or-unsupported-url');
         url = redactUrlSecrets(url);
         const parsedUrl = parseUrlComponents(url);
         const { headers, headersArray, cookieObservations } = await extractHeadersWithOrder(request, 'cookie', epochMs);
@@ -4073,7 +4277,8 @@ export class CamoufoxTrafficRecorder {
      * @param {object} request - Playwright Request
      */
     async _handleRequestFinished(request, { epochMs, attributionSnapshot: eventAttribution }) {
-        if (!request) return;
+        if (!request || this.completedRequests.has(request)) return;
+        this.completedRequests.add(request);
 
         const timestamp = new Date(epochMs).toISOString();
         const seq = this._nextSeq();
@@ -4150,12 +4355,13 @@ export class CamoufoxTrafficRecorder {
         }
 
         // Reconcile wire byte sizes if Playwright's `request.sizes()` reported larger actual totals
-        if (tx && sizes && typeof sizes === 'object') {
-            const effectiveStepName = tx.actionStep || attributionSnapshot.actionStep;
-            const effectiveStepIndex = tx.stepIndex ?? attributionSnapshot.stepIndex;
+        if (sizes && typeof sizes === 'object') {
+            const effectiveStepName = tx?.actionStep || attributionSnapshot.actionStep;
+            const effectiveStepIndex = tx?.stepIndex ?? attributionSnapshot.stepIndex;
             const stepBucket = this._ensureStepRecord(effectiveStepName, effectiveStepIndex);
             const triggerBucket = this._ensureTriggerActionRecord(triggerSnapshot);
-            this._reconcileTransactionSizes(sizes, tx, stepBucket, domainBucket, triggerBucket);
+            const txSizes = tx ?? { estimatedEgressBytes: 0, countedIngressBytes: 0 };
+            this._reconcileTransactionSizes(sizes, txSizes, stepBucket, domainBucket, triggerBucket);
         }
     }
 
@@ -4268,8 +4474,9 @@ export class CamoufoxTrafficRecorder {
      * Hook Playwright `WebSocket` lifecycle events (`framesent`, `framereceived`, `socketerror`, `close`).
      *
      * @param {object} ws - Playwright WebSocket instance
+     * @param {Set<Function>} socketDisposers - Listeners owned by the emitting page
      */
-    _handleWebSocket(ws) {
+    _handleWebSocket(ws, socketDisposers) {
         if (!this._canStartRecording() || !ws || typeof ws.on !== 'function' || this.attachedWebSockets.has(ws)) {
             return;
         }
@@ -4434,6 +4641,7 @@ export class CamoufoxTrafficRecorder {
         const remove = typeof ws.off === 'function' ? ws.off : ws.removeListener;
         const dispose = () => {
             this.webSocketDisposers.delete(dispose);
+            socketDisposers.delete(dispose);
             if (typeof remove === 'function') {
                 for (const [event, callback] of listeners) {
                     try {
@@ -4443,6 +4651,7 @@ export class CamoufoxTrafficRecorder {
             }
         };
         this.webSocketDisposers.add(dispose);
+        socketDisposers.add(dispose);
         for (const [event, callback] of listeners) {
             ws.on(event, callback);
         }
@@ -4545,30 +4754,35 @@ export class CamoufoxTrafficRecorder {
             };
         }
 
-        const nativeArtifacts = { ...this.profileNativeArtifacts };
+        // Keep the pre-launch evidence when the connection is gone but the writer may still be active.
+        const checkpoint = this.#nativeLogsAreClosed?.() === null ? this.#nativeLogCheckpoint : null;
+        const nativeArtifacts = { ...(checkpoint?.nativeArtifacts ?? this.profileNativeArtifacts) };
         const readLog = (type, logPath, describe) => {
             const file = logPath && path.basename(logPath);
             if (this.profileNativeDir && logPath && path.dirname(logPath) === this.profileNativeDir &&
                 profileNativeArtifactName(type, file)) {
-                const raw = readCaptureFile(this.profileNativeDir, file, {
-                    trustedLocal: this.trustedLocal, maxBytes: MAX_INTEGRITY_LOG_BYTES
-                });
-                const summary = describe(raw);
+                const { evidence, summary } = captureNativeFile(this.profileNativeDir, file, this.trustedLocal, describe);
+                const children = type === 'neckoMozLog'
+                    ? profileNativeLogNames(this.profileNativeDir, this.trustedLocal)
+                        .filter((name) => isNeckoChildLog(file, name))
+                        .map((name) => captureNativeFile(this.profileNativeDir, name, this.trustedLocal, describe))
+                    : [];
                 const prior = this.profileNativeArtifacts[type];
                 const { previous = [], ...generation } = prior ?? {};
                 nativeArtifacts[type] = {
-                    file,
-                    sha256: summary.sha256,
-                    bytes: summary.bytes,
+                    ...evidence,
                     closed: this.#canSealNativeLogs(nativeLogsClosed),
+                    ...(children.length ? { children: children.map((child) => child.evidence) } : {}),
                     ...(prior ? { previous: [...previous, generation] } : {})
                 };
-                return summary;
+                return summarizeNeckoWithChildren(summary, children.map(({ evidence, summary }) => ({
+                    file: evidence.file, summary
+                })));
             }
             return describe(readNativeLogFile(logPath));
         };
-        const sslKeyLogSummary = readLog('sslKeyLog', this.sslKeyLogPath, parseSslKeyLogBytes);
-        const neckoMozLogSummary = readLog('neckoMozLog', this.neckoMozLogPath, parseNeckoMozLogBytes);
+        const sslKeyLogSummary = checkpoint?.sslKeyLog ?? readLog('sslKeyLog', this.sslKeyLogPath, parseSslKeyLogBytes);
+        const neckoMozLogSummary = checkpoint?.neckoMozLog ?? readLog('neckoMozLog', this.neckoMozLogPath, parseNeckoMozLogBytes);
         const sslKeyLogFile = nativeArtifactName(this.trafficDir, this.sslKeyLogPath, INTEGRITY_ARTIFACTS.sslKeyLog);
         const neckoMozLogFile = nativeArtifactName(this.trafficDir, this.neckoMozLogPath, INTEGRITY_ARTIFACTS.neckoMozLog);
         const prior = this.priorArtifactIntegrity;
@@ -4581,13 +4795,12 @@ export class CamoufoxTrafficRecorder {
         const sslArtifact = captureNative('sslKeyLog', sslKeyLogSummary, sslKeyLogFile);
         const neckoArtifact = captureNative('neckoMozLog', neckoMozLogSummary, neckoMozLogFile);
 
+        const wireFile = this.recordWireLog ? this.preTlsWireLogFile : this.priorWireLogFile;
         const wirePath = this.recordWireLog ? this.preTlsWireLogPath
-            : this.priorWireLog ? path.join(this.trafficDir, INTEGRITY_ARTIFACTS.preTlsWireLog) : null;
-        const wire = wirePath ? hashCaptureFile(path.dirname(wirePath), path.basename(wirePath), {
+            : wireFile ? path.join(this.trafficDir, wireFile) : null;
+        const wire = wireFile ? hashCaptureFile(this.trafficDir, wireFile, {
             trustedLocal: this.trustedLocal, maxBytes: MAX_INTEGRITY_LOG_BYTES
         }) : null;
-        const preTlsWireLogSha256 = wire?.sha256 ?? prior?.preTlsWireLogSha256 ?? null;
-        const preTlsWireLogBytes = wire?.bytes ?? prior?.preTlsWireLogBytes ?? 0;
 
         const signatures = this.platformSignatures.map(redactDiagnosticMetadata);
         const byPlatform = Object.create(null);
@@ -4596,6 +4809,7 @@ export class CamoufoxTrafficRecorder {
             byPlatform[signature.platform] = (byPlatform[signature.platform] || 0) + 1;
         }
 
+        const artifactReference = (file) => file ? path.relative(this.trafficDir, file) : null;
         return {
             session: {
                 traceId: this.attribution.traceId,
@@ -4609,14 +4823,15 @@ export class CamoufoxTrafficRecorder {
                 endedAt: endedAtIso,
                 totalDurationMs
             },
+            ...(this.#harRecovery ? { harRecovery: { ...this.#harRecovery, finalized: this.stopped } } : {}),
             artifacts: {
-                trafficNdjsonPath: this.trafficNdjsonPath,
-                preTlsWireLogPath: wirePath,
-                neckoMozLogPath: neckoMozLogFile ? this.neckoMozLogPath : null,
-                payloadsDir: this.payloadsDir,
-                sslKeyLogPath: sslKeyLogFile ? this.sslKeyLogPath : null,
-                harPath: this.harPath,
-                attributionIndexPath: this.attributionIndexPath
+                trafficNdjsonPath: artifactReference(this.trafficNdjsonPath),
+                preTlsWireLogPath: artifactReference(wirePath),
+                neckoMozLogPath: artifactReference(neckoMozLogFile ? this.neckoMozLogPath : null),
+                payloadsDir: artifactReference(this.payloadsDir),
+                sslKeyLogPath: artifactReference(sslKeyLogFile ? this.sslKeyLogPath : null),
+                harPath: artifactReference(this.harPath),
+                attributionIndexPath: artifactReference(this.attributionIndexPath)
             },
             sslKeyLog: sslKeyLogFile ? sslKeyLogSummary : { ...sslKeyLogSummary, sha256: null },
             neckoMozLog: neckoMozLogFile ? neckoMozLogSummary : { ...neckoMozLogSummary, sha256: null },
@@ -4659,9 +4874,9 @@ export class CamoufoxTrafficRecorder {
                 payloadCount: Object.keys(this.payloadManifest).length,
                 payloadManifest: { ...this.payloadManifest },
                 payloadCaptureIssues: { ...this.payloadCaptureIssues },
-                preTlsWireLogSha256,
-                preTlsWireLogBytes,
-                ...(!wire && prior?.preTlsWireLogFile ? { preTlsWireLogFile: prior.preTlsWireLogFile } : {}),
+                preTlsWireLogSha256: wire?.sha256 ?? null,
+                preTlsWireLogBytes: wire?.bytes ?? 0,
+                ...(wire && { preTlsWireLogFile: wireFile }),
                 sslKeyLogSha256: sslArtifact.sha256,
                 sslKeyLogBytes: sslArtifact.bytes,
                 ...(sslArtifact.file ? { sslKeyLogFile: sslArtifact.file } : {}),
@@ -4678,7 +4893,8 @@ export class CamoufoxTrafficRecorder {
             start: this.harStartEventCount,
             end: this.chainedEventCount,
             head: this.chainHeadHash,
-            payloadManifest: this.payloadManifest
+            payloadManifest: this.payloadManifest,
+            stoppedReason: this.captureStoppedReason ?? (this.pendingEventLimitReached ? 'pending-event-limit' : null)
         };
     }
 
@@ -4722,8 +4938,10 @@ export class CamoufoxTrafficRecorder {
             recordBodies: this.recordBodies && recordBodies === true,
             trustedLocal: this.trustedLocal,
             [HAR_SESSION_RANGE]: this.#harSessionRange(),
-            [HAR_PROTECTED_PATHS]: [this.profileNativeDir, this.sslKeyLogPath, this.neckoMozLogPath,
-                this.preTlsWireLogPath].filter(Boolean)
+            [HAR_PROTECTED_PATHS]: [
+                this.profileNativeDir, this.sslKeyLogPath, this.neckoMozLogPath, this.preTlsWireLogPath,
+                this.priorWireLogFile && path.join(this.trafficDir, this.priorWireLogFile)
+            ].filter(Boolean)
         });
     }
 
@@ -4743,7 +4961,7 @@ export class CamoufoxTrafficRecorder {
             return structuredClone(this.#finalSummary);
         }
         const logsClosed = this.#canSealNativeLogs(nativeLogsClosed);
-        const finalizing = this.stopped && logsClosed;
+        const finalizing = this.stopped && (logsClosed || this.#nativeLogsAreClosed?.() === null);
         let summary;
         try {
             if (this.stopped) this.endedAt ??= new Date().toISOString();
@@ -4756,6 +4974,14 @@ export class CamoufoxTrafficRecorder {
 
             summary = this.buildAttributionSummary({ nativeLogsClosed: logsClosed });
             writePrivateFile(this.attributionIndexPath, `${JSON.stringify(summary, null, 2)}\n`);
+            if (!this.stopped && this.#nativeLogsAreClosed?.() === false &&
+                (this.sslKeyLogPath || this.neckoMozLogPath)) {
+                this.#nativeLogCheckpoint ??= structuredClone({
+                    nativeArtifacts: summary.integrity.nativeArtifacts,
+                    sslKeyLog: summary.sslKeyLog,
+                    neckoMozLog: summary.neckoMozLog
+                });
+            }
         } catch (error) {
             if (finalizing && !this.#nativeLogsAreClosed) {
                 this.#finalizationError = error;
@@ -4772,7 +4998,7 @@ export class CamoufoxTrafficRecorder {
     }
 
     #canSealNativeLogs(requested) {
-        return Boolean(requested && (!this.#nativeLogsAreClosed || this.#nativeLogsAreClosed()));
+        return Boolean(requested && (!this.#nativeLogsAreClosed || this.#nativeLogsAreClosed() === true));
     }
 
     #releaseCaptureLease() {
@@ -4791,7 +5017,9 @@ export class CamoufoxTrafficRecorder {
     }
 
     async abandon() {
-        if (!this.#canSealNativeLogs(true)) throw new Error('Camoufox has not confirmed browser closure');
+        if (!this.#canSealNativeLogs(true) && this.#nativeLogsAreClosed?.() !== null) {
+            throw new Error('Camoufox has not confirmed capture detachment');
+        }
         this.#detachRecordingListeners();
         const error = new Error('Camoufox capture could not be finalized');
         this.ledgerWriteError ??= error;
@@ -4998,24 +5226,26 @@ export function readCaptureExportBody(trafficDir, event, {
     if (trafficDir != null && event.payloadFile != null) {
         const recorded = {
             sha256: event.postDataSha256 ?? event.bodySha256 ?? event.payloadSha256,
-            bytes: expectedBytes
+            bytes: isByteCount(expectedBytes) ? expectedBytes : null
         };
         const manifest = payloadManifest && Object.hasOwn(payloadManifest, event.payloadFile)
             ? payloadManifest[event.payloadFile] : null;
-        const evidence = [recorded, event.payloadStorage, manifest].filter((entry) => entry?.sha256 != null);
+        const evidence = [recorded, event.payloadStorage, manifest].filter((entry) =>
+            entry?.sha256 != null || isByteCount(entry?.bytes)
+        );
         try {
             const bytes = readCapturePayload(trafficDir, event.payloadFile, { maxBytes: limit, trustedLocal });
             const expandedBytes = bytes.byteLength;
             if (evidence.length) {
-                const actual = { sha256: hashPayload(bytes).sha256, bytes: expandedBytes };
+                const actual = {
+                    sha256: evidence.some((proof) => proof.sha256 != null) ? hashPayload(bytes).sha256 : null,
+                    bytes: expandedBytes
+                };
                 try {
                     for (const proof of evidence) comparePayloadEvidence(proof, actual, 'recorded attachment');
                 } catch {
                     return { ...omitted, expandedBytes, reason: 'payload-integrity' };
                 }
-            }
-            if (Number.isSafeInteger(expectedBytes) && expandedBytes !== expectedBytes) {
-                return { ...omitted, expandedBytes };
             }
             const text = projectTrafficBody(bytes, format, limit);
             if (text === null) return { ...omitted, expandedBytes };
@@ -5062,6 +5292,15 @@ function harIntegrityError(message) {
     return Object.assign(new Error(message), { code: 'ERR_CAPTURE_INTEGRITY' });
 }
 
+function observedHarDuration(start, end) {
+    return Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end >= start
+        ? end - start : null;
+}
+
+function harSize(value) {
+    return isByteCount(value) ? value : null;
+}
+
 /** Reconstruct a bounded W3C HAR 1.2 document from a profile's traffic directory. */
 function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
     recordBodies,
@@ -5087,7 +5326,12 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
         ...(traceId === (fallbackSession?.traceId ?? null) ? fallbackSession : {}),
         ...(traceId === (sessionMeta.traceId ?? null) ? sessionMeta : {})
     });
-    const payloadManifest = contextual ? sessionRange.payloadManifest : indexData?.integrity?.payloadManifest;
+    const checkpoint = indexData?.integrity;
+    const hasCheckpoint = checkpoint?.algorithm === 'sha256-chain' ||
+        [checkpoint?.eventCount, checkpoint?.chainHeadHash, checkpoint?.genesisHash].some((value) => value !== undefined);
+    const payloadManifest = contextual ? sessionRange.payloadManifest : checkpoint?.payloadManifest;
+    const stoppedReason = contextual ? sessionRange.stoppedReason : indexData?.captureLimits?.stoppedReason;
+    let includesStoppedSession = !matchTransaction || contextual;
     const log = {
         version: '1.2',
         creator: { name: 'CamoufoxTrafficRecorder', version: '1.0.0' },
@@ -5133,15 +5377,15 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
         optional: true, trustedLocal, maxBytes: MAX_HAR_LEDGER_BYTES
     });
     const pagesMap = new Map();
-    const ensurePageForStep = (stepName, stepIndex, timestamp) => {
+    const ensurePageForStep = (traceId, stepName, stepIndex, timestamp) => {
         const cleanStep = redactDiagnosticText(stepName || 'init');
         const idx = Number.isFinite(Number(stepIndex)) ? Number(stepIndex) : pagesMap.size;
-        const pageKey = `${idx}:${cleanStep}`;
+        const pageKey = JSON.stringify([traceId, idx, cleanStep]);
         if (!pagesMap.has(pageKey)) {
             if (pagesMap.size >= MAX_HAR_ENTRIES) throw harLimitError('page count');
             const page = {
                 startedDateTime: timestamp || new Date().toISOString(),
-                id: `page_${idx}_${cleanStep}`,
+                id: `page_${pagesMap.size}_${idx}_${cleanStep}`,
                 title: `${cleanStep} (step ${idx})`,
                 pageTimings: {
                     onContentLoad: -1,
@@ -5157,6 +5401,7 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
     const txMap = new Map();
     let eventCount = 0;
     let chainHead = TRAFFIC_GENESIS_HASH;
+    let observedCheckpoint;
     for (let offset = 0; eventCount < sessionEnd && offset < (captureBytes?.length ?? 0);) {
         const newline = captureBytes.indexOf(0x0a, offset);
         const end = newline === -1 ? captureBytes.length : newline;
@@ -5177,17 +5422,19 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
         }
         eventCount += 1;
         const traceId = captureEventTraceId(ev);
-        if (contextual) {
+        if (contextual || hasCheckpoint) {
             if (ev.prevEventHash !== chainHead || ev.eventHash !== computeEventHash(ev)) {
                 throw harIntegrityError(`Traffic ledger integrity mismatch at record ${eventCount}`);
             }
             chainHead = ev.eventHash;
-            if (eventCount <= sessionStart || traceId !== bodyPolicy.traceId) continue;
+            if (eventCount === checkpoint?.eventCount) observedCheckpoint = chainHead;
         }
+        if (contextual && (eventCount <= sessionStart || traceId !== bodyPolicy.traceId)) continue;
         if (!matchTransaction && ev.payloadStorage) countPayloadIssues([ev]);
         if (ev.type === 'step-transition') {
             if (!matchTransaction) {
                 ensurePageForStep(
+                    traceId,
                     ev.actionStep || ev.attribution?.actionStep || 'init',
                     ev.stepIndex ?? ev.attribution?.stepIndex ?? 0,
                     ev.timestamp || sessionForTrace(traceId).startedAt
@@ -5232,6 +5479,13 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
     if (contextual && (eventCount !== sessionEnd || chainHead !== sessionRange.head)) {
         throw harIntegrityError('Traffic ledger no longer contains the recorded HAR session');
     }
+    if (hasCheckpoint) {
+        try {
+            verifyObservedLedgerCheckpoint(checkpoint, eventCount, observedCheckpoint, { allowLaterEvents: true });
+        } catch (error) {
+            throw harIntegrityError(error.message);
+        }
+    }
 
     const decodeEvent = (rawLine) => rawLine ? JSON.parse(rawLine.toString('utf8').trim()) : null;
     for (const tx of txMap.values()) {
@@ -5242,44 +5496,19 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
         const failed = decodeEvent(tx.failed);
         const securityBlock = decodeEvent(tx.securityBlock);
 
-        const attribution =
-            egress?.attribution ||
-            ingress?.attribution ||
-            failed?.attribution ||
-            securityBlock?.attribution ||
-            finished?.attribution ||
-            {};
         const transactionSession = sessionForTrace(traceId);
-        const observedAttributions = [egress, ingress, failed, securityBlock, finished]
-            .filter(Boolean).flatMap((event) => [event.attribution, event].filter(Boolean));
+        const transactionEvents = [egress, ingress, failed, securityBlock, finished].filter(Boolean);
+        const observedAttributions = transactionEvents.flatMap((event) => [event.attribution, event].filter(Boolean));
         const attributed = (field) => {
             const observed = observedAttributions.find((record) => Object.hasOwn(record, field));
             return observed ? observed[field] : transactionSession[field];
         };
-        const actionStep =
-            attribution.actionStep ||
-            egress?.actionStep ||
-            ingress?.actionStep ||
-            failed?.actionStep ||
-            securityBlock?.actionStep ||
-            finished?.actionStep ||
-            'init';
-        const stepIndex =
-            attribution.stepIndex ??
-            egress?.stepIndex ??
-            ingress?.stepIndex ??
-            failed?.stepIndex ??
-            securityBlock?.stepIndex ??
-            finished?.stepIndex ??
-            0;
-        const triggerAction =
-            egress?.triggerAction ||
-            ingress?.triggerAction ||
-            failed?.triggerAction ||
-            securityBlock?.triggerAction ||
-            finished?.triggerAction ||
-            attribution.triggerAction ||
-            null;
+        const step = observedAttributions.find((record) => record.actionStep);
+        const actionStep = step?.actionStep || 'init';
+        const stepIndex = step?.stepIndex ??
+            observedAttributions.find((record) => record.stepIndex != null)?.stepIndex ?? 0;
+        const triggerAction = transactionEvents.find((event) => event.triggerAction)?.triggerAction ||
+            observedAttributions.find((record) => record.triggerAction)?.triggerAction || null;
 
         const rawUrl =
             egress?.url ||
@@ -5293,6 +5522,7 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
             correlationId, url: rawUrl, actionStep, triggerAction, status
         })) continue;
         if (matchTransaction) countPayloadIssues([egress, ingress]);
+        includesStoppedSession ||= traceId === (sessionMeta.traceId ?? null);
 
         const startedDateTime =
             egress?.timestamp ||
@@ -5303,19 +5533,21 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
             transactionSession.startedAt ||
             new Date().toISOString();
 
-        const pageref = ensurePageForStep(actionStep, stepIndex, startedDateTime);
+        const pageref = ensurePageForStep(traceId, actionStep, stepIndex, startedDateTime);
 
-        let totalTimeMs = 0;
-        if (typeof finished?.durationMs === 'number' && Number.isFinite(finished.durationMs)) {
-            totalTimeMs = Math.max(0, finished.durationMs);
-        } else if (typeof failed?.durationMs === 'number' && Number.isFinite(failed.durationMs)) {
-            totalTimeMs = Math.max(0, failed.durationMs);
-        } else if (
-            typeof egress?.epochMs === 'number' &&
-            typeof ingress?.epochMs === 'number'
-        ) {
-            totalTimeMs = Math.max(0, ingress.epochMs - egress.epochMs);
-        }
+        const timing = finished?.timing;
+        const wait = observedHarDuration(timing?.requestStart, timing?.responseStart);
+        const receive = observedHarDuration(timing?.responseStart, timing?.responseEnd);
+        const duration = observedHarDuration(0, finished?.durationMs) ??
+            observedHarDuration(0, failed?.durationMs) ??
+            observedHarDuration(egress?.epochMs, ingress?.epochMs) ?? 0;
+        // The available request interval includes sending. The HAR-required fields retain
+        // nonnegative values, with inferred placeholders identified in the extension.
+        const waitTime = wait ?? Math.max(0, duration - (receive ?? 0));
+        const receiveTime = receive ?? Math.max(0, duration - waitTime);
+        const unmeasured = ['send'];
+        if (wait === null) unmeasured.push('wait');
+        if (receive === null) unmeasured.push('receive');
 
         const method =
             egress?.method ||
@@ -5356,10 +5588,8 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
             reqHeaders.find((h) => h.name.toLowerCase() === 'content-type')?.value || '';
         const requestBody = readBody(egress, rawUrl, reqMimeType);
         const reqBodyText = requestBody.text || '';
-        const reqBodySize =
-            Number(egress?.postDataBytes) ||
-            Number(finished?.sizes?.requestBodySize) ||
-            (reqBodyText ? Buffer.byteLength(reqBodyText, 'utf8') : 0);
+        const reqBodySize = harSize(finished?.sizes?.requestBodySize) ?? harSize(egress?.postDataBytes) ??
+            requestBody.byteLength ?? -1;
 
         const postData = {
             mimeType: reqMimeType || (reqBodyText ? 'application/octet-stream' : ''),
@@ -5378,8 +5608,18 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
 
         const responseBody = readBody(ingress, rawUrl, resMimeType);
         const resBodyText = responseBody.text || '';
-        const resBodySize = responseBody.byteLength ?? (Number(ingress?.bodyBytes) ||
-            Number(finished?.sizes?.responseBodySize) || Buffer.byteLength(resBodyText, 'utf8'));
+        const responseStatus = Number(status ?? 0);
+        const responseWithoutBody = method === 'HEAD' || (responseStatus >= 100 && responseStatus < 200) ||
+            responseStatus === 204 || responseStatus === 205 || responseStatus === 304;
+        const contentEncoded = resHeaders.some(({ name, value }) =>
+            name.toLowerCase() === 'content-encoding' &&
+            String(value).toLowerCase().split(',').some((coding) => coding.trim() && coding.trim() !== 'identity')
+        );
+        const observedContentSize = responseBody.byteLength ??
+            (ingress?.bodyOmittedReason && ingress.bodyBytes === 0 ? null : harSize(ingress?.bodyBytes));
+        const wireBodySize = harSize(finished?.sizes?.responseBodySize) ??
+            (responseWithoutBody ? 0 : contentEncoded ? null : observedContentSize) ?? -1;
+        const contentSize = observedContentSize ?? (responseWithoutBody ? 0 : contentEncoded ? -1 : wireBodySize);
 
         const redirectURL =
             resHeaders.find((h) => h.name.toLowerCase() === 'location')?.value || '';
@@ -5396,7 +5636,7 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
         retain(log.entries, {
             pageref,
             startedDateTime,
-            time: totalTimeMs,
+            time: waitTime + receiveTime,
             request: {
                 method,
                 url: requestUrl,
@@ -5405,33 +5645,34 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
                 headers: reqHeaders,
                 queryString,
                 postData,
-                headersSize: Number(finished?.sizes?.requestHeadersSize) || -1,
+                headersSize: harSize(finished?.sizes?.requestHeadersSize) ?? -1,
                 bodySize: reqBodySize
             },
             response: {
-                status: Number(status ?? 0),
+                status: responseStatus,
                 statusText,
                 httpVersion: 'HTTP/1.1',
                 cookies: [],
                 headers: resHeaders,
                 content: {
-                    size: resBodySize,
+                    size: contentSize,
                     mimeType: resMimeType,
                     text: resBodyText
                 },
                 redirectURL,
-                headersSize: Number(finished?.sizes?.responseHeadersSize) || -1,
-                bodySize: resBodySize
+                headersSize: harSize(finished?.sizes?.responseHeadersSize) ?? -1,
+                bodySize: wireBodySize
             },
             cache: {},
             timings: {
-                blocked: 0,
+                blocked: -1,
                 dns: -1,
                 connect: -1,
                 ssl: -1,
                 send: 0,
-                wait: totalTimeMs,
-                receive: 0
+                wait: waitTime,
+                receive: receiveTime,
+                _unmeasured: unmeasured
             },
             serverIPAddress: ingress?.serverAddr?.ipAddress || '',
             ...(securityBlock
@@ -5495,7 +5736,14 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
     }
 
     if (pagesMap.size === 0 && !matchTransaction) {
-        ensurePageForStep('init', 0, sessionMeta.startedAt || fallbackSession?.startedAt);
+        ensurePageForStep(sessionMeta.traceId ?? fallbackSession?.traceId ?? null,
+            'init', 0, sessionMeta.startedAt || fallbackSession?.startedAt);
+    }
+
+    if (includesStoppedSession && ['storage-limit', 'event-limit', 'pending-event-limit'].includes(stoppedReason)) {
+        const captureLimits = { stoppedReason };
+        reserve(Buffer.byteLength(JSON.stringify({ _captureLimits: captureLimits })) - 1);
+        log._captureLimits = captureLimits;
     }
 
     if (payloadCaptureIssues.writeFailures || payloadCaptureIssues.storageOmissions) {
@@ -5503,7 +5751,7 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
         reserve(Buffer.byteLength(JSON.stringify({ _payloadCaptureIssues: payloadCaptureIssues })) - 1);
         log._payloadCaptureIssues = payloadCaptureIssues;
     }
-    return { archive: { log }, artifacts: indexData?.artifacts };
+    return { archive: { log }, artifacts: indexData?.artifacts, integrity: checkpoint };
 }
 
 function* serializeHar({ log: { pages, entries, ...metadata } }) {
@@ -5552,19 +5800,25 @@ export function exportTrafficToHar(trafficDir, outputPath, fallbackSession = {},
         }
     }
 
-    const { archive: harArchive, artifacts } = buildHarFromTrafficDir(resolvedTrafficDir, fallbackSession, options);
+    const { archive: harArchive, artifacts, integrity } = buildHarFromTrafficDir(resolvedTrafficDir, fallbackSession, options);
     const current = fs.statSync(resolvedTrafficDir, { bigint: true });
     if (current.dev !== source.dev || current.ino !== source.ino) {
         throw harIntegrityError('Traffic directory changed during HAR export');
     }
     const captureName = path.basename(captureRoot);
     const nativeDir = path.join(path.dirname(captureRoot), captureName === 'traffic' ? '.native' : `.${captureName}-native`);
-    const declaredLedger = artifacts?.trafficNdjsonPath;
-    const recordedLedger = typeof declaredLedger === 'string' && path.isAbsolute(declaredLedger)
-        ? resolveFilesystemPath(declaredLedger) : null;
-    const inputLedgers = [resolveFilesystemPath(path.join(resolvedTrafficDir, 'traffic.ndjson')),
-        path.join(captureRoot, 'traffic.ndjson')];
-    const recordedWirePath = inputLedgers.includes(recordedLedger) ? artifacts.preTlsWireLogPath : null;
+    const wireFile = getCaptureWireLogFileName(integrity);
+    let recordedWirePath = null;
+    if (integrity?.preTlsWireLogFile === undefined) {
+        // Older indexes use artifact paths for output protection only.
+        const declaredLedger = recordedArtifactPath(resolvedTrafficDir, artifacts?.trafficNdjsonPath);
+        const recordedLedger = declaredLedger ? resolveFilesystemPath(declaredLedger) : null;
+        const inputLedgers = [resolveFilesystemPath(path.join(resolvedTrafficDir, 'traffic.ndjson')),
+            path.join(captureRoot, 'traffic.ndjson')];
+        if (inputLedgers.includes(recordedLedger)) {
+            recordedWirePath = recordedArtifactPath(resolvedTrafficDir, artifacts.preTlsWireLogPath);
+        }
+    }
     const bytes = writeCaptureExport(resolvedOutputPath, serializeHar(harArchive), {
         replace: Boolean(outputPath),
         recordedWirePath,
@@ -5573,6 +5827,7 @@ export function exportTrafficToHar(trafficDir, outputPath, fallbackSession = {},
                 .map((name) => path.join(captureRoot, name)),
             captureWriterLeaseDirectory(captureRoot),
             nativeDir,
+            path.join(captureRoot, wireFile),
             ...(options[HAR_PROTECTED_PATHS] ?? [])
         ]
     });

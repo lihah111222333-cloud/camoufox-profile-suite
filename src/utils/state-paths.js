@@ -30,12 +30,8 @@ if (STATE_DIRECTORY === path.parse(STATE_DIRECTORY).root || STATE_DIRECTORY === 
 
 export function validateExistingStateDirectory() {
     let existing;
-    let homeIdentity;
     try {
         existing = fs.lstatSync(STATE_DIRECTORY, { bigint: true, throwIfNoEntry: false });
-        if (existing?.isDirectory()) {
-            homeIdentity = fs.statSync(home, { bigint: true, throwIfNoEntry: false });
-        }
     } catch (cause) {
         throw new Error('Could not inspect GMAIL_CREATOR_STATE_DIR', { cause });
     }
@@ -43,6 +39,13 @@ export function validateExistingStateDirectory() {
     if (!existing.isDirectory() ||
         (typeof process.geteuid === 'function' && existing.uid !== BigInt(process.geteuid()))) {
         throw new Error('GMAIL_CREATOR_STATE_DIR must name a real directory owned by the current user');
+    }
+    let homeIdentity;
+    try {
+        homeIdentity = fs.statSync(home, { bigint: true, throwIfNoEntry: false });
+    } catch (error) {
+        // A service can use an independent state directory when its HOME is unavailable.
+        if (error.code !== 'EACCES' && error.code !== 'EPERM' && error.code !== 'ENOTDIR') throw error;
     }
     if (homeIdentity && existing.dev === homeIdentity.dev && existing.ino === homeIdentity.ino) {
         throw new Error(DEDICATED_DIRECTORY_REQUIRED);

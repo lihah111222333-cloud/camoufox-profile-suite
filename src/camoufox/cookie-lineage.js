@@ -11,6 +11,7 @@ export const ANTI_BOT_COOKIE_REGEX =
     /^(datr|sb|fr|c_user|xs|ig_did|mid|csrftoken|rur|ttwid|msToken|s_v_web_id|verifyFp|odin_tt|passport_csrf_token|guest_id|guest_id_marketing|guest_id_ads|ct0|auth_token|kdt|_twitter_sess|__cf_bm|cf_clearance|_cfuvid|NID|AEC|SOCS|SID|HSID|SSID|APISID|SAPISID|__Secure-[0-9A-Za-z_-]+|__Host-[0-9A-Za-z_-]+)$/i;
 
 const COOKIE_VALUE_MASK = '[REDACTED]';
+const COOKIE_PATH_MASK = /\[REDACTED(?::[a-f\d]{8})?\]|%5BREDACTED(?:%3A[a-f\d]{8})?%5D|\bprofile-legacy-\d{13}(?:-\d{1,8})?(?![a-z\d_-])/i;
 
 /**
  * Parse a `Set-Cookie` response header string into structured metadata with a full
@@ -37,6 +38,12 @@ const COOKIE_VALUE_MASK = '[REDACTED]';
  * }|null}
  */
 export function parseSetCookieHeader(rawSetCookieValue, observedAt = Date.now()) {
+    const parsed = parseSetCookie(rawSetCookieValue, observedAt);
+    if (parsed?.path) parsed.path = redactUrlSecrets(parsed.path);
+    return parsed;
+}
+
+function parseSetCookie(rawSetCookieValue, observedAt) {
     if (typeof rawSetCookieValue !== 'string') {
         return null;
     }
@@ -82,7 +89,7 @@ export function parseSetCookieHeader(rawSetCookieValue, observedAt = Date.now())
         if (attrName === 'domain') {
             domain = attrVal || null;
         } else if (attrName === 'path') {
-            cookiePath = attrVal ? redactUrlSecrets(attrVal) : null;
+            cookiePath = attrVal || null;
         } else if (attrName === 'secure') {
             secure = true;
         } else if (attrName === 'httponly') {
@@ -167,7 +174,19 @@ export function parseCookieHeader(rawCookieHeader) {
     return results;
 }
 
-export function deriveCookieObservations({ headers = {}, headersArray = [] }, name, observedAt) {
+export function deriveCookieObservations(headers, name, observedAt) {
+    return collectCookieObservations(headers, name, observedAt).map((observation) => {
+        if (!observation.path) return observation;
+        const path = redactUrlSecrets(observation.path);
+        return {
+            ...observation,
+            path,
+            ...(observation.path.startsWith('/') && path !== observation.path && { pathScopeUnknown: true })
+        };
+    });
+}
+
+function collectCookieObservations({ headers = {}, headersArray = [] }, name, observedAt = Date.now()) {
     const orderedValues = (Array.isArray(headersArray) ? headersArray : [])
         .filter((header) => String(header?.name).toLowerCase() === name)
         .map((header) => header?.value);
@@ -176,7 +195,7 @@ export function deriveCookieObservations({ headers = {}, headersArray = [] }, na
         .flatMap(([, value]) => value);
 
     const parsed = name === 'set-cookie'
-        ? rawValues.flatMap((value) => String(value ?? '').split(/\r?\n/).map((header) => parseSetCookieHeader(header, observedAt)))
+        ? rawValues.flatMap((value) => String(value ?? '').split(/\r?\n/).map((header) => parseSetCookie(header, observedAt)))
         : rawValues.flatMap(parseCookieHeader);
     return parsed.filter(Boolean).map(({ value, ...observation }) => observation);
 }
@@ -210,6 +229,22 @@ function matchingPath(requestPath, cookiePath) {
         requestPath.startsWith(cookiePath) &&
         (cookiePath.endsWith('/') || requestPath[cookiePath.length] === '/')
     );
+}
+
+function observedPath(path, obscured = false) {
+    // A leading // can have its entire first component changed by URL redaction.
+    const mask = obscured && path.startsWith('//') ? null : COOKIE_PATH_MASK.exec(path);
+    if (mask) return { exact: null, prefix: path.slice(0, path.lastIndexOf('/', mask.index) + 1) || '/' };
+    return obscured ? { exact: null, prefix: '/' } : { exact: path, prefix: path };
+}
+
+function matchingObservedPath(request, cookie) {
+    if (cookie.exact !== null) {
+        if (matchingPath(request.prefix, cookie.exact)) return true;
+        return request.exact === null && cookie.exact.startsWith(request.prefix) ? null : false;
+    }
+    if (request.prefix.startsWith(cookie.prefix)) return null;
+    return request.exact === null && cookie.prefix.startsWith(request.prefix) ? null : false;
 }
 
 function requestScope(event) {
@@ -265,8 +300,11 @@ function entryFor(entries, observation, scope, key) {
             historyCount: 0,
             sent: new Map(),
             sentCount: 0,
+            pathEvidence: null,
+            validDomain: false,
             expiresAt: null,
             lastSetClock: null,
+            hasUntimedSet: false,
             deleted: false
         });
     }
@@ -276,6 +314,7 @@ function entryFor(entries, observation, scope, key) {
 /** One projection for live capture, ledger replay, and offline queries. */
 export class CookieLineage {
     #lastObservation = null;
+    #unknownScopeCount = 0;
 
     constructor({ limit = RETAINED_OBSERVATIONS_PER_SCOPE } = {}) {
         this.limit = limit;
@@ -299,9 +338,10 @@ export class CookieLineage {
         if (this.needsReplay || (!incoming && event?.type !== 'egress')) return;
         const timestamp = event.timestamp || null;
         const clock = observationClock(event);
+        const hasClock = Number.isFinite(clock);
         const observations = Array.isArray(event.cookieObservations)
             ? event.cookieObservations
-            : deriveCookieObservations(event, incoming ? 'set-cookie' : 'cookie', clock);
+            : collectCookieObservations(event, incoming ? 'set-cookie' : 'cookie', clock);
         if (!observations.length) return;
         const order = observationOrder(event, clock);
         if (this.#lastObservation && compareObservationOrder(order, this.#lastObservation) < 0) {
@@ -313,6 +353,7 @@ export class CookieLineage {
         const correlationId = event.correlationId || null;
         const triggerActionId = event.triggerAction?.actionId || event.attribution?.triggerAction?.actionId || null;
         const { hostname, pathname, secure } = requestScope(event);
+        const requestPath = observedPath(pathname);
 
         for (const observation of observations) {
             if (typeof observation?.name !== 'string' || !observation.name) continue;
@@ -332,19 +373,25 @@ export class CookieLineage {
                 const domain = hostOnly
                     ? hostname
                     : /[\s@/#?]/.test(declaredDomain) ? '' : domainToASCII(declaredDomain);
-                const path = typeof observation.path === 'string' && observation.path.startsWith('/')
-                    ? redactUrlSecrets(observation.path)
-                    : pathname.slice(0, pathname.lastIndexOf('/')) || '/';
+                const explicitPath = typeof observation.path === 'string' &&
+                    (observation.path.startsWith('/') || observation.path === COOKIE_VALUE_MASK);
+                const rawPath = explicitPath ? observation.path : pathname.slice(0, pathname.lastIndexOf('/')) || '/';
+                const path = redactUrlSecrets(rawPath);
+                const pathEvidence = observedPath(rawPath, observation.pathScopeUnknown === true);
                 const partitioned = Boolean(observation.partitioned || partitionKey);
-                const scopeStatus = matchingDomain(hostname, domain) ? 'set-cookie' : 'unknown';
+                const validDomain = matchingDomain(hostname, domain);
+                const scopeStatus = validDomain && pathEvidence.exact !== null ? 'set-cookie' : 'unknown';
                 const scope = { domain: domain || hostname, hostOnly, path, partitioned, partitionKey, scopeStatus };
-                const scopeKey = JSON.stringify([scopeStatus, domain, hostOnly, path, partitioned, partitionKey,
-                    scopeStatus === 'unknown' ? hostname : null]);
+                // Keep separate settings when the capture cannot prove that their paths are identical.
+                const pathIdentity = pathEvidence.exact ?? ++this.#unknownScopeCount;
+                const scopeKey = JSON.stringify([scopeStatus, domain, hostOnly, pathIdentity, partitioned, partitionKey,
+                    validDomain ? null : hostname]);
                 const state = entryFor(entries, observation, scope, scopeKey);
                 const { entry } = state;
                 const maxAge = observation.maxAge;
                 const expiresAt = Number.isFinite(maxAge) ? clock + maxAge * 1000 : Date.parse(observation.expires);
-                const isDeleted = Boolean(observation.isDeleted || expiresAt <= clock || maxAge === 0);
+                const isDeleted = Boolean(observation.isDeleted || expiresAt <= clock ||
+                    (Number.isFinite(maxAge) && maxAge <= 0));
                 if (!state.historyCount) {
                     entry.firstSetAt = timestamp;
                     entry.firstSetByCorrelationId = correlationId;
@@ -362,7 +409,10 @@ export class CookieLineage {
                 entry.lastSetByCorrelationId = correlationId;
                 entry.lastSetAtStep = actionStep;
                 entry.lastValueSha256 = valueSha256;
+                state.pathEvidence = pathEvidence;
+                state.validDomain = validDomain;
                 state.lastSetClock = clock;
+                state.hasUntimedSet ||= !hasClock;
                 state.expiresAt = expiresAt;
                 state.deleted = isDeleted;
                 const historyKey = JSON.stringify([correlationId ?? timestamp, valueSha256, isDeleted]);
@@ -375,22 +425,30 @@ export class CookieLineage {
             }
 
             const candidates = [];
+            let hasUncertainCandidate = false;
             for (const state of entries.values()) {
                 const { entry } = state;
-                if (entry.scopeStatus !== 'set-cookie' || state.deleted || state.expiresAt <= clock ||
+                if (!state.validDomain || state.deleted || state.expiresAt <= clock ||
                     state.lastSetClock > clock || !valueSha256 || valueSha256 !== entry.lastValueSha256 || (entry.secure && !secure) ||
                     !hostname || !(entry.hostOnly ? hostname === entry.domain : matchingDomain(hostname, entry.domain)) ||
-                    !matchingPath(pathname, entry.path) ||
                     (entry.partitioned && partitionKey && entry.partitionKey && entry.partitionKey !== partitionKey)) {
                     continue;
                 }
-                candidates.push(state);
+                const matchesPath = matchingObservedPath(requestPath, state.pathEvidence);
+                if (matchesPath === false) continue;
+                if (matchesPath === null || !hasClock || state.hasUntimedSet) {
+                    hasUncertainCandidate = true;
+                } else {
+                    candidates.push(state);
+                }
             }
-            const candidate = candidates.length === 1 ? candidates[0] : null;
+            const candidate = !hasUncertainCandidate && candidates.length === 1 ? candidates[0] : null;
             const matched = candidate && (!candidate.entry.partitioned || (
                 partitionKey && candidate.entry.partitionKey === partitionKey
             ));
-            const scopeStatus = candidates.length ? 'ambiguous' : 'unmatched';
+            let scopeStatus = 'unmatched';
+            if (hasUncertainCandidate) scopeStatus = 'unknown';
+            if (candidates.length > 1 || (candidates.length && !hasUncertainCandidate)) scopeStatus = 'ambiguous';
             const state = matched ? candidate : entryFor(entries, observation, {
                 domain: hostname, hostOnly: null, path: null, partitioned: null, partitionKey, scopeStatus
             }, JSON.stringify([scopeStatus, hostname, partitionKey]));

@@ -79,6 +79,7 @@ test('in-tree files survive HAR and wire export with credential fields filtered'
     const har = exportTrafficToHar(trafficDir, outputPath);
     const entry = har.log.entries[0];
     assert.equal(entry.request.postData.text, wire.requestPayload);
+    assert.equal(entry.request.bodySize, fs.statSync(path.join(payloadsDir, 'nested', 'request.json')).size);
     assert.equal(entry.response.content.text, wire.responsePayload);
     assert.equal(entry.request.queryString[0].value, 'compact');
     assert.equal(entry.response.redirectURL, '/v1/next?token=[REDACTED]');
@@ -172,7 +173,6 @@ test('HAR and query wire omit unsupported, malformed and truncated legacy bodies
         { mimeType: mimeTypes.json, body: '{"count":7,"label":"private-test-marker"' },
         { mimeType: mimeTypes.json, body: '{"count":7}', payloadTruncated: true },
         { mimeType: mimeTypes.json, body: '{"count":7}', bodyPreviewTruncated: true, inlineOnly: true },
-        { mimeType: mimeTypes.json, body: '{"count":7}', postDataBytes: 200 },
         { mimeType: mimeTypes.form, body: 'count=7&label=%invalid' },
         { mimeType: mimeTypes.multipart, body: '--fixture\r\nContent-Disposition: form-data; name="label"\r\n\r\nprivate-test-marker\r\n--fixture--\r\n' },
         { mimeType: mimeTypes.binary, body: 'private-test-marker' },
@@ -283,7 +283,7 @@ test('default CLI export is private and exclusive, and an explicit file may be a
     const command = [cliPath, `--profiles-dir=${profilesDir}`, '--profile=fixture', '--export-har', '--json'];
     const result = JSON.parse(execFileSync(process.execPath, command, { cwd: operatorDir, encoding: 'utf8' }));
     const defaultOutput = path.join(operatorDir, 'traffic.har');
-    assert.equal(result.harPath, fs.realpathSync.native(defaultOutput));
+    assert.equal(result.harPath, path.basename(defaultOutput));
     assert.equal(fs.statSync(defaultOutput).mode & 0o777, 0o600);
     assert.equal(fs.existsSync(path.join(trafficDir, 'traffic.har')), false);
     const original = fs.readFileSync(defaultOutput);
@@ -434,8 +434,8 @@ test('HAR regression preserves local native and custom wire artifacts', { skip: 
     context.emit('request', { method: () => 'GET', url: () => 'https://fixture.example/notes', headers: () => ({}) });
     await recorder.stop();
     const index = JSON.parse(fs.readFileSync(recorder.attributionIndexPath, 'utf8'));
-    assert.equal(index.artifacts.trafficNdjsonPath, ledger);
-    assert.equal(index.artifacts.preTlsWireLogPath, wireLog);
+    assert.equal(index.artifacts.trafficNdjsonPath, path.relative(trafficDir, ledger));
+    assert.equal(index.artifacts.preTlsWireLogPath, path.relative(trafficDir, wireLog));
 
     for (const target of [nativeLog, wireLog]) {
         const original = fs.readFileSync(target);

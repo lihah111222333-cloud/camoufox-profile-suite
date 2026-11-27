@@ -125,6 +125,87 @@ test('cookie instances use effective scope and keep uncertain observations separ
     assert.deepEqual((await resumed.stop()).cookieLineage, summary.cookieLineage);
 });
 
+test('masked cookie paths leave separate settings and unknown sends in live and replayed lineage', async (t) => {
+    const { recorder, context, trafficDir, options } = fixture(t);
+    const firstPath = '/members/sample-one%40fixture.invalid';
+    const secondPath = '/members/sample-two%40fixture.invalid';
+    const url = (scope) => 'https://scope.fixture.invalid' + scope + '/request';
+    setCookie(context, url(firstPath), [
+        'Sample=first; Path=' + firstPath, 'Peer=sample; Path=' + firstPath
+    ]);
+    setCookie(context, url(secondPath), ['Sample=second; Path=' + secondPath]);
+    setCookie(context, url('/plain'), ['Peer=sample; Path=/plain', 'Parent=sample; Path=/members']);
+    await recorder.flushSummary();
+
+    emitCookie(context, url(firstPath), 'Sample=first; Parent=sample');
+    emitCookie(context, url(secondPath), 'Sample=second');
+    emitCookie(context, url('/plain'), 'Peer=sample');
+    const summary = await recorder.stop();
+    const scopes = summary.cookieLineage.Sample.instances;
+    assert.equal(scopes.length, 3);
+    const settings = scopes.filter((entry) => entry.firstSetByCorrelationId);
+    assert.equal(settings.length, 2);
+    assert.ok(settings.every((entry) => entry.sentCount === 0 && entry.scopeStatus === 'unknown'));
+    assert.ok(settings.every((entry) => entry.path === '/members/[REDACTED]'));
+    const observations = scopes.find((entry) => entry.sentCount);
+    assert.equal(observations.scopeStatus, 'unknown');
+    assert.equal(observations.sentCount, 2);
+    assert.equal(observations.matchesLatestSetCookie, null);
+    assert.equal(summary.cookieLineage.Peer.instances.find((entry) => entry.path === '/plain').sentCount, 1);
+    assert.equal(summary.cookieLineage.Parent.sentCount, 1);
+    assert.doesNotMatch(fs.readFileSync(recorder.trafficNdjsonPath, 'utf8'), /sample-(?:one|two)/);
+
+    const ordinary = queryProfileTraffic({ trafficDir });
+    assert.deepEqual(ordinary.cookieLineage.Sample.instances.map(({ scopeStatus }) => scopeStatus),
+        scopes.map(({ scopeStatus }) => scopeStatus));
+    assert.doesNotMatch(JSON.stringify(ordinary), /sample-(?:one|two)|valueSha256|lastValueSha256/);
+    assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+    assert.deepEqual((await new CamoufoxTrafficRecorder(options).stop()).cookieLineage.Sample, summary.cookieLineage.Sample);
+});
+
+test('legacy cookie scopes use available path and time evidence without exposing path identities', (t) => {
+    const profilesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'legacy-cookie-lineage-'));
+    t.after(() => fs.rmSync(profilesDir, { recursive: true, force: true }));
+    const trafficDir = path.join(profilesDir, 'fixture', 'traffic');
+    fs.mkdirSync(trafficDir, { recursive: true });
+    const [firstUrl, secondUrl] = ['sample-one', 'sample-two'].map((id) =>
+        'https://scope.fixture.invalid/members/' + id + '%40fixture.invalid/request');
+    const set = (correlationId, url, header, epochMs) => ({
+        type: 'ingress', correlationId, url, epochMs, headers: { 'Set-Cookie': header }
+    });
+    const send = (correlationId, url, header, epochMs) => ({
+        type: 'egress', correlationId, url, epochMs, headers: { Cookie: header }
+    });
+    const secondPath = new URL(secondUrl).pathname.replace(/\/request$/, '');
+    const ledger = [
+        set('set-first', firstUrl, 'Sample=first; Max-Age=1', 1000),
+        set('set-second', secondUrl, 'Sample=second; Max-Age=1; Path=' + secondPath, 1001),
+        send('first-before-expiration', firstUrl, 'Sample=first', 1999),
+        send('second-before-expiration', secondUrl, 'Sample=second', 1999),
+        send('first-at-expiration', firstUrl, 'Sample=first', 2000),
+        send('unknown-expiration', firstUrl, 'Unknown=sample', 2000),
+        set('set-unknown', firstUrl, 'Unknown=sample; Max-Age=1')
+    ];
+    fs.writeFileSync(path.join(trafficDir, 'traffic.ndjson'), ledger.map((event) => JSON.stringify(event)).join('\n') + '\n');
+    const ordinaryJson = execFileSync(process.execPath, [
+        cliPath, '--profiles-dir=' + profilesDir, '--profile=fixture', '--json'
+    ], { encoding: 'utf8' });
+    assert.doesNotMatch(ordinaryJson, /sample-(?:one|two)|valueSha256|lastValueSha256/);
+    const { Sample, Unknown } = JSON.parse(ordinaryJson).cookieLineage;
+    const [first, second, expired] = Sample.instances;
+    assert.deepEqual([first.path, second.path], Array(2).fill('/members/[REDACTED]'));
+    assert.deepEqual(first.sentInCorrelationIds, ['first-before-expiration']);
+    assert.deepEqual(second.sentInCorrelationIds, ['second-before-expiration']);
+    assert.equal(expired.scopeStatus, 'unmatched');
+    assert.deepEqual(expired.sentInCorrelationIds, ['first-at-expiration']);
+    assert.equal(expired.matchesLatestSetCookie, null);
+
+    const uncertain = Unknown.instances.find((entry) => entry.sentCount);
+    assert.equal(uncertain.scopeStatus, 'unknown');
+    assert.deepEqual(uncertain.sentInCorrelationIds, ['unknown-expiration']);
+    assert.equal(uncertain.matchesLatestSetCookie, null);
+});
+
 test('recorder bounds repeated cookie history while the ledger keeps the complete lineage', async (t) => {
     const { recorder, context, trafficDir, options } = fixture(t);
     const url = 'https://repeat.test/';

@@ -8,7 +8,7 @@ import {
     restrictPrivateFile,
     writePrivateFile
 } from '../utils/private-storage.js';
-import { describeProcessOwner, isDeadProcessOwner, readProcessOwner } from '../utils/process-owner.js';
+import { describeProcessOwner, processOwnerStatus, readProcessOwner } from '../utils/process-owner.js';
 
 // This directory name cannot be a valid profile ID.
 export const PROFILE_LEASE_DIRECTORY = '.camoufox-leases~';
@@ -147,6 +147,20 @@ function removeLeaseOwner(directory, owner) {
     }
 }
 
+function assertInactiveLeaseOwner(incumbent) {
+    if (!incumbent) return;
+    const status = processOwnerStatus(incumbent.pid, incumbent.identity);
+    if (status === 'dead') return;
+    const message = status === 'unverified'
+        ? 'Camoufox profile lease owner could not be verified. Follow the lock recovery steps in ENV_VARIABLES.md.'
+        : 'Camoufox profile is in use by an active owner';
+    throw Object.assign(new Error(message), { code: 'ERR_CAMOUFOX_PROFILE_BUSY' });
+}
+
+export function assertProfileLeaseIdle({ profilesDir, id }) {
+    assertInactiveLeaseOwner(leaseOwner(path.join(profilesDir, PROFILE_LEASE_DIRECTORY, id)));
+}
+
 export function acquireProfileLease(location) {
     const leaseRoot = path.join(location.profilesDir, PROFILE_LEASE_DIRECTORY);
     try {
@@ -178,11 +192,7 @@ export function acquireDirectoryLease(directory) {
             }
 
             const incumbent = leaseOwner(directory);
-            if (incumbent && !isDeadProcessOwner(incumbent.pid, incumbent.identity)) {
-                throw Object.assign(new Error('Camoufox profile is in use by an active owner'), {
-                    code: 'ERR_CAMOUFOX_PROFILE_BUSY'
-                });
-            }
+            assertInactiveLeaseOwner(incumbent);
             removeLeaseOwner(directory, incumbent?.name);
         }
     } catch (error) {
@@ -308,7 +318,7 @@ function isNativeLogName({ name }) {
     return Object.values(NATIVE_LOG_NAMES).some((base) => name === base || name.startsWith(`${base}.`));
 }
 
-function resolveExistingAncestors(filePath) {
+export function resolveExistingAncestors(filePath) {
     try {
         return fs.realpathSync.native(filePath);
     } catch (error) {

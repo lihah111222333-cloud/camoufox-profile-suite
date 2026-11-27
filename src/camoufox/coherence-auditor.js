@@ -7,8 +7,8 @@
  */
 
 import { isIP } from 'node:net';
-import logger from '../utils/logger.js';
 import { readCaptureFile } from './capture-io.js';
+import { captureEventTraceId } from './capture-export-policy.js';
 import {
     APPLE_SILICON_SKU_CATALOG,
     INTEL_MAC_SKU_CATALOG,
@@ -1018,32 +1018,16 @@ export async function collectBrowserFingerprint(page) {
             }
         }
 
-        let unpermittedLabelsLeaked = false;
-        if (mediaDevicesAvailable) {
-            try {
-                const devices = await Promise.race([
-                    navigator.mediaDevices.enumerateDevices(),
-                    new Promise((resolve) => setTimeout(() => resolve([]), 500))
-                ]);
-                if (Array.isArray(devices)) {
-                    unpermittedLabelsLeaked = devices.some(
-                        (d) => d && typeof d.label === 'string' && d.label.trim().length > 0
-                    );
-                }
-            } catch {
-                unpermittedLabelsLeaked = false;
-            }
-        }
-
         const stackAndMediaHygiene = {
             hasAtSignFormat,
             leakedStackMarkers,
             enumerateDevicesNative,
-            unpermittedLabelsLeaked,
+            // Enumerating devices alone cannot establish whether a label was exposed without permission.
+            unpermittedLabelsLeaked: null,
             mediaDevices: {
                 available: mediaDevicesAvailable,
                 enumerateDevicesNative,
-                unpermittedLabelsLeaked
+                unpermittedLabelsLeaked: null
             }
         };
 
@@ -1695,13 +1679,16 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
     {
         const voices = telemetry.speechVoices;
         const issues = [];
+        let observed = false;
 
         if (Array.isArray(voices) && voices.length > 0 && targetOs) {
             for (const v of voices) {
                 const name = typeof v === 'string' ? v : String(v?.name || '');
                 const uri = typeof v === 'string' ? v : String(v?.voiceURI || '');
                 const combined = `${name} ${uri}`;
-                const label = name || uri || JSON.stringify(v);
+                if (!combined.trim()) continue;
+                observed = true;
+                const label = name || uri;
 
                 if (targetOs === 'win') {
                     if (/com\.apple\.speech|\bapple\b|\bsamantha\b|\bvictoria\b|\balex\b/i.test(combined)) {
@@ -1725,14 +1712,12 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
             }
         }
 
-        const passed = issues.length === 0;
-        checks.push({
-            name: 'speech-voices-coherence',
-            passed,
-            details: passed
-                ? 'SpeechSynthesis voices match target OS speech engine catalog'
-                : issues.join('; ')
-        });
+        checks.push(evidenceCheck('speech-voices-coherence', {
+            issues,
+            observed,
+            success: 'Observed voices match the target OS speech engine catalog',
+            unavailable: 'Speech voice evidence is unavailable'
+        }));
     }
 
     // Check 11: Storage, PDF Viewer & OS Font Exclusive Signature Coherence
@@ -2047,14 +2032,15 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
             }
         }
 
-        const passed = issues.length === 0;
-        checks.push({
-            name: 'stack-trace-and-mediadevices-hygiene',
-            passed,
-            details: passed
-                ? 'SpiderMonkey Error.prototype.stack format is clean and MediaDevices.prototype.enumerateDevices is native without unpermitted label leaks'
-                : issues.join('; ')
-        });
+        const labelEvidence = [hygiene?.unpermittedLabelsLeaked, hygiene?.mediaDevices?.unpermittedLabelsLeaked];
+        const stackObserved = typeof hygiene?.hasAtSignFormat === 'boolean' ||
+            (typeof hygiene?.stack === 'string' && hygiene.stack.length > 0);
+        checks.push(evidenceCheck('stack-trace-and-mediadevices-hygiene', {
+            issues,
+            observed: stackObserved && labelEvidence.includes(false),
+            success: 'Observed stack format and media device label checks pass',
+            unavailable: 'Stack or unpermitted media label evidence is unavailable'
+        }));
     }
 
     // Check 16: Exact hardware SKU, browser version, and any supplied GPU fixture.
@@ -2182,6 +2168,12 @@ function isEgressRequestEvent(event) {
     return type === 'egress' || type === 'request' || event.direction === 'egress';
 }
 
+function invalidCoherenceCapture() {
+    return Object.assign(new Error('Traffic ledger contains an invalid record'), {
+        code: 'ERR_COHERENCE_CAPTURE_INVALID'
+    });
+}
+
 /** Read the ledger in a capture directory selected by the caller. */
 export function readCoherenceCaptureEvents(trafficDir, { trustedLocal = false } = {}) {
     const raw = readCaptureFile(trafficDir, 'traffic.ndjson', {
@@ -2195,12 +2187,16 @@ export function readCoherenceCaptureEvents(trafficDir, { trustedLocal = false } 
     for (const line of raw.toString('utf8').split('\n')) {
         const trimmed = line.trim();
         if (!trimmed) continue;
+        let event;
         try {
-            const event = JSON.parse(trimmed);
-            if (isEgressRequestEvent(event)) events.push(event);
+            event = JSON.parse(trimmed);
         } catch {
-            // A partially written line does not contribute an observation.
+            throw invalidCoherenceCapture();
         }
+        if (!event || typeof event !== 'object' || Array.isArray(event)) {
+            throw invalidCoherenceCapture();
+        }
+        if (isEgressRequestEvent(event)) events.push(event);
     }
     return events;
 }
@@ -2335,6 +2331,8 @@ function normalizeEgressHeaders(event) {
  * @param {object} domTelemetry Output of `collectBrowserFingerprint(page)` (or object containing `.navigator`)
  * @param {Array<object> | object} trafficEventsOrSummary Array of egress events, `{ egressEvents }`, or `CamoufoxTrafficRecorder`
  * @param {string | null} [expectedOs=null] Optional expected OS ('win' | 'mac' | 'lin')
+ * @param {object} [options]
+ * @param {string | null} [options.traceId=null] Restrict observations to one known active trace
  * @returns {{
  *   passed: boolean,
  *   status: string,
@@ -2343,7 +2341,7 @@ function normalizeEgressHeaders(event) {
  *   checks: Array<{ name: string, passed: boolean, status: string, details: string }>
  * }}
  */
-export function evaluateWireToDomCoherence(domTelemetry, trafficEventsOrSummary, expectedOs = null) {
+export function evaluateWireToDomCoherence(domTelemetry, trafficEventsOrSummary, expectedOs = null, { traceId = null } = {}) {
     if (!domTelemetry || typeof domTelemetry !== 'object') {
         throw new TypeError('evaluateWireToDomCoherence requires a domTelemetry object');
     }
@@ -2355,7 +2353,10 @@ export function evaluateWireToDomCoherence(domTelemetry, trafficEventsOrSummary,
     ).trim();
     const targetOs = normalizeTargetOs(expectedOs);
 
-    const egressEvents = extractEgressRequestEvents(trafficEventsOrSummary);
+    const suppliedEvents = extractEgressRequestEvents(trafficEventsOrSummary);
+    const egressEvents = traceId === null
+        ? suppliedEvents
+        : suppliedEvents.filter((event) => captureEventTraceId(event) === traceId);
     let inspectedRequests = 0;
     let requestsWithUserAgent = 0;
     let requestsWithAcceptLanguage = 0;
@@ -2369,7 +2370,7 @@ export function evaluateWireToDomCoherence(domTelemetry, trafficEventsOrSummary,
 
     for (let idx = 0; idx < egressEvents.length; idx += 1) {
         const ev = egressEvents[idx];
-        const reqLabel = ev.url || ev.correlationId || `req#${idx + 1}`;
+        const reqLabel = `request #${idx + 1}`;
         const headers = normalizeEgressHeaders(ev);
         if (headers.length === 0) continue;
         inspectedRequests += 1;
@@ -2378,26 +2379,28 @@ export function evaluateWireToDomCoherence(domTelemetry, trafficEventsOrSummary,
 
         for (const h of headers) {
             if (h.lowerName === 'user-agent') {
+                if (!h.value) continue;
                 hasUserAgent = true;
                 if (domUa && h.value !== domUa) {
                     uaMismatches.push(
-                        `Wire User-Agent "${h.value}" on ${reqLabel} does not match DOM navigator.userAgent "${domUa}"`
+                        `Wire User-Agent on ${reqLabel} does not match DOM navigator.userAgent`
                     );
                 }
                 if (targetOs === 'win' && !h.value.includes('Windows NT')) {
                     uaMismatches.push(
-                        `Wire User-Agent "${h.value}" on ${reqLabel} contradicts expected Windows OS`
+                        `Wire User-Agent on ${reqLabel} contradicts expected Windows OS`
                     );
                 } else if (targetOs === 'mac' && !h.value.includes('Macintosh')) {
                     uaMismatches.push(
-                        `Wire User-Agent "${h.value}" on ${reqLabel} contradicts expected macOS`
+                        `Wire User-Agent on ${reqLabel} contradicts expected macOS`
                     );
                 } else if (targetOs === 'lin' && !h.value.includes('Linux')) {
                     uaMismatches.push(
-                        `Wire User-Agent "${h.value}" on ${reqLabel} contradicts expected Linux OS`
+                        `Wire User-Agent on ${reqLabel} contradicts expected Linux OS`
                     );
                 }
             } else if (h.lowerName === 'accept-language') {
+                if (!h.value) continue;
                 hasAcceptLanguage = true;
                 if (domPrimaryLang) {
                     const wireValueLower = h.value.toLowerCase();
@@ -2405,17 +2408,17 @@ export function evaluateWireToDomCoherence(domTelemetry, trafficEventsOrSummary,
                     const wirePrimaryTag = wireValueLower.split(',')[0].split(';')[0].trim();
                     if (!wireValueLower.startsWith(domLangLower) || wirePrimaryTag !== domLangLower) {
                         langMismatches.push(
-                            `Wire Accept-Language "${h.value}" on ${reqLabel} does not start with DOM primary language "${domPrimaryLang}"`
+                            `Wire Accept-Language on ${reqLabel} does not start with DOM primary language`
                         );
                     }
                 }
             } else if (h.lowerName.startsWith('sec-ch-ua')) {
                 clientHintsLeaks.push(
-                    `Chromium Client Hint header "${h.name}: ${h.value}" leaked on Gecko egress request (${reqLabel})`
+                    `Sec-CH-UA Client Hint header observed on Gecko egress request (${reqLabel})`
                 );
             } else if (proxyLeakRegex.test(h.lowerName)) {
                 proxyHeaderLeaks.push(
-                    `Proxy leak header "${h.name}: ${h.value}" detected on egress request (${reqLabel})`
+                    `Proxy attribution header "${h.name}" detected on egress request (${reqLabel})`
                 );
             }
         }
@@ -2434,7 +2437,7 @@ export function evaluateWireToDomCoherence(domTelemetry, trafficEventsOrSummary,
         evidenceCheck('wire-accept-language-matches-dom', {
             issues: langMismatches,
             observed: haveRequestHeaders && Boolean(domPrimaryLang) && requestsWithAcceptLanguage === inspectedRequests,
-            success: `All ${inspectedRequests} pre-TLS egress requests start with DOM primary language "${domPrimaryLang}"`,
+            success: `All ${inspectedRequests} pre-TLS egress requests start with DOM primary language`,
             unavailable: 'DOM language or captured request Accept-Language evidence is missing'
         }),
         evidenceCheck('wire-no-chromium-client-hints', {
@@ -2455,11 +2458,12 @@ export function evaluateWireToDomCoherence(domTelemetry, trafficEventsOrSummary,
 }
 
 /**
- * Execute an end-to-end in-browser fingerprint collection and platform coherence audit
- * on a live Camoufox page, logging and returning the full diagnostic report.
+ * Audit browser observations and return a report without raw measurements by default.
  *
  * @param {import('playwright').Page | import('puppeteer-core').Page} page
- * @param {string} [expectedOs] Expected OS ('win' | 'mac' | 'lin')
+ * @param {string | object} [expectedOs] Expected OS, or an options object with expectedOs
+ * @param {object} [options]
+ * @param {boolean} [options.includeTelemetry=false] Explicitly return raw observations in memory
  * @returns {Promise<{
  *   passed: boolean,
  *   status: string,
@@ -2483,18 +2487,13 @@ export async function auditProfileCoherence(page, expectedOs, options = {}) {
             ? expectedOs.expectedOs || expectedOs.os || null
             : expectedOs;
     const normalizedOs = normalizeTargetOs(rawExpectedOs);
-    logger.info('Running Camoufox in-browser fingerprint coherence audit...', {
-        expectedOs: normalizedOs || rawExpectedOs || 'auto'
-    });
-
     const collectedTelemetry = await collectBrowserFingerprint(page);
     const userAgent = collectedTelemetry?.navigator?.userAgent;
     if (typeof userAgent !== 'string' || !userAgent.trim()) {
         const reason = 'Browser navigator observations are unavailable';
-        logger.warn(reason);
         return {
             ...summarizeCoherenceChecks([]),
-            expectedOs: normalizedOs || rawExpectedOs || null,
+            expectedOs: normalizedOs || null,
             telemetry: null,
             reason,
             timestamp: new Date().toISOString()
@@ -2512,31 +2511,20 @@ export async function auditProfileCoherence(page, expectedOs, options = {}) {
     }
 
     const evaluation = evaluatePlatformCoherence(telemetry, normalizedOs || rawExpectedOs);
-    const report = {
+    return {
         ...evaluation,
-        expectedOs: normalizedOs || rawExpectedOs || null,
-        telemetry,
+        expectedOs: normalizedOs || null,
+        checks: evaluation.checks.map(({ name, passed, status, details }) => ({
+            name,
+            passed,
+            status: status ?? (passed ? 'passed' : 'failed'),
+            details: status === 'not-tested'
+                ? details
+                : passed ? 'Observed evidence passed this check' : 'Observed evidence failed this check'
+        })),
+        telemetry: opts.includeTelemetry === true ? telemetry : null,
         timestamp: new Date().toISOString()
     };
-
-    if (report.passed) {
-        logger.info(`Camoufox browser telemetry audit PASSED (${report.score}/100)`, {
-            expectedOs: report.expectedOs,
-            renderer: telemetry.webgl?.unmaskedRenderer,
-            canvasHash: telemetry.canvas2d?.fnv1aHash,
-            timeZone: telemetry.intl?.timeZone
-        });
-    } else {
-        const failedChecks = report.checks.filter((c) => !c.passed && c.status !== 'not-tested');
-        const untestedChecks = report.checks.filter((c) => c.status === 'not-tested').map((c) => c.name);
-        logger.warn(`Camoufox browser telemetry audit ${report.status.toUpperCase()} (${report.score}/100)`, {
-            expectedOs: report.expectedOs,
-            failedChecks,
-            untestedChecks
-        });
-    }
-
-    return report;
 }
 
 export default {

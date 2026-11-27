@@ -4,20 +4,21 @@
  */
 
 import { parseAccountCount, parseThreadCount } from './utils/cli-counts.js';
-import { loadApplicationEnvironment } from './utils/private-env.js';
+import { configurationError, loadApplicationEnvironment, resolveRecordingOptions } from './utils/private-env.js';
 import { getDefaultProfilesDirectory } from './utils/state-paths.js';
 
-try {
-    loadApplicationEnvironment();
-} catch (error) {
-    throw Object.assign(error, { code: 'PRIVATE_ENV_CONFIGURATION_ERROR' });
+loadApplicationEnvironment();
+
+const profileService = process.env.PROFILE_SERVICE?.trim() || 'gpm';
+if (!['gpm', 'dolphin', 'camoufox'].includes(profileService)) {
+    throw configurationError('PROFILE_SERVICE must be gpm, dolphin, or camoufox');
 }
 
 const configuredAccountsCount = process.env.ACCOUNTS_COUNT ?? '1';
 const configuredThreadsCount = process.env.THREADS_COUNT ?? '1';
 
 export const config = {
-    profileService: process.env.PROFILE_SERVICE || 'gpm', // 'gpm', 'dolphin', or 'camoufox'
+    profileService,
     gpmlogin: {
         apiUrl: process.env.GPM_API_URL || 'http://127.0.0.1:14517'
     },
@@ -35,7 +36,7 @@ export const config = {
         geoip: process.env.CAMOUFOX_GEOIP !== 'false', // Default: true when proxy is used
         canvasNoise: process.env.CAMOUFOX_CANVAS_NOISE !== 'false', // Default: true for cross-OS isolation
         enablePortScanProtection: process.env.CAMOUFOX_PORT_SCAN_PROTECTION !== 'false', // Default: true (Ziniao-absorbed localhost/RFC1918 LAN port-scan guard)
-        portScanProtectionMode: process.env.CAMOUFOX_PORT_SCAN_MODE || 'url-only',
+        portScanProtectionMode: process.env.CAMOUFOX_PORT_SCAN_MODE ?? 'url-only',
         allowedLocalPorts: process.env.CAMOUFOX_ALLOWED_LOCAL_PORTS
             ? process.env.CAMOUFOX_ALLOWED_LOCAL_PORTS.split(',')
                   .map((p) => parseInt(p.trim(), 10))
@@ -48,14 +49,8 @@ export const config = {
             : undefined,
         maxHammingDistance: parseInt(process.env.CAMOUFOX_CANVAS_MAX_HAMMING_DISTANCE || '0', 10),
         storageDir: getDefaultProfilesDirectory(),
-        recordTraffic: process.env.CAMOUFOX_RECORD_TRAFFIC !== 'false', // Default: true (pre-TLS Necko egress/ingress NDJSON + attribution)
-        recordBodies: process.env.CAMOUFOX_RECORD_BODIES === 'true', // Opt in to private request and WebSocket attachments
-        recordWireLog: process.env.CAMOUFOX_RECORD_WIRE_LOG !== 'false', // Default: true (writes canonical pre-TLS HTTP/1.1 & HTTP/2 wire stream to pre-tls-wire.log)
-        sslKeyLog: process.env.CAMOUFOX_SSLKEYLOG === 'true', // Private diagnostic for a dedicated browser process
-        neckoMozLog: process.env.CAMOUFOX_NECKO_MOZ_LOG === 'true', // Default: false (enables Firefox C++ Necko kernel MOZ_LOG to necko-pre-tls.moz_log)
-        neckoMozLogModules: process.env.CAMOUFOX_NECKO_MOZ_LOG_MODULES || 'timestamp,nsHttp:5,nsSocketTransport:5,nsHostResolver:4',
-        recordHar: process.env.CAMOUFOX_RECORD_HAR === 'true', // Optional sanitized HAR 1.2 archive
-        maxBodyBytes: parseInt(process.env.CAMOUFOX_TRAFFIC_MAX_BODY_BYTES || '5242880', 10) // Default: 5MB
+        ...resolveRecordingOptions(),
+        neckoMozLogModules: process.env.CAMOUFOX_NECKO_MOZ_LOG_MODULES || 'timestamp,nsHttp:5,nsSocketTransport:5,nsHostResolver:4'
     },
     gologin: {
         apiKey: process.env.GOLOGIN_API_KEY || '',
@@ -112,9 +107,6 @@ if (config.profileService === 'gpm') {
     } else {
         config.camoufox.os = String(config.camoufox.os).toLowerCase();
     }
-} else {
-    console.warn('⚠ Unknown PROFILE_SERVICE. Using default: gpm');
-    config.profileService = 'gpm';
 }
 
 if (!config.smsVerify.apiKey) {

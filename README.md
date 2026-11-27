@@ -225,16 +225,16 @@ flowchart TD
 
 ## Function reference
 
-Public entry points and selected helper methods used across the app.
+Public entry points and selected internal helpers used across the app.
 
 ### `src/index.js`
 
 | Symbol | Type | Description |
 |--------|------|-------------|
-| `saveResult(result)` | function | Appends one object to `results.json` with ISO timestamp. |
-| `createAccount(accountNumber)` | async function | Full pipeline: proxy → data → profile → `createGmailAccount` → save → cleanup. |
-| `processQueue(queue, concurrency)` | async function | Runs an array of zero-arg async factories with a sliding concurrency limit; returns stats. |
-| `main()` | async function | Parses argv/env, builds the queue, awaits `processQueue`, writes `summary.json`. |
+| `saveResult(resultsFile, result, logger)` | internal function | Appends and returns a sanitized result with an ISO timestamp. |
+| `createAccount(accountNumber = null)` | async function | Full pipeline: proxy → data → profile → `createGmailAccount` → save → cleanup. |
+| `processQueue(total, concurrency, createTask, logger, signal)` | internal async function | Calls `createTask` with a one-based task number, honors the concurrency limit, and returns `{ results, stats }`. |
+| `main({ signal, failIfAllAttemptsFail = false } = {})` | async function | Parses argv/env, runs the queue, and writes `summary.json`. |
 | `default` export | object | `{ createAccount, main }` for programmatic use. |
 
 ### `src/config.js`
@@ -259,6 +259,12 @@ Public entry points and selected helper methods used across the app.
 | `elementExists(page, selector)` | Boolean check for a selector. |
 | `waitForPageLoad(page, timeout)` | Waits for `load` / network idle style readiness. |
 | **Internal** | `detectSignInPage`, `detectSignUpPage`, `detectVerificationPage`, `detectByClassNames`, `detectByElements` — used by `detectGmailPage`. |
+
+### `src/camoufox/profile.js` page compatibility
+
+- Navigation supports a single `waitUntil` condition. Requests for multiple conditions fail before reaching the browser.
+- Multi-argument `evaluate` and `evaluateHandle` accept standalone functions or arrow functions. Page initializers registered through `evaluateOnNewDocument` require the same forms for function callbacks. Object method shorthand, bound functions, and class constructors fail before evaluation or registration.
+- `setViewport` applies width and height. Other supplied fields are compatibility metadata. A failed resize leaves the last successful viewport available.
 
 ### `src/captcha/omo-handler.js`
 
@@ -437,14 +443,13 @@ export GMAIL_CREATOR_STATE_DIR="$HOME/.local/state/gmail-account-creator"
   umask 077
   mkdir -p "$GMAIL_CREATOR_STATE_DIR/config" &&
     set -C &&
-    cat .env.example > "$GMAIL_CREATOR_STATE_DIR/.env" &&
-    : > "$GMAIL_CREATOR_STATE_DIR/config/proxies.txt"
+    cat .env.example > "$GMAIL_CREATOR_STATE_DIR/.env"
 )
 ```
 
 For existing regular files, set mode `0600` before editing `.env`, the optional `.emv`, or `config/proxies.txt`. On Windows, configure the state directory's NTFS ACL before adding credentials and verify that both existing and newly created files allow access only to the run account and authorized system principals.
 
-Add one proxy per line in `config/proxies.txt` under the state directory. Startup requires every non-comment line to be valid. To keep using an inventory from an older installation, move it into the state directory or set `GMAIL_CREATOR_LEGACY_DIR` to its installation directory.
+For a new inventory, create `config/proxies.txt` with mode `0600` on POSIX and add one proxy per line. Startup requires every non-comment line to be valid. To adopt an older inventory, move its file into the state directory or set `GMAIL_CREATOR_LEGACY_DIR` to the old installation directory and leave the current inventory absent. An existing current inventory takes precedence even if it is empty or contains only comments.
 
 ```text
 # config/proxies.txt
@@ -466,7 +471,7 @@ Add one proxy per line in `config/proxies.txt` under the state directory. Startu
 | `SMS_VERIFY_API_KEY`, `SMS_VERIFY_LANG`, `SMS_VERIFY_COUNTRIES` | Optional separate use of the SMS Verification library |
 | `SMS_PROVIDER` | `sms-verification`. The legacy adapter is disabled. |
 | `ACCOUNTS_COUNT`, `THREADS_COUNT` | Batch size and concurrency |
-| `LOG_LEVEL`, `MAX_RETRIES`, `TEST_PROXY`, `SETUP_OMO_CAPTCHA` | Runtime tuning |
+| `LOG_LEVEL`, `MAX_RETRIES`, `SETUP_OMO_CAPTCHA` | Runtime tuning |
 
 Full reference: [`ENV_VARIABLES.md`](ENV_VARIABLES.md). Additional setup notes: [`SETUP.md`](SETUP.md) (replace any sample keys with your own — never commit real secrets).
 
@@ -587,12 +592,17 @@ Then:
 npm install @code-root/gmail-account-creator
 ```
 
-Global / npx CLI (after install):
+After a local install, run the CLI from that project.
 
 ```bash
-npx @code-root/gmail-account-creator
-# or
-gmail-account-creator
+npm exec -- gmail-account-creator --help
+```
+
+Install globally to use the command on your shell's `PATH`.
+
+```bash
+npm install --global @code-root/gmail-account-creator
+gmail-account-creator --help
 ```
 
 ### Publish workflow

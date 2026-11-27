@@ -7,21 +7,27 @@
  */
 
 import {
-    appendAccountResult, migrateExistingAccountOutputs, recordAccountCleanup, writeRunSummary
+    appendAccountResult, migrateExistingAccountOutputs, needsProfileCleanupReview, recordAccountCleanup, writeRunSummary
 } from './utils/account-results.js';
 import { parseRunCountOptions, resolveRunCounts } from './utils/cli-counts.js';
 import { requireControllerProfileId } from './utils/controller-id.js';
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { setImmediate } from 'node:timers/promises';
 import path from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
+import { fileURLToPath } from 'url';
 
 const PROFILE_TYPES = new Set(['Camoufox', 'Dolphin Anty', 'GPM Login']);
-const UNCONFIRMED_CLEANUP = new Set([
-    'allocation-unconfirmed', 'stop-unconfirmed', 'delete-unconfirmed', 'recycle-unconfirmed'
-]);
 const MANUAL_SIGNUP_REQUIRED = 'MANUAL_SIGNUP_REQUIRED';
+
+function describeCleanupRecords(records) {
+    return records.map(({ entry, resultId, profileCleanup }) => {
+        const reference = entry === undefined
+            ? `resultId ${resultId}`
+            : `entry ${entry}${resultId ? ` (resultId ${resultId})` : ''}`;
+        return `${reference} (${profileCleanup})`;
+    }).join(', ');
+}
 
 function accountOutputDiagnostic(error) {
     if (error?.code === 'ACCOUNT_OUTPUT_INVALID_DATA' || error?.code === 'ACCOUNT_OUTPUT_LOCK_FAILED') {
@@ -37,7 +43,8 @@ async function prepareAccountOutputs(signal) {
     const summaryFile = path.join(STATE_DIRECTORY, 'summary.json');
     try {
         ensureStateDirectory();
-        migrateExistingAccountOutputs(resultsFile, summaryFile, { legacyDirectory: LEGACY_DIRECTORY });
+        const cleanupReview = migrateExistingAccountOutputs(resultsFile, summaryFile, { legacyDirectory: LEGACY_DIRECTORY });
+        return { resultsFile, summaryFile, cleanupReview };
     } catch (error) {
         const details = error instanceof AggregateError
             ? error.errors.map(accountOutputDiagnostic).join('')
@@ -46,7 +53,6 @@ async function prepareAccountOutputs(signal) {
             'Could not prepare results.json or summary.json in the application state directory.' + details, error
         );
     }
-    return { resultsFile, summaryFile };
 }
 
 class AccountOutputWriteError extends Error {
@@ -61,7 +67,7 @@ class AccountOutputWriteError extends Error {
 
     addUnconfirmedProfiles(outcomes) {
         for (const { profileId, profileType, profileCleanup } of outcomes) {
-            if (!UNCONFIRMED_CLEANUP.has(profileCleanup)) continue;
+            if (!needsProfileCleanupReview(profileCleanup)) continue;
             const report = {
                 profileType: PROFILE_TYPES.has(profileType) ? profileType : 'Profile',
                 profileCleanup
@@ -133,6 +139,9 @@ async function createAccount(accountNumber = null) {
     const { default: config } = await import('./config.js');
     const { resultsFile } = await prepareAccountOutputs();
     const { result, failure } = await createAccountWithRuntime(await loadRuntime(config, resultsFile), accountNumber);
+    if (result.errorCode === MANUAL_SIGNUP_REQUIRED) {
+        failure.profileCleanup = result.profileCleanup ?? 'stop-unconfirmed';
+    }
     if (!result.success) throw failure;
     return result;
 }
@@ -309,7 +318,7 @@ async function createAccountWithRuntime(runtime, accountNumber, { signal, active
             errorCode: error?.code,
             errorStage: error?.stage,
             profileId,
-            ...(profileId !== null || UNCONFIRMED_CLEANUP.has(profileCleanup) ? { profileType: serviceName } : {}),
+            ...(profileId !== null || needsProfileCleanupReview(profileCleanup) ? { profileType: serviceName } : {}),
             trafficAttribution: profile?.trafficPaths || null,
             profileCleanup,
             timestamp: new Date().toISOString()
@@ -436,7 +445,7 @@ async function processQueue(total, concurrency, createTask, logger, signal) {
  * Main function
  * الدالة الرئيسية
  */
-async function main({ signal, failIfAllAttemptsFail = false } = {}) {
+async function main({ signal, failIfAllAttemptsFail = false, notifyManualHandoff } = {}) {
     signal?.throwIfAborted();
     const args = process.argv.slice(2);
     if (args.length === 1 && (args[0] === '--help' || args[0] === '-h')) {
@@ -458,7 +467,11 @@ async function main({ signal, failIfAllAttemptsFail = false } = {}) {
     const { accountsCount, threadsCount: requestedThreads } = resolveRunCounts(countOptions);
     const threadsCount = Math.min(requestedThreads, accountsCount);
     signal?.throwIfAborted();
-    const { resultsFile, summaryFile } = await prepareAccountOutputs(signal);
+    const { resultsFile, summaryFile, cleanupReview } = await prepareAccountOutputs(signal);
+    if (cleanupReview.length) {
+        console.warn('Profile cleanup was pending or unconfirmed in results.json at startup. ' +
+            `${describeCleanupRecords(cleanupReview)}. A concurrent run may still be processing these entries.`);
+    }
     const runtime = await loadRuntime(config, resultsFile);
     const { logger, proxyManager } = runtime;
     const activeStops = new Set();
@@ -535,8 +548,10 @@ async function main({ signal, failIfAllAttemptsFail = false } = {}) {
         }
         logger.info('Summary saved to summary.json');
 
-        if (results.some(({ profileCleanup }) => UNCONFIRMED_CLEANUP.has(profileCleanup))) {
-            const error = new Error('Managed profile cleanup is unconfirmed. Review summary.json and resolve the reported cleanup before continuing.');
+        const uncheckedCleanup = results.filter(({ profileCleanup }) => needsProfileCleanupReview(profileCleanup));
+        if (uncheckedCleanup.length) {
+            const error = new Error('Managed profile cleanup is unconfirmed. ' +
+                `Review results.json for ${describeCleanupRecords(uncheckedCleanup)} and resolve the reported cleanup before continuing.`);
             error.code = 'PROFILE_CLEANUP_UNCONFIRMED';
             throw error;
         }
@@ -547,7 +562,7 @@ async function main({ signal, failIfAllAttemptsFail = false } = {}) {
         }
         if (!signal?.aborted && results.some(({ errorCode, profileCleanup }) =>
             errorCode === MANUAL_SIGNUP_REQUIRED && profileCleanup === 'stopped')) {
-            logger.warn('Continue signup manually in a trusted browser you control.');
+            (notifyManualHandoff ?? logger.warn)('Continue signup manually in a trusted browser you control.');
         }
         logger.info(signal?.aborted ? '=== Bot execution interrupted ===' : '=== Bot execution completed ===');
     } catch (error) {
@@ -571,7 +586,11 @@ export async function runCli() {
     process.on('SIGTERM', onSigterm);
 
     try {
-        await main({ signal: controller.signal, failIfAllAttemptsFail: true });
+        await main({
+            signal: controller.signal,
+            failIfAllAttemptsFail: true,
+            notifyManualHandoff: console.log
+        });
     } catch (error) {
         if (error !== controller.signal.reason) {
             const safeMessage = error instanceof AccountOutputWriteError ||
@@ -592,14 +611,11 @@ export async function runCli() {
 const isMainModule = (() => {
     if (!process.argv[1]) return false;
     try {
-        const mainModulePath = pathToFileURL(path.resolve(process.argv[1])).href;
-        const currentModulePath = pathToFileURL(fileURLToPath(import.meta.url)).href;
-        return mainModulePath === currentModulePath;
+        const currentModulePath = fileURLToPath(import.meta.url);
+        return path.resolve(process.argv[1]) === currentModulePath ||
+            realpathSync.native(process.argv[1]) === realpathSync.native(currentModulePath);
     } catch {
-        // Fallback: check if import.meta.url matches process.argv[1]
-        const mainPath = process.argv[1].replace(/\\/g, '/');
-        const currentPath = fileURLToPath(import.meta.url).replace(/\\/g, '/');
-        return path.resolve(mainPath) === path.resolve(currentPath);
+        return false;
     }
 })();
 

@@ -3,7 +3,6 @@
  * عميل GoLogin API
  */
 
-import dotenv from 'dotenv';
 import axios from 'axios';
 import net from 'node:net';
 import logger from '../utils/logger.js';
@@ -11,12 +10,12 @@ import { profileIdPathComponent, requireControllerProfileId } from '../utils/con
 import { controllerRequestOptions } from '../utils/controller-url.js';
 import {
     ControllerRequestError, controllerAcknowledged, controllerErrorDetails, controllerRejected,
-    parseControllerPayload, profileAllocationUnconfirmed, sendControllerRequest
+    controllerRequestFailedBeforeDispatch, parseControllerPayload, profileAllocationUnconfirmed, sendControllerRequest
 } from '../utils/controller-request.js';
-import { loadPrivateEnvironment } from '../utils/private-env.js';
+import { loadApplicationEnvironment } from '../utils/private-env.js';
 import { requireProxyProtocol } from '../utils/proxy-protocol.js';
 
-loadPrivateEnvironment('.emv', '.env', env => !env.GOLOGIN_API_KEY, dotenv.parse, dotenv.decrypt);
+loadApplicationEnvironment();
 
 const GOLOGIN_API_ORIGIN = 'https://api.gologin.com';
 const supportedProfileOs = new Set(['lin', 'mac', 'win']);
@@ -63,6 +62,13 @@ function formatGoLoginProxy(proxy) {
 function unconfirmedWrite(operation, cause) {
     const error = new Error(`GoLogin ${operation} could not be confirmed`, { cause });
     return operation === 'profile creation' ? profileAllocationUnconfirmed(error) : error;
+}
+
+class GoLoginWriteRejected extends Error {}
+
+export function isGoLoginWriteRejected(error) {
+    if (error instanceof GoLoginWriteRejected || controllerRequestFailedBeforeDispatch(error)) return true;
+    return error instanceof ControllerRequestError && error.status >= 400 && error.status < 500 && error.status !== 408;
 }
 
 /**
@@ -125,14 +131,25 @@ export class GoLoginClient {
 
     async #write(method, endpoint, operation, data) {
         const response = await this.#request(method, endpoint, data).catch(error => {
-            const status = error?.status;
-            if (error instanceof ControllerRequestError && (status === undefined || status === 408 || status >= 500)) {
+            if (error instanceof ControllerRequestError && !isGoLoginWriteRejected(error)) {
                 throw unconfirmedWrite(operation, error);
             }
             throw error;
         });
-        if (controllerRejected(response.data)) throw new Error(`GoLogin API rejected ${operation}`);
+        if (controllerRejected(response.data)) {
+            if (response.status === 200 || (method === 'POST' && response.status === 201)) {
+                throw new GoLoginWriteRejected(`GoLogin API rejected ${operation}`);
+            }
+            throw unconfirmedWrite(operation);
+        }
         return response;
+    }
+
+    async #readProfileData(endpoint) {
+        const data = parseControllerPayload(await this.request('GET', endpoint));
+        if (controllerRejected(data)) throw new Error('GoLogin API rejected the profile read');
+        if (!data || typeof data !== 'object') throw new Error('GoLogin returned an invalid profile response');
+        return data;
     }
 
     /**
@@ -141,11 +158,9 @@ export class GoLoginClient {
      */
     async getProfiles(page = 1, limit = 50) {
         try {
-            const response = await this.request(
-                'GET',
+            return await this.#readProfileData(
                 `/browser/v2?page=${page}&limit=${limit}&sorterField=createdAt&sorterOrder=descend`
             );
-            return response;
         } catch (error) {
             throw new Error(`Failed to get profiles: ${error.message}`);
         }
@@ -253,8 +268,7 @@ export class GoLoginClient {
      */
     async getProfile(profileId) {
         try {
-            const response = await this.request('GET', `/browser/${profileIdPathComponent(profileId)}`);
-            return response;
+            return await this.#readProfileData(`/browser/${profileIdPathComponent(profileId)}`);
         } catch (error) {
             throw new Error(`Failed to get profile: ${error.message}`);
         }
@@ -266,8 +280,7 @@ export class GoLoginClient {
      */
     async startProfile(profileId) {
         try {
-            const response = await this.request('GET', `/browser/${profileIdPathComponent(profileId)}`);
-            return response;
+            return await this.#readProfileData(`/browser/${profileIdPathComponent(profileId)}`);
         } catch (error) {
             throw new Error(`Failed to start profile: ${error.message}`);
         }

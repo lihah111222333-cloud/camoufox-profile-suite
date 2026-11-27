@@ -19,6 +19,7 @@ import { requireControllerProfileId } from '../utils/controller-id.js';
 import {
     controllerAcknowledged,
     controllerErrorDetails,
+    controllerProfileMatches,
     controllerRejected,
     parseControllerPayload,
     requireCreatedProfileId,
@@ -50,6 +51,11 @@ function dolphinErrorCode(data) {
     const code = data?.code;
     if (code === 12001 || code === '12001') return '12001';
     if (code === 50200 || code === '50200') return '50200';
+}
+
+function dolphinRejected(data) {
+    return controllerRejected(data) || dolphinErrorCode(data) !== undefined ||
+        (data?.code != null && typeof data.message === 'string');
 }
 
 function dolphinPost(operation, path, body, timeout, { authorization, allocatesProfile = false } = {}) {
@@ -396,8 +402,11 @@ export async function getProfile(profileId) {
     try {
         const id = requireControllerProfileId(profileId);
         const response = await dolphinPost('Dolphin Anty API get profile', '/api/profile/detail', { profileId: id }, 10000);
-        if (controllerRejected(response.data)) throw new Error('Dolphin Anty API rejected the profile lookup');
-        return response.data;
+        const profile = parseControllerPayload(response.data);
+        if (response.status !== 200 || dolphinRejected(profile) || !controllerProfileMatches(profile, id)) {
+            throw new Error('Dolphin Anty API returned an invalid profile response');
+        }
+        return profile;
     } catch (error) {
         logger.error('Dolphin Anty API get profile failed', controllerErrorDetails(error));
         throw error;
@@ -423,7 +432,12 @@ export async function updateProfileProxy(profileIds, proxy) {
 
         const response = await dolphinPost('Dolphin Anty API update profile proxy', '/api/profile/updateProfileBaseProxy',
             requestBody, 15000);
-        if (controllerRejected(response.data)) throw new Error('Dolphin Anty API rejected the proxy update');
+        // The documented HTTP 200 response may omit the body.
+        const emptySuccess = response.status === 200 && (response.data === undefined || response.data === '');
+        if (!emptySuccess &&
+            (!controllerAcknowledged(response) || dolphinRejected(parseControllerPayload(response.data)))) {
+            throw new Error('Dolphin Anty API did not confirm the proxy update');
+        }
         logger.info('Dolphin Anty profile proxy updated successfully');
         return {
             success: true,
@@ -445,6 +459,11 @@ export async function updateProfileProxy(profileIds, proxy) {
  * الحصول على قائمة المجلدات
  */
 export async function getFolderList(page = 1, pageSize = 100) {
+    const { data } = await readFolderPage(page, pageSize);
+    return data;
+}
+
+async function readFolderPage(page, pageSize) {
     const operation = 'Dolphin Anty API list folders';
     const auth = getAuthHeader();
     const request = authorization => dolphinPost(operation, '/api/folder/list', { page, pageSize }, 10000, { authorization });
@@ -452,21 +471,21 @@ export async function getFolderList(page = 1, pageSize = 100) {
     try {
         response = await request(auth);
     } catch (error) {
-        if (error.status !== 401 || auth.startsWith('Bearer ')) throw error;
-        response = await request(`Bearer ${auth}`);
+        if (error.status !== 401 || /\s/.test(auth.trim())) throw error;
+        response = await request(`Bearer ${auth.trim()}`);
     }
-    const data = readJsonResponse(response.data, operation);
-    if (controllerRejected(data)) throw new Error('Dolphin Anty API rejected the folder lookup');
-    return data;
-}
 
-function folderListItems(data) {
-    if (Array.isArray(data)) return data;
-    const folders = [data?.list, data?.data, data?.folders].find(Array.isArray);
-    if (!folders) {
+    const data = readJsonResponse(response.data, operation);
+    const folders = Array.isArray(data) ? data : [data?.list, data?.data, data?.folders].find(Array.isArray);
+    if (response.status !== 200 || dolphinRejected(data) ||
+        !folders || folders.some(folder => !folder || typeof folder !== 'object' || Array.isArray(folder))) {
         throw new Error('Dolphin Anty API returned an invalid folder list');
     }
-    return folders;
+    return { data, folders };
+}
+
+function folderCount(value) {
+    return typeof value === 'string' && /^[0-9]+$/.test(value.trim()) ? Number(value) : value;
 }
 
 function readFolderId(folder) {
@@ -482,12 +501,38 @@ function readFolderId(folder) {
 export async function getAllFolders() {
     const pageSize = 100;
     const allFolders = [];
+    const seenIds = new Set();
+    let expectedTotal;
     for (let page = 1; ; page++) {
-        const data = await getFolderList(page, pageSize);
-        const folders = folderListItems(data);
+        const { data, folders } = await readFolderPage(page, pageSize);
+        const nextLength = allFolders.length + folders.length;
+        const total = data.total === undefined ? expectedTotal : folderCount(data.total);
+        if (data.total === undefined) {
+            const returnedPageSize = data.pageSize === undefined ? pageSize : folderCount(data.pageSize);
+            const shortPage = Number.isSafeInteger(returnedPageSize) &&
+                folders.length < Math.min(returnedPageSize, pageSize);
+            const complete = expectedTotal === undefined ? shortPage : nextLength === expectedTotal;
+            if (data.totalNum !== undefined || !complete) {
+                throw new Error('Dolphin Anty API did not confirm that the folder list is complete');
+            }
+            if (expectedTotal === undefined) return folders;
+        }
+
+        if (!Number.isSafeInteger(total) || total < nextLength ||
+            (expectedTotal !== undefined && total !== expectedTotal) ||
+            (folders.length === 0 && allFolders.length < total)) {
+            throw new Error('Dolphin Anty API returned inconsistent folder pagination');
+        }
+        expectedTotal = total;
+        for (const folder of folders) {
+            const id = readFolderId(folder);
+            if (id === null) continue;
+            const key = String(id);
+            if (seenIds.has(key)) throw new Error('Dolphin Anty API returned duplicate folder IDs across the list');
+            seenIds.add(key);
+        }
         allFolders.push(...folders);
-        const total = Number(data.total);
-        if (folders.length === 0 || !Number.isSafeInteger(total) || allFolders.length >= total) return allFolders;
+        if (allFolders.length === expectedTotal) return allFolders;
     }
 }
 
@@ -538,7 +583,7 @@ export async function createFolder(folderName, folderColor = '#3370FF', sortOrde
  * الحصول على أول مجلد متاح من القائمة
  */
 export async function getFirstAvailableFolder() {
-    const [folder] = folderListItems(await getFolderList(1, 100));
+    const { folders: [folder] } = await readFolderPage(1, 100);
     return readFolderId(folder);
 }
 

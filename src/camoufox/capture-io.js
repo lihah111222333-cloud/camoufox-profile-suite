@@ -132,10 +132,13 @@ function withCaptureDirectory(trafficDir, parents, trustedLocal, useDirectory) {
     }
 }
 
-function withCaptureFile(trafficDir, components, { trustedLocal, maxBytes, flags }, useFile) {
+function withCaptureFile(trafficDir, components, { trustedLocal, maxBytes, flags, prefixBytes }, useFile) {
     const maximum = trustedLocal ? MAX_LOCAL_BYTES : MAX_CAPTURE_BYTES;
     if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > maximum) {
         throw captureError('Invalid capture file size limit');
+    }
+    if (prefixBytes !== undefined && (!Number.isSafeInteger(prefixBytes) || prefixBytes < 0)) {
+        throw captureError('Invalid capture file prefix length');
     }
     const name = components.at(-1);
     return withCaptureDirectory(trafficDir, components.slice(0, -1), trustedLocal, (directory, verifyDirectories) => {
@@ -144,7 +147,7 @@ function withCaptureFile(trafficDir, components, { trustedLocal, maxBytes, flags
         if (!before.isFile() || before.nlink !== 1n) {
             throw captureError('Capture entry must be a regular file with one directory link');
         }
-        if (before.size > BigInt(maxBytes)) {
+        if ((prefixBytes === undefined ? before.size : BigInt(prefixBytes)) > BigInt(maxBytes)) {
             throw captureError(`Capture entry exceeds ${maxBytes} bytes`, 'ERR_CAPTURE_TOO_LARGE');
         }
 
@@ -246,12 +249,12 @@ export function readCaptureFile(trafficDir, fileName, {
     return accessCaptureArtifact(trafficDir, fileName, { optional, trustedLocal, maxBytes }, readBytes);
 }
 
-function accessCaptureArtifact(trafficDir, fileName, { optional, trustedLocal, maxBytes }, useFile) {
+function accessCaptureArtifact(trafficDir, fileName, { optional, trustedLocal, maxBytes, prefixBytes }, useFile) {
     const components = captureFileComponents(fileName);
     if (optional && !SECURE_DIRECTORY_OPEN && !trustedLocal &&
         !fs.lstatSync(path.join(trafficDir, ...components), { throwIfNoEntry: false })) return null;
     try {
-        return withCaptureFile(trafficDir, components, { trustedLocal, maxBytes, flags: fs.constants.O_RDONLY }, useFile);
+        return withCaptureFile(trafficDir, components, { trustedLocal, maxBytes, prefixBytes, flags: fs.constants.O_RDONLY }, useFile);
     } catch (error) {
         if (optional && error.code === 'ENOENT') return null;
         throw error;
@@ -262,9 +265,9 @@ function accessCaptureArtifact(trafficDir, fileName, { optional, trustedLocal, m
 export function hashCaptureFile(trafficDir, fileName, {
     optional = false, trustedLocal = false, maxBytes = MAX_CAPTURE_BYTES, prefixBytes
 } = {}) {
-    return accessCaptureArtifact(trafficDir, fileName, { optional, trustedLocal, maxBytes }, (fd, size, verifyFile) => {
+    return accessCaptureArtifact(trafficDir, fileName, { optional, trustedLocal, maxBytes, prefixBytes }, (fd, size, verifyFile) => {
         const length = prefixBytes ?? size;
-        if (!Number.isSafeInteger(length) || length < 0 || length > size) {
+        if (length > size) {
             throw captureError(`${fileName} byte length mismatch`);
         }
 

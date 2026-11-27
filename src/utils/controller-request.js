@@ -38,6 +38,10 @@ export async function sendControllerRequest(operation, send, getProviderCode) {
     }
 }
 
+export function controllerRequestFailedBeforeDispatch(error) {
+    return error instanceof ControllerRequestError && error.status === undefined && beforeConnectionCodes.has(error.transportCode);
+}
+
 export function profileAllocationUnconfirmed(error) {
     return Object.assign(error, {
         code: 'PROFILE_ALLOCATION_UNCONFIRMED',
@@ -87,6 +91,11 @@ export function parseControllerPayload(data) {
 export function controllerRejected(data) {
     const payload = parseControllerPayload(data);
     return payload === false || payload?.success === false;
+}
+
+export function controllerProfileMatches(data, profileId) {
+    const id = data?.id;
+    return (typeof id === 'string' || Number.isSafeInteger(id)) && String(id) === String(profileId);
 }
 
 export function controllerAcknowledged({ status, data }) {

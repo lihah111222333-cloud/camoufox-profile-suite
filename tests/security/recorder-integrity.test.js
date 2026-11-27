@@ -403,3 +403,181 @@ test('legacy native archive migration keeps the new capture under its writer lea
     assert.deepEqual(fs.readFileSync(preserved), original);
     assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
 });
+
+test('capture-relative custom wire logs verify and are reused on open', async (t) => {
+    const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'recorder-wire-name-'));
+    t.after(() => fs.rmSync(root, { force: true, recursive: true }));
+    const trafficDir = path.join(root, 'traffic');
+    const fileName = 'named wire.log';
+    const preTlsWireLogPath = path.join(trafficDir, fileName);
+    const recorder = new CamoufoxTrafficRecorder({ trafficDir, preTlsWireLogPath });
+    recorder.recordSecurityBlock({ type: 'fixture', url: 'https://example.test/first' });
+    const first = await recorder.stop();
+    assert.equal(first.integrity.preTlsWireLogFile, fileName);
+    assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+
+    const resumed = new CamoufoxTrafficRecorder({ trafficDir });
+    resumed.recordSecurityBlock({ type: 'fixture', url: 'https://example.test/next' });
+    const second = await resumed.stop();
+    assert.equal(second.integrity.preTlsWireLogFile, fileName);
+    assert.ok(second.integrity.preTlsWireLogBytes > first.integrity.preTlsWireLogBytes);
+    assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+    assert.equal(fs.existsSync(path.join(trafficDir, 'pre-tls-wire.log')), false);
+
+    const indexPath = resumed.attributionIndexPath;
+    second.integrity.preTlsWireLogFile = 'traffic.ndjson';
+    fs.writeFileSync(indexPath, JSON.stringify(second));
+    assert.match(verifyTrafficIntegrity(trafficDir).errors.join('\n'), /Invalid capture wire log file name/);
+});
+
+test('a reset failure aborts before starting a new chain over a retained ledger', async (t) => {
+    const { trafficDir, recorder, create, ledgerPath, indexPath } = fixture(t);
+    recorder.setStep('before reset');
+    await recorder.stop();
+    const ledger = fs.readFileSync(ledgerPath);
+    const index = fs.readFileSync(indexPath);
+    const remove = fs.rmSync;
+    fs.rmSync = (filePath, ...args) => {
+        if (filePath === ledgerPath) throw Object.assign(new Error('fixture reset failure'), { code: 'EACCES' });
+        return remove(filePath, ...args);
+    };
+    try {
+        assert.throws(() => create({ resetTrafficOnStart: true }), { code: 'EACCES' });
+    } finally {
+        fs.rmSync = remove;
+    }
+    assert.deepEqual(fs.readFileSync(ledgerPath), ledger);
+    assert.deepEqual(fs.readFileSync(indexPath), index);
+    assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+
+    const resumed = create();
+    resumed.setStep('after reopening');
+    assert.equal((await resumed.stop()).integrity.eventCount, 2);
+    assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+});
+
+test('recovery preserves an unfinished wire block and refuses to seal it', async (t) => {
+    for (const cutAt of ['opening separator', 'middle of request line']) {
+        await t.test(cutAt, async (t) => {
+            const { recorder, create, ledgerPath, indexPath } = fixture(t);
+            recorder.recordSecurityBlock({ type: 'fixture', url: 'https://example.test/before' });
+            await recorder.flushSummary();
+            const index = fs.readFileSync(indexPath);
+            const context = new EventEmitter();
+            recorder.attachContext(context);
+            const write = fs.writeFileSync;
+            fs.writeFileSync = (file, data, ...args) => {
+                if (typeof data === 'string' && data.includes('GET /wire-interrupted HTTP/1.1')) {
+                    const count = cutAt === 'opening separator' ? data.indexOf('\n') + 1
+                        : data.indexOf('GET /wire-interrupted') + 'GET /wire-inter'.length;
+                    write(file, data.slice(0, count), ...args);
+                    throw Object.assign(new Error('fixture wire short write'), { code: 'ENOSPC' });
+                }
+                return write(file, data, ...args);
+            };
+            try {
+                context.emit('request', { method: () => 'GET', url: () => 'https://example.test/wire-interrupted' });
+                await assert.rejects(recorder.stop(), /Could not append to pre-tls-wire.log/);
+            } finally {
+                fs.writeFileSync = write;
+            }
+            const wire = fs.readFileSync(recorder.preTlsWireLogPath);
+            const ledger = fs.readFileSync(ledgerPath);
+            assert.equal(readEvents(ledgerPath).length, 2);
+            assert.throws(() => create(), { code: 'ERR_CAPTURE_INCOMPLETE_WIRE' });
+            assert.deepEqual(fs.readFileSync(recorder.preTlsWireLogPath), wire);
+            assert.deepEqual(fs.readFileSync(ledgerPath), ledger);
+            assert.deepEqual(fs.readFileSync(indexPath), index);
+        });
+    }
+});
+
+test('a completion-only request contributes exact measured sizes before and after reopen', async (t) => {
+    const { recorder, create, ledgerPath } = fixture(t, { recordWireLog: false });
+    const context = new EventEmitter();
+    recorder.attachContext(context);
+    const request = {
+        url: () => 'https://example.test/in-flight',
+        sizes: async () => ({
+            requestHeadersSize: 80,
+            requestBodySize: 0,
+            responseHeadersSize: 100,
+            responseBodySize: 200
+        })
+    };
+    context.emit('requestfinished', request);
+    context.emit('requestfinished', request);
+    const live = await recorder.stop();
+    assert.deepEqual(readEvents(ledgerPath).map(({ type }) => type), ['request-finished']);
+    assert.equal(live.totals.totalRequests, 0);
+    assert.equal(live.totals.totalResponses, 0);
+    assert.equal(live.totals.totalEgressBytes, 80);
+    assert.equal(live.totals.totalIngressBytes, 300);
+    const recovered = await create().stop();
+    assert.deepEqual(recovered.totals, live.totals);
+    assert.deepEqual(recovered.byDomain, live.byDomain);
+    assert.deepEqual(recovered.byActionStep, live.byActionStep);
+});
+
+test('redirected requests retain the originating action after the first request completes', async (t) => {
+    const { recorder, ledgerPath } = fixture(t, { recordWireLog: false });
+    const context = new EventEmitter();
+    const frame = { url: () => 'https://example.test/' };
+    recorder.attachContext(context);
+    const request = (pathname) => ({
+        method: () => 'GET', url: () => 'https://example.test/' + pathname, frame: () => frame
+    });
+    const record = (req, status) => {
+        context.emit('request', req);
+        context.emit('response', { request: () => req, url: req.url, status: () => status });
+        context.emit('requestfinished', req);
+    };
+
+    recorder.setStep('origin step');
+    const initialAction = recorder.recordTriggerAction('page.click', '#initial', {}, frame);
+    const initialRequest = request('initial');
+    record(initialRequest, 302);
+    await recorder.flushSummary();
+    assert.equal(recorder.transactions.size, 0);
+
+    recorder.setStep('other step');
+    const otherAction = recorder.recordTriggerAction('page.click', '#other', {}, frame);
+    const redirected = request('redirected');
+    redirected.redirectedFrom = () => initialRequest;
+    record(redirected, 200);
+    record(request('unrelated'), 204);
+    await recorder.stop();
+
+    const egress = new Map(readEvents(ledgerPath).filter(event => event.type === 'egress').map(event => [event.url, event]));
+    const parent = egress.get(initialRequest.url());
+    const child = egress.get(redirected.url());
+    const other = egress.get('https://example.test/unrelated');
+    assert.equal(child.redirectedFromCorrelationId, parent.correlationId);
+    assert.equal(child.triggerAction.actionId, initialAction.actionId);
+    assert.equal(child.attribution.actionStep, 'origin step');
+    assert.equal(other.triggerAction.actionId, otherAction.actionId);
+    assert.equal(other.attribution.actionStep, 'other step');
+});
+
+test('closing a page releases its open socket listeners while other pages keep recording', async (t) => {
+    const { recorder } = fixture(t, { recordWireLog: false });
+    const closedPage = new EventEmitter();
+    const activePage = new EventEmitter();
+    const makeSocket = name => Object.assign(new EventEmitter(), { url: () => 'wss://example.test/' + name });
+    const closedSocket = makeSocket('closed-page');
+    const activeSocket = makeSocket('active-page');
+    recorder.attachPage(closedPage);
+    recorder.attachPage(activePage);
+    closedPage.emit('websocket', closedSocket);
+    activePage.emit('websocket', activeSocket);
+
+    closedPage.emit('close');
+    for (const event of ['framesent', 'framereceived', 'socketerror', 'close']) {
+        assert.equal(closedSocket.listenerCount(event), 0);
+        assert.equal(activeSocket.listenerCount(event), 1);
+    }
+    activeSocket.emit('framesent', { payload: 'fixture' });
+    activeSocket.emit('close');
+    assert.equal(recorder.webSocketDisposers.size, 0);
+    assert.equal((await recorder.stop()).totals.wsFramesSent, 1);
+});

@@ -143,6 +143,7 @@ test('Proxy parsing preserves unambiguous legacy and URL credentials', async t =
     const result = runModule(root, `
         import assert from 'node:assert/strict';
         import manager from './src/utils/proxy-manager.js';
+        import { normalizeProxy } from './src/camoufox/client.js';
 
         for (const [input, expected] of [
             ['proxy.invalid:8080:user:part@word:end', ['http', 'proxy.invalid', '8080', 'user', 'part@word:end']],
@@ -153,9 +154,41 @@ test('Proxy parsing preserves unambiguous legacy and URL credentials', async t =
             const { type, ip, port, username, password } = manager.parseProxyLine(input);
             assert.deepEqual([type, ip, port, username, password], expected);
         }
-        assert.equal(manager.parseProxyLine('https://user:123:part@proxy.invalid:443'), null);
+        for (const invalid of [
+            'https://user:123:fixture-marker@proxy.invalid:443',
+            'https://user:123:fixture-marker@proxy.invalid:443/unexpected-path',
+            'https://user:fixture-marker@proxy.invalid'
+        ]) {
+            assert.equal(manager.parseProxyLine(invalid), null);
+            assert.throws(() => normalizeProxy(invalid), error =>
+                /Invalid or ambiguous proxy configuration/.test(error.message) &&
+                !error.message.includes('fixture-marker'));
+        }
     `);
     assert.equal(result.status, 0, result.stderr);
+});
+
+test('successful proxy updates log status without the endpoint or credentials', async t => {
+    const root = await makeFixture(t);
+    const result = runModule(root, `
+        import { createProfile, updateProfileProxy } from './src/camoufox/client.js';
+        const proxy = {
+            server: 'https://fixture-proxy.invalid:8443',
+            username: 'fixture-proxy-user',
+            password: 'fixture-proxy-password'
+        };
+        await createProfile('fixture', proxy, { profileId: 'fixture' });
+        await updateProfileProxy('fixture', proxy);
+    `);
+    assert.equal(result.status, 0, result.stderr);
+    const [name] = await readdir(path.join(root, 'logs'));
+    const logs = await readFile(path.join(root, 'logs', name), 'utf8');
+    for (const output of [result.stdout, logs]) {
+        assert.match(output, /Updated Camoufox profile proxy configuration.*"hasProxy":true/);
+        assert.ok(!output.includes(fixtureProxyHost));
+        assert.ok(!output.includes(fixtureUser));
+        assert.ok(!output.includes(fixturePassword));
+    }
 });
 
 test('Existing proxy files become private and a failed reload cannot reuse a stale or empty pool', async t => {
@@ -237,6 +270,7 @@ test('The common dotenv loader protects both files and preserves exported enviro
 
 test('The application interprets commented dotenv settings consistently across Node versions', async t => {
     const root = await makeFixture(t);
+    const escaped = String.raw`fixture \"quoted\" label`;
     await writeFile(path.join(root, '.env'), [
         '# Synthetic settings',
         'ACCOUNTS_COUNT=1',
@@ -246,6 +280,9 @@ test('The application interprets commented dotenv settings consistently across N
         'CAMOUFOX_STORAGE_DIR="./fixture # store" # storage directory',
         "SMS_VERIFY_API_KEY='fixture#literal' # only this part is a comment",
         'FIXTURE_COMMENTED_EMPTY= # empty',
+        'FIXTURE_COLON: fixture-value',
+        'FIXTURE_ESCAPED="' + escaped + '"',
+        'FIXTURE_CARRIAGE_RETURN="first\\rsecond"',
         'FIXTURE_LINES="first\\nsecond"',
         'FIXTURE_MULTILINE="first',
         'second"'
@@ -261,6 +298,9 @@ test('The application interprets commented dotenv settings consistently across N
         assert.equal(config.smsVerify.apiKey, 'fixture#literal');
         assert.equal(process.env.FIXTURE_EMPTY, '');
         assert.equal(process.env.FIXTURE_COMMENTED_EMPTY, '');
+        assert.equal(process.env.FIXTURE_COLON, 'fixture-value');
+        assert.equal(process.env.FIXTURE_ESCAPED, ${JSON.stringify(escaped)});
+        assert.equal(process.env.FIXTURE_CARRIAGE_RETURN, 'first\\rsecond');
         assert.equal(process.env.FIXTURE_LINES, 'first\\nsecond');
         assert.equal(process.env.FIXTURE_MULTILINE, 'first\\nsecond');
     `);
@@ -414,7 +454,6 @@ test('Skipping a state fallback file does not allow legacy configuration to take
 
 async function stubGoLoginModules(root) {
     for (const [name, content] of Object.entries({
-        dotenv: "module.exports = { parse: require('node:util').parseEnv };",
         axios: 'function request() { throw new Error("Unexpected transport call"); } request.create = () => request; module.exports = request;'
     })) {
         const directory = path.join(root, 'node_modules', name);
@@ -440,25 +479,151 @@ test('Standalone GoLogin startup reads its key from the private state source', a
     if (posix) assert.equal(await permissions(state, '.env'), 0o600);
 });
 
-test('An exported GoLogin key keeps the state source in either import order', async t => {
+test('Application and standalone GoLogin imports resolve the same configuration source and key', async t => {
     const root = await makeFixture(t);
     const state = path.join(root, 'operator-state');
     await mkdir(state, { mode: 0o700 });
     await stubGoLoginModules(root);
-    await writeFile(path.join(state, '.env'), 'PROFILE_SERVICE=camoufox\nGOLOGIN_API_KEY=fixture-state-key\n', { mode: 0o600 });
-    await writeFile(path.join(root, '.emv'), 'PROFILE_SERVICE=dolphin\nDOLPHIN_API_KEY=fixture-legacy-key\n', { mode: 0o600 });
-    const env = { GMAIL_CREATOR_STATE_DIR: state, GMAIL_CREATOR_LEGACY_DIR: root, GOLOGIN_API_KEY: 'fixture-exported' };
+    const primary = path.join(state, '.env');
+    await writeFile(primary, 'PROFILE_SERVICE=camoufox\nGOLOGIN_API_KEY=fixture-primary-key\n', { mode: 0o600 });
+    await writeFile(path.join(state, '.emv'), 'PROFILE_SERVICE=dolphin\nGOLOGIN_API_KEY=fixture-fallback-key\nLOG_LEVEL=debug\n', { mode: 0o600 });
+    await writeFile(path.join(root, '.env'), 'DOLPHIN_API_KEY=fixture-legacy-key\n', { mode: 0o600 });
+    const env = { GMAIL_CREATOR_STATE_DIR: state, GMAIL_CREATOR_LEGACY_DIR: root };
 
-    for (const first of ['config.js', 'gologin/client.js']) {
+    const check = (first, expected, overrides) => {
         const result = runModule(root, `
             import assert from 'node:assert/strict';
             await import('./src/' + ${JSON.stringify(first)});
             const { default: config } = await import('./src/config.js');
             const { getGoLoginApiKey } = await import('./src/gologin/client.js');
-            assert.equal(getGoLoginApiKey(), 'fixture-exported');
+            assert.equal(getGoLoginApiKey(), ${JSON.stringify(expected)});
+            assert.equal(config.gologin.apiKey, getGoLoginApiKey());
             assert.equal(config.profileService, 'camoufox');
+            assert.equal(process.env.LOG_LEVEL, undefined);
             assert.equal(process.env.DOLPHIN_API_KEY, undefined);
-        `, env);
+        `, { ...env, ...overrides });
         assert.equal(result.status, 0, result.stderr);
+    };
+
+    for (const first of ['config.js', 'gologin/client.js']) {
+        check(first, 'fixture-primary-key');
+        check(first, 'fixture-exported', { GOLOGIN_API_KEY: 'fixture-exported' });
     }
+    await writeFile(primary, 'PROFILE_SERVICE=camoufox\n');
+    for (const first of ['config.js', 'gologin/client.js']) {
+        check(first, 'fixture-fallback-key');
+    }
+});
+
+
+test('An independent state directory works when HOME cannot be traversed', {
+    skip: !posix || process.geteuid() === 0
+}, async t => {
+    const root = await makeFixture(t);
+    const parent = path.join(root, 'home-parent');
+    const home = path.join(parent, 'home');
+    await mkdir(home, { recursive: true });
+    await writeFile(path.join(root, '.env'), 'PROFILE_SERVICE=camoufox\n', { mode: 0o600 });
+    await chmod(parent, 0o000);
+    try {
+        const result = runModule(root, `
+            import assert from 'node:assert/strict';
+            import { statSync } from 'node:fs';
+            assert.throws(() => statSync(process.env.HOME), { code: 'EACCES' });
+            const { default: config } = await import('./src/config.js');
+            assert.equal(config.profileService, 'camoufox');
+        `, { HOME: home });
+        assert.equal(result.status, 0, result.stderr);
+    } finally {
+        await chmod(parent, 0o700);
+    }
+});
+
+test('An unrelated launch setting and an empty override preserve a configured profile service', async t => {
+    const root = await makeFixture(t);
+    await writeFile(path.join(root, '.emv'), 'PROFILE_SERVICE=camoufox\n', { mode: 0o600 });
+    const readService = `
+        const { default: config } = await import('./src/config.js');
+        console.log(config.profileService);
+    `;
+    const fallback = runModule(root, readService, { DOLPHIN_API_KEY: 'fixture-unused' });
+    assert.equal(fallback.status, 0, fallback.stderr);
+    assert.equal(fallback.stdout.trim(), 'camoufox');
+
+    await writeFile(path.join(root, '.env'), 'PROFILE_SERVICE=dolphin\n', { mode: 0o600 });
+    const empty = runModule(root, readService, { PROFILE_SERVICE: '' });
+    assert.equal(empty.status, 0, empty.stderr);
+    assert.equal(empty.stdout.trim(), 'dolphin');
+    const override = runModule(root, readService, { PROFILE_SERVICE: 'camoufox' });
+    assert.equal(override.status, 0, override.stderr);
+    assert.equal(override.stdout.trim(), 'camoufox');
+
+    const invalid = runNode(root, ['bin/gmail-account-creator.js'], { PROFILE_SERVICE: 'fixture-unknown' });
+    assert.equal(invalid.status, 1, invalid.stderr);
+    assert.match(invalid.stderr, /PROFILE_SERVICE must be gpm, dolphin, or camoufox/);
+});
+
+test('Invalid recording settings are rejected before startup and valid limits are exact', async t => {
+    const root = await makeFixture(t);
+    for (const [key, value] of [
+        ['CAMOUFOX_RECORD_TRAFFIC', 'False'],
+        ['CAMOUFOX_RECORD_WIRE_LOG', ''],
+        ['CAMOUFOX_RECORD_BODIES', 'yes'],
+        ['CAMOUFOX_TRAFFIC_MAX_BODY_BYTES', '0'],
+        ['CAMOUFOX_TRAFFIC_MAX_BODY_BYTES', '-8'],
+        ['CAMOUFOX_TRAFFIC_MAX_BODY_BYTES', '8.75'],
+        ['CAMOUFOX_TRAFFIC_MAX_BODY_BYTES', '8 bytes'],
+        ['CAMOUFOX_TRAFFIC_MAX_BODY_BYTES', ''],
+        ['CAMOUFOX_TRAFFIC_MAX_BODY_BYTES', '9007199254740992']
+    ]) {
+        await writeFile(path.join(root, '.env'), 'PROFILE_SERVICE=camoufox\n' + key + '=' + value + '\n', { mode: 0o600 });
+        const result = runNode(root, ['bin/gmail-account-creator.js']);
+        assert.equal(result.status, 1, result.stderr);
+        assert.match(result.stderr, new RegExp(key + ' must be'));
+    }
+    const call = runModule(root, `
+        import assert from 'node:assert/strict';
+        import { startProfile } from './src/camoufox/client.js';
+        await assert.rejects(startProfile('invalid', { maxBodyBytes: 0 }), /maxBodyBytes must be a positive safe integer/);
+        await assert.rejects(startProfile('invalid', { recordTraffic: 'false' }), /recordTraffic must be a boolean/);
+    `);
+    assert.equal(call.status, 0, call.stderr);
+
+    const valid = runModule(root, `
+        import assert from 'node:assert/strict';
+        import config from './src/config.js';
+        assert.equal(config.camoufox.recordTraffic, false);
+        assert.equal(config.camoufox.recordWireLog, false);
+        assert.equal(config.camoufox.maxBodyBytes, 8);
+    `, { CAMOUFOX_RECORD_TRAFFIC: 'false', CAMOUFOX_RECORD_WIRE_LOG: 'false', CAMOUFOX_TRAFFIC_MAX_BODY_BYTES: '8' });
+    assert.equal(valid.status, 0, valid.stderr);
+});
+
+test('Standalone Camoufox uses the deployment profiles directory and managed policy', async t => {
+    const root = await makeFixture(t);
+    await writeFile(path.join(root, '.env'), [
+        'PROFILE_SERVICE=camoufox',
+        'CAMOUFOX_STORAGE_DIR=fixture-profiles',
+        'CAMOUFOX_PORT_SCAN_MODE=managed-proxy',
+        'CAMOUFOX_MANAGED_EGRESS_ORIGIN=http://proxy.invalid:8080'
+    ].join('\n'), { mode: 0o600 });
+    const result = runModule(root, `
+        import assert from 'node:assert/strict';
+        import path from 'node:path';
+        import {
+            getProfileDir, setCamoufoxModule, startProfile, validateCamoufoxNetworkPolicy
+        } from './src/camoufox/client.js';
+        import { CamoufoxTrafficRecorder } from './src/camoufox/traffic-recorder.js';
+
+        const profiles = path.join(process.cwd(), 'fixture-profiles');
+        assert.equal(getProfileDir('fixture'), path.join(profiles, 'fixture'));
+        assert.equal(new CamoufoxTrafficRecorder({ profileId: 'recorder-fixture' }).profilesDir, profiles);
+        setCamoufoxModule({ Camoufox: () => assert.fail('Unexpected launch without proxy authorization') });
+        await assert.rejects(startProfile('fixture', { recordTraffic: false }), {
+            code: 'ERR_CAMOUFOX_MANAGED_EGRESS_BINDING'
+        });
+        const authorized = validateCamoufoxNetworkPolicy({}, { server: 'http://proxy.invalid:8080' });
+        assert.equal(authorized.origin, 'http://proxy.invalid:8080');
+    `);
+    assert.equal(result.status, 0, result.stderr);
 });

@@ -27,21 +27,12 @@ function git(args, { showOutput = false, allowMissing = false } = {}) {
 }
 
 async function storagePaths() {
-    // The runtime configuration owns .env and .emv precedence. Keep its diagnostics
-    // out of the distribution check and use the original environment for Git.
-    const warn = console.warn;
-    console.warn = () => {};
-    let storageDir;
-    try {
-        const { config } = await import('../src/config.js');
-        storageDir = config.camoufox.storageDir;
-    } finally {
-        console.warn = warn;
-    }
-
-    const { STATE_DIRECTORY } = await import('../src/utils/state-paths.js');
+    const { loadApplicationEnvironment } = await import('../src/utils/private-env.js');
+    const { getDefaultProfilesDirectory, STATE_DIRECTORY } = await import('../src/utils/state-paths.js');
+    const env = loadApplicationEnvironment({ env: { ...process.env }, readOnly: true });
+    const storageDir = getDefaultProfilesDirectory(env);
     const roots = new Set();
-    const configuredPaths = [STATE_DIRECTORY, storageDir, process.env.CAMOUFOX_PROFILES_DIR];
+    const configuredPaths = [STATE_DIRECTORY, storageDir, env.CAMOUFOX_PROFILES_DIR];
     for (const configured of configuredPaths.filter(Boolean)) {
         const absolute = path.resolve(configured);
         roots.add(absolute);

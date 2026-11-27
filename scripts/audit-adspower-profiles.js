@@ -88,12 +88,11 @@ function inspectAdsPowerProfileDir(profileDir) {
     const webglEntry = listCaptureDirectory(profileDir).find(({ name }) => name.startsWith(webglMd5));
     const webglConfig = webglEntry ? readCacheObject(profileDir, webglEntry.name) : {};
 
-    const platform = staticConfig.Platform || 'MacIntel';
-    const targetOs = platform.toLowerCase().includes('win')
-        ? 'win'
-        : platform.toLowerCase().includes('mac')
-          ? 'mac'
-          : 'lin';
+    const platform = typeof staticConfig.Platform === 'string' ? staticConfig.Platform.trim() : null;
+    const platformName = platform?.toLowerCase() || '';
+    const targetOs = platformName.includes('win') ? 'win'
+        : platformName.includes('mac') ? 'mac'
+          : platformName.includes('linux') ? 'lin' : null;
 
     const uam = staticConfig.UserAgentMetadata || {};
     const telemetry = {
@@ -121,6 +120,15 @@ function inspectAdsPowerProfileDir(profileDir) {
     };
 
     const result = validateHardwareModelSpec(telemetry, targetOs);
+    const cores = telemetry.navigator.hardwareConcurrency;
+    const renderer = telemetry.webgl.unmaskedRenderer;
+    const evidencePresent = targetOs && Number.isInteger(cores) && cores > 0 &&
+        typeof renderer === 'string' && Boolean(renderer.trim());
+    let status = 'not-tested';
+    if (evidencePresent) {
+        if (!result.passed) status = 'failed';
+        else if (result.matchedSku) status = 'passed';
+    }
     const healed = sanitizeAdsPowerProfileToCoherentPreset({
         fbccId,
         Platform: platform,
@@ -143,7 +151,8 @@ function inspectAdsPowerProfileDir(profileDir) {
         osVersion: uam.platformVersion || null,
         renderer: webglConfig.UNMASKED_RENDERER_WEBGL || null,
         webgpuArch: webglConfig.GPUAdapterInfo?.architecture || null,
-        passed: result.passed,
+        status,
+        passed: status === 'passed',
         matchedSku: result.matchedSku,
         issues: result.issues,
         healed
@@ -197,30 +206,23 @@ function main() {
     }
 
     const passedCount = reports.filter((r) => r.passed).length;
-    const failedCount = reports.length - passedCount;
+    const failedCount = reports.filter((report) => report.status === 'failed').length;
+    const untestedCount = reports.length - passedCount - failedCount;
+    const unreadableCount = dirs.length - reports.length;
     const healedPassCount = reports.filter((r) => r.healed?.validation?.passed).length;
 
     console.log('================================================================================');
     console.log('🔍 AdsPower Local Profile Cache Hardware SKU Coherence Audit');
     console.log('================================================================================');
-    console.log(`Unreadable or unsupported profile directories: ${dirs.length - reports.length}`);
-    console.log(`📊 Audited Profiles: ${reports.length} (Raw Passed: ${passedCount}, Raw Failed: ${failedCount}, Auto-Healed Passed: ${healedPassCount}/${reports.length})\n`);
+    console.log(`Unreadable or unsupported profile directories: ${unreadableCount}`);
+    console.log(`📊 Audited Profiles: ${reports.length} (Raw Passed: ${passedCount}, Raw Failed: ${failedCount}, Raw Not Tested: ${untestedCount})`);
+    if (showHeal) console.log(`Suggested Presets Passed: ${healedPassCount}/${reports.length}`);
 
+    const badges = { passed: '✅ PASS', failed: '❌ FAIL', 'not-tested': 'NOT TESTED' };
     for (const [index, r] of reports.entries()) {
-        const badge = r.passed ? '✅ PASS' : '❌ FAIL';
-        const fields = [
-            `Device="${displayField(r.deviceName)}"`,
-            `Arch=${displayField(r.architecture)}`,
-            `OS=${displayField(r.osVersion)}`,
-            `Cores=${displayField(r.cores)}`,
-            `Mem=${displayField(r.deviceMemoryGb)}GB`,
-            `GPU="${displayField(r.renderer)}"`,
-            `WebGPU_Arch=${displayField(r.webgpuArch)}`
-        ];
-        console.log(`${badge} [Profile ${index + 1}] ${fields.join(' | ')}`);
-        for (const issue of r.issues) {
-            console.log(`   ↳ ⚠️  ${displayField(issue)}`);
-        }
+        console.log(`${badges[r.status]} [Profile ${index + 1}]`);
+        if (r.status === 'failed') console.log(`   Hardware conflicts: ${r.issues.length}`);
+        if (r.status === 'not-tested') console.log('   Insufficient evidence to verify a hardware SKU');
         if (!r.passed && showHeal && r.healed) {
             const { hardwareProfile, telemetry } = r.healed.healedProfile;
             const details = [
@@ -232,8 +234,11 @@ function main() {
                 `GPU="${displayField(telemetry.webgl.unmaskedRenderer)}"`
             ];
             const verdict = r.healed.validation.passed ? '100% PASS' : 'FAIL';
-            console.log(`   ↳ 🛠️  AUTO-HEALED -> Preset="${displayField(r.healed.healedPresetId)}" (${details.join(' | ')}) [SKU Verified: ${verdict}]`);
+            console.log(`   ↳ 🛠️  SUGGESTED -> Preset="${displayField(r.healed.healedPresetId)}" (${details.join(' | ')}) [SKU Verified: ${verdict}]`);
         }
+    }
+    if (passedCount === 0 || failedCount > 0 || untestedCount > 0 || unreadableCount > 0) {
+        process.exitCode = 1;
     }
 }
 

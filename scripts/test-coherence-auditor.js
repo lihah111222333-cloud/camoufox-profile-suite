@@ -911,7 +911,8 @@ const tests = [
 
             const langCheck = findCheck(res, 'wire-accept-language-matches-dom');
             assert.equal(langCheck.passed, false);
-            assert.match(langCheck.details, /does not start with DOM primary language "en-US"/);
+            assert.match(langCheck.details, /does not start with DOM primary language/);
+            assert.doesNotMatch(langCheck.details, /en-US|fr-FR/);
         }
     },
     {
@@ -1175,11 +1176,13 @@ const tests = [
             profile.metadata = { os: 'windows' };
             profile.getPage = async () => ({ evaluate: async () => telemetry });
             profile.trafficRecorder = {
+                traceId: 'fixture-current-trace',
                 transactions: new Map([
                     [
                         'tx-1',
                         {
                             correlationId: 'tx-1',
+                            attribution: { traceId: 'fixture-current-trace' },
                             url: 'https://accounts.google.com/v3/signin',
                             headers: {
                                 'User-Agent': telemetry.navigator.userAgent,
@@ -1201,7 +1204,8 @@ const tests = [
             assert.equal(report.wireToDomCoherence.inspectedRequests, 1);
             assert.equal(report.wireToDomCoherence.checks.length, 4);
 
-            profile.trafficRecorder.transactions.clear();
+            const historical = profile.trafficRecorder.transactions.get('tx-1');
+            historical.attribution.traceId = 'fixture-old-trace';
             const incomplete = await profile.auditCoherence();
             assert.equal(incomplete.wireToDomCoherence.status, 'not-tested');
             assert.equal(incomplete.passed, false);
@@ -1209,6 +1213,7 @@ const tests = [
             assert.ok(incomplete.score < 100);
 
             profile.trafficRecorder.transactions.set('tx-2', {
+                attribution: { traceId: 'fixture-current-trace' },
                 headers: { 'User-Agent': 'different user agent', 'Accept-Language': 'en-US' }
             });
             const failed = await profile.auditCoherence();

@@ -6,7 +6,10 @@ import { inspect } from 'node:util';
 import {
     buyNumberAndGetSMS,
     buySmsVerifyNumber,
-    buySmsVerifyNumberV2
+    buySmsVerifyNumberV2,
+    getSmsVerifyBalance,
+    setSmsVerifyStatus,
+    waitForSmsVerifyCode
 } from '../../src/providers/sms-verification-api.js';
 
 const API_KEY = 'fixture-api-key';
@@ -130,6 +133,8 @@ test('SMS purchases require a valid order ID and phone in each receipt format', 
         [`ACCESS_NUMBER:${ORDER_ID}x:${PHONE_NUMBER}`, null],
         [`ACCESS_NUMBER:9007199254740992:${PHONE_NUMBER}`, null],
         [`ACCESS_NUMBER:${ORDER_ID}:`, ORDER_ID],
+        [`ACCESS_NUMBER:${ORDER_ID}:0`, ORDER_ID],
+        [`ACCESS_NUMBER:${ORDER_ID}:+00000`, ORDER_ID],
         [`${ORDER_REPLY}:${SMS_CODE}`, ORDER_ID]
     ];
     const invalidV2 = [
@@ -141,6 +146,10 @@ test('SMS purchases require a valid order ID and phone in each receipt format', 
         [{ activationId: 12.5, phoneNumber: PHONE_NUMBER }, null],
         [{ activationId: '9007199254740992', phoneNumber: PHONE_NUMBER }, null],
         [{ activationId: ORDER_ID }, ORDER_ID],
+        [{ activationId: ORDER_ID, phoneNumber: '0', activationCost: 0.25 }, ORDER_ID],
+        [{ activationId: ORDER_ID, phoneNumber: PHONE_NUMBER, activationCost: 0.25, error: 'NO_BALANCE' }, null],
+        [{ activationId: ORDER_ID, phoneNumber: PHONE_NUMBER, activationCost: 0.25, success: false }, null],
+        [{ activationId: ORDER_ID, phoneNumber: PHONE_NUMBER, activationCost: 0.25, status: 'failed' }, null],
         [{ activationId: ORDER_ID, phoneNumber: { key: API_KEY, code: SMS_CODE } }, ORDER_ID]
     ];
     const requests = mockTransport(t, ...invalidV1.map(([body]) => body),
@@ -172,6 +181,40 @@ test('SMS purchases preserve valid V1 and V2 receipt fields', async t => {
     assert.deepEqual(requests.map(({ action }) => action), ['getNumber', 'getNumberV2']);
 });
 
+test('SMS balance must be a finite numeric amount', async t => {
+    const requests = mockTransport(t, ' 12.50 ', '-2.50', '12.50 incomplete', '[12.5,"incomplete"]', '1e309', 'null');
+    assert.equal(await getSmsVerifyBalance(), 12.5);
+    assert.equal(await getSmsVerifyBalance(), -2.5);
+    for (let i = 0; i < 4; i++) {
+        await assert.rejects(getSmsVerifyBalance(), /invalid balance/);
+    }
+    assert.equal(requests.length, 6);
+});
+
+test('SMS V2 receipts with unusable billing or an amount above the cap require reconciliation', async t => {
+    const valid = {
+        activationId: String(ORDER_ID), phoneNumber: PHONE_NUMBER, activationCost: '0.2500', currency: 'USD'
+    };
+    const invalid = [
+        { activationCost: '0.70' }, { activationCost: '0.25000000000000000001' },
+        { activationCost: '-0.25' }, { activationCost: '0.10 extra' },
+        { activationCost: '1e309' }, { activationCost: null }, { activationCost: undefined },
+        { currency: { amount: PRIVATE_DATA } }, { currency: '' }, { currency: null }
+    ];
+    const requests = mockTransport(t, JSON.stringify(valid),
+        ...invalid.map(fields => JSON.stringify({ ...valid, ...fields })), 'WRONG_MAX_PRICE:');
+    const buy = () => buySmsVerifyNumberV2(undefined, undefined, undefined, { maxPrice: 0.25 });
+    const receipt = await buy();
+    assert.equal(receipt.price, valid.activationCost);
+    assert.equal(receipt.currency, valid.currency);
+    for (const fields of invalid) {
+        await assert.rejects(buy(), expectOrderError('RECONCILIATION_REQUIRED'), JSON.stringify(fields));
+    }
+    await assert.rejects(buy(), expectOrderError('RECONCILIATION_REQUIRED', null));
+    assert.equal(requests.length, invalid.length + 2);
+    assert.ok(requests.every(({ action, maxPrice }) => action === 'getNumberV2' && maxPrice === '0.25'));
+});
+
 test('SMS order wrapper rejects an unknown provider before requesting anything', async t => {
     const requests = mockTransport(t);
     const wrapper = await importWrapper(t, PRIVATE_DATA, 'unknown-provider');
@@ -196,19 +239,38 @@ test('SMS order wrapper exposes only status when checking preexisting orders', a
 });
 
 test('SMS order wrapper distinguishes confirmed and unconfirmed finish and cancel actions', async t => {
-    const requests = mockTransport(t, 'ACCESS_ACTIVATION', 'ACCESS_CANCEL', 'CANNOT_BEFORE_2_MIN', PRIVATE_DATA);
+    const requests = mockTransport(t, 'ACCESS_ACTIVATION', 'ACCESS_CANCEL', 'CANNOT_BEFORE_2_MIN',
+        new Response('CANNOT_BEFORE_2_MIN', { status: 400 }), PRIVATE_DATA,
+        new Error(API_KEY), new Response('ACCESS_CANCEL', { status: 202 }),
+        new Response('CANNOT_BEFORE_2_MIN', { status: 408 }));
     const wrapper = await importWrapper(t, 'sms-verification', 'reconcile-actions');
     assert.equal(await wrapper.setOrderStatus(ORDER_ID, 6), true);
     assert.equal(await wrapper.setOrderStatus(ORDER_ID, 8), true);
     assert.equal(await wrapper.cancelOrder(ORDER_ID), false);
-    assert.equal(await wrapper.finishOrder(ORDER_ID), false);
+    assert.equal(await wrapper.cancelOrder(ORDER_ID), false);
+    const unconfirmed = expectOrderError('RECONCILIATION_REQUIRED');
+    await assert.rejects(wrapper.finishOrder(ORDER_ID), unconfirmed);
+    await assert.rejects(wrapper.finishOrder(ORDER_ID), unconfirmed);
+    await assert.rejects(wrapper.cancelOrder(ORDER_ID), unconfirmed);
+    await assert.rejects(wrapper.cancelOrder(ORDER_ID), unconfirmed);
     await assert.rejects(wrapper.setOrderStatus(ORDER_ID, 3), RangeError);
-    assert.deepEqual(requests.map(({ action, id, status }) => [action, id, status]), [
-        ['setStatus', String(ORDER_ID), '6'],
-        ['setStatus', String(ORDER_ID), '8'],
-        ['setStatus', String(ORDER_ID), '8'],
-        ['setStatus', String(ORDER_ID), '6']
-    ]);
+    assert.deepEqual(requests.map(({ action, id, status }) => [action, id, status]),
+        ['6', '8', '8', '8', '6', '6', '8', '8'].map(status => ['setStatus', String(ORDER_ID), status]));
+});
+
+test('SMS order mutations reject invalid targets before dispatch', async t => {
+    const requests = mockTransport(t, 'ACCESS_CANCEL', 'ACCESS_ACTIVATION');
+    const wrapper = await importWrapper(t, 'sms-verification', 'invalid-order-target');
+    for (const id of [undefined, null, '', ' ', NaN, 0, -1, '12x', '9007199254740992']) {
+        await assert.rejects(wrapper.cancelOrder(id), /Order ID must/);
+        await assert.rejects(wrapper.setOrderStatus(id, 6), /Order ID must/);
+        await assert.rejects(setSmsVerifyStatus(id, '8'), /Order ID must/);
+    }
+    assert.deepEqual(requests, []);
+    const stringId = `00${ORDER_ID}`;
+    assert.equal(await wrapper.cancelOrder(stringId), true);
+    assert.equal(await setSmsVerifyStatus(ORDER_ID, '6'), 'ACCESS_ACTIVATION');
+    assert.deepEqual(requests.map(({ id, status }) => [id, status]), [[stringId, '8'], [String(ORDER_ID), '6']]);
 });
 
 test('SMS order receipts distinguish cancellation confirmation from reconciliation needed', async t => {
@@ -231,4 +293,49 @@ test('SMS order receipts preserve cancellation observed during status lookup', a
     const requests = mockTransport(t, ORDER_REPLY, 'STATUS_CANCEL');
     await assert.rejects(buyNumberAndGetSMS({ maxWaitTime: 1000, maxPrice: 0.25 }), expectOrderError('CANCELED'));
     assert.deepEqual(requests.map(({ action, id }) => [action, id]), [['getNumber', null], ['getStatus', String(ORDER_ID)]]);
+});
+
+test('SMS status polling sleep is limited to the remaining wait budget', async t => {
+    let now = 0;
+    const sleeps = [];
+    const response = new Response('STATUS_WAIT_CODE');
+    t.mock.method(response, 'text', async () => {
+        now += 5;
+        return 'STATUS_WAIT_CODE';
+    });
+    const requests = mockTransport(t, response);
+    t.mock.method(performance, 'now', () => now);
+    t.mock.method(globalThis, 'setTimeout', (resolve, delay) => {
+        sleeps.push(delay);
+        now += delay;
+        queueMicrotask(resolve);
+    });
+    await assert.rejects(waitForSmsVerifyCode(ORDER_ID, 50), /Timeout waiting/);
+    assert.deepEqual(sleeps, [45]);
+    assert.equal(requests.length, 1);
+    assert.equal(now, 50);
+});
+
+test('SMS pending status request is aborted at the wait deadline', async t => {
+    let now = 0;
+    const timeouts = [];
+    const controller = new AbortController();
+    setEnv(t, 'SMS_VERIFY_API_KEY', API_KEY);
+    t.mock.method(performance, 'now', () => now);
+    t.mock.method(AbortSignal, 'timeout', milliseconds => {
+        timeouts.push(milliseconds);
+        return controller.signal;
+    });
+    const fetch = t.mock.method(globalThis, 'fetch', async (url, { signal }) => {
+        assert.equal(new URL(url).searchParams.get('action'), 'getStatus');
+        return new Promise((resolve, reject) => {
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+        });
+    });
+    const waiting = waitForSmsVerifyCode(ORDER_ID, 50);
+    now += 50;
+    controller.abort();
+    await assert.rejects(waiting, /Timeout waiting/);
+    assert.deepEqual(timeouts, [50]);
+    assert.equal(fetch.mock.callCount(), 1);
 });

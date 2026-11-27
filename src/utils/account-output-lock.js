@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
-import { describeProcessOwner, isDeadProcessOwner, readProcessOwner } from './process-owner.js';
+import { describeProcessOwner, processOwnerStatus, readProcessOwner } from './process-owner.js';
 
 const WAIT_MS = 5_000;
 const WAIT_INTERVAL_MS = 25;
@@ -68,10 +68,12 @@ function discardDeadLock(directory, label) {
 
         const identity = readProcessOwner(path.join(directory, owner));
         if (!identity || (!identity.host && entries.length !== 1)) throw invalidLock(label);
-        if (isDeadProcessOwner(pid, identity)) {
+        const status = processOwnerStatus(pid, identity);
+        if (status === 'dead') {
             if (identity.host) removeSnapshot(directory, owner, label);
             removeOwner(directory, owner);
         }
+        return status;
     } catch (error) {
         // Release can remove the named marker while a waiter is reading it.
         if (error.code !== 'ENOENT') throw error;
@@ -122,8 +124,11 @@ export function withAccountOutputLock(filePath, operation) {
                 break;
             } catch (error) {
                 if (!LOCK_COLLISION.has(error.code)) throw error;
-                discardDeadLock(directory, label);
+                const status = discardDeadLock(directory, label);
                 if (performance.now() >= deadline) {
+                    if (status === 'unverified') {
+                        throw lockFailure(`Timed out waiting for the ${label} writer lock. The owner could not be verified. Follow the lock recovery steps in ENV_VARIABLES.md.`);
+                    }
                     throw lockFailure(`Timed out waiting for the ${label} writer lock. Inspect ${label}.lock with all writers stopped.`);
                 }
                 Atomics.wait(waitBuffer, 0, 0, WAIT_INTERVAL_MS);

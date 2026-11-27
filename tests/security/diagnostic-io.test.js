@@ -6,9 +6,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import vm from 'node:vm';
 import {
-    evaluatePlatformCoherence, evaluateWireToDomCoherence, readCoherenceCaptureEvents
+    auditProfileCoherence, collectBrowserFingerprint, evaluatePlatformCoherence,
+    evaluateWireToDomCoherence, readCoherenceCaptureEvents
 } from '../../src/camoufox/coherence-auditor.js';
+import { resolveDeterministicDeviceProfile } from '../../src/camoufox/device-presets.js';
 
 const repo = fileURLToPath(new URL('../../', import.meta.url));
 const supportsCaptureReads = process.platform === 'darwin' || process.platform === 'linux';
@@ -55,6 +58,57 @@ test('WebRTC and wire coherence require observations', () => {
     assert.equal(missingHeaders.inspectedRequests, 1);
 });
 
+test('coherence reports minimize observations and mark absent voice and media evidence', async () => {
+    let mediaCalls = 0;
+    const page = { evaluate: (callback) => vm.runInNewContext(`(${callback})()`, {
+        navigator: {
+            userAgent: 'Private Fixture Agent',
+            mediaDevices: {
+                async enumerateDevices() {
+                    mediaCalls += 1;
+                    return [{ label: 'Private Fixture Microphone' }];
+                }
+            }
+        },
+        window: { screen: {} },
+        speechSynthesis: { getVoices() { throw new Error('Speech service unavailable'); } }
+    }) };
+    const collected = await collectBrowserFingerprint(page);
+    assert.equal(mediaCalls, 0);
+    assert.equal(collected.stackAndMediaHygiene.unpermittedLabelsLeaked, null);
+
+    const telemetry = resolveDeterministicDeviceProfile('diagnostic-fixture', { os: 'windows' }).telemetry;
+    telemetry.navigator.userAgent = collected.navigator.userAgent;
+    telemetry.speechVoices = collected.speechVoices;
+    telemetry.stackAndMediaHygiene.unpermittedLabelsLeaked = null;
+    telemetry.stackAndMediaHygiene.mediaDevices.unpermittedLabelsLeaked = null;
+    const evaluated = await auditProfileCoherence({ evaluate: async () => telemetry }, 'windows');
+    for (const name of ['speech-voices-coherence', 'stack-trace-and-mediadevices-hygiene']) {
+        assert.equal(evaluated.checks.find((check) => check.name === name).status, 'not-tested');
+    }
+    assert.equal(evaluated.telemetry, null);
+    assert.doesNotMatch(JSON.stringify(evaluated), /Private Fixture/);
+    const detailed = await auditProfileCoherence({ evaluate: async () => telemetry }, 'windows', {
+        includeTelemetry: true
+    });
+    assert.equal(detailed.telemetry.navigator.userAgent, 'Private Fixture Agent');
+});
+
+test('wire report details omit supplied URLs, header values and DOM values', () => {
+    const result = evaluateWireToDomCoherence({ navigator: { userAgent: 'Private DOM UA', language: 'fixture-dom-language' } }, [{
+        type: 'egress',
+        url: 'https://example.invalid/path?fixture=private',
+        headers: {
+            'User-Agent': 'Private Wire UA', 'Accept-Language': 'fixture-wire-language',
+            'X-Forwarded-For': '203.0.113.20', 'Sec-CH-UA': 'Fixture Client Hints'
+        }
+    }]);
+    assert.equal(result.status, 'failed');
+    assert.equal(result.inspectedRequests, 1);
+    assert.match(result.checks[0].details, /request #1/);
+    assert.doesNotMatch(JSON.stringify(result), /example[.]invalid|fixture=private|Private (DOM|Wire) UA|fixture-(dom|wire)-language|203[.]0[.]113[.]20|Fixture Client Hints/);
+});
+
 test('only explicitly selected local capture roots supply coherence ledger files', { skip: !supportsCaptureReads }, (t) => {
     const root = fixture(t);
     const ledger = path.join(root, 'traffic.ndjson');
@@ -68,6 +122,11 @@ test('only explicitly selected local capture roots supply coherence ledger files
     assert.equal(evaluateWireToDomCoherence(dom, { events: [event] }).inspectedRequests, 1);
     assert.equal(evaluateWireToDomCoherence(dom, readCoherenceCaptureEvents(root)).inspectedRequests, 1);
 
+    fs.writeFileSync(ledger, `${JSON.stringify(event)}\nfixture-invalid-row\n${JSON.stringify(event)}\n`);
+    assert.throws(() => readCoherenceCaptureEvents(root), { code: 'ERR_COHERENCE_CAPTURE_INVALID' });
+    fs.writeFileSync(ledger, JSON.stringify(event));
+    assert.equal(readCoherenceCaptureEvents(root).length, 1);
+
     fs.truncateSync(ledger, 128 * 1024 * 1024 + 1);
     assert.throws(() => readCoherenceCaptureEvents(root), { code: 'ERR_CAPTURE_TOO_LARGE' });
     fs.renameSync(ledger, path.join(root, 'other.ndjson'));
@@ -75,7 +134,42 @@ test('only explicitly selected local capture roots supply coherence ledger files
     assert.throws(() => readCoherenceCaptureEvents(root));
 });
 
-test('AdsPower audits valid caches alongside rejected entries and escapes every terminal row', { skip: !supportsCaptureReads }, (t) => {
+test('active audit ignores prior traces and does not fall back after ledger damage', { skip: !supportsCaptureReads }, async (t) => {
+    const { CamoufoxProfile } = await import('../../src/camoufox/profile.js');
+    const trafficDir = fixture(t);
+    const ledger = path.join(trafficDir, 'traffic.ndjson');
+    const { telemetry } = resolveDeterministicDeviceProfile('diagnostic-fixture', { os: 'windows' });
+    const historical = {
+        type: 'egress',
+        attribution: { traceId: 'prior-fixture-trace' },
+        headers: { 'User-Agent': telemetry.navigator.userAgent, 'Accept-Language': telemetry.navigator.language }
+    };
+    const current = { ...historical, attribution: { traceId: 'current-fixture-trace' } };
+    const profile = new CamoufoxProfile('diagnostic-fixture', { os: 'windows' });
+    let consistencyWrites = 0;
+    profile.getPage = () => ({ evaluate: async () => telemetry });
+    profile.fingerprintLedger = { recordOrVerify() { consistencyWrites += 1; } };
+    profile.trafficPaths = { trafficDir };
+    profile.trafficRecorder = { traceId: 'current-fixture-trace', transactions: [current] };
+
+    fs.writeFileSync(ledger, JSON.stringify(historical) + '\n');
+    const priorOnly = await profile.auditCoherence();
+    assert.equal(priorOnly.wireToDomCoherence.status, 'not-tested');
+    assert.equal(priorOnly.wireToDomCoherence.inspectedRequests, 0);
+    assert.equal(priorOnly.telemetry, null);
+    fs.appendFileSync(ledger, JSON.stringify(current) + '\n');
+    const currentProof = await profile.auditCoherence();
+    assert.equal(currentProof.wireToDomCoherence.status, 'passed');
+    assert.equal(currentProof.wireToDomCoherence.inspectedRequests, 1);
+    fs.appendFileSync(ledger, 'fixture-invalid-row\n');
+    const invalid = await profile.auditCoherence();
+    assert.equal(invalid.wireToDomCoherence.status, 'not-tested');
+    assert.equal(invalid.wireToDomCoherence.captureIssue, 'invalid-capture-record');
+    assert.equal(invalid.passed, false);
+    assert.equal(consistencyWrites, 0);
+});
+
+test('AdsPower reports incomplete caches and omits cache values from terminal rows', { skip: !supportsCaptureReads }, (t) => {
     const root = fixture(t);
     const cache = path.join(root, 'cache');
     fs.mkdirSync(cache);
@@ -112,14 +206,35 @@ test('AdsPower audits valid caches alongside rejected entries and escapes every 
         encoding: 'utf8',
         timeout: 5000
     });
-    assert.equal(result.status, 0, result.error?.message || result.stderr);
+    assert.equal(result.status, 1, result.error?.message || result.stderr);
     assert.match(result.stdout, /Audited Profiles: 1\b/);
     assert.match(result.stdout, /Unreadable or unsupported profile directories: 4\b/);
-    assert.equal(result.stdout.split('\n').filter((row) => /^(?:✅ PASS|❌ FAIL)/.test(row)).length, 1);
-    assert.match(result.stdout, /Fixture\\u\{1b\}\[31m\\u\{d\}\\u\{a\}row text\\u\{2028\}unicode text/);
-    assert.match(result.stdout, /arm\\u\{85\}separator/);
-    assert.doesNotMatch(result.stdout, /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029]/u);
-    assert.doesNotMatch(result.stdout, /(?:valid|hardlink)_fixture/);
+    assert.equal(result.stdout.split('\n').filter((row) => /^(?:✅ PASS|❌ FAIL|NOT TESTED)/.test(row)).length, 1);
+    assert.doesNotMatch(result.stdout, /Fixture|row text|unicode text|arm|valid_fixture|hardlink_fixture/);
+    const isolatedCache = path.join(root, 'isolated-cache');
+    fs.mkdirSync(isolatedCache);
+    const runCache = () => spawnSync(process.execPath, [cli, '--cache-dir=' + isolatedCache], {
+        encoding: 'utf8', timeout: 5000
+    });
+    assert.equal(runCache().status, 1);
+
+    const raw = makeEntry('partial', 'static', isolatedCache);
+    fs.writeFileSync(raw, JSON.stringify({ Platform: 'MacIntel' }));
+    let audited = runCache();
+    assert.equal(audited.status, 1);
+    assert.match(audited.stdout, /Raw Not Tested: 1/);
+    const gl = makeEntry('partial', 'webgl', isolatedCache);
+    fs.writeFileSync(gl, JSON.stringify({ UNMASKED_RENDERER_WEBGL: 'Apple M2 Pro' }));
+    const full = { Platform: 'MacIntel', HardwareConcurrency: 10,
+        UserAgentMetadata: { architecture: 'arm', platformVersion: '13.6' } };
+    fs.writeFileSync(raw, JSON.stringify({ ...full, HardwareConcurrency: 1 }));
+    audited = runCache();
+    assert.equal(audited.status, 1);
+    assert.match(audited.stdout, /Raw Failed: 1/);
+    fs.writeFileSync(raw, JSON.stringify(full));
+    audited = runCache();
+    assert.equal(audited.status, 0);
+    assert.match(audited.stdout, /Raw Passed: 1/);
     const noRoot = spawnSync(process.execPath, [cli], { encoding: 'utf8', timeout: 5000 });
     assert.equal(noRoot.status, 1);
     assert.match(noRoot.stderr, /--cache-dir=/);
@@ -203,6 +318,7 @@ test('Camoufox diagnostic separates live evidence, unavailable data, and synthet
     const sources = [
         script,
         'src/camoufox/capture-io.js',
+        'src/camoufox/capture-export-policy.js',
         'src/camoufox/coherence-auditor.js',
         'src/camoufox/device-presets.js',
         'src/camoufox/gpu-performance-scaler.js',
@@ -212,7 +328,9 @@ test('Camoufox diagnostic separates live evidence, unavailable data, and synthet
         'src/camoufox/traffic-redaction.js',
         'src/camoufox/ziniao-security.js',
         'src/utils/logger.js',
+        'src/utils/private-env.js',
         'src/utils/private-storage.js',
+        'src/utils/proxy-protocol.js',
         'src/utils/state-paths.js'
     ];
     for (const source of sources) {
@@ -270,15 +388,18 @@ test('Camoufox diagnostic separates live evidence, unavailable data, and synthet
     assert.equal(report.overallStatus, 'passed');
     assert.equal(report.results[0].mode, 'dry-run-synthetic');
     assert.equal(report.environment.camoufoxSdkInstalled, true);
-    assert.equal(report.results[0].auditReport.telemetry.gpuPerformance.hostBaseline.hostChipModel, 'Synthetic fixture');
-    assert.equal(Object.hasOwn(report.environment, 'camoufoxConfig'), false);
+    assert.equal(report.results[0].auditReport.telemetry, null);
+    assert.deepEqual(report.environment, { camoufoxSdkInstalled: true, playwrightCoreInstalled: false });
+    assert.doesNotMatch(run.stdout, /Node Version|Host Platform|Synthetic fixture/);
     if (process.platform !== 'win32') {
         assert.equal(fs.statSync(path.dirname(reportFile)).mode & 0o777, 0o700);
         assert.equal(fs.statSync(reportFile).mode & 0o777, 0o600);
     }
+    fs.writeFileSync(path.join(stateDir, 'logs'), 'Fixture unavailable log directory');
     const check = runWithTemporaryReport('--check-env');
     assert.equal(check.run.status, 0, check.run.error?.message || check.run.stderr + check.run.stdout);
     assert.equal(check.report.results[0].mode, 'dry-run-synthetic');
+    assert.equal(fs.readFileSync(path.join(stateDir, 'logs'), 'utf8'), 'Fixture unavailable log directory');
 
     fs.writeFileSync(path.join(root, 'src', 'config.js'), 'export {};');
     const profile = path.join(root, 'src', 'camoufox', 'profile.js');
@@ -288,10 +409,18 @@ test('Camoufox diagnostic separates live evidence, unavailable data, and synthet
     assert.equal(startupFailure.report.overallStatus, 'not-tested');
     assert.equal(startupFailure.report.results[0].auditReport, null);
 
-    function useMockPage(evaluate) {
-        fs.writeFileSync(profile, `export async function createAndStartProfile() {
-            return { getPage: () => ({ evaluate: ${evaluate} }), stop: async () => {} };
-        }`);
+    function useMockPage(evaluate, stopped = true) {
+        fs.writeFileSync(profile, `
+            import fs from 'node:fs';
+            import path from 'node:path';
+            export async function createAndStartProfile(name, proxy, options) {
+                if (options.recordTraffic || options.recordHar || options.sslKeyLog || options.neckoMozLog) {
+                    throw new Error('Unexpected recording enabled');
+                }
+                fs.writeFileSync(path.join(options.profilesDir, 'isolated-fixture'), 'fixture');
+                return { getPage: () => ({ evaluate: ${evaluate} }), stop: async () => ${stopped} };
+            }
+        `);
     }
     useMockPage('() => { throw new Error("No evidence collected"); }');
     const collectionFailure = runWithTemporaryReport();
@@ -305,10 +434,12 @@ test('Camoufox diagnostic separates live evidence, unavailable data, and synthet
     assert.equal(noEvidence.report.overallStatus, 'not-tested');
     assert.equal(noEvidence.report.results[0].auditReport.score, null);
     assert.equal(noEvidence.report.results[0].auditReport.telemetry, null);
+    assert.equal(noEvidence.report.results[0].cleanupStatus, 'removed');
+    assert.ok(fs.readdirSync(temporaryDir).every((name) => name.startsWith('camoufox-audit-')));
     for (const persistent of existingReports) assert.equal(fs.readFileSync(persistent, 'utf8'), 'original diagnostic fixture');
 
     // Mock browser output so no SDK or browser code runs in this test.
-    const telemetry = report.results[0].auditReport.telemetry;
+    const { telemetry } = resolveDeterministicDeviceProfile('diagnostic-fixture', { os: 'windows' });
     const persistentReport = path.join(stateDir, reportName);
     useMockPage(`() => (${JSON.stringify({ ...telemetry, webrtc: { available: true } })})`);
     const incomplete = runDiagnostic();
@@ -323,6 +454,20 @@ test('Camoufox diagnostic separates live evidence, unavailable data, and synthet
     assert.equal(simulated.status, 0, simulated.error?.message || simulated.stderr + simulated.stdout);
     const persisted = fs.readFileSync(persistentReport, 'utf8');
     assert.equal(JSON.parse(persisted).results[0].mode, 'live-browser');
+    assert.equal(JSON.parse(persisted).results[0].auditReport.telemetry, null);
+    assert.ok(fs.readdirSync(temporaryDir).every((name) => name.startsWith('camoufox-audit-')));
+
+    useMockPage(`() => (${JSON.stringify(telemetry)})`, false);
+    const unconfirmed = runDiagnostic();
+    assert.equal(unconfirmed.status, 1);
+    assert.match(unconfirmed.stderr, /cleanup could not be confirmed/);
+    const cleanupReport = JSON.parse(fs.readFileSync(persistentReport, 'utf8'));
+    assert.equal(cleanupReport.overallStatus, 'failed');
+    assert.equal(cleanupReport.results[0].cleanupStatus, 'unconfirmed');
+    assert.equal(fs.readdirSync(temporaryDir).filter((name) => name.startsWith('camoufox-diagnostic-profile-')).length, 1);
+    useMockPage(`() => (${JSON.stringify(telemetry)})`);
+    assert.equal(runDiagnostic().status, 0);
+    const confirmedReport = fs.readFileSync(persistentReport, 'utf8');
     if (process.platform !== 'win32') {
         assert.equal(fs.statSync(persistentReport).mode & 0o777, 0o600);
         const other = path.join(root, 'synthetic-report-target');
@@ -331,7 +476,7 @@ test('Camoufox diagnostic separates live evidence, unavailable data, and synthet
         const rejected = runDiagnostic();
         assert.equal(rejected.status, 1);
         assert.match(rejected.stderr, /Capture export destination must be an ordinary file/);
-        assert.equal(fs.readFileSync(other, 'utf8'), persisted);
+        assert.equal(fs.readFileSync(other, 'utf8'), confirmedReport);
         assert.ok(fs.lstatSync(persistentReport).isSymbolicLink());
     }
 });

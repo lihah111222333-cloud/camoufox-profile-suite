@@ -34,11 +34,11 @@ function setup(t, configureContext = () => {}, beforeLaunch = () => {}) {
                     connected = false;
                     browser.emit('disconnected');
                 },
-                async newContext() {
+                async newContext({ storageState } = {}) {
                     const fixture = {
                         routes: new Set(),
                         pages: [],
-                        state: { cookies: [], origins: [] },
+                        state: structuredClone(storageState ?? { cookies: [], origins: [] }),
                         closed: false,
                         finishClose() {
                             if (fixture.closed) return;
@@ -48,12 +48,17 @@ function setup(t, configureContext = () => {}, beforeLaunch = () => {}) {
                     };
                     fixture.context = Object.assign(new EventEmitter(), {
                         browser: () => browser,
-                        pages: () => fixture.pages,
+                        pages: () => fixture.pages.filter((page) => !page.isClosed()),
                         async newPage() {
                             await fixture.beforeNewPage?.();
+                            let pageClosed = false;
                             const page = Object.assign(new EventEmitter(), {
                                 context: () => fixture.context,
-                                isClosed: () => fixture.closed,
+                                isClosed: () => fixture.closed || pageClosed,
+                                async close() {
+                                    pageClosed = true;
+                                    page.emit('close');
+                                },
                                 url: () => 'about:blank',
                                 evaluate: () => fixture.evaluate?.()
                             });
@@ -243,6 +248,8 @@ test('public context closure reports a failed final snapshot and shutdown preser
     const context = await manager.getContext();
     await assert.rejects(context.close(), /Fixture snapshot unavailable/);
     assert.equal(fixture.closed, true);
+    await assert.rejects(manager.getPage(), /Previous Camoufox profile session could not be stopped/);
+    assert.equal(contexts.length, 1);
     assert.equal(await manager.stop(), false);
     assert.equal(fs.readFileSync(manager.storageStatePath, 'utf8'), snapshot);
 });
@@ -254,6 +261,64 @@ test('a context that closes unexpectedly reports the unavailable final snapshot'
     contexts[0].finishClose();
     assert.equal(await manager.stop(), false);
     assert.deepEqual(getActiveProfileIds(), []);
+});
+
+test('getPage reopens a context closed externally from the last saved snapshot', async (t) => {
+    const { contexts, options } = setup(t);
+    const manager = await new CamoufoxProfile('externally-closed', options).start();
+    const first = await manager.getPage();
+    contexts[0].state.cookies = [{ name: 'fixture', value: 'saved-before-close' }];
+    const savedPath = await manager.saveStorageState();
+    const savedBytes = fs.readFileSync(savedPath);
+    contexts[0].state.cookies[0].value = 'unsaved';
+    contexts[0].finishClose();
+
+    const reopened = await manager.getPage();
+    assert.notEqual(reopened, first);
+    assert.equal(reopened.isClosed(), false);
+    assert.equal(contexts.length, 2);
+    assert.equal(contexts[1].state.cookies[0].value, 'saved-before-close');
+    assert.deepEqual(fs.readFileSync(savedPath), savedBytes);
+});
+
+test('all callers reuse one live primary page in a profile session', { timeout: 5000 }, async (t) => {
+    const { contexts, options } = setup(t);
+    const profileId = 'primary-page';
+    const session = await startProfile(profileId, options);
+    const manager = await new CamoufoxProfile(profileId, options).start();
+    const otherManager = await new CamoufoxProfile(profileId, options).start();
+    await session.page.close();
+
+    let opened = 0;
+    let announce;
+    let resume;
+    const opening = new Promise((resolve) => { announce = resolve; });
+    const wait = new Promise((resolve) => { resume = resolve; });
+    contexts[0].beforeNewPage = () => {
+        opened += 1;
+        announce();
+        return wait;
+    };
+    const pages = Promise.all([
+        manager.getPage(), otherManager.getPage(), manager.getPage(), startProfile(profileId, options)
+    ]);
+    await opening;
+    resume();
+
+    const [page, other, repeated, reused] = await pages;
+    assert.equal(opened, 1);
+    assert.equal(page, other);
+    assert.equal(page, repeated);
+    assert.equal(reused, session);
+    assert.equal(session.page, page);
+    assert.deepEqual(session.context.pages(), [page]);
+
+    await page.close();
+    const restarted = await startProfile(profileId, options);
+    assert.equal(restarted, session);
+    assert.notEqual(restarted.page, page);
+    assert.equal(restarted.page.isClosed(), false);
+    assert.equal(opened, 2);
 });
 
 test('a failed HAR scratch removal keeps cleanup retryable after the browser context closes', async (t) => {

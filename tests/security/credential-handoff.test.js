@@ -52,6 +52,7 @@ test('App diagnostics omit credentials and preserve private log permissions acro
         'src/utils/private-env.js',
         'src/utils/state-paths.js',
         'src/utils/cli-counts.js',
+        'src/gmail/credential-handoff.js',
         'src/gmail/page-detector.js',
         'src/captcha/omo-handler.js',
         'src/config.js',
@@ -100,7 +101,7 @@ test('App diagnostics omit credentials and preserve private log permissions acro
     });
     const result = runLogger(`
         import assert from 'node:assert/strict';
-        const { detectGmailPage } = await import('./src/gmail/page-detector.js');
+        const { detectGmailPage, waitForElement } = await import('./src/gmail/page-detector.js');
         const main = await import('./src/captcha/omo-handler.js');
         const legacy = await import('./scripts/omocaptcha-extension.js');
 
@@ -133,11 +134,49 @@ test('App diagnostics omit credentials and preserve private log permissions acro
 
         let trace;
         const classification = await detectGmailPage({
-            url: () => 'https://accounts.google.com/challenge/sms?code=' + secret,
+            url: () => 'https://accounts.google.com/challenge/sms?code=' + secret + '#' + secret,
             setTrafficStep: (_step, fields) => { trace = fields; }
         });
-        assert.equal(classification.type, 'VERIFICATION_CODE');
+        assert.deepEqual(classification, {
+            type: 'VERIFICATION_CODE', elements: ['code'], action: 'enter_code'
+        });
         assert.deepEqual(trace, { pageType: 'VERIFICATION_CODE', action: 'enter_code' });
+
+        let inspections = 0;
+        for (const address of [
+            'https://' + secret + '.example.invalid/help?route=/signup/phone',
+            'https://accounts.google.com/example/signup/name',
+            'https://accounts.google.com/signup/name-old',
+            'https://accounts.google.com/?next=/signup/phone',
+            'https://accounts.google.com/#/challenge/sms',
+            'https://accounts.google.com.example.invalid/signup/name',
+            'http://accounts.google.com/signup/name',
+            'blob:https://accounts.google.com/signup/name',
+            'https://fixture@accounts.google.com/signup/name'
+        ]) {
+            trace = null;
+            assert.deepEqual(await detectGmailPage({
+                url: () => address,
+                $: async () => { inspections++; return {}; },
+                evaluate: async () => { inspections++; },
+                waitForTimeout: async () => { inspections++; },
+                setTrafficStep: (_step, fields) => { trace = fields; }
+            }), { type: 'UNKNOWN', elements: [] });
+            assert.equal(trace, null);
+        }
+        assert.equal(inspections, 0);
+
+        let address = 'https://accounts.google.com/ServiceLogin';
+        assert.deepEqual(await detectGmailPage({
+            url: () => address,
+            $: async () => { address = 'https://diagnostic-fixture.invalid/'; return {}; },
+            setTrafficStep: (_step, fields) => { trace = fields; }
+        }), { type: 'UNKNOWN', elements: [] });
+        assert.equal(trace, null);
+
+        assert.equal(await waitForElement({
+            async waitForSelector() { throw new Error(secret); }
+        }, 'input[data-fixture="' + secret + '"]'), null);
     `);
     assert.equal(result.status, 0, result.stderr);
     const firstRunFile = await readFile(activeLog, 'utf8');

@@ -89,7 +89,7 @@ test('pending and active reuse require the same effective routing and normalized
         allowedLocalPorts: [8300, 8100, 8300],
         allowSameOriginLocalDev: true,
         allowedExtensionIds: ['test-extension'],
-        contextOptions: { proxy: { server: 'http://context.example.invalid:8080' } }
+        contextOptions: { acceptDownloads: false }
     };
     const incompatible = [
         { proxy: null },
@@ -98,8 +98,7 @@ test('pending and active reuse require the same effective routing and normalized
         { allowedLocalPorts: [8100] },
         { allowSameOriginLocalDev: false },
         { allowedExtensionIds: [] },
-        { contextOptions: { proxy: { server: 'http://changed.example.invalid:8080' } } },
-        { launchOptions: { proxy: { server: 'http://changed.example.invalid:8080' } } }
+        { contextOptions: { acceptDownloads: true } }
     ];
     const pending = startProfile('routing', requested);
     let samePending;
@@ -120,6 +119,30 @@ test('pending and active reuse require the same effective routing and normalized
     assert.equal(await stopProfile('routing', options), true);
     await startProfile('routing', { ...requested, proxy: null, allowedLocalPorts: [] });
     assert.equal(launches.length, 2);
+});
+
+test('nested proxy options cannot replace the selected profile proxy', async (t) => {
+    const { launches, options } = setup(t);
+    const settings = { ...options, proxy };
+
+    for (const conflicting of [
+        { launchOptions: { proxy: null } },
+        { launchOptions: { proxy: { server: 'http://other.example.invalid:8080' } } },
+        { contextOptions: { proxy: null } },
+        { contextOptions: { proxyOverride: proxy } }
+    ]) {
+        await assert.rejects(startProfile('conflicting', { ...settings, ...conflicting }), /Conflicting Camoufox proxy/);
+    }
+    assert.equal(launches.length, 0);
+
+    const session = await startProfile('consistent', {
+        ...settings,
+        launchOptions: { proxy: undefined },
+        contextOptions: { proxy }
+    });
+    assert.deepEqual(session.metadata.proxy, proxy);
+    assert.deepEqual(launches[0].options.proxy, proxy);
+    assert.equal(Object.hasOwn(launches[0].contexts[0], 'proxy'), false);
 });
 
 test('all capture opt-outs reject pending and active reuse under the previous policy', async (t) => {

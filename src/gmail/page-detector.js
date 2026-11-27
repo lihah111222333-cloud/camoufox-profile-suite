@@ -4,6 +4,11 @@
  */
 
 import logger from '../utils/logger.js';
+import { GOOGLE_ACCOUNTS_ORIGIN } from './credential-handoff.js';
+
+function unknownPage() {
+    return { type: 'UNKNOWN', elements: [] };
+}
 
 /**
  * Automatically advance pre-TLS traffic attribution step when a new Gmail page type is detected.
@@ -34,106 +39,103 @@ function finalizeDetectedPage(page, detected) {
  */
 export async function detectGmailPage(page) {
     try {
-        const url = page.url();
-        logger.debug('Detecting Gmail page', { url });
+        const address = page.url();
+        const url = new URL(address);
+        if (url.protocol !== 'https:' || url.origin !== GOOGLE_ACCOUNTS_ORIGIN || url.username || url.password) {
+            return unknownPage();
+        }
+        const path = url.pathname.replace(/\/$/, '');
+        const signupPath = path.replace(/^\/steps\//, '/');
+        const signInPath = path.replace(/^\/(?:v3\/)?signin\//, '/');
+        logger.debug('Detecting Gmail page');
 
         // Check URL patterns first (most reliable)
         // Check for phone verification page
-        if (url.includes('/collectemailphone') || url.includes('/signup/phone')) {
+        if (signInPath === '/collectemailphone' || signupPath === '/signup/phone') {
             logger.info('Detected: Phone verification page (by URL)');
             return finalizeDetectedPage(page, {
                 type: 'PHONE_VERIFICATION',
                 elements: ['phone'],
-                action: 'enter_phone',
-                url: url
+                action: 'enter_phone'
             });
         }
 
         // Check for verification code page
-        if (url.includes('/challenge/phone') || url.includes('/verification/phone') || 
-            url.includes('/challenge/sms') || url.includes('/verification/sms')) {
+        if (/^\/(?:challenge|verification)\/(?:phone|sms)$/.test(signInPath)) {
             logger.info('Detected: Verification code page (by URL)');
             return finalizeDetectedPage(page, {
                 type: 'VERIFICATION_CODE',
                 elements: ['code'],
-                action: 'enter_code',
-                url: url
+                action: 'enter_code'
             });
         }
 
         // Check for name input page
-        if (url.includes('/steps/signup/name') || url.includes('/signup/name')) {
+        if (signupPath === '/signup/name') {
             logger.info('Detected: Name input page (by URL)');
             return finalizeDetectedPage(page, {
                 type: 'SIGN_UP_FORM',
                 elements: ['firstName', 'lastName'],
-                action: 'fill_name',
-                url: url
+                action: 'fill_name'
             });
         }
 
         // Check for username/email input page
-        if (url.includes('/steps/signup/username') || url.includes('/signup/username') ||
-            url.includes('/steps/signup/email') || url.includes('/signup/email')) {
+        if (signupPath === '/signup/username' || signupPath === '/signup/email') {
             logger.info('Detected: Username/Email input page (by URL)');
             return finalizeDetectedPage(page, {
                 type: 'USERNAME_INPUT',
                 elements: ['username'],
-                action: 'enter_username',
-                url: url
+                action: 'enter_username'
             });
         }
 
         // Check for password input page
-        if (url.includes('/steps/signup/password') || url.includes('/signup/password')) {
+        if (signupPath === '/signup/password') {
             logger.info('Detected: Password input page (by URL)');
             return finalizeDetectedPage(page, {
                 type: 'PASSWORD_INPUT',
                 elements: ['password'],
-                action: 'enter_password',
-                url: url
+                action: 'enter_password'
             });
         }
 
         // Check for birthday/gender input page
-        if (url.includes('/steps/signup/birthdaygender') || url.includes('/signup/birthdaygender') ||
-            url.includes('/birthdaygender')) {
+        if (signupPath === '/signup/birthdaygender' || signInPath === '/birthdaygender') {
             logger.info('Detected: Birthday/Gender input page (by URL)');
             return finalizeDetectedPage(page, {
                 type: 'BIRTHDAY_GENDER',
                 elements: ['day', 'month', 'year', 'gender'],
-                action: 'fill_birthday_gender',
-                url: url
+                action: 'fill_birthday_gender'
             });
         }
 
-        if (url.includes('/signin/identifier') || url.includes('/ServiceLogin')) {
-            const signInPage = await detectSignInPage(page);
-            if (signInPage) return finalizeDetectedPage(page, signInPage);
-        }
-        
-        if (url.includes('/signup') || url.includes('/webcreateaccount')) {
-            const signUpPage = await detectSignUpPage(page);
-            if (signUpPage) return finalizeDetectedPage(page, signUpPage);
-        }
-        
-        if (url.includes('/challenge') || url.includes('/verification')) {
-            const verificationPage = await detectVerificationPage(page);
-            if (verificationPage) return finalizeDetectedPage(page, verificationPage);
-        }
+        let detectFlow;
+        if (path === '/ServiceLogin' || /^\/(?:v3\/)?signin\/identifier$/.test(path)) {
+            detectFlow = detectSignInPage;
+        } else if (signupPath === '/signup' || path === '/webcreateaccount') {
+            detectFlow = detectSignUpPage;
+        } else if (signInPath === '/challenge' || signInPath === '/verification') {
+            detectFlow = detectVerificationPage;
+        } else return unknownPage();
+
+        const initial = await detectFlow(page);
+        if (page.url() !== address) return unknownPage();
+        if (initial) return finalizeDetectedPage(page, initial);
 
         // Detect by class names (more reliable for Google pages)
         const pageTypeByClass = await detectByClassNames(page);
+        if (page.url() !== address) return unknownPage();
         if (pageTypeByClass && pageTypeByClass.type !== 'UNKNOWN') {
             return finalizeDetectedPage(page, pageTypeByClass);
         }
 
         // Detect by page elements as fallback
         const pageType = await detectByElements(page);
-        return finalizeDetectedPage(page, pageType);
+        return page.url() === address ? finalizeDetectedPage(page, pageType) : unknownPage();
     } catch (error) {
         logger.error('Error detecting Gmail page', { error: error.message });
-        return finalizeDetectedPage(page, { type: 'UNKNOWN', elements: [] });
+        return unknownPage();
     }
 }
 
@@ -613,8 +615,8 @@ export async function waitForElement(page, selector, timeout = 10000) {
     try {
         await page.waitForSelector(selector, { timeout });
         return await page.$(selector);
-    } catch (error) {
-        logger.debug(`Element not found: ${selector}`, { error: error.message });
+    } catch {
+        logger.debug('Element not found');
         return null;
     }
 }
