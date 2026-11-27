@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import childProcess, { execFile, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
+import { setTimeout as wait } from 'node:timers/promises';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,6 +12,7 @@ import {
     appendAccountResult, migrateExistingAccountOutputs, recordAccountCleanup, writeRunSummary
 } from '../../src/utils/account-results.js';
 import { describeProcessOwner, readProcessOwner } from '../../src/utils/process-owner.js';
+import { ensurePrivateDirectory, writePrivateFile } from '../../src/utils/private-storage.js';
 
 const runFile = promisify(execFile);
 const source = fileURLToPath(new URL('../../', import.meta.url));
@@ -581,9 +583,8 @@ function installedCli(t) {
     fs.writeFileSync(path.join(install, 'src', 'gmail', 'creator.js'),
         "export async function createGmailAccount() { throw new Error('Unexpected browser call'); }");
     if (process.platform !== 'win32') fs.chmodSync(install, 0o555);
-    const run = (args, overrides = {}) => spawnSync(process.execPath, [
-        path.join(install, 'bin', 'gmail-account-creator.js'), ...args
-    ], {
+    const entry = path.join(install, 'bin', 'gmail-account-creator.js');
+    const options = overrides => ({
         cwd: workingDirectory,
         env: {
             PATH: process.env.PATH,
@@ -594,12 +595,149 @@ function installedCli(t) {
             PROFILE_SERVICE: 'gpm',
             LOG_LEVEL: 'info',
             ...overrides
-        },
-        encoding: 'utf8',
-        timeout: 12_000
+        }
     });
-    return { run, install, workingDirectory, state: path.join(xdg, 'gmail-account-creator') };
+    const run = (args, overrides = {}) => spawnSync(process.execPath, [entry, ...args], {
+        ...options(overrides), encoding: 'utf8', timeout: 12_000
+    });
+    const start = (args, overrides = {}) => childProcess.spawn(process.execPath, [entry, ...args], options(overrides));
+    return { run, start, install, workingDirectory, state: path.join(xdg, 'gmail-account-creator') };
 }
+
+test('CLI cancels a pending result lock without clearing the active writer', {
+    skip: process.platform === 'win32'
+}, async (t) => {
+    for (const [signal, status] of [['SIGINT', 130], ['SIGTERM', 143], [null, 1]]) {
+        await t.test(signal ?? 'normal handoff', async (t) => {
+            const { start, state } = installedCli(t);
+            fs.mkdirSync(state, { recursive: true });
+            const resultFile = path.join(state, 'results.json');
+            const lock = resultFile + '.lock';
+            const release = path.join(state, 'release-fixture');
+            const original = JSON.stringify([{ success: true, profileId: 'preserved' }], null, 2);
+            fs.writeFileSync(resultFile, original, { mode: 0o600 });
+            const holderCode = [
+                'import fs from "node:fs";',
+                'const [module, resultFile, release] = process.argv.slice(1);',
+                'const { withAccountOutputLock } = await import(module);',
+                'const pause = new Int32Array(new SharedArrayBuffer(4));',
+                'withAccountOutputLock(resultFile, () => {',
+                '    fs.writeSync(1, "holding\\n");',
+                '    for (let elapsed = 0; elapsed < 12_000 && !fs.existsSync(release); elapsed += 20) {',
+                '        Atomics.wait(pause, 0, 0, 20);',
+                '    }',
+                '});'
+            ].join('\n');
+            const holder = childProcess.spawn(process.execPath, [
+                '--input-type=module', '--eval', holderCode, lockModule, resultFile, release
+            ], { stdio: ['ignore', 'pipe', 'pipe'] });
+            const holderClosed = once(holder, 'close');
+            let cli;
+            let cliClosed;
+            try {
+                await once(holder.stdout, 'data', { signal: AbortSignal.timeout(4_000) });
+                const owner = fs.readdirSync(lock);
+                cli = start(['--accounts=1'], { FIXTURE_NO_PROXY: '1' });
+                cliClosed = once(cli, 'close');
+                let stderr = '';
+                cli.stderr.on('data', (chunk) => { stderr += chunk; });
+                const deadline = Date.now() + 4_000;
+                const waiting = () => fs.readdirSync(state).some(name => name.startsWith('.results.json.writer-'));
+                while (!waiting()) {
+                    assert.ok(Date.now() < deadline && cli.exitCode === null, 'CLI did not wait at results lock');
+                    await wait(10);
+                }
+
+                if (signal) assert.equal(cli.kill(signal), true);
+                else fs.writeFileSync(release, '');
+                const [exit, terminalSignal] = await once(cli, 'close', { signal: AbortSignal.timeout(4_000) });
+                assert.equal(exit, status, stderr);
+                assert.equal(terminalSignal, null);
+                assert.equal(fs.readFileSync(resultFile, 'utf8'), original);
+                assert.equal(waiting(), false);
+                if (signal) {
+                    assert.doesNotMatch(stderr, /Timed out waiting|Could not prepare|No proxies available/);
+                    assert.deepEqual(fs.readdirSync(lock), owner);
+                    assert.equal(fs.existsSync(path.join(state, 'summary.json')), false);
+                } else {
+                    assert.match(stderr, /No proxies available/);
+                }
+            } finally {
+                if (cli && cli.exitCode === null && cli.signalCode === null) cli.kill('SIGKILL');
+                if (!fs.existsSync(release)) fs.writeFileSync(release, '');
+                if (cliClosed) await cliClosed;
+                assert.deepEqual(await holderClosed, [0, null]);
+            }
+            assert.equal(fs.existsSync(lock), false);
+        });
+    }
+});
+
+test('private macOS outputs refuse inherited grants without weakening deny ACLs', {
+    skip: process.platform !== 'darwin'
+}, (t) => {
+    const root = temporaryDirectory(t);
+    const state = path.join(root, 'existing-state');
+    const safe = path.join(root, 'private-state');
+    fs.mkdirSync(state, { mode: 0o750 });
+    fs.mkdirSync(safe, { mode: 0o700 });
+    const chmod = (file, acl) => childProcess.execFileSync('/bin/chmod', ['+a', acl, file]);
+    const acl = (file) => childProcess.execFileSync('/bin/ls', ['-ledbn', file], { encoding: 'utf8' })
+        .trimEnd().split('\n').slice(1);
+    const options = { requireOwner: true };
+    const error = { code: 'PRIVATE_STORAGE_ACL_ERROR' };
+
+    chmod(state, 'group:everyone allow list,search,file_inherit,directory_inherit');
+    const originalAcl = acl(state);
+    assert.ok(originalAcl.length);
+    assert.throws(() => ensurePrivateDirectory(state, options), error);
+    assert.deepEqual(acl(state), originalAcl);
+
+    const result = path.join(safe, 'results\nwith quote.json');
+    writePrivateFile(result, '[{"success":true}]', options);
+    const snapshot = path.join(state, 'temporary-snapshot');
+    const writes = t.mock.method(fs, 'writeFileSync', fs.writeFileSync);
+    assert.throws(() => writePrivateFile(result, 'changed', { ...options, temporaryPath: snapshot }), error);
+    assert.equal(writes.mock.callCount(), 0);
+    writes.mock.restore();
+    assert.equal(fs.existsSync(snapshot), false);
+    assert.equal(fs.readFileSync(result, 'utf8'), '[{"success":true}]');
+
+    chmod(result, 'group:everyone deny execute');
+    const restrictiveAcl = acl(result);
+    assert.ok(restrictiveAcl.length);
+    assert.throws(() => writePrivateFile(result, 'changed', options), {
+        ...error, message: /could remove existing ACL restrictions/
+    });
+    assert.deepEqual(acl(result), restrictiveAcl);
+    assert.equal(fs.readFileSync(result, 'utf8'), '[{"success":true}]');
+
+    const oldResult = path.join(state, 'old-results.json');
+    fs.writeFileSync(oldResult, '[{"success":true}]', { mode: 0o600 });
+    assert.ok(acl(oldResult).length);
+    assert.throws(() => appendAccountResult(oldResult, { success: true }), error);
+    assert.equal(fs.readFileSync(oldResult, 'utf8'), '[{"success":true}]');
+
+    chmod(safe, 'group:everyone deny writeextattr');
+    ensurePrivateDirectory(safe, options);
+    assert.ok(acl(safe).some(entry => entry.includes('deny writeextattr')));
+    const fresh = path.join(safe, 'fresh.json');
+    appendAccountResult(fresh, { success: true });
+    assert.deepEqual(acl(fresh), []);
+    assert.equal(readJson(fresh)[0].success, true);
+
+    const previouslyVerified = path.join(root, 'verified-directory');
+    ensurePrivateDirectory(previouslyVerified, options);
+    ensurePrivateDirectory(previouslyVerified, options);
+    chmod(previouslyVerified, 'group:everyone allow list');
+    assert.equal(fs.statSync(previouslyVerified).mode & 0o777, 0o700);
+    assert.throws(() => ensurePrivateDirectory(previouslyVerified, options), error);
+
+    fs.renameSync(safe, path.join(root, 'prior-private-directory'));
+    fs.mkdirSync(safe, { mode: 0o700 });
+    chmod(safe, 'group:everyone allow list');
+    assert.throws(() => ensurePrivateDirectory(safe, options), error);
+});
 
 test('installed CLI rejects malformed counts without altering history or starting runtime', (t) => {
     const { run, state } = installedCli(t);

@@ -419,7 +419,24 @@ export function attachFrameCompatibility(frame, page = null) {
 
     if (typeof frame.goto === 'function') {
         const originalGoto = frame.goto.bind(frame);
-        frame.goto = async (url, options) => originalGoto(url, normalizeNavigationOptions(options));
+        frame.goto = async (url, options) => {
+            const normalized = normalizeNavigationOptions(options);
+            try {
+                const recorder = frame._camoufoxPageCompatAttached
+                    ? resolveContextRecorder(resolvePageContext(frame))
+                    : null;
+                if (recorder) {
+                    const targetUrl = typeof url === 'string' ? url : String(url ?? '');
+                    recorder.recordTriggerAction?.('page.goto', targetUrl, {
+                        url: targetUrl,
+                        pageUrl: typeof frame.url === 'function' ? frame.url() : null
+                    }, frame);
+                }
+            } catch {
+                // Never allow instrumentation to interfere with navigation
+            }
+            return originalGoto(url, normalized);
+        };
     }
 
     if (typeof frame.waitForNavigation === 'function') {
@@ -507,26 +524,6 @@ export function attachPageCompatibility(page, context = null, profile = null) {
 
     // Apply all Frame-level shims ($x, waitForXPath, waitForSelector, goto, waitForNavigation, evaluate, evaluateHandle, waitForTimeout)
     attachFrameCompatibility(page);
-
-    // Instrument page.goto with causal trigger attribution
-    if (typeof page.goto === 'function') {
-        const normalizedGoto = page.goto.bind(page);
-        page.goto = async (url, options) => {
-            try {
-                const recorder = resolveRecorder();
-                if (recorder) {
-                    const targetUrl = typeof url === 'string' ? url : String(url ?? '');
-                    recorder.recordTriggerAction?.('page.goto', targetUrl, {
-                        url: targetUrl,
-                        pageUrl: typeof page.url === 'function' ? page.url() : null
-                    }, page);
-                }
-            } catch {
-                // Never allow instrumentation to interfere with navigation
-            }
-            return normalizedGoto(url, options);
-        };
-    }
 
     // Instrument UI action drivers on page: click, fill, type, press, tap
     for (const methodName of ['click', 'fill', 'type', 'press', 'tap']) {

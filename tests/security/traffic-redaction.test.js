@@ -138,6 +138,16 @@ test('inline authentication and absolute paths in file errors are removed from d
     assert.equal(redactDiagnosticText('GET /notes/part%2Ejson'), 'GET /notes/part%2Ejson');
 });
 
+test('HTTP redirect targets and file operation destinations keep their separate privacy rules', () => {
+    const diagnostic = 'Redirect failed: /previous -> /next?view=compact&token=' + fixtureToken + ' (HTTP 302)';
+    assert.equal(redactDiagnosticText(diagnostic),
+        'Redirect failed: /previous -> /next?view=compact&token=' + mask + ' (HTTP 302)');
+    assert.equal(redactDiagnosticText("EXDEV: rename 'relative.txt' -> '/opt/fixture-private/destination.txt'"),
+        "EXDEV: rename 'relative.txt' -> '" + mask + "'");
+    assert.equal(redactDiagnosticText("EXDEV: copyfile '/opt/fixture-private/a -> b' -> '/opt/fixture-private/out'"),
+        "EXDEV: copyfile '" + mask + "' -> '" + mask + "'");
+});
+
 const diagnosticUrl = 'https://fixture.invalid/collection(review)?token=' + fixtureToken;
 const localFileUrl = 'file:///Users/fixture-operator/Documents/fixture-local-document.pdf';
 
@@ -495,6 +505,67 @@ test('new captures and shared reports omit private query, action and failure det
             assert.ok(!output.includes(value), 'private fixture value survived projection');
         }
     }
+});
+
+const contactsByEmail = {
+    [fixtureEmail]: { email: fixtureEmail, state: 'pending' },
+    [mask + ' 1']: { state: 'literal' },
+    'second%40person%2Einvalid': { state: 'ready' },
+    ordinary: { state: 'queued' }
+};
+const projectedContacts = {
+    [mask + ' 2']: { email: mask, state: 'pending' },
+    [mask + ' 1']: { state: 'literal' },
+    [mask + ' 3']: { state: 'ready' },
+    ordinary: { state: 'queued' }
+};
+
+test('diagnostic metadata gives private identity keys distinct collision-free labels', () => {
+    const raw = { details: [{ contacts: contactsByEmail }] };
+    const expected = { details: [{ contacts: projectedContacts }] };
+    assert.deepEqual(redactDiagnosticMetadata(raw), expected);
+    assert.deepEqual(redactDiagnosticMetadata(expected), expected);
+    assert.ok(Object.hasOwn(contactsByEmail, fixtureEmail));
+});
+
+test('metadata key privacy holds in new recordings and when projecting existing ledgers', async (t) => {
+    const root = directory(t);
+    const recorder = new CamoufoxTrafficRecorder({
+        profileDir: root, harPath: path.join(root, 'traffic.har'), recordBodies: false
+    });
+    const transport = new EventEmitter();
+    recorder.attachContext(transport);
+    const frame = { url: () => 'https://fixture.invalid/' };
+    const metadata = { contacts: contactsByEmail };
+    const action = recorder.recordTriggerAction('locator.click', '#fixture', metadata, frame);
+    const request = {
+        frame: () => frame, url: () => 'https://fixture.invalid/items', method: () => 'GET', headers: () => ({})
+    };
+    transport.emit('request', request);
+    await recorder.stop();
+
+    const ledger = fs.readFileSync(recorder.trafficNdjsonPath, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.deepEqual(ledger.find(({ type }) => type === 'trigger-action').metadata.contacts, projectedContacts);
+    const { log } = recorder.exportHar();
+    assert.deepEqual(log.entries[0]._attribution.triggerAction.metadata.contacts, projectedContacts);
+    const id = log.entries[0]._attribution.correlationId;
+    const newWire = queryProfileTraffic({ trafficDir: recorder.trafficDir, correlation: id });
+    assert.deepEqual(newWire.egress.triggerAction.metadata.contacts, projectedContacts);
+
+    const legacyDir = path.join(root, 'legacy', 'traffic');
+    fs.mkdirSync(legacyDir, { recursive: true });
+    const legacy = {
+        type: 'egress', timestamp: '2025-01-01T00:00:00.000Z', correlationId: 'legacy-contact-map',
+        url: request.url(), method: 'GET', triggerAction: { ...action, metadata }
+    };
+    const legacyLedger = path.join(legacyDir, 'traffic.ndjson');
+    const original = JSON.stringify(legacy) + '\n';
+    fs.writeFileSync(legacyLedger, original, { mode: 0o600 });
+    const legacyHar = exportTrafficToHar(legacyDir, path.join(root, 'legacy.har'));
+    assert.deepEqual(legacyHar.log.entries[0]._attribution.triggerAction.metadata.contacts, projectedContacts);
+    const legacyProfile = queryProfileTraffic({ trafficDir: legacyDir });
+    assert.deepEqual(legacyProfile.transactions[0].egress.triggerAction.metadata.contacts, projectedContacts);
+    assert.equal(fs.readFileSync(legacyLedger, 'utf8'), original);
 });
 
 test('legacy archive profile lookup, JSON and HAR use the anonymous profile label', (t) => {

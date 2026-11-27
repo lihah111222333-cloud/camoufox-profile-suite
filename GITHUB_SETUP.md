@@ -25,14 +25,23 @@ git config --local user.email "YOUR_GITHUB_COMMIT_EMAIL"
 
 بعد نجاح الفحص، يستخدم المساعد الالتزام الحالي إذا لم توجد تغييرات جاهزة للالتزام.
 
+ابدأ من فرع محلي. إذا كان لديك فرع `main` محلي، انتقل إليه عندما يكون هو الفرع المراد دفعه. إذا كان الاسم `main` متاحًا، تعيد الكتلة تسمية الفرع الحالي إليه قبل الدفع.
+
 ```bash
 expected_origin=https://github.com/YOUR_USERNAME/REPO_NAME.git
-bash PUSH_TO_GITHUB.sh &&
-  git remote add origin "$expected_origin" &&
-  push_origin=$(git remote get-url --push --all origin) &&
-  test "$push_origin" = "$expected_origin" &&
-  git branch -M main &&
-  git push -u origin main
+if first_push_ref=$(git symbolic-ref --quiet HEAD) &&
+   main_refs=$(git for-each-ref --format='%(refname)' refs/heads/main) &&
+   { [ "$first_push_ref" = refs/heads/main ] || [ -z "$main_refs" ]; }; then
+  bash PUSH_TO_GITHUB.sh &&
+    git remote add origin "$expected_origin" &&
+    push_origin=$(git remote get-url --push --all origin) &&
+    test "$push_origin" = "$expected_origin" &&
+    { [ "$first_push_ref" = refs/heads/main ] || git branch -m -- "${first_push_ref#refs/heads/}" main; } &&
+    git push -u origin refs/heads/main
+else
+  printf '%s\n' 'Check out local main or a named branch when main is available.' >&2
+  false
+fi
 ```
 
 ### 3. التحقق من الملفات الحساسة

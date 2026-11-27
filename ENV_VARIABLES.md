@@ -6,7 +6,7 @@ The app keeps `.env`, the optional `.emv`, `config/proxies.txt`, `results.json`,
 
 The app can read legacy configuration and import sanitized history when the corresponding state files are missing. A source checkout uses its root as the legacy directory. To adopt configuration and history from another installation, set `GMAIL_CREATOR_LEGACY_DIR` to its absolute path in the shell environment before launch. Existing state outputs take precedence. Original files and logs stay in place. Startup reports invalid history and keeps the original file available for review. Set `CAMOUFOX_STORAGE_DIR` to the absolute path of an existing profile store to keep using it.
 
-Within the selected configuration directory, settings supplied by the launch environment take precedence over `.env`. An empty `PROFILE_SERVICE` is treated as unset. If the service is still unset, `.emv` can supply fallback settings. Once a service is selected, `.emv` can supply a missing GoLogin key. Applications and direct SDK callers use the same profile storage and deployment network configuration.
+Within the selected configuration directory, settings supplied by the launch environment take precedence over `.env`. An empty `PROFILE_SERVICE` is treated as unset. If the service is still unset, `.emv` can supply fallback settings. Once a service is selected, `.emv` is read for a missing GoLogin key when GoLogin configuration is requested. Applications and direct SDK callers use the same profile storage and deployment network configuration. A launch `DOTENV_KEY` is validated when a selected encrypted configuration file is read.
 
 Concurrent runs append to `results.json`. `summary.json` holds the latest completed run. If a write times out while another process owns the lock, stop all writers sharing this state directory before inspecting a stranded `results.json.lock` or `summary.json.lock`.
 
@@ -123,5 +123,7 @@ When a HAR-only export fails, the recorder keeps the captured data in private sc
 ## Host filesystem permissions
 
 On POSIX hosts, the app sets private directory and file modes to `0700` and `0600`. These settings follow the host running Node.js.
+
+On macOS, review extended ACLs on state and configuration directories, existing files and newly replaced files. Mode bits such as `0700` and `0600` describe POSIX permissions. Apply owner-only effective access before placing private data in a directory. The app refuses ACL grants on its state directory and on checked current result and configuration files. An ACL check preserves existing deny entries and refuses replacement when it could remove such restrictions. Verify effective permissions on any separate profile or capture directories you configure.
 
 On native Windows, deploy the app in a dedicated local NTFS directory with operator-provisioned discretionary access control lists (DACLs). Limit access to the app's run account and authorized system principals. Verify the DACLs on the directories holding results, summaries, logs, browser state and native diagnostics, and on any existing files. Also check a synthetic record after creation and atomic replacement by the run account, since a new file inherits access from its containing directory. The app relies on this Windows host setup.

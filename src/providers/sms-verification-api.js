@@ -6,6 +6,7 @@
 
 const SMS_VERIFY_API_URL = 'https://sms-verification-number.com/stubs/handler_api';
 const REQUEST_TIMEOUT_MS = 30000;
+const STATUS_CHECK_INTERVAL_MS = 3000;
 const TERMINAL_ORDER_RECEIPTS = new Map([
     ['6', 'ACCESS_ACTIVATION'],
     ['8', 'ACCESS_CANCEL']
@@ -145,6 +146,10 @@ async function makeRequest(action, params = {}, timeoutMs = REQUEST_TIMEOUT_MS) 
         throw new Error('SMS Verification API request failed');
     }
 
+    if ((isPurchase || expectedReceipt) && (response.status === 202 || response.status === 206)) {
+        throw unconfirmed();
+    }
+
     try {
         data = JSON.parse(data);
     } catch {
@@ -234,6 +239,10 @@ function numberOrderParams(service, country, operator, { maxPrice }) {
 function parseOrderId(value) {
     const id = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : value;
     return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+function requireOrderId(orderId) {
+    if (parseOrderId(orderId) === null) throw new RangeError('Order ID must be a positive safe integer');
 }
 
 function isPhoneNumber(value) {
@@ -336,20 +345,22 @@ function classifyOrderStatus(response) {
 
 /**
  * Check the status of an existing order for reconciliation.
- * @param {number} orderId - Order ID
+ * @param {number|string} orderId - Positive safe integer order ID
  * @returns {Promise<{status: string}>}
  */
 export async function getSmsVerifyOrderStatus(orderId) {
+    requireOrderId(orderId);
     const response = await makeRequest('getStatus', { id: orderId });
     return { status: classifyOrderStatus(response) };
 }
 
 /**
  * Check order status and get SMS code
- * @param {number} orderId - Order ID
+ * @param {number|string} orderId - Positive safe integer order ID
  * @returns {Promise<{status: string, code?: string}>}
  */
 export async function checkSmsVerifyOrder(orderId) {
+    requireOrderId(orderId);
     return readSmsVerifyOrder(orderId);
 }
 
@@ -367,7 +378,7 @@ async function readSmsVerifyOrder(orderId, timeoutMs) {
  * @returns {Promise<string>} Response
  */
 export async function setSmsVerifyStatus(orderId, status) {
-    if (parseOrderId(orderId) === null) throw new RangeError('Order ID must be a positive safe integer');
+    requireOrderId(orderId);
     const response = await makeRequest('setStatus', { id: orderId, status });
 
     if (response === 'CANNOT_BEFORE_2_MIN') {
@@ -433,12 +444,34 @@ export async function getSmsVerifyActivations(options = {}) {
 
 /**
  * Wait for SMS code
- * @param {number} orderId - Order ID
- * @param {number} maxWaitTime - Max wait time in ms (default: 5 min)
+ * @param {number|string} orderId - Positive safe integer order ID
+ * @param {number} maxWaitTime - Finite nonnegative wait time in ms (default: 5 min)
  * @param {number} checkInterval - Check interval in ms (default: 3 sec)
  * @returns {Promise<string>} SMS code
  */
-export async function waitForSmsVerifyCode(orderId, maxWaitTime = 300000, checkInterval = 3000) {
+export async function waitForSmsVerifyCode(orderId, maxWaitTime = 300000, checkInterval = STATUS_CHECK_INTERVAL_MS) {
+    requireOrderId(orderId);
+    requireWaitBudget(maxWaitTime);
+    return waitForOrder(orderId, maxWaitTime, checkInterval);
+}
+
+function requireWaitBudget(maxWaitTime) {
+    if (!Number.isFinite(maxWaitTime) || maxWaitTime < 0) {
+        throw new RangeError('maxWaitTime must be a nonnegative finite number');
+    }
+}
+
+function requireOriginalApiKey(orderId, apiKey) {
+    if (apiKey !== undefined && process.env.SMS_VERIFY_API_KEY !== apiKey) {
+        throw new SmsVerifyOrderError(
+            'SMS Verification order credentials changed. Reconcile the order before ordering again.',
+            orderId,
+            'RECONCILIATION_REQUIRED'
+        );
+    }
+}
+
+async function waitForOrder(orderId, maxWaitTime, checkInterval, apiKey) {
     const startTime = performance.now();
     const remainingTime = () => maxWaitTime - (performance.now() - startTime);
     let lastStatus = 'PENDING';
@@ -447,6 +480,7 @@ export async function waitForSmsVerifyCode(orderId, maxWaitTime = 300000, checkI
 
     let remaining = remainingTime();
     while (remaining > 0) {
+        requireOriginalApiKey(orderId, apiKey);
         let result;
         try {
             result = await readSmsVerifyOrder(orderId, Math.min(REQUEST_TIMEOUT_MS, Math.ceil(remaining)));
@@ -456,6 +490,7 @@ export async function waitForSmsVerifyCode(orderId, maxWaitTime = 300000, checkI
             console.log('Retrying SMS status request');
         }
 
+        requireOriginalApiKey(orderId, apiKey);
         remaining = remainingTime();
         if (remaining <= 0) break;
         if (result) {
@@ -484,7 +519,7 @@ export async function waitForSmsVerifyCode(orderId, maxWaitTime = 300000, checkI
  * @param {string} options.service - Service code (default: 'fu' for Snapchat)
  * @param {number} options.country - Country ID (default: 16 for UK)
  * @param {string} options.operator - Operator code (default: 'any')
- * @param {number} options.maxWaitTime - Max wait time for SMS
+ * @param {number} options.maxWaitTime - Finite nonnegative wait time in ms
  * @param {number} [options.maxPrice] - Positive, finite spending cap
  * @returns {Promise<{phone: string, code: string, orderId: number}>}
  * @throws {SmsVerifyOrderError} Includes status and an orderId when known. Reconciliation-required errors are not retryable.
@@ -496,11 +531,15 @@ export async function buyNumberAndGetSMS({
     maxWaitTime = 300000,
     maxPrice
 } = {}) {
+    requireWaitBudget(maxWaitTime);
+    const apiKey = process.env.SMS_VERIFY_API_KEY;
     const order = await buySmsVerifyNumber(service, country, operator, { maxPrice });
     let code;
     try {
-        code = await waitForSmsVerifyCode(order.id, maxWaitTime);
+        code = await waitForOrder(order.id, maxWaitTime, STATUS_CHECK_INTERVAL_MS, apiKey);
     } catch (error) {
+        if (error instanceof SmsVerifyOrderError) throw error;
+        requireOriginalApiKey(order.id, apiKey);
         const canceled = error instanceof SmsVerifyCanceledError ||
             await cancelSmsVerifyOrder(order.id).catch(() => false);
         if (canceled) {
@@ -514,6 +553,7 @@ export async function buyNumberAndGetSMS({
     }
 
     // A finish request can succeed even if its response is lost. Preserve the order for reconciliation.
+    requireOriginalApiKey(order.id, apiKey);
     const finished = await finishSmsVerifyOrder(order.id).catch(() => false);
     if (!finished) {
         throw new SmsVerifyOrderError(

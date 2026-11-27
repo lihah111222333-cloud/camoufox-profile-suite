@@ -207,15 +207,18 @@ function observationClock(event) {
 }
 
 function observationOrder(event, clock = observationClock(event)) {
+    const sequence = event.observationSequence;
     return {
         clock: Number.isFinite(clock) ? clock : -Infinity,
-        sequence: Number.isSafeInteger(event.observationSequence) ? event.observationSequence : 0
+        sequence: Number.isSafeInteger(sequence) && sequence > 0 ? sequence : 0
     };
 }
 
 function compareObservationOrder(first, second) {
+    // Older records precede the sequenced format. New observations retain capture order across clock adjustments.
+    if (first.sequence !== second.sequence) return first.sequence - second.sequence;
     if (first.clock !== second.clock) return first.clock < second.clock ? -1 : 1;
-    return first.sequence - second.sequence;
+    return 0;
 }
 
 function matchingDomain(host, domain) {
@@ -303,7 +306,7 @@ function entryFor(entries, observation, scope, key) {
             pathEvidence: null,
             validDomain: false,
             expiresAt: null,
-            lastSetClock: null,
+            lastSetOrder: null,
             hasUntimedSet: false,
             deleted: false
         });
@@ -411,7 +414,7 @@ export class CookieLineage {
                 entry.lastValueSha256 = valueSha256;
                 state.pathEvidence = pathEvidence;
                 state.validDomain = validDomain;
-                state.lastSetClock = clock;
+                state.lastSetOrder = order;
                 state.hasUntimedSet ||= !hasClock;
                 state.expiresAt = expiresAt;
                 state.deleted = isDeleted;
@@ -429,14 +432,17 @@ export class CookieLineage {
             for (const state of entries.values()) {
                 const { entry } = state;
                 if (!state.validDomain || state.deleted || state.expiresAt <= clock ||
-                    state.lastSetClock > clock || !valueSha256 || valueSha256 !== entry.lastValueSha256 || (entry.secure && !secure) ||
+                    !valueSha256 || valueSha256 !== entry.lastValueSha256 || (entry.secure && !secure) ||
                     !hostname || !(entry.hostOnly ? hostname === entry.domain : matchingDomain(hostname, entry.domain)) ||
                     (entry.partitioned && partitionKey && entry.partitionKey && entry.partitionKey !== partitionKey)) {
                     continue;
                 }
                 const matchesPath = matchingObservedPath(requestPath, state.pathEvidence);
                 if (matchesPath === false) continue;
-                if (matchesPath === null || !hasClock || state.hasUntimedSet) {
+                const clockMovedBack = state.lastSetOrder.clock > order.clock;
+                const cannotUseClock = clockMovedBack &&
+                    (!order.sequence || !state.lastSetOrder.sequence || Number.isFinite(state.expiresAt));
+                if (matchesPath === null || !hasClock || state.hasUntimedSet || cannotUseClock) {
                     hasUncertainCandidate = true;
                 } else {
                     candidates.push(state);

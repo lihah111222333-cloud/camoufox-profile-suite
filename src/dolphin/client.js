@@ -58,6 +58,10 @@ function dolphinRejected(data) {
         (data?.code != null && typeof data.message === 'string');
 }
 
+function dolphinAcknowledged(response) {
+    return controllerAcknowledged(response) && !dolphinRejected(parseControllerPayload(response.data));
+}
+
 function dolphinPost(operation, path, body, timeout, { authorization, allocatesProfile = false } = {}) {
     const url = controllerApiUrl(DOLPHIN_API_URL, path, 'DOLPHIN_TRUSTED_HTTP_API_URL');
     const auth = authorization ?? getAuthHeader();
@@ -359,7 +363,7 @@ export async function stopProfile(profileId) {
     try {
         const response = await dolphinPost('Dolphin Anty API stop profile', '/api/browser/closeProfiles',
             { profileIds: [requireControllerProfileId(profileId)] }, 10000);
-        if (!controllerAcknowledged(response)) {
+        if (!dolphinAcknowledged(response)) {
             logger.warn('Dolphin Anty API did not confirm profile closure');
             return false;
         }
@@ -379,7 +383,7 @@ export async function recycleProfile(profileId) {
         const id = String(requireControllerProfileId(profileId));
         const response = await dolphinPost('Dolphin Anty API recycle profile', '/api/profile/moveProfiletoRecycle',
             { ids: [id] }, 10000);
-        if (response.status !== 200 || !controllerAcknowledged(response)) {
+        if (response.status !== 200 || !dolphinAcknowledged(response)) {
             throw new Error('Dolphin Anty API did not confirm profile recycling');
         }
         logger.info('Dolphin Anty profile moved to the recycle bin');
@@ -434,8 +438,7 @@ export async function updateProfileProxy(profileIds, proxy) {
             requestBody, 15000);
         // The documented HTTP 200 response may omit the body.
         const emptySuccess = response.status === 200 && (response.data === undefined || response.data === '');
-        if (!emptySuccess &&
-            (!controllerAcknowledged(response) || dolphinRejected(parseControllerPayload(response.data)))) {
+        if (!emptySuccess && !dolphinAcknowledged(response)) {
             throw new Error('Dolphin Anty API did not confirm the proxy update');
         }
         logger.info('Dolphin Anty profile proxy updated successfully');

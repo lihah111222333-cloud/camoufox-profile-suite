@@ -16,6 +16,7 @@ if (!['gpm', 'dolphin', 'camoufox'].includes(profileService)) {
 
 const configuredAccountsCount = process.env.ACCOUNTS_COUNT ?? '1';
 const configuredThreadsCount = process.env.THREADS_COUNT ?? '1';
+let configuredGoLoginKey = process.env.GOLOGIN_API_KEY;
 
 export const config = {
     profileService,
@@ -53,7 +54,13 @@ export const config = {
         neckoMozLogModules: process.env.CAMOUFOX_NECKO_MOZ_LOG_MODULES || 'timestamp,nsHttp:5,nsSocketTransport:5,nsHostResolver:4'
     },
     gologin: {
-        apiKey: process.env.GOLOGIN_API_KEY || '',
+        get apiKey() {
+            configuredGoLoginKey ??= loadApplicationEnvironment({
+                env: { ...process.env },
+                includeGoLoginFallback: true
+            }).GOLOGIN_API_KEY ?? '';
+            return configuredGoLoginKey;
+        },
         apiUrl: 'https://api.gologin.com'
     },
     omocaptcha: {

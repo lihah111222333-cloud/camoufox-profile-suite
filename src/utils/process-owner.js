@@ -13,10 +13,14 @@ function digest(value) {
     return createHash('sha256').update(value).digest('hex');
 }
 
-const host = digest(`${process.platform}:${os.hostname()}`);
 const windowsRoot = process.env.SystemRoot;
+let host;
 let ownGeneration;
 let ownScope;
+
+function hostDigest() {
+    return host ??= digest(`${process.platform}:${os.hostname()}`);
+}
 
 function readProcessScope() {
     try {
@@ -72,7 +76,7 @@ export function describeProcessOwner() {
     const generation = ownGeneration ??= processGeneration(process.pid);
     const { boot, namespace } = ownScope ??= readProcessScope();
     const scope = boot ? ` ${boot} ${namespace}` : '';
-    return `${host} ${generation}${scope}\n`;
+    return `${hostDigest()} ${generation}${scope}\n`;
 }
 
 export function readProcessOwner(filePath) {
@@ -93,7 +97,7 @@ export function processOwnerStatus(pid, identity) {
     const sameBoot = identity.boot && identity.boot === scope.boot;
     // A boot match can establish ownership after a rename, within the same PID namespace.
     if (sameBoot && identity.namespace !== scope.namespace) return 'unverified';
-    if (!sameBoot && identity.host && identity.host !== host) return 'unverified';
+    if (!sameBoot && identity.host && identity.host !== hostDigest()) return 'unverified';
     try {
         process.kill(pid, 0);
     } catch (error) {

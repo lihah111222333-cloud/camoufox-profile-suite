@@ -13,6 +13,7 @@ const launchTimeout = 120000;
 const browserOperationTimeout = 10000;
 const compensateFailedStart = Symbol('compensateFailedStart');
 const internallyBoundSession = Symbol('internallyBoundSession');
+const claimedBrowsers = new WeakSet();
 
 function bindGoLoginSession() {
     const token = getGoLoginApiKey();
@@ -63,6 +64,7 @@ class GoLoginProfile {
     #starting;
     #launching;
     #ownedBrowser;
+    #browserClosed = false;
     #closing;
     #stopping;
     #stoppingSdk;
@@ -75,7 +77,14 @@ class GoLoginProfile {
     constructor(profileId, gologinApi = null, session = null) {
         this.#profileId = requireControllerProfileId(profileId);
         this.#gologinApi = gologinApi;
-        this.#session = session;
+        if (session) {
+            const { client, createSdk } = session;
+            this.#session = {
+                client,
+                createSdk: typeof createSdk === 'function' ? createSdk.bind(session) : undefined,
+                [internallyBoundSession]: session[internallyBoundSession]
+            };
+        }
         this.browser = null;
         this.page = null;
     }
@@ -148,8 +157,16 @@ class GoLoginProfile {
             this.#needsCleanup = true;
             this.#stopConfirmed = false;
             const result = await this.#gologinApi.launch({ profileId: String(this.profileId), cloud: true });
-            this.#ownedBrowser = result?.browser;
-            return this.#ownedBrowser;
+            const browser = result?.browser;
+            if (browser) {
+                if (claimedBrowsers.has(browser)) {
+                    this.#ownsSdk = false;
+                    throw new GoLoginWaitError('GoLogin browser is already managed by another profile');
+                }
+                claimedBrowsers.add(browser);
+            }
+            this.#ownedBrowser = browser;
+            return browser;
         });
         this.#launching = launching;
         return waitFor(launching, launchTimeout, 'GoLogin browser launch timed out', signal, () => {
@@ -178,10 +195,10 @@ class GoLoginProfile {
 
     #closeBrowser() {
         const browser = this.#ownedBrowser;
-        if (!browser) return Promise.resolve(true);
+        if (!browser || this.#browserClosed) return Promise.resolve(true);
         this.#closing ??= Promise.resolve().then(() => browser.close()).then(result => {
             if (result === false) return false;
-            this.#ownedBrowser = null;
+            this.#browserClosed = true;
             if (!this.#ownsSdk || typeof this.#gologinApi?.stop !== 'function') this.#stopConfirmed = true;
             return true;
         }, () => false).finally(() => {
@@ -190,11 +207,20 @@ class GoLoginProfile {
         return waitFor(this.#closing, browserOperationTimeout, 'GoLogin browser close timed out').catch(() => false);
     }
 
+    #confirmStopped() {
+        if (!this.#stopConfirmed || (this.#ownedBrowser && !this.#browserClosed)) return false;
+        if (this.#ownedBrowser) claimedBrowsers.delete(this.#ownedBrowser);
+        this.#ownedBrowser = null;
+        this.#browserClosed = false;
+        this.#needsCleanup = false;
+        return true;
+    }
+
     async #stopBrowser() {
         this.browser = null;
         this.page = null;
         if (!this.#needsCleanup) return this.#stopConfirmed;
-        const closed = await this.#closeBrowser();
+        await this.#closeBrowser();
         if (this.#ownsSdk && !this.#stopConfirmed && typeof this.#gologinApi?.stop === 'function') {
             this.#stoppingSdk ??= Promise.resolve().then(() => this.#gologinApi.stop()).then(result => {
                 this.#stopConfirmed = result !== false;
@@ -203,9 +229,7 @@ class GoLoginProfile {
             });
             await waitFor(this.#stoppingSdk, browserOperationTimeout, 'GoLogin session stop timed out').catch(() => {});
         }
-        if (!closed || !this.#stopConfirmed) return false;
-        this.#needsCleanup = false;
-        return true;
+        return this.#confirmStopped();
     }
 
     stop() {
@@ -228,13 +252,15 @@ class GoLoginProfile {
         if (this.#deleteUnconfirmed) {
             return Promise.reject(cleanupError(this.profileId, 'delete-unconfirmed', 'GoLogin profile deletion is unconfirmed'));
         }
-        if (this.#gologinApi && !this.#session) {
-            return Promise.reject(new Error('Deleting an externally managed GoLogin profile requires a bound REST credential'));
-        }
         try {
-            this.#session ??= bindGoLoginSession();
+            if (!this.#gologinApi) this.#session ??= bindGoLoginSession();
         } catch (error) {
             return Promise.reject(error);
+        }
+        if (typeof this.#session?.client?.deleteProfile !== 'function') {
+            return Promise.reject(cleanupError(
+                this.profileId, 'delete-rejected', 'Deleting an externally managed GoLogin profile requires a bound REST credential'
+            ));
         }
         this.#deleting = Promise.resolve().then(() => this.#deleteProfile(mode === compensateFailedStart)).finally(() => {
             this.#deleting = null;
@@ -244,15 +270,10 @@ class GoLoginProfile {
 
     async #deleteProfile(compensate) {
         if (this.#starting || this.#needsCleanup) await this.stop();
-        if (this.#needsCleanup) {
-            if (compensate && this.#launching) {
-                // The factory owns this allocation. Continue only after a confirmed stop and before any DELETE.
-                void this.#launching.then(async stopped => {
-                    if (stopped !== true) return;
-                    await this.#deleting?.catch(() => {});
-                    await this.delete();
-                }).catch(error => {
-                    logger.warn('GoLogin late launch profile deletion failed', {
+        if (this.#needsCleanup && (this.#launching || !this.#confirmStopped())) {
+            if (compensate && (this.#launching || this.#closing || this.#stoppingSdk)) {
+                void this.#finishPendingCleanup().catch(error => {
+                    logger.warn('GoLogin deferred profile cleanup failed', {
                         profileId: this.profileId, profileCleanup: error.profileCleanup ?? 'delete-unconfirmed'
                     });
                 });
@@ -274,6 +295,15 @@ class GoLoginProfile {
         this.#deleted = true;
         logger.info('GoLogin profile deleted', { profileId: this.profileId });
         return true;
+    }
+
+    async #finishPendingCleanup() {
+        // Only the owning factory can continue an unsent DELETE. Observe the original stop operations.
+        await this.#launching;
+        await Promise.all([this.#closing, this.#stoppingSdk]);
+        if (!this.#confirmStopped()) return;
+        await this.#deleting?.catch(() => {});
+        await this.delete();
     }
 }
 

@@ -42,10 +42,16 @@ const INLINE_AUTHORIZATION_REGEX = new RegExp(
     'gi'
 );
 const ABSOLUTE_FILE_PATH_PREFIX = String.raw`(?:[a-z]:[\\/]|\\\\|\/(?!\/))`;
-const DIAGNOSTIC_FILE_PATH_REGEX = new RegExp(
-    String.raw`(\b(?:access|chmod|chown|copyfile|directory|file|lstat|mkdir|open|path|read(?:file|link)?|realpath|rename|rmdir|scandir|stat|symlink|unlink|write(?:file)?)[ \t]+|[ \t]+->[ \t]+)` +
+const DIAGNOSTIC_FILE_ARGUMENT =
     '(?:(["\'])' + ABSOLUTE_FILE_PATH_PREFIX + String.raw`[^\r\n]*?(?:\2|(?=\r?\n|$))|` +
-    ABSOLUTE_FILE_PATH_PREFIX + String.raw`[^\s"'<>()[\]{},;]+)`, 'gi'
+    ABSOLUTE_FILE_PATH_PREFIX + String.raw`[^\s"'<>()[\]{},;]+)`;
+const DIAGNOSTIC_FILE_PATH_REGEX = new RegExp(
+    String.raw`(\b(?:access|chmod|chown|copyfile|directory|file|lstat|mkdir|open|path|read(?:file|link)?|realpath|rename|rmdir|scandir|stat|symlink|unlink|write(?:file)?)[ \t]+)` +
+    DIAGNOSTIC_FILE_ARGUMENT, 'gi'
+);
+const DIAGNOSTIC_FILE_DESTINATION_REGEX = new RegExp(
+    String.raw`(\b(?:copyfile|link|rename|symlink)[ \t]+(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s"']+)[ \t]+->[ \t]+)` +
+    DIAGNOSTIC_FILE_ARGUMENT, 'gi'
 );
 const LINK_HEADER_REGEX = /^link$/i;
 const REFRESH_HEADER_REGEX = /^refresh$/i;
@@ -279,6 +285,10 @@ function redactUrlReference(reference) {
     return redactUrlSecrets(reference.slice(0, end)) + reference.slice(end);
 }
 
+function redactFileArgument(_, prefix, quote = '') {
+    return prefix + quote + MASK + quote;
+}
+
 export function redactDiagnosticText(rawText) {
     const cleaned = String(rawText ?? '')
         .replace(DIAGNOSTIC_CREDENTIAL_HEADER_REGEX,
@@ -292,8 +302,8 @@ export function redactDiagnosticText(rawText) {
             })
         .replace(INLINE_AUTHORIZATION_REGEX,
             (_, prefix, name, value) => prefix + name + ': ' + redactCredentialHeader(name, value))
-        .replace(DIAGNOSTIC_FILE_PATH_REGEX,
-            (_, prefix, quote = '') => prefix + quote + MASK + quote)
+        .replace(DIAGNOSTIC_FILE_DESTINATION_REGEX, redactFileArgument)
+        .replace(DIAGNOSTIC_FILE_PATH_REGEX, redactFileArgument)
         .replace(QUOTED_PRIVATE_URL_REGEX, (_, quote, url) => quote + redactUrlSecrets(url) + quote)
         .replace(URL_REFERENCE_REGEX, redactUrlReference)
         .replace(LEGACY_MASK_REGEX, MASK);
@@ -366,6 +376,7 @@ export function redactDiagnosticMetadata(metadata) {
         const searchParams = /^searchParams$/i.test(key);
         const hasCloudFrontKey = searchParams && Object.keys(value)
             .some(name => name.trim().toLowerCase() === CLOUDFRONT_KEY_ID);
+        let maskedKeyCount = 0;
         const copyEntry = ([name, item]) => {
             if (privateUrl && Object.hasOwn(PRIVATE_URL_COMPONENTS, name)) {
                 return [name, PRIVATE_URL_COMPONENTS[name]];
@@ -374,14 +385,21 @@ export function redactDiagnosticMetadata(metadata) {
                 if (name === 'maskedPreview') return [name, MASK];
                 if (/^(?:rawValue|value|valueLength|valueSha256)$/.test(name)) return [name, null];
             }
+            let projectedName = name;
+            if (redactUrlPathIdentity(name) !== name) {
+                // Allocate local labels without overwriting an existing literal or projected key.
+                do {
+                    projectedName = MASK + ' ' + ++maskedKeyCount;
+                } while (Object.hasOwn(value, projectedName));
+            }
             if (searchParams) {
                 const parameterName = name.trim();
                 const sanitize = (param) => hasCloudFrontKey && /^policy$/i.test(parameterName)
                     ? MASK
                     : copy(typeof param === 'string' ? redactUrlValue(param, 1) : param, parameterName);
-                return [name, Array.isArray(item) ? Object.freeze(item.map(sanitize)) : sanitize(item)];
+                return [projectedName, Array.isArray(item) ? Object.freeze(item.map(sanitize)) : sanitize(item)];
             }
-            return [name, copy(item, name)];
+            return [projectedName, copy(item, name)];
         };
         const sanitized = Array.isArray(value)
             ? value.map((item) => copy(item, key))

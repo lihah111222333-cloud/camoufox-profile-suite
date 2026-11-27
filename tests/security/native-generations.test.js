@@ -9,7 +9,7 @@ import {
     createProfile, rollbackCreatedProfile, setCamoufoxModule, startProfile, stopAllActiveProfiles,
     stopProfile, unregisterProcessCleanupHooks
 } from '../../src/camoufox/client.js';
-import { CamoufoxTrafficRecorder, verifyTrafficIntegrity } from '../../src/camoufox/traffic-recorder.js';
+import { CamoufoxTrafficRecorder, exportTrafficToHar, verifyTrafficIntegrity } from '../../src/camoufox/traffic-recorder.js';
 
 function mockLauncher(launches = [], browsers = []) {
     return {
@@ -511,4 +511,87 @@ test('startup rollback preserves native evidence when physical exit is unconfirm
     }), /Synthetic startup disconnected/);
     assert.equal(await rollbackCreatedProfile(created), 'delete-unconfirmed');
     assert.match(fs.readFileSync(nativeFile, 'utf8'), /before startup disconnect/);
+});
+
+
+test('HAR publication and cleanup keep their distinct states after a process exits', async (t) => {
+    for (const failure of ['cleanup', 'partial-cleanup', 'receipt']) {
+        await t.test(failure, async (t) => {
+            const { stop, options, profileId } = managedFixture(t);
+            const clientModule = new URL('../../src/camoufox/client.js', import.meta.url).href;
+            const profileDir = path.join(options.profilesDir, profileId);
+            const scratch = path.join(profileDir, '.native', '~har-scratch');
+            const indexPath = path.join(scratch, 'attribution-index.json');
+            const harPath = path.join(profileDir, 'traffic', 'trace.har');
+            const child = `
+                import assert from 'node:assert/strict';
+                import { EventEmitter } from 'node:events';
+                import fs from 'node:fs';
+                import { setCamoufoxModule, startProfile, stopProfile, unregisterProcessCleanupHooks }
+                    from ${JSON.stringify(clientModule)};
+                const mockLauncher = ${mockLauncher.toString()};
+                const observeSyntheticRequest = ${observeSyntheticRequest.toString()};
+                const options = ${JSON.stringify({ ...options, ...HAR_ONLY })};
+                const profileId = ${JSON.stringify(profileId)};
+                setCamoufoxModule(mockLauncher());
+                const session = await startProfile(profileId, options);
+                observeSyntheticRequest(session);
+
+                const mode = ${JSON.stringify(failure)};
+                const remove = fs.rmSync;
+                const rename = fs.renameSync;
+                const fail = () => { throw Object.assign(new Error('Synthetic HAR phase failure'), { code: 'EACCES' }); };
+                fs.rmSync = (file, ...args) => {
+                    if (mode !== 'receipt' && file === ${JSON.stringify(scratch)}) {
+                        if (mode === 'partial-cleanup') {
+                            remove(${JSON.stringify(path.join(scratch, 'traffic.ndjson'))});
+                        }
+                        fail();
+                    }
+                    return remove(file, ...args);
+                };
+                fs.renameSync = (from, to) => {
+                    if (mode === 'receipt' && to === ${JSON.stringify(indexPath)} &&
+                        JSON.parse(fs.readFileSync(from)).harRecovery?.publication?.published === true) fail();
+                    return rename(from, to);
+                };
+                try {
+                    assert.equal(await stopProfile(profileId, options), false);
+                } finally {
+                    fs.rmSync = remove;
+                    fs.renameSync = rename;
+                    unregisterProcessCleanupHooks();
+                }
+            `;
+            execFileSync(process.execPath, ['--input-type=module', '-e', child], { timeout: 10000 });
+            const index = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+            assert.equal(index.harRecovery.publication?.published, failure !== 'receipt');
+
+            const profileArchive = fs.readFileSync(harPath);
+            assert.equal(JSON.parse(profileArchive).log.entries.length, 1);
+            const independent = path.join(options.profilesDir, 'operator-capture');
+            const recorder = new CamoufoxTrafficRecorder({ trafficDir: independent, recordWireLog: false, trustedLocal: true });
+            const context = new EventEmitter();
+            recorder.attachContext(context);
+            context.emit('request', { method: () => 'GET', url: () => 'https://fixture.invalid/newer' });
+            await recorder.stop();
+            assert.equal(exportTrafficToHar(independent, harPath).entryCount, 1);
+            const newer = fs.readFileSync(harPath);
+            assert.notDeepEqual(newer, profileArchive);
+
+            assert.equal(await stop(), failure !== 'receipt');
+            assert.deepEqual(fs.readFileSync(harPath), newer);
+            assert.equal(fs.existsSync(scratch), failure === 'receipt');
+
+            if (failure === 'receipt') {
+                const kept = path.join(profileDir, 'traffic', 'kept.har');
+                fs.renameSync(harPath, kept);
+                assert.equal(await stop(), true);
+                assert.deepEqual(fs.readFileSync(kept), newer);
+                assert.equal(JSON.parse(fs.readFileSync(harPath)).log.entries[0].request.url,
+                    'https://fixture.invalid/resource');
+                assert.equal(fs.existsSync(scratch), false);
+            }
+        });
+    }
 });

@@ -11,8 +11,9 @@ export function configurationError(message) {
 function parseEnvironment(content) {
     const values = Object.create(null);
     // Quoted values may span lines and preserve escaped delimiters. Double
-    // quotes also expand dotenv's newline and carriage return escapes.
-    const entry = /^[ \t]*(?:export[ \t]+)?([\w.-]+)(?:[ \t]*=[ \t]*|:[ \t]+)(?:"((?:\\[\s\S]|[^"\\])*)"|'((?:\\[\s\S]|[^'\\])*)'|`((?:\\[\s\S]|[^`\\])*)`|([^#\n]*?))[ \t]*(?:#.*)?$/gm;
+    // quotes also expand dotenv's newline and carriage return escapes. A final
+    // backslash can be a literal separator immediately before the closing quote.
+    const entry = /^[ \t]*(?:export[ \t]+)?([\w.-]+)(?:[ \t]*=[ \t]*|:[ \t]+)(?:"((?:\\[\s\S]|[^"\\])*(?:\\)?)"|'((?:\\[\s\S]|[^'\\])*(?:\\)?)'|`((?:\\[\s\S]|[^`\\])*(?:\\)?)`|([^#\n]*?))[ \t]*(?:#.*)?$/gm;
     const source = content.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
     for (const [, name, doubleQuoted, singleQuoted, backtickQuoted, unquoted] of source.matchAll(entry)) {
         values[name] = doubleQuoted?.replace(/\\n/g, '\n').replace(/\\r/g, '\r') ??
@@ -21,18 +22,12 @@ function parseEnvironment(content) {
     return values;
 }
 
-function readEnvironmentFile(filePath, parse, readOnly) {
-    let content;
+function readEnvironmentFile(filePath, readOnly) {
     try {
-        content = readPrivateFile(filePath, 'utf8', { requireOwner: true, restrict: !readOnly });
+        return readPrivateFile(filePath, 'utf8', { requireOwner: true, restrict: !readOnly, checkAcl: true });
     } catch (error) {
         if (error.code === 'ENOENT') return undefined;
         throw configurationError('Could not read ' + path.basename(filePath) + ' as a private configuration file');
-    }
-    try {
-        return parse(content);
-    } catch {
-        throw configurationError('Could not parse environment configuration in ' + path.basename(filePath));
     }
 }
 
@@ -100,26 +95,38 @@ function applyEnvironment(env, values, onlyKey) {
     }
 }
 
-export function loadApplicationEnvironment({ env = process.env, readOnly = false } = {}) {
+export function loadApplicationEnvironment({ env = process.env, readOnly = false, includeGoLoginFallback = false } = {}) {
+    const vaultKey = env.DOTENV_KEY;
     let directory;
     try {
-        directory = selectEnvironmentDirectory(Boolean(env.DOTENV_KEY));
+        directory = selectEnvironmentDirectory(Boolean(vaultKey));
     } catch (error) {
         throw configurationError(error.message);
     }
-    const parseVault = env.DOTENV_KEY && createVaultParser(env.DOTENV_KEY);
     if (!directory) return env;
 
+    let parseVault;
     const read = filename => {
         const filePath = path.join(directory, filename);
-        return (parseVault && readEnvironmentFile(filePath + '.vault', parseVault, readOnly)) ||
-            readEnvironmentFile(filePath, parseEnvironment, readOnly);
+        if (vaultKey) {
+            const vault = readEnvironmentFile(filePath + '.vault', readOnly);
+            if (vault !== undefined) {
+                parseVault ??= createVaultParser(vaultKey);
+                try {
+                    return parseVault(vault);
+                } catch {
+                    throw configurationError('Could not parse environment configuration in ' + filename + '.vault');
+                }
+            }
+        }
+        const plaintext = readEnvironmentFile(filePath, readOnly);
+        return plaintext === undefined ? undefined : parseEnvironment(plaintext);
     };
 
     applyEnvironment(env, read('.env'));
     if (!env.PROFILE_SERVICE?.trim()) {
         applyEnvironment(env, read('.emv'));
-    } else if (!('GOLOGIN_API_KEY' in env)) {
+    } else if (includeGoLoginFallback && !('GOLOGIN_API_KEY' in env)) {
         // Keep support for a legacy GoLogin key without activating unrelated
         // fallback settings once the application service is configured.
         applyEnvironment(env, read('.emv'), 'GOLOGIN_API_KEY');

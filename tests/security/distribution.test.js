@@ -735,25 +735,34 @@ test('commit helper requires explicit Git identity for a new commit', {
     assert.equal(git('config', '--get', 'user.useConfigOnly').status, 1);
 });
 
-test('the GitHub setup command stops after a failed preflight or an existing origin', {
-    skip: process.platform === 'win32'
-}, (t) => {
-    const { root, git, env } = temporaryRepository(t);
+function githubSetupBlock() {
     const instructions = fs.readFileSync(path.join(PROJECT, 'GITHUB_SETUP.md'), 'utf8');
     const block = Array.from(instructions.matchAll(/```bash\n([\s\S]*?)\n```/g), ([, code]) => code)
         .find((code) => code.includes('bash PUSH_TO_GITHUB.sh'));
     assert.ok(block);
+    return block;
+}
+
+function runGithubSetup(root, env, block) {
     const setup = `git() {
         if [ "$1" = push ]; then
             echo "fixture push attempted"
-            return 90
+            return 0
         fi
         command git "$@"
     }
-    ${block}`;
-    const run = () => spawnSync('bash', ['-c', setup], {
+    ${block.replace(/^\s*expected_origin=.*$/m, 'expected_origin=file:///fixture-remote.git')}`;
+    return spawnSync('bash', ['-c', setup], {
         cwd: root, env: { ...env, GIT_ALLOW_PROTOCOL: 'file' }, input: 'y\n', encoding: 'utf8'
     });
+}
+
+test('the GitHub setup command stops after a failed preflight or an existing origin', {
+    skip: process.platform === 'win32'
+}, (t) => {
+    const { root, git, env } = temporaryRepository(t);
+    const block = githubSetupBlock();
+    const run = () => runGithubSetup(root, env, block);
     const priorOrigin = 'https://other.example.test/fixture.git';
     assert.equal(git('remote', 'add', 'origin', priorOrigin).status, 0);
     fs.writeFileSync(path.join(root, '.env.local'), FAKE_PASSWORD);
@@ -771,6 +780,62 @@ test('the GitHub setup command stops after a failed preflight or an existing ori
     assert.match(rejectedOrigin.stderr, /origin already exists/);
     assert.doesNotMatch(rejectedOrigin.stdout, /fixture push attempted/);
     assert.equal(git('remote', 'get-url', '--push', 'origin').stdout.trim(), priorOrigin);
+});
+
+test('first-push commands preserve a separate main and require a named branch before adding origin', {
+    skip: process.platform === 'win32'
+}, (t) => {
+    const { root, git, prepareCommit, env } = temporaryRepository(t);
+    assert.equal(git('symbolic-ref', 'HEAD', 'refs/heads/reviewed').status, 0);
+    assert.equal(git('config', 'user.name', 'Local Fixture').status, 0);
+    assert.equal(git('config', 'user.email', 'fixture@example.test').status, 0);
+    assert.equal(git('add', '.').status, 0);
+    assert.equal(git('commit', '-qm', 'Shared fixture').status, 0);
+    const prepared = prepareCommit('y\n');
+    assert.equal(prepared.status, 0, prepared.stderr);
+    const handoff = /^ {3}expected_origin=[\s\S]*?(?=\n\n)/m.exec(prepared.stdout)?.[0];
+    assert.ok(handoff);
+    const documented = githubSetupBlock();
+
+    assert.equal(git('checkout', '-qb', 'main').status, 0);
+    fs.writeFileSync(path.join(root, 'main.txt'), 'Local main fixture');
+    assert.equal(git('add', 'main.txt').status, 0);
+    assert.equal(git('commit', '-qm', 'Independent main fixture').status, 0);
+    const existingMain = git('rev-parse', 'refs/heads/main').stdout;
+    assert.equal(git('checkout', '-q', 'reviewed').status, 0);
+    fs.writeFileSync(path.join(root, 'reviewed.txt'), 'Reviewed branch fixture');
+    assert.equal(git('add', 'reviewed.txt').status, 0);
+    assert.equal(git('commit', '-qm', 'Independent reviewed fixture').status, 0);
+    const review = git('rev-parse', 'HEAD').stdout;
+
+    for (const checkout of ['reviewed', '--detach']) {
+        assert.equal(git('checkout', '-q', checkout).status, 0);
+        for (const block of [documented, handoff]) {
+            const rejected = runGithubSetup(root, env, block);
+            assert.notEqual(rejected.status, 0, rejected.stdout);
+            assert.match(rejected.stderr, /Check out local main/);
+            assert.doesNotMatch(rejected.stdout, /fixture push attempted/);
+            assert.equal(git('rev-parse', 'refs/heads/main').stdout, existingMain);
+            assert.equal(git('rev-parse', 'refs/heads/reviewed').stdout, review);
+            assert.equal(git('rev-parse', 'HEAD').stdout, review);
+            assert.equal(git('remote').stdout, '');
+        }
+    }
+
+    assert.equal(git('checkout', '-q', 'reviewed').status, 0);
+    assert.equal(git('branch', '-m', 'main', 'prior-main').status, 0);
+    const normal = runGithubSetup(root, env, documented);
+    assert.equal(normal.status, 0, normal.stderr);
+    assert.match(normal.stdout, /fixture push attempted/);
+    assert.equal(git('symbolic-ref', 'HEAD').stdout.trim(), 'refs/heads/main');
+    assert.equal(git('rev-parse', 'HEAD').stdout, review);
+    assert.equal(git('rev-parse', 'refs/heads/prior-main').stdout, existingMain);
+
+    assert.equal(git('remote', 'remove', 'origin').status, 0);
+    const onMain = runGithubSetup(root, env, handoff);
+    assert.equal(onMain.status, 0, onMain.stderr);
+    assert.match(onMain.stdout, /fixture push attempted/);
+    assert.equal(git('rev-parse', 'refs/heads/main').stdout, review);
 });
 
 test('commit helper checks .npmrc in both the worktree and index and accepts environment references', {

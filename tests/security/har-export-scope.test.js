@@ -448,3 +448,52 @@ test('legacy response attribution supplies missing HAR step and trigger before f
     const full = queryProfileTraffic({ trafficDir, exportHar: outputPath });
     assert.deepEqual(full.log.entries[0]._attribution, attribution);
 });
+
+
+test('HAR checks retained hash-chain evidence even when an index is absent', { skip: !supported }, async (t) => {
+    const { trafficDir, ledgerPath, indexPath, outputPath } = fixture(t);
+    const recorder = new CamoufoxTrafficRecorder({ trafficDir, trustedLocal: true, recordWireLog: false });
+    const context = new EventEmitter();
+    recorder.attachContext(context);
+    for (const suffix of ['first', 'second']) {
+        context.emit('request', { method: () => 'GET', url: () => 'https://fixture.example/' + suffix });
+    }
+    await recorder.stop();
+    const ledger = fs.readFileSync(ledgerPath, 'utf8').trimEnd().split('\n');
+    fs.unlinkSync(indexPath);
+    assert.equal(exportTrafficToHar(trafficDir, outputPath).entryCount, 2);
+    const previous = fs.readFileSync(outputPath);
+
+    fs.writeFileSync(ledgerPath, ledger[1] + '\n');
+    assert.throws(() => exportTrafficToHar(trafficDir, outputPath), { code: 'ERR_CAPTURE_INTEGRITY' });
+    assert.deepEqual(fs.readFileSync(outputPath), previous);
+
+    writeLedger(ledgerPath, transaction('legacy-without-chain'));
+    assert.equal(exportTrafficToHar(trafficDir, outputPath).entryCount, 1);
+});
+
+test('missing HAR correlation preserves the existing target for both scoped entry points', { skip: !supported }, (t) => {
+    const { root, trafficDir, ledgerPath, outputPath } = fixture(t);
+    writeLedger(ledgerPath, transaction('selected'));
+    const command = [cliPath, '--profiles-dir=' + root, '--export-har=' + outputPath, '--json'];
+    const run = (...args) => spawnSync(process.execPath, [...command, ...args], { encoding: 'utf8' });
+    const selected = run('--profile=fixture', '--correlation=selected');
+    assert.equal(selected.status, 0, selected.stderr);
+    assert.equal(JSON.parse(selected.stdout).entryCount, 1);
+    const previous = fs.readFileSync(outputPath);
+
+    for (const scope of [[], ['--profile=fixture']]) {
+        const missing = run(...scope, '--correlation=missing');
+        assert.equal(missing.status, 1, missing.stderr);
+        assert.match(missing.stderr, /Correlation ID .*not found/);
+        assert.deepEqual(fs.readFileSync(outputPath), previous);
+    }
+    assert.throws(() => queryProfileTraffic({
+        trafficDir, correlationId: 'missing', exportHar: outputPath
+    }), { code: 'ERR_HAR_CORRELATION_NOT_FOUND' });
+    assert.deepEqual(fs.readFileSync(outputPath), previous);
+
+    const empty = run('--profile=fixture', '--status=2xx');
+    assert.equal(empty.status, 0, empty.stderr);
+    assert.equal(JSON.parse(empty.stdout).entryCount, 0);
+});

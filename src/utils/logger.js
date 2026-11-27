@@ -16,13 +16,6 @@ const LOG_LEVELS = {
 
 const LOG_DIR = path.join(STATE_DIRECTORY, 'logs');
 
-try {
-    ensureStateDirectory();
-    ensurePrivateDirectory(LOG_DIR, { requireOwner: true });
-} catch {
-    throw new Error('Could not secure the application log directory');
-}
-
 const REDACTED_FIELDS = new Set([
     'code', 'otp', 'otpcode', 'phonecode', 'verificationcode', 'lastcode',
     'password', 'passwd', 'proxypassword', 'passphrase', 'passcode',
@@ -31,6 +24,10 @@ const REDACTED_FIELDS = new Set([
     'expected', 'actual', 'entered', 'currentvalue', 'text',
     'stack', 'errormessage', 'message', 'response',
     'name', 'firstname', 'lastname', 'fullname', 'username', 'email', 'accountemail',
+    'emailaddress', 'contactemail', 'recoveryemail', 'recoveryemailaddress',
+    'phone', 'phonenumber', 'telephone', 'telephonenumber', 'mobile', 'mobilephone', 'mobilenumber',
+    'mobilephonenumber', 'contactphone', 'contactphonenumber', 'recoveryphone', 'recoveryphonenumber',
+    'birthdate', 'birthday', 'dateofbirth', 'dob',
     'profilename', 'foldername', 'title',
     'id', 'accountid', 'browserid', 'profileid', 'profileids', 'folderid', 'folderids',
     'cpu', 'cpumodel', 'gpu', 'gpumodel', 'gpuperformance', 'hostbaseline', 'hostchipmodel',
@@ -113,6 +110,8 @@ function writeLog(level, message, data = null) {
 
     // File output
     try {
+        ensureStateDirectory();
+        ensurePrivateDirectory(LOG_DIR, { requireOwner: true });
         const logFile = path.join(LOG_DIR, `app-${timestamp.slice(0, 10)}.log`);
         appendPrivateFile(logFile, formatted, { requireOwner: true });
     } catch {

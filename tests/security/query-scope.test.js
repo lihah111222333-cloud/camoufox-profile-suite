@@ -299,9 +299,9 @@ test('both CLI value forms agree and reject unknown options or unexpected argume
     assert.throws(() => parseCliArgs(['unexpected']), /Unexpected positional argument/);
 });
 
-test('audit CLI uses the private application configuration and keeps help and explicit paths independent', { skip: !supported }, (t) => {
+test('CLI and JS queries use the private application configuration and keeps help and explicit paths independent', { skip: !supported }, (t) => {
     const { root, profilesDir } = fixture(t);
-    writeProfile(profilesDir, 'configured', sample('sample-1', 'https://reports.example/item'));
+    const trafficDir = writeProfile(profilesDir, 'configured', sample('sample-1', 'https://reports.example/item'));
     const stateDir = path.join(root, 'state');
     const defaultProfilesDir = path.join(stateDir, 'profiles');
     writeProfile(defaultProfilesDir, 'default', sample('sample-2', 'https://other.example/item'));
@@ -317,10 +317,22 @@ test('audit CLI uses the private application configuration and keeps help and ex
     const run = (args, overrides = {}) =>
         spawnSync(process.execPath, [cliPath, ...args], { cwd: root, env: { ...env, ...overrides }, encoding: 'utf8' });
 
+    const api = (expression) => spawnSync(process.execPath, ['--input-type=module', '--eval',
+        'import { queryProfileTraffic, listTrafficProfiles } from ' +
+        JSON.stringify(new URL('../../scripts/query-traffic-attribution.js', import.meta.url).href) +
+        '; console.log(JSON.stringify(' + expression + '));'
+    ], { cwd: root, env, encoding: 'utf8' });
     const audit = run(['--json']);
     assert.equal(audit.status, 0, audit.stderr);
     assert.deepEqual(JSON.parse(audit.stdout).profiles.map(({ profileId }) => profileId), ['configured']);
     assert.equal(fs.readFileSync(configPath, 'utf8'), config);
+    assert.equal(fs.statSync(configPath).mode & 0o777, 0o644);
+
+    for (const expression of ['queryProfileTraffic().profiles', 'listTrafficProfiles()']) {
+        const report = api(expression);
+        assert.equal(report.status, 0, report.stderr);
+        assert.deepEqual(JSON.parse(report.stdout).map(({ profileId }) => profileId), ['configured']);
+    }
     assert.equal(fs.statSync(configPath).mode & 0o777, 0o644);
 
     const override = run(['--json'], { CAMOUFOX_STORAGE_DIR: defaultProfilesDir });
@@ -335,6 +347,9 @@ test('audit CLI uses the private application configuration and keeps help and ex
     const explicit = run(['--profiles-dir', profilesDir, '--json']);
     assert.equal(explicit.status, 0, explicit.stderr);
     assert.equal(JSON.parse(explicit.stdout).count, 1);
+    const direct = api('queryProfileTraffic({ trafficDir: ' + JSON.stringify(trafficDir) + ' })');
+    assert.equal(direct.status, 0, direct.stderr);
+    assert.equal(JSON.parse(direct.stdout).eventsCount, 2);
     const invalidConfig = run(['--json']);
     assert.equal(invalidConfig.status, 1);
     assert.match(invalidConfig.stderr, /Could not read \.env as a private configuration file/);

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { isIP } from 'node:net';
 import path from 'node:path';
 import { TextDecoder } from 'node:util';
-import { withAccountOutputLock } from './account-output-lock.js';
+import { withAccountOutputLock, withAccountOutputLockAsync } from './account-output-lock.js';
 import { readPrivateFile, writePrivateFile } from './private-storage.js';
 
 const ATTEMPT_FIELDS = ['orderId', 'profileId', 'profileType', 'proxyIP', 'profileIP', 'timestamp'];
@@ -175,49 +175,75 @@ function projectSummary(summary) {
     };
 }
 
-export function migrateExistingAccountOutputs(resultsFile, summaryFile, { legacyDirectory } = {}) {
+function accountOutputMigrations(resultsFile, summaryFile, legacyDirectory) {
     const outputs = [
         { filePath: resultsFile, label: 'Account results file', project: projectResults },
         { filePath: summaryFile, label: 'Run summary file', project: projectSummary }
     ];
-    const errors = [];
-    const cleanupReview = [];
-    for (const { filePath, label, project } of outputs) {
-        try {
-            const projected = withAccountOutputLock(filePath, (temporaryPath) => {
-                const existing = readExistingOutput(filePath, label);
-                const legacy = !existing && legacyDirectory
-                    ? readExistingOutput(path.join(legacyDirectory, path.basename(filePath)), label, { restrict: false })
-                    : undefined;
-                const source = existing || legacy;
-                if (!source) return;
 
-                const records = project(source.data);
-                const updated = JSON.stringify(records, null, 2);
-                if (!existing || existing.content !== updated) {
-                    writePrivateFile(filePath, updated, { requireOwner: true, temporaryPath });
-                }
-                return records;
-            });
-            if (filePath === resultsFile && projected) {
-                for (const [index, { resultId, profileCleanup }] of projected.entries()) {
-                    if (needsProfileCleanupReview(profileCleanup)) {
-                        cleanupReview.push({ entry: index + 1, resultId, profileCleanup });
-                    }
-                }
+    return outputs.map(({ filePath, label, project }) => ({
+        filePath,
+        migrate(temporaryPath) {
+            const existing = readExistingOutput(filePath, label);
+            const legacy = !existing && legacyDirectory
+                ? readExistingOutput(path.join(legacyDirectory, path.basename(filePath)), label, { restrict: false })
+                : undefined;
+            const source = existing || legacy;
+            if (!source) return;
+
+            const records = project(source.data);
+            const updated = JSON.stringify(records, null, 2);
+            if (!existing || existing.content !== updated) {
+                writePrivateFile(filePath, updated, { requireOwner: true, temporaryPath });
             }
-        } catch (error) {
-            errors.push(error);
+            return records;
         }
-    }
-    if (errors.length) {
-        throw new AggregateError(errors, errors.map((error) => error.message).join('\n'));
+    }));
+}
+
+function migrationReview(results, errors) {
+    if (errors.length) throw new AggregateError(errors, errors.map((error) => error.message).join('\n'));
+    const cleanupReview = [];
+    for (const [index, { resultId, profileCleanup }] of (results ?? []).entries()) {
+        if (needsProfileCleanupReview(profileCleanup)) {
+            cleanupReview.push({ entry: index + 1, resultId, profileCleanup });
+        }
     }
     return cleanupReview;
 }
 
-function updateResults(filePath, update) {
-    return withAccountOutputLock(filePath, (temporaryPath) => {
+export function migrateExistingAccountOutputs(resultsFile, summaryFile, { legacyDirectory } = {}) {
+    const errors = [];
+    const [results] = accountOutputMigrations(resultsFile, summaryFile, legacyDirectory).map(({ filePath, migrate }) => {
+        try {
+            return withAccountOutputLock(filePath, migrate);
+        } catch (error) {
+            errors.push(error);
+            return undefined;
+        }
+    });
+    return migrationReview(results, errors);
+}
+
+export async function migrateExistingAccountOutputsAsync(resultsFile, summaryFile, { legacyDirectory, signal } = {}) {
+    const errors = [];
+    const [resultsJob, summaryJob] = accountOutputMigrations(resultsFile, summaryFile, legacyDirectory);
+    const migrateJob = async ({ filePath, migrate }) => {
+        try {
+            return await withAccountOutputLockAsync(filePath, migrate, { signal });
+        } catch (error) {
+            signal?.throwIfAborted();
+            errors.push(error);
+            return undefined;
+        }
+    };
+    const results = await migrateJob(resultsJob);
+    await migrateJob(summaryJob);
+    return migrationReview(results, errors);
+}
+
+function updateResults(filePath, update, withLock) {
+    return withLock(filePath, (temporaryPath) => {
         const existing = readExistingOutput(filePath, 'Account results file');
         const results = existing ? projectResults(existing.data) : [];
         const updated = update(results);
@@ -226,15 +252,23 @@ function updateResults(filePath, update) {
     });
 }
 
-export function appendAccountResult(filePath, record) {
+function appendResult(filePath, record, withLock) {
     const added = savedAccountRecord({ ...record, createdAt: new Date().toISOString(), resultId: randomUUID() });
     return updateResults(filePath, (results) => {
         results.push(added);
         return added;
-    });
+    }, withLock);
 }
 
-export function recordAccountCleanup(filePath, resultId, profileCleanup) {
+export function appendAccountResult(filePath, record) {
+    return appendResult(filePath, record, withAccountOutputLock);
+}
+
+export async function appendAccountResultAsync(filePath, record) {
+    return appendResult(filePath, record, withAccountOutputLockAsync);
+}
+
+function updateAccountCleanup(filePath, resultId, profileCleanup, withLock) {
     if (typeof resultId !== 'string' || !RESULT_ID.test(resultId)) {
         throw invalidOutput('Invalid result ID for profile cleanup.');
     }
@@ -248,11 +282,27 @@ export function recordAccountCleanup(filePath, resultId, profileCleanup) {
         if (!record) throw invalidOutput('The result to update is missing from results.json.');
         record.profileCleanup = profileCleanup;
         return record;
+    }, withLock);
+}
+
+export function recordAccountCleanup(filePath, resultId, profileCleanup) {
+    return updateAccountCleanup(filePath, resultId, profileCleanup, withAccountOutputLock);
+}
+
+export async function recordAccountCleanupAsync(filePath, resultId, profileCleanup) {
+    return updateAccountCleanup(filePath, resultId, profileCleanup, withAccountOutputLockAsync);
+}
+
+function saveRunSummary(filePath, summary, withLock) {
+    return withLock(filePath, (temporaryPath) => {
+        writePrivateFile(filePath, JSON.stringify(projectSummary(summary), null, 2), { requireOwner: true, temporaryPath });
     });
 }
 
 export function writeRunSummary(filePath, summary) {
-    withAccountOutputLock(filePath, (temporaryPath) => {
-        writePrivateFile(filePath, JSON.stringify(projectSummary(summary), null, 2), { requireOwner: true, temporaryPath });
-    });
+    saveRunSummary(filePath, summary, withAccountOutputLock);
+}
+
+export async function writeRunSummaryAsync(filePath, summary) {
+    return saveRunSummary(filePath, summary, withAccountOutputLockAsync);
 }

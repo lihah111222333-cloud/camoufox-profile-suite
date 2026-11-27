@@ -18,6 +18,7 @@ export default class ManagedProfile {
     #recycleDispatched = false;
     #stopConfirmed = false;
     #deleted = false;
+    #deleteUnconfirmed = false;
     #ownedPages = new Set();
     #openingPage = null;
     #borrowedCleanupBrowser = null;
@@ -43,6 +44,9 @@ export default class ManagedProfile {
         signal?.throwIfAborted();
         if (this.#deleted) throw new Error('Managed profile has been deleted');
         if (this.#deleting) throw new Error('Managed profile deletion is in progress');
+        if (this.#deleteUnconfirmed) {
+            throw cleanupError(this.profileId, 'delete-unconfirmed', 'Managed profile deletion unconfirmed');
+        }
         if (this.#recycling) throw new Error('Managed profile recycling has been requested');
         if (this.#starting) return this.#starting;
         if (this.#borrowedCleanupBrowser) throw new Error('Borrowed browser cleanup is incomplete. Retry stop before reconnecting.');
@@ -84,6 +88,7 @@ export default class ManagedProfile {
             if (this.browser !== browser) throw new Error('Managed browser was detached');
             this.page = page;
         }
+        if (this.page.isClosed()) throw new Error('Managed page is unavailable because it has been closed');
         return this.page;
     }
 
@@ -172,6 +177,9 @@ export default class ManagedProfile {
         if (!this.#client) throw new Error('Profile deletion requires a bound REST controller');
         if (this.#recycling) throw new Error('Managed profile recycling has been requested');
         if (this.#deleted) return true;
+        if (this.#deleteUnconfirmed) {
+            throw cleanupError(this.profileId, 'delete-unconfirmed', 'Managed profile deletion unconfirmed');
+        }
         await this.#stopBeforeCleanup();
         let cause;
         try {
@@ -182,6 +190,7 @@ export default class ManagedProfile {
         } catch (error) {
             cause = error;
         }
+        this.#deleteUnconfirmed = true;
         throw cleanupError(this.profileId, 'delete-unconfirmed', 'Managed profile deletion unconfirmed', cause);
     }
 

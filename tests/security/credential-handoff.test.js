@@ -166,13 +166,64 @@ test('App diagnostics omit credentials and preserve private log permissions acro
         }
         assert.equal(inspections, 0);
 
-        let address = 'https://accounts.google.com/ServiceLogin';
-        assert.deepEqual(await detectGmailPage({
-            url: () => address,
-            $: async () => { address = 'https://diagnostic-fixture.invalid/'; return {}; },
-            setTrafficStep: (_step, fields) => { trace = fields; }
-        }), { type: 'UNKNOWN', elements: [] });
-        assert.equal(trace, null);
+        const { createContext, runInContext } = await import('node:vm');
+        const allowedAddress = 'https://accounts.google.com/ServiceLogin';
+        const outsideAddress = 'https://diagnostic-fixture.invalid/settings';
+        for (const phase of ['wait', 'same-origin path', 'transport', 'same-address reload', 'stable']) {
+            let outOfScopeReads = 0;
+            let evaluations = 0;
+            let disposed = false;
+            let changed = false;
+            trace = null;
+            const context = createContext({});
+            function show(address, inScope) {
+                context.location = new URL(address);
+                context.window = { origin: context.location.origin };
+                context.window.top = context.window;
+                context.document = {
+                    querySelector(selector) {
+                        if (!inScope) outOfScopeReads++;
+                        return phase === 'stable' && selector === 'input[type="email"]' ? {} : null;
+                    },
+                    querySelectorAll() { if (!inScope) outOfScopeReads++; return []; }
+                };
+                changed ||= !inScope;
+            }
+            show(allowedAddress, true);
+            const diagnostic = await detectGmailPage({
+                url: () => context.location.href,
+                $: async selector => context.document.querySelector(selector),
+                evaluate: async operation => runInContext('(' + operation + ')()', context),
+                async waitForTimeout() {
+                    if (phase === 'wait') show(outsideAddress, false);
+                    if (phase === 'same-origin path') show('https://accounts.google.com/settings', false);
+                },
+                async evaluateHandle(operation, input) {
+                    context.argument = input;
+                    context.handle = runInContext('(' + operation + ')(argument)', context);
+                    return {
+                        async evaluate(read, argument) {
+                            if (++evaluations === 2 && phase === 'transport') show(outsideAddress, false);
+                            if (evaluations === 2 && phase === 'same-address reload') show(allowedAddress, false);
+                            context.argument = argument;
+                            return runInContext('(' + read + ')(handle, argument)', context);
+                        },
+                        async dispose() { disposed = true; }
+                    };
+                },
+                setTrafficStep: (_step, fields) => { trace = fields; }
+            });
+            assert.equal(outOfScopeReads, 0, phase);
+            assert.equal(disposed, true, phase);
+            if (phase === 'stable') {
+                assert.equal(diagnostic.type, 'SIGN_IN');
+                assert.equal(trace.pageType, 'SIGN_IN');
+            } else {
+                assert.equal(changed, true, phase);
+                assert.deepEqual(diagnostic, { type: 'UNKNOWN', elements: [] });
+                assert.equal(trace, null, phase);
+            }
+        }
 
         assert.equal(await waitForElement({
             async waitForSelector() { throw new Error(secret); }

@@ -5,8 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { listTrafficProfiles, queryProfileTraffic } from '../../scripts/query-traffic-attribution.js';
-import { CamoufoxTrafficRecorder, exportTrafficToHar } from '../../src/camoufox/traffic-recorder.js';
+import { formatCliReport, listTrafficProfiles, queryProfileTraffic } from '../../scripts/query-traffic-attribution.js';
+import { CamoufoxTrafficRecorder, exportTrafficToHar, verifyTrafficIntegrity } from '../../src/camoufox/traffic-recorder.js';
 
 const cliPath = fileURLToPath(new URL('../../scripts/query-traffic-attribution.js', import.meta.url));
 
@@ -157,4 +157,72 @@ test('standalone captures validate a claimed profile against their recorded iden
     assert.equal(unverified.session.profileId, unverified.profileId);
     assert.ok(!JSON.stringify(unverified).includes(root));
     assert.equal(fs.readFileSync(output, 'utf8'), 'original');
+});
+
+test('standalone identity stays the same inside and outside a given profiles root', async (t) => {
+    const { root, profilesDir, cli } = fixture(t);
+    const trafficDir = path.join(profilesDir, 'folder', 'traffic');
+    const correlationId = 'independent-item';
+    await record(profilesDir, 'recorded-profile', { trafficDir }, [{ correlationId }]);
+    assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+
+    for (const scanRoot of [profilesDir, path.join(root, 'other-profiles')]) {
+        const options = { profilesDir: scanRoot, trafficDir, profile: 'recorded-profile' };
+        assert.equal(queryProfileTraffic(options).profileId, 'recorded-profile');
+        assert.throws(() => queryProfileTraffic({ ...options, profile: 'folder' }), /Selected profile ID does not match/);
+    }
+
+    assert.equal(listTrafficProfiles(profilesDir)[0].profileId, 'recorded-profile');
+    const scan = cli('--correlation=' + correlationId, '--json');
+    assert.equal(scan.status, 0, scan.stderr);
+    assert.equal(JSON.parse(scan.stdout).profileId, 'recorded-profile');
+    assert.equal(queryProfileTraffic({ profilesDir, profile: 'recorded-profile' }).profileId, 'recorded-profile');
+});
+
+test('a real managed directory remains authoritative for its capture', async (t) => {
+    const { root, profilesDir } = fixture(t);
+    const profileDir = path.join(profilesDir, 'managed-profile');
+    const trafficDir = path.join(profileDir, 'traffic');
+    fs.mkdirSync(profileDir, { recursive: true });
+    fs.writeFileSync(path.join(profileDir, 'profile.json'), JSON.stringify({ id: 'managed-profile' }), { mode: 0o600 });
+    await record(profilesDir, 'stored-legacy-label', { trafficDir });
+
+    const options = { profilesDir: path.join(root, 'other-profiles'), trafficDir, profile: 'managed-profile' };
+    assert.equal(queryProfileTraffic(options).profileId, 'managed-profile');
+    assert.throws(() => queryProfileTraffic({ ...options, profile: 'stored-legacy-label' }), /Selected profile ID does not match/);
+    assert.equal(listTrafficProfiles(profilesDir)[0].profileId, 'managed-profile');
+});
+
+test('a mixed standalone capture cannot be claimed as one profile or mislabeled in wire output', async (t) => {
+    const { root, profilesDir } = fixture(t);
+    const trafficDir = path.join(root, 'independent-archive');
+    const options = { profilesDir, trafficDir };
+    await record(profilesDir, 'earlier-profile', { trafficDir }, [{ correlationId: 'earlier-item' }]);
+    await record(profilesDir, 'later-profile', { trafficDir }, [{ correlationId: 'later-item' }]);
+    assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+
+    for (const profile of ['earlier-profile', 'later-profile']) {
+        assert.throws(() => queryProfileTraffic({ ...options, profile }), /multiple recording profiles/);
+        assert.throws(() => queryProfileTraffic({ ...options, profile, correlation: 'earlier-item' }),
+            /multiple recording profiles/);
+    }
+    const wire = queryProfileTraffic({ ...options, correlation: 'earlier-item' });
+    assert.equal(wire.profileId, 'earlier-profile');
+    assert.equal(wire.securityBlock.attribution.profileId, wire.profileId);
+    const mixed = queryProfileTraffic(options);
+    assert.equal(mixed.profileIdentity, 'mixed');
+    assert.match(formatCliReport(mixed), /Multiple recording profiles/);
+    assert.equal(mixed.profileId, 'standalone-capture');
+    assert.equal(mixed.transactionsCount, 2);
+    assert.equal(mixed.session.profileId, mixed.profileId);
+
+    const output = path.join(root, 'existing.har');
+    const original = Buffer.from('previous archive');
+    fs.writeFileSync(output, original);
+    assert.throws(() => queryProfileTraffic({ ...options, profile: 'later-profile', exportHar: output }),
+        /multiple recording profiles/);
+    assert.deepEqual(fs.readFileSync(output), original);
+    const archive = queryProfileTraffic({ ...options, exportHar: output });
+    assert.equal(archive.profileIdentity, 'mixed');
+    assert.equal(archive.entryCount, 2);
 });

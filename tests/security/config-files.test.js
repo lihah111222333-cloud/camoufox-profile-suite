@@ -307,6 +307,74 @@ test('The application interprets commented dotenv settings consistently across N
     assert.equal(result.status, 0, result.stderr);
 });
 
+test('Private dotenv accepts quoted Windows directories ending in a separator', async t => {
+    const root = await makeFixture(t);
+    const directory = 'C:\\Fixture\\Profiles\\';
+    await writeFile(path.join(root, '.env'), [
+        'CAMOUFOX_STORAGE_DIR="' + directory + '"',
+        "FIXTURE_SINGLE='" + directory + "'",
+        'FIXTURE_BACKTICK=`' + directory + '`',
+        'FIXTURE_AFTER="still parsed"'
+    ].join('\n'), { mode: 0o600 });
+
+    const result = runModule(root, `
+        import assert from 'node:assert/strict';
+        import { win32 } from 'node:path';
+        import { loadApplicationEnvironment } from './src/utils/private-env.js';
+        const env = loadApplicationEnvironment({ env: {}, readOnly: true });
+        const expected = ${JSON.stringify(directory)};
+        assert.equal(env.CAMOUFOX_STORAGE_DIR, expected);
+        assert.equal(env.FIXTURE_SINGLE, expected);
+        assert.equal(env.FIXTURE_BACKTICK, expected);
+        assert.equal(env.FIXTURE_AFTER, 'still parsed');
+        assert.equal(win32.isAbsolute(env.CAMOUFOX_STORAGE_DIR), true);
+    `);
+    assert.equal(result.status, 0, result.stderr);
+});
+
+test('A vault key is validated only for a selected vault and an invalid active key stops plaintext fallback', async t => {
+    const root = await makeFixture(t);
+    await writeFile(path.join(root, '.env'), 'PROFILE_SERVICE=camoufox\nCAMOUFOX_STORAGE_DIR=fixture-primary\n', { mode: 0o600 });
+    const env = { DOTENV_KEY: 'fixture-unrelated-label' };
+    const plaintext = runModule(root, `
+        import assert from 'node:assert/strict';
+        import path from 'node:path';
+        import { getConfiguredProfilesDirectory } from './src/utils/private-env.js';
+        assert.equal(getConfiguredProfilesDirectory(), path.join(process.cwd(), 'fixture-primary'));
+    `, env);
+    assert.equal(plaintext.status, 0, plaintext.stderr);
+
+    await writeFile(path.join(root, '.env.vault'), 'DOTENV_VAULT_PRODUCTION=fixture-encrypted-data\n', { mode: 0o600 });
+    const selected = runModule(root, `
+        import assert from 'node:assert/strict';
+        import { getConfiguredProfilesDirectory } from './src/utils/private-env.js';
+        assert.throws(getConfiguredProfilesDirectory, { code: 'PRIVATE_ENV_CONFIGURATION_ERROR', message: 'Invalid DOTENV_KEY' });
+        assert.equal(process.env.CAMOUFOX_STORAGE_DIR, undefined);
+    `, env);
+    assert.equal(selected.status, 0, selected.stderr);
+});
+
+test('The GoLogin fallback is read only by callers that need its key', async t => {
+    const root = await makeFixture(t);
+    const primary = path.join(root, '.env');
+    await writeFile(primary, 'PROFILE_SERVICE=camoufox\nCAMOUFOX_STORAGE_DIR=fixture-primary\n', { mode: 0o600 });
+    await mkdir(path.join(root, '.emv'));
+
+    const result = runModule(root, `
+        import assert from 'node:assert/strict';
+        import path from 'node:path';
+        import { getConfiguredProfilesDirectory } from './src/utils/private-env.js';
+        assert.equal(getConfiguredProfilesDirectory(), path.join(process.cwd(), 'fixture-primary'));
+        const { default: config } = await import('./src/config.js');
+        assert.equal(config.camoufox.storageDir, path.join(process.cwd(), 'fixture-primary'));
+        assert.throws(() => config.gologin.apiKey, {
+            code: 'PRIVATE_ENV_CONFIGURATION_ERROR',
+            message: 'Could not read .emv as a private configuration file'
+        });
+    `);
+    assert.equal(result.status, 0, result.stderr);
+});
+
 test('A symlink state directory is rejected before loading its configuration', { skip: !posix }, async t => {
     const root = await makeFixture(t);
     const target = path.join(root, 'other-state');
@@ -333,6 +401,67 @@ test('Reading configuration does not create a missing state directory', async t 
     const result = runModule(root, `await import('./src/config.js');`, { GMAIL_CREATOR_STATE_DIR: missing });
     assert.equal(result.status, 0, result.stderr);
     await assert.rejects(stat(missing), { code: 'ENOENT' });
+});
+
+test('Reading an explicit Camoufox profile does not initialize application logs', async t => {
+    const root = await makeFixture(t);
+    const state = path.join(root, 'missing-log-state');
+    const profilesDir = path.join(root, 'explicit-profiles');
+    const profile = path.join(profilesDir, 'fixture');
+    await mkdir(profile, { recursive: true });
+    await writeFile(path.join(profile, 'profile.json'), '{"id":"fixture"}', { mode: 0o600 });
+
+    const result = runModule(root, `
+        import assert from 'node:assert/strict';
+        import { existsSync } from 'node:fs';
+        import { getProfile } from './src/camoufox/client.js';
+        import logger from './src/utils/logger.js';
+        const state = process.env.GMAIL_CREATOR_STATE_DIR;
+        assert.equal(existsSync(state), false);
+        assert.deepEqual(await getProfile('fixture', { profilesDir: 'explicit-profiles' }), { id: 'fixture' });
+        logger.debug('Filtered fixture message');
+        assert.equal(existsSync(state), false);
+    `, { GMAIL_CREATOR_STATE_DIR: state, LOG_LEVEL: 'INFO' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, '');
+    await assert.rejects(stat(state), { code: 'ENOENT' });
+});
+
+test('An unavailable application log directory affects only file logging and can recover', async t => {
+    const root = await makeFixture(t);
+    const state = path.join(root, 'blocked-log-state');
+    const profile = path.join(root, 'explicit-profiles', 'fixture');
+    await writeFile(state, 'unrelated fixture', { mode: 0o600 });
+    await mkdir(profile, { recursive: true });
+    await writeFile(path.join(profile, 'profile.json'), '{"id":"fixture"}', { mode: 0o600 });
+
+    const result = runModule(root, `
+        import assert from 'node:assert/strict';
+        import { readFileSync, unlinkSync } from 'node:fs';
+        import { getProfile } from './src/camoufox/client.js';
+        import logger from './src/utils/logger.js';
+        const state = process.env.GMAIL_CREATOR_STATE_DIR;
+        assert.deepEqual(await getProfile('fixture', { profilesDir: 'explicit-profiles' }), { id: 'fixture' });
+        logger.info('Fixture with unavailable log directory');
+        assert.equal(readFileSync(state, 'utf8'), 'unrelated fixture');
+        unlinkSync(state);
+        logger.info('Fixture after log directory recovery');
+    `, { GMAIL_CREATOR_STATE_DIR: state, LOG_LEVEL: 'INFO' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Fixture with unavailable log directory/);
+    assert.match(result.stdout, /Fixture after log directory recovery/);
+    assert.equal(result.stderr.trim(), 'Failed to write to the application log file');
+
+    const logDir = path.join(state, 'logs');
+    const [name] = await readdir(logDir);
+    const log = await readFile(path.join(logDir, name), 'utf8');
+    assert.match(name, /^app-\d{4}-\d{2}-\d{2}\.log$/);
+    assert.match(log, /\[INFO\] Fixture after log directory recovery\n$/);
+    assert.doesNotMatch(log, /unavailable log directory/);
+    if (posix) {
+        assert.equal(await permissions(state, 'logs'), 0o700);
+        assert.equal(await permissions(logDir, name), 0o600);
+    }
 });
 
 test('The state directory cannot be an alias of the user home', { skip: !posix }, async t => {
@@ -495,8 +624,8 @@ test('Application and standalone GoLogin imports resolve the same configuration 
             import assert from 'node:assert/strict';
             await import('./src/' + ${JSON.stringify(first)});
             const { default: config } = await import('./src/config.js');
+            assert.equal(config.gologin.apiKey, ${JSON.stringify(expected)});
             const { getGoLoginApiKey } = await import('./src/gologin/client.js');
-            assert.equal(getGoLoginApiKey(), ${JSON.stringify(expected)});
             assert.equal(config.gologin.apiKey, getGoLoginApiKey());
             assert.equal(config.profileService, 'camoufox');
             assert.equal(process.env.LOG_LEVEL, undefined);

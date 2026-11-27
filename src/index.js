@@ -7,7 +7,8 @@
  */
 
 import {
-    appendAccountResult, migrateExistingAccountOutputs, needsProfileCleanupReview, recordAccountCleanup, writeRunSummary
+    appendAccountResultAsync, migrateExistingAccountOutputsAsync, needsProfileCleanupReview,
+    recordAccountCleanupAsync, writeRunSummaryAsync
 } from './utils/account-results.js';
 import { parseRunCountOptions, resolveRunCounts } from './utils/cli-counts.js';
 import { requireControllerProfileId } from './utils/controller-id.js';
@@ -30,7 +31,8 @@ function describeCleanupRecords(records) {
 }
 
 function accountOutputDiagnostic(error) {
-    if (error?.code === 'ACCOUNT_OUTPUT_INVALID_DATA' || error?.code === 'ACCOUNT_OUTPUT_LOCK_FAILED') {
+    if (error?.code === 'ACCOUNT_OUTPUT_INVALID_DATA' || error?.code === 'ACCOUNT_OUTPUT_LOCK_FAILED' ||
+        error?.code === 'PRIVATE_STORAGE_ACL_ERROR') {
         return ' ' + error.message;
     }
     return '';
@@ -43,9 +45,12 @@ async function prepareAccountOutputs(signal) {
     const summaryFile = path.join(STATE_DIRECTORY, 'summary.json');
     try {
         ensureStateDirectory();
-        const cleanupReview = migrateExistingAccountOutputs(resultsFile, summaryFile, { legacyDirectory: LEGACY_DIRECTORY });
+        const cleanupReview = await migrateExistingAccountOutputsAsync(resultsFile, summaryFile, {
+            legacyDirectory: LEGACY_DIRECTORY, signal
+        });
         return { resultsFile, summaryFile, cleanupReview };
     } catch (error) {
+        signal?.throwIfAborted();
         const details = error instanceof AggregateError
             ? error.errors.map(accountOutputDiagnostic).join('')
             : accountOutputDiagnostic(error);
@@ -65,23 +70,31 @@ class AccountOutputWriteError extends Error {
         this.unconfirmedProfiles = [];
     }
 
-    addUnconfirmedProfiles(outcomes) {
-        for (const { profileId, profileType, profileCleanup } of outcomes) {
+    addUnconfirmedProfiles(outcomes, { savedResults = false } = {}) {
+        for (const { profileId, profileType, profileCleanup, resultId } of outcomes) {
             if (!needsProfileCleanupReview(profileCleanup)) continue;
             const report = {
                 profileType: PROFILE_TYPES.has(profileType) ? profileType : 'Profile',
                 profileCleanup
             };
-            try {
-                report.profileId = requireControllerProfileId(profileId);
-            } catch {
-                // Preserve the cleanup status when no printable profile ID is available.
+            if (savedResults && resultId) {
+                report.resultId = resultId;
+            } else {
+                try {
+                    report.profileId = requireControllerProfileId(profileId);
+                } catch {
+                    // Preserve the cleanup status when no printable profile ID is available.
+                }
             }
             this.unconfirmedProfiles.push(report);
         }
         if (this.unconfirmedProfiles.length) {
-            const details = new Set(this.unconfirmedProfiles.map(({ profileId, profileType, profileCleanup }) =>
-                `${profileType} ${profileId ?? '(profile ID unavailable)'} (${profileCleanup})`));
+            const details = new Set(this.unconfirmedProfiles.map(({ profileId, profileType, profileCleanup, resultId }) => {
+                const reference = resultId
+                    ? `results.json resultId ${resultId}`
+                    : `${profileType} ${profileId ?? '(profile ID unavailable)'}`;
+                return `${reference} (${profileCleanup})`;
+            }));
             this.message = `${this.#outputMessage} Managed profile cleanup is unconfirmed. ${[...details].join(', ')}.`;
         }
     }
@@ -117,10 +130,10 @@ async function loadRuntime(config, resultsFile) {
  * Save account result
  * حفظ نتيجة الحساب
  */
-function saveResult(resultsFile, result, logger) {
+async function saveResult(resultsFile, result, logger) {
     let saved;
     try {
-        saved = appendAccountResult(resultsFile, result);
+        saved = await appendAccountResultAsync(resultsFile, result);
     } catch (error) {
         const message = result.success
             ? 'An account was created and its result could not be saved safely in results.json.'
@@ -160,9 +173,9 @@ async function createAccountWithRuntime(runtime, accountNumber, { signal, active
     let profileCleanup;
     let stopping;
     let outputWriteError;
-    const saveOutcome = outcome => {
+    const saveOutcome = async outcome => {
         try {
-            return saveResult(resultsFile, outcome, logger);
+            return await saveResult(resultsFile, outcome, logger);
         } catch (error) {
             if (error instanceof AccountOutputWriteError) outputWriteError = error;
             throw error;
@@ -296,7 +309,7 @@ async function createAccountWithRuntime(runtime, accountNumber, { signal, active
             typeof profile?.getTelemetrySummary === 'function' ? profile.getTelemetrySummary() : null;
 
         // Save account outcome before attempting cleanup.
-        savedResult = saveOutcome({
+        savedResult = await saveOutcome({
             ...result,
             success: true,
             profileId: profile.profileId,
@@ -313,7 +326,7 @@ async function createAccountWithRuntime(runtime, accountNumber, { signal, active
 
         const profileId = profile?.profileId ?? error?.profileId ?? null;
         profileCleanup = profile ? 'pending' : error?.profileCleanup;
-        savedResult = saveOutcome({
+        savedResult = await saveOutcome({
             success: false,
             errorCode: error?.code,
             errorStage: error?.stage,
@@ -336,7 +349,7 @@ async function createAccountWithRuntime(runtime, accountNumber, { signal, active
     let result = savedResult;
     if (profile) {
         try {
-            result = recordAccountCleanup(resultsFile, savedResult.resultId, profileCleanup);
+            result = await recordAccountCleanupAsync(resultsFile, savedResult.resultId, profileCleanup);
         } catch (error) {
             const writeError = new AccountOutputWriteError(
                 'Could not save profile cleanup in results.json.' + accountOutputDiagnostic(error), error
@@ -538,12 +551,12 @@ async function main({ signal, failIfAllAttemptsFail = false, notifyManualHandoff
         };
 
         try {
-            writeRunSummary(summaryFile, summary);
+            await writeRunSummaryAsync(summaryFile, summary);
         } catch (error) {
             const writeError = new AccountOutputWriteError(
                 'Run summary could not be saved safely in summary.json.' + accountOutputDiagnostic(error), error
             );
-            writeError.addUnconfirmedProfiles(results);
+            writeError.addUnconfirmedProfiles(results, { savedResults: true });
             throw writeError;
         }
         logger.info('Summary saved to summary.json');

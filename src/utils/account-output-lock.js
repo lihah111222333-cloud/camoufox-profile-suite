@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { setTimeout as wait } from 'node:timers/promises';
 import { describeProcessOwner, processOwnerStatus, readProcessOwner } from './process-owner.js';
 
 const WAIT_MS = 5_000;
@@ -106,13 +107,14 @@ function releaseLock(directory, staging, owner, label) {
     }
 }
 
-export function withAccountOutputLock(filePath, operation) {
+function* acquireAccountOutputLock(filePath) {
     const directory = `${path.resolve(filePath)}.lock`;
     const label = path.basename(filePath);
     const id = randomUUID();
     const owner = `owner-${process.pid}-${id}`;
     const staging = path.join(path.dirname(directory), `.${label}.writer-${id}.tmp`);
     fs.mkdirSync(staging, { mode: 0o700 });
+    let acquired = false;
     try {
         // Publish the already nonempty directory atomically. A stopped writer's
         // unique owner name lets a later process remove only that owner's entry.
@@ -121,7 +123,8 @@ export function withAccountOutputLock(filePath, operation) {
         for (;;) {
             try {
                 fs.renameSync(staging, directory);
-                break;
+                acquired = true;
+                return { directory, staging, owner, label };
             } catch (error) {
                 if (!LOCK_COLLISION.has(error.code)) throw error;
                 const status = discardDeadLock(directory, label);
@@ -131,20 +134,59 @@ export function withAccountOutputLock(filePath, operation) {
                     }
                     throw lockFailure(`Timed out waiting for the ${label} writer lock. Inspect ${label}.lock with all writers stopped.`);
                 }
-                Atomics.wait(waitBuffer, 0, 0, WAIT_INTERVAL_MS);
+                yield;
             }
         }
-    } catch (error) {
-        try {
-            removeOwner(staging, owner);
-        } catch {
-            warnCleanup(label);
+    } finally {
+        if (!acquired) {
+            try {
+                removeOwner(staging, owner);
+            } catch {
+                warnCleanup(label);
+            }
         }
-        throw error;
     }
+}
+
+function runLocked({ directory, staging, owner, label }, operation) {
     try {
         return operation(path.join(directory, `${owner}.snapshot`));
     } finally {
         releaseLock(directory, staging, owner, label);
+    }
+}
+
+export function withAccountOutputLock(filePath, operation) {
+    const acquisition = acquireAccountOutputLock(filePath);
+    try {
+        let lock = acquisition.next();
+        while (!lock.done) {
+            Atomics.wait(waitBuffer, 0, 0, WAIT_INTERVAL_MS);
+            lock = acquisition.next();
+        }
+        return runLocked(lock.value, operation);
+    } finally {
+        acquisition.return();
+    }
+}
+
+export async function withAccountOutputLockAsync(filePath, operation, { signal } = {}) {
+    signal?.throwIfAborted();
+    const acquisition = acquireAccountOutputLock(filePath);
+    try {
+        let lock = acquisition.next();
+        while (!lock.done) {
+            try {
+                await wait(WAIT_INTERVAL_MS, undefined, { signal });
+            } catch (error) {
+                signal?.throwIfAborted();
+                throw error;
+            }
+            signal?.throwIfAborted();
+            lock = acquisition.next();
+        }
+        return runLocked(lock.value, operation);
+    } finally {
+        acquisition.return();
     }
 }

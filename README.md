@@ -447,7 +447,7 @@ export GMAIL_CREATOR_STATE_DIR="$HOME/.local/state/gmail-account-creator"
 )
 ```
 
-For existing regular files, set mode `0600` before editing `.env`, the optional `.emv`, or `config/proxies.txt`. On Windows, configure the state directory's NTFS ACL before adding credentials and verify that both existing and newly created files allow access only to the run account and authorized system principals.
+For existing regular files, set mode `0600` before editing `.env`, the optional `.emv`, or `config/proxies.txt`. On macOS, check that extended ACLs and inheritance also limit effective access to the run account. On Windows, configure the state directory's NTFS ACL before adding credentials and verify that both existing and newly created files allow access only to the run account and authorized system principals.
 
 For a new inventory, create `config/proxies.txt` with mode `0600` on POSIX and add one proxy per line. Startup requires every non-comment line to be valid. To adopt an older inventory, move its file into the state directory or set `GMAIL_CREATOR_LEGACY_DIR` to the old installation directory and leave the current inventory absent. An existing current inventory takes precedence even if it is empty or contains only comments.
 

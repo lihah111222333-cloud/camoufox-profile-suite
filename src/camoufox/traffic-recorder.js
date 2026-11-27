@@ -21,9 +21,12 @@ import { getConfiguredProfilesDirectory } from '../utils/private-env.js';
 import { getDefaultProfilesDirectory } from '../utils/state-paths.js';
 import {
     hashCaptureFile, hashCapturePayload, listCaptureDirectory, listCapturePayloads, measureCapturePayload, readCaptureFile,
-    readCapturePayload, removeCapturePayload, resolveFilesystemPath, truncateCaptureFile, writeCaptureExport
+    readCapturePayload, removeCapturePayload, removeVerifiedCaptureFile, resolveFilesystemPath, truncateCaptureFile,
+    writeCaptureExport
 } from './capture-io.js';
-import { captureEventTraceId, capturePolicyAllowsBody, readCaptureExportIndex } from './capture-export-policy.js';
+import {
+    captureEventProfileId, captureEventTraceId, capturePolicyAllowsBody, readCaptureExportIndex
+} from './capture-export-policy.js';
 import { CookieLineage, deriveCookieObservations } from './cookie-lineage.js';
 import {
     acquireDirectoryLease, archiveLegacyNativeLogs, assertExternalNativePath, assertProfileLease, inspectProfileDirectory,
@@ -1435,14 +1438,10 @@ function isNeckoChildLog(parentFile, name) {
         /^\.child-\d+(?:\.\d+)?$/.test(name.slice(parentFile.length));
 }
 
-function profileNativeLogNames(nativeDir, trustedLocal) {
-    if (!nativeDir) return [];
+function profileNativeEntries(nativeDir, trustedLocal) {
     try {
         return listCaptureDirectory(nativeDir, { trustedLocal })
-            .map(({ name }) => name)
-            .filter((name) => [INTEGRITY_ARTIFACTS.neckoMozLog, INTEGRITY_ARTIFACTS.sslKeyLog]
-                .some((base) => name === base || name.startsWith(base + '.')))
-            .sort();
+            .sort((left, right) => left.name.localeCompare(right.name));
     } catch (error) {
         if (error.code !== 'ENOENT') throw error;
         return [];
@@ -1633,8 +1632,14 @@ function verifyProfileNativeGenerations(index, nativeDir, { trustedLocal, check,
         artifacts[prefix] = { ...generation, ...(previous.length > 0 ? { previous } : {}) };
     }
     if (nativeDir && Object.keys(descriptions).length > 0) {
-        for (const file of check(() => profileNativeLogNames(nativeDir, trustedLocal)) ?? []) {
-            if (!declared.has(file)) unverified.add(file);
+        const bases = [INTEGRITY_ARTIFACTS.neckoMozLog, INTEGRITY_ARTIFACTS.sslKeyLog];
+        for (const entry of check(() => profileNativeEntries(nativeDir, trustedLocal)) ?? []) {
+            if (declared.has(entry.name)) continue;
+            if (bases.some((base) => entry.name === base || entry.name.startsWith(base + '.'))) {
+                unverified.add(entry.name);
+            } else if (entry.isFile()) {
+                unverified.add('unclassified file in profile native directory');
+            }
         }
     }
     return { artifacts, unverified: [...unverified], summaries };
@@ -1747,17 +1752,27 @@ export function inspectHarScratch(trafficDir, profileId, harDirectory, storageGe
             typeof harRecovery.ready !== 'boolean' || typeof harRecovery.finalized !== 'boolean'
         )) return null;
 
+        const publication = harRecovery?.publication;
+        if (publication !== undefined && (
+            !publication || typeof publication.published !== 'boolean' ||
+            (publication.previousTarget !== null && typeof publication.previousTarget !== 'string')
+        )) return null;
+        const phase = harRecovery?.ready === false ? 'unready' :
+            publication?.published === true ? 'published' :
+                harRecovery?.finalized === false ? 'recording' : 'finalized';
+        const pending = { harPath, recordBodies: session.recordBodies === true, phase, index };
+        // Cleanup can fail after removing part of the scratch. A confirmed publication
+        // needs the ownership record, while a pending publication still needs the ledger.
+        if (phase === 'published') return pending;
+
         const raw = readCaptureFile(trafficDir, 'traffic.ndjson', options);
         const { events } = parseTrafficLedger(raw, { recover: true });
         if (!events.every((event) => ownsId(event.attribution?.profileId) &&
             captureEventTraceId(event) === session.traceId)) return null;
         const payloads = new Set(events.map((event) => event.payloadFile));
         if (listCapturePayloads(trafficDir, options).some((file) => !payloads.has(file))) return null;
-
-        const phase = harRecovery?.ready === false ? 'unready' :
-            harRecovery?.finalized === false ? 'recording' : 'finalized';
         verifyLedgerCheckpoint(index.integrity, events, { allowLaterEvents: phase === 'recording' });
-        return { harPath, recordBodies: session.recordBodies === true, phase };
+        return pending;
     } catch {
         return null;
     }
@@ -1827,9 +1842,9 @@ export class CamoufoxTrafficRecorder {
      * @param {boolean} [options.recordWireLog=true]
      * @param {string|null} [options.preTlsWireLogPath=null]
      * @param {boolean} [options.sslKeyLog=false]
-     * @param {string|null} [options.sslKeyLogPath=null]
+     * @param {string|null} [options.sslKeyLogPath=null] TLS destination. An external file is unverified.
      * @param {boolean} [options.neckoMozLog=false]
-     * @param {string|null} [options.neckoMozLogPath=null]
+     * @param {string|null} [options.neckoMozLogPath=null] Necko destination. An external file is unverified.
      * @param {function(): (boolean|null)} [options.nativeLogsAreClosed] Managed shutdown confirmation. Null denotes disconnected with no native exit confirmation.
      * @param {string|null} [options.profileNativeDir=null]
      * @param {boolean} [options.trustedLocal=false]
@@ -1888,8 +1903,16 @@ export class CamoufoxTrafficRecorder {
         this.sslKeyLogPath = sslKeyLog === true
             ? path.resolve(options.sslKeyLogPath || path.join(this.profileNativeDir, INTEGRITY_ARTIFACTS.sslKeyLog))
             : null;
-        for (const nativePath of [this.profileNativeDir, this.neckoMozLogPath, this.sslKeyLogPath]) {
-            if (nativePath) assertExternalNativePath(this.trafficDir, nativePath);
+        assertExternalNativePath(this.trafficDir, this.profileNativeDir);
+        for (const [type, nativePath] of [
+            ['neckoMozLog', this.neckoMozLogPath], ['sslKeyLog', this.sslKeyLogPath]
+        ]) {
+            if (!nativePath) continue;
+            assertExternalNativePath(this.trafficDir, nativePath);
+            if (path.dirname(nativePath) === this.profileNativeDir &&
+                !profileNativeArtifactName(type, path.basename(nativePath))) {
+                throw new Error('Native logs require a supported filename directly in the profile native directory');
+            }
         }
         this.attributionIndexPath = path.join(this.trafficDir, 'attribution-index.json');
         this.harPath = options.harPath
@@ -2012,12 +2035,13 @@ export class CamoufoxTrafficRecorder {
 
             this.resetTrafficOnStart = options.resetTrafficOnStart === true;
             if (this.resetTrafficOnStart) {
+                const removedWirePath = this.#removeIndexedWireForReset();
                 for (const artifactPath of new Set([
                     this.trafficNdjsonPath,
                     this.preTlsWireLogPath,
                     this.attributionIndexPath
                 ])) {
-                    fs.rmSync(artifactPath, { force: true });
+                    if (artifactPath !== removedWirePath) fs.rmSync(artifactPath, { force: true });
                 }
                 fs.rmSync(this.payloadsDir, { recursive: true, force: true });
             } else {
@@ -2047,6 +2071,23 @@ export class CamoufoxTrafficRecorder {
             releaseProfileLease(this.#captureLease);
             throw error;
         }
+    }
+
+    #removeIndexedWireForReset() {
+        const { trafficDir, trustedLocal } = this;
+        const { integrity } = readTrafficIndex(trafficDir, { optional: true, trustedLocal }) ?? {};
+        if (integrity?.preTlsWireLogFile === undefined) return;
+
+        const fileName = getCaptureWireLogFileName(integrity);
+        if (fileName === INTEGRITY_ARTIFACTS.preTlsWireLog &&
+            this.preTlsWireLogPath === path.join(trafficDir, fileName)) return;
+
+        const { preTlsWireLogSha256: sha256, preTlsWireLogBytes: bytes } = integrity;
+        if (!isSha256(sha256) || !isByteCount(bytes)) {
+            throw new Error('Missing or invalid capture wire log checkpoint');
+        }
+        removeVerifiedCaptureFile(trafficDir, fileName, { sha256, bytes, trustedLocal });
+        return path.join(trafficDir, fileName);
     }
 
     /**
@@ -2618,14 +2659,18 @@ export class CamoufoxTrafficRecorder {
     }
 
     /**
-     * Return the launch environment with only this recorder's enabled native log destinations.
+     * Return the launch environment with native log destinations for an active writer.
      *
      * @param {Record<string, string>} [baseEnv=process.env]
      * @returns {Record<string, string>}
      */
     getLaunchEnv(baseEnv = process.env) {
+        const env = buildBrowserEnvironment(baseEnv);
+        if (this.stopped || !this.#captureLease) return buildNativeLogEnvironment(env);
+
+        assertProfileLease(this.#captureLease);
         this._ensureDirectories();
-        return buildNativeLogEnvironment(buildBrowserEnvironment(baseEnv), {
+        return buildNativeLogEnvironment(env, {
             sslKeyLogPath: this.sslKeyLogPath,
             neckoMozLogPath: this.neckoMozLogPath,
             neckoMozLogModules: baseEnv.MOZ_LOG
@@ -4754,7 +4799,7 @@ export class CamoufoxTrafficRecorder {
             };
         }
 
-        // Keep the pre-launch evidence when the connection is gone but the writer may still be active.
+        // Keep the latest persisted evidence when the writer's exit has not been confirmed.
         const checkpoint = this.#nativeLogsAreClosed?.() === null ? this.#nativeLogCheckpoint : null;
         const nativeArtifacts = { ...(checkpoint?.nativeArtifacts ?? this.profileNativeArtifacts) };
         const readLog = (type, logPath, describe) => {
@@ -4762,11 +4807,19 @@ export class CamoufoxTrafficRecorder {
             if (this.profileNativeDir && logPath && path.dirname(logPath) === this.profileNativeDir &&
                 profileNativeArtifactName(type, file)) {
                 const { evidence, summary } = captureNativeFile(this.profileNativeDir, file, this.trustedLocal, describe);
-                const children = type === 'neckoMozLog'
-                    ? profileNativeLogNames(this.profileNativeDir, this.trustedLocal)
-                        .filter((name) => isNeckoChildLog(file, name))
-                        .map((name) => captureNativeFile(this.profileNativeDir, name, this.trustedLocal, describe))
+                const childNames = type === 'neckoMozLog'
+                    ? profileNativeEntries(this.profileNativeDir, this.trustedLocal)
+                        .map(({ name }) => name).filter((name) => isNeckoChildLog(file, name))
                     : [];
+                const previousCheckpoint = this.#nativeLogCheckpoint?.nativeArtifacts?.[type];
+                if (previousCheckpoint?.file === file) {
+                    const present = new Set(childNames);
+                    for (const child of previousCheckpoint.children ?? []) {
+                        if (!present.has(child.file)) throw new Error(`Missing ${child.file} on disk`);
+                    }
+                }
+                const children = childNames.map((name) =>
+                    captureNativeFile(this.profileNativeDir, name, this.trustedLocal, describe));
                 const prior = this.profileNativeArtifacts[type];
                 const { previous = [], ...generation } = prior ?? {};
                 nativeArtifacts[type] = {
@@ -4779,7 +4832,8 @@ export class CamoufoxTrafficRecorder {
                     file: evidence.file, summary
                 })));
             }
-            return describe(readNativeLogFile(logPath));
+            const summary = describe(readNativeLogFile(logPath));
+            return logPath ? { ...summary, scope: 'external-file' } : summary;
         };
         const sslKeyLogSummary = checkpoint?.sslKeyLog ?? readLog('sslKeyLog', this.sslKeyLogPath, parseSslKeyLogBytes);
         const neckoMozLogSummary = checkpoint?.neckoMozLog ?? readLog('neckoMozLog', this.neckoMozLogPath, parseNeckoMozLogBytes);
@@ -4930,13 +4984,14 @@ export class CamoufoxTrafficRecorder {
      *   har: { log: object }
      * }}
      */
-    exportHar(outputPath = this.harPath, { recordBodies = this.recordBodies } = {}) {
+    exportHar(outputPath = this.harPath, { recordBodies = this.recordBodies, expectedTargetVersion } = {}) {
         return exportTrafficToHar(this.trafficDir, outputPath ?? this.harPath, {
             ...this.getAttributionSnapshot(),
             startedAt: this.startedAt
         }, {
             recordBodies: this.recordBodies && recordBodies === true,
             trustedLocal: this.trustedLocal,
+            expectedTargetVersion,
             [HAR_SESSION_RANGE]: this.#harSessionRange(),
             [HAR_PROTECTED_PATHS]: [
                 this.profileNativeDir, this.sslKeyLogPath, this.neckoMozLogPath, this.preTlsWireLogPath,
@@ -4974,9 +5029,9 @@ export class CamoufoxTrafficRecorder {
 
             summary = this.buildAttributionSummary({ nativeLogsClosed: logsClosed });
             writePrivateFile(this.attributionIndexPath, `${JSON.stringify(summary, null, 2)}\n`);
-            if (!this.stopped && this.#nativeLogsAreClosed?.() === false &&
+            if (!finalizing && this.#nativeLogsAreClosed?.() !== null &&
                 (this.sslKeyLogPath || this.neckoMozLogPath)) {
-                this.#nativeLogCheckpoint ??= structuredClone({
+                this.#nativeLogCheckpoint = structuredClone({
                     nativeArtifacts: summary.integrity.nativeArtifacts,
                     sslKeyLog: summary.sslKeyLog,
                     neckoMozLog: summary.neckoMozLog
@@ -5064,7 +5119,9 @@ export class CamoufoxTrafficRecorder {
  *   errors: string[]
  * }}
  */
-export function verifyTrafficIntegrity(trafficDir, { nativeDir = null, trustedLocal = false } = {}) {
+export function verifyTrafficIntegrity(trafficDir, {
+    nativeDir = null, trustedLocal = false, validateCaptureProfile
+} = {}) {
     const errors = [];
     const scope = nativeDir ? 'profile' : 'capture';
     let chainHeadHash = TRAFFIC_GENESIS_HASH;
@@ -5123,6 +5180,9 @@ export function verifyTrafficIntegrity(trafficDir, { nativeDir = null, trustedLo
         if (integrity) {
             check(() => verifyLedgerCheckpoint(integrity, ledger.events));
         }
+        if (validateCaptureProfile && errors.length === 0) {
+            validateCaptureProfile(new Set(ledger.events.map(captureEventProfileId)), summary?.session);
+        }
     }
 
     let sslKeyLog = parseSslKeyLogBytes(null);
@@ -5170,6 +5230,13 @@ export function verifyTrafficIntegrity(trafficDir, { nativeDir = null, trustedLo
             trustedLocal, check, descriptions: { sslKeyLog: parseSslKeyLogBytes, neckoMozLog: parseNeckoMozLogBytes }
         });
         unverifiedNativeArtifacts = native.unverified;
+        for (const [type, legacy] of [['sslKeyLog', legacySslKeyLog], ['neckoMozLog', legacyNeckoMozLog]]) {
+            if (summary[type]?.scope === 'external-file') {
+                unverifiedNativeArtifacts.push(`${INTEGRITY_ARTIFACTS[type]} (external log)`);
+            } else if (summary[type]?.exists === true && !native.artifacts[type] && !legacy) {
+                unverifiedNativeArtifacts.push(`${INTEGRITY_ARTIFACTS[type]} (untracked historical log)`);
+            }
+        }
         sslKeyLog = native.summaries.sslKeyLog ?? legacySslKeyLog ?? sslKeyLog;
         neckoMozLog = native.summaries.neckoMozLog ?? legacyNeckoMozLog ?? neckoMozLog;
 
@@ -5306,6 +5373,7 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
     recordBodies,
     trustedLocal = false,
     matchTransaction,
+    validateCaptureProfile,
     [HAR_SESSION_RANGE]: sessionRange = null
 } = {}) {
     const resolvedTrafficDir = path.resolve(String(trafficDir));
@@ -5399,9 +5467,11 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
     };
 
     const txMap = new Map();
+    const observedProfileIds = validateCaptureProfile ? new Set() : null;
     let eventCount = 0;
     let chainHead = TRAFFIC_GENESIS_HASH;
     let observedCheckpoint;
+    let checkChain = contextual || hasCheckpoint;
     for (let offset = 0; eventCount < sessionEnd && offset < (captureBytes?.length ?? 0);) {
         const newline = captureBytes.indexOf(0x0a, offset);
         const end = newline === -1 ? captureBytes.length : newline;
@@ -5422,7 +5492,11 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
         }
         eventCount += 1;
         const traceId = captureEventTraceId(ev);
-        if (contextual || hasCheckpoint) {
+        if (!checkChain && (Object.hasOwn(ev, 'prevEventHash') || Object.hasOwn(ev, 'eventHash'))) {
+            if (eventCount !== 1) throw harIntegrityError('Traffic ledger mixes unchained and chained records');
+            checkChain = true;
+        }
+        if (checkChain) {
             if (ev.prevEventHash !== chainHead || ev.eventHash !== computeEventHash(ev)) {
                 throw harIntegrityError(`Traffic ledger integrity mismatch at record ${eventCount}`);
             }
@@ -5430,6 +5504,7 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
             if (eventCount === checkpoint?.eventCount) observedCheckpoint = chainHead;
         }
         if (contextual && (eventCount <= sessionStart || traceId !== bodyPolicy.traceId)) continue;
+        observedProfileIds?.add(captureEventProfileId(ev));
         if (!matchTransaction && ev.payloadStorage) countPayloadIssues([ev]);
         if (ev.type === 'step-transition') {
             if (!matchTransaction) {
@@ -5486,6 +5561,8 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
             throw harIntegrityError(error.message);
         }
     }
+
+    validateCaptureProfile?.(observedProfileIds, indexData?.session);
 
     const decodeEvent = (rawLine) => rawLine ? JSON.parse(rawLine.toString('utf8').trim()) : null;
     for (const tx of txMap.values()) {
@@ -5801,6 +5878,13 @@ export function exportTrafficToHar(trafficDir, outputPath, fallbackSession = {},
     }
 
     const { archive: harArchive, artifacts, integrity } = buildHarFromTrafficDir(resolvedTrafficDir, fallbackSession, options);
+    if (options.requiredCorrelationId != null && !harArchive.log.entries.some((entry) =>
+        entry._attribution.correlationId === options.requiredCorrelationId
+    )) {
+        throw Object.assign(new Error('Correlation ID not found in the selected HAR transactions'), {
+            code: 'ERR_HAR_CORRELATION_NOT_FOUND'
+        });
+    }
     const current = fs.statSync(resolvedTrafficDir, { bigint: true });
     if (current.dev !== source.dev || current.ino !== source.ino) {
         throw harIntegrityError('Traffic directory changed during HAR export');
@@ -5822,6 +5906,7 @@ export function exportTrafficToHar(trafficDir, outputPath, fallbackSession = {},
     const bytes = writeCaptureExport(resolvedOutputPath, serializeHar(harArchive), {
         replace: Boolean(outputPath),
         recordedWirePath,
+        expectedTargetVersion: options.expectedTargetVersion,
         protectedPaths: [
             ...['traffic.ndjson', 'attribution-index.json', 'payloads', '.private', ...Object.values(INTEGRITY_ARTIFACTS)]
                 .map((name) => path.join(captureRoot, name)),

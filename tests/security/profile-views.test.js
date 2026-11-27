@@ -213,3 +213,43 @@ test('recording follows context ownership and sanitizes navigation metadata', as
     assert.equal(contexts[1].clicks.length, 2);
     assert.equal(await fs.readFile(recorder.trafficNdjsonPath, 'utf8'), recorded);
 });
+
+test('locally rejected navigation leaves later request attribution on the prior action', async (t) => {
+    const { first, contexts: [fixture] } = await setupProfiles(t, true);
+    const { page, trafficRecorder: recorder } = first;
+    const origin = 'https://profile.invalid';
+    const frame = page.mainFrame();
+    function emitRequest(name) {
+        fixture.context.emit('request', {
+            method: () => 'GET',
+            url: () => origin + '/' + name,
+            frame: () => frame,
+            headers: () => ({}),
+            headersArray: async () => []
+        });
+    }
+
+    await page.click('button[data-action=refresh]');
+    emitRequest('before-poll');
+    await assert.rejects(page.goto(origin + '/rejected', {
+        waitUntil: ['domcontentloaded', 'load']
+    }), /only one waitUntil condition/);
+    assert.deepEqual(fixture.navigations, []);
+    emitRequest('after-poll');
+    await page.goto(origin + '/accepted', { waitUntil: ['load'] });
+    assert.deepEqual(fixture.navigations, [
+        { url: origin + '/accepted', options: { waitUntil: 'load' } }
+    ]);
+    emitRequest('accepted-poll');
+    await recorder.flushSummary();
+
+    const ledger = (await fs.readFile(recorder.trafficNdjsonPath, 'utf8')).trim().split('\n').map(JSON.parse);
+    const actions = ledger.filter(({ type }) => type === 'trigger-action');
+    const egress = new Map(ledger.filter(({ type }) => type === 'egress')
+        .map(({ url, triggerAction }) => [url, triggerAction?.actionId]));
+    assert.equal(egress.size, 3);
+    assert.equal(egress.get(origin + '/before-poll'), actions[0].actionId);
+    assert.equal(egress.get(origin + '/after-poll'), actions[0].actionId);
+    assert.deepEqual(actions.map(({ actionType }) => actionType), ['page.click', 'page.goto']);
+    assert.equal(egress.get(origin + '/accepted-poll'), actions[1].actionId);
+});

@@ -29,6 +29,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { readPrivateFile, writePrivateFile } from '../utils/private-storage.js';
 import { assertManagedProxyBinding, resolveNetworkPolicyMode } from './network-policy.js';
+import { acquireDirectoryLease, releaseProfileLease } from './profile-storage.js';
 import { redactDiagnosticText, redactUrlSecrets } from './traffic-redaction.js';
 
 /**
@@ -642,6 +643,19 @@ export function isSoftwareRasterizerRenderer(renderer) {
     return /\b(?:SwiftShader|llvmpipe|softpipe|Microsoft Basic Render Driver|Mesa OffScreen)\b/i.test(renderer);
 }
 
+function readLedgerBytes(filePath) {
+    try {
+        return readPrivateFile(filePath, null);
+    } catch (error) {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+    }
+}
+
+function ledgerRevision(content) {
+    return content === null ? null : crypto.createHash('sha256').update(content).digest('hex');
+}
+
 /**
  * Per-Profile, Per-Domain Canvas & WebGL Fingerprint Consistency Ledger
  * (`CanvasWebglConsistencyLedger`).
@@ -653,6 +667,7 @@ export function isSoftwareRasterizerRenderer(renderer) {
 export class CanvasWebglConsistencyLedger {
     #assertStorageOwner;
     #loadFailed = false;
+    #storageRevision = null;
 
     /**
      * @param {{
@@ -851,11 +866,14 @@ export class CanvasWebglConsistencyLedger {
         try {
             this.#assertStorageOwner?.();
         } catch {
+            this.#loadFailed = true;
             return false;
         }
 
         try {
-            const raw = JSON.parse(readPrivateFile(this.ledgerPath));
+            const bytes = readLedgerBytes(this.ledgerPath);
+            if (bytes === null) return false;
+            const raw = JSON.parse(bytes.toString('utf8'));
             if (!Array.isArray(raw?.entries) ||
                 (raw.profileId !== undefined && raw.profileId !== this.profileId) ||
                 (raw.driftAlerts !== undefined && !Array.isArray(raw.driftAlerts)) ||
@@ -867,10 +885,11 @@ export class CanvasWebglConsistencyLedger {
             if (entries.size !== raw.entries.length) throw new Error('Duplicate Camoufox fingerprint ledger entries');
             this.entries = entries;
             this.driftAlerts = raw.driftAlerts ?? [];
+            this.#storageRevision = ledgerRevision(bytes);
             this.#loadFailed = false;
             return true;
-        } catch (error) {
-            if (error.code !== 'ENOENT') this.#loadFailed = true;
+        } catch {
+            this.#loadFailed = true;
             return false;
         }
     }
@@ -903,8 +922,9 @@ export class CanvasWebglConsistencyLedger {
 
     #writeToDisk(entry = null, alert = null) {
         if (!this.ledgerPath) return;
+        const directory = path.dirname(this.ledgerPath);
         if (!this.#assertStorageOwner) {
-            fs.mkdirSync(path.dirname(this.ledgerPath), { recursive: true, mode: 0o700 });
+            fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
         }
         const entries = Array.from(this.entries, ([key, stored]) => key === entry?.key ? entry : stored);
         if (entry && !this.entries.has(entry.key)) entries.push(entry);
@@ -915,7 +935,20 @@ export class CanvasWebglConsistencyLedger {
             entries,
             driftAlerts: alert ? [...this.driftAlerts, alert] : this.driftAlerts
         };
-        writePrivateFile(this.ledgerPath, JSON.stringify(payload, null, 2));
+        const content = JSON.stringify(payload, null, 2);
+        const filePath = path.join(fs.realpathSync.native(directory), path.basename(this.ledgerPath));
+        const lease = acquireDirectoryLease(filePath + '.ledger-lock');
+        try {
+            if (ledgerRevision(readLedgerBytes(filePath)) !== this.#storageRevision) {
+                throw Object.assign(new Error('Camoufox fingerprint ledger changed. Reload it before writing.'), {
+                    code: 'ERR_CAMOUFOX_FINGERPRINT_LEDGER_CONFLICT'
+                });
+            }
+            writePrivateFile(filePath, content);
+        } finally {
+            releaseProfileLease(lease);
+        }
+        this.#storageRevision = ledgerRevision(content);
     }
 }
 

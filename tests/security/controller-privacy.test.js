@@ -633,6 +633,21 @@ test('controller clients require a positive stop, delete or recycle acknowledgem
     assert.deepEqual(responses, []);
 });
 
+test('Dolphin rejects contradictory stop and recycle acknowledgements', async t => {
+    const { dolphin, requests, responses } = await loadControllers(t);
+    const data = { success: true, code: 50200, message: 'Insufficient permissions' };
+    for (const body of [data, JSON.stringify({ ...data, code: '50200' })]) {
+        responses.push({ status: 200, data: body }, { status: 200, data: body });
+        assert.equal(await dolphin.stopProfile('fixture'), false);
+        await assert.rejects(dolphin.recycleProfile('fixture'), /did not confirm profile recycling/);
+    }
+    responses.push({ status: 204 }, { status: 200, data: { success: true } });
+    assert.equal(await dolphin.stopProfile('fixture'), true);
+    assert.equal(await dolphin.recycleProfile('fixture'), true);
+    assert.deepEqual(responses, []);
+    assert.equal(requests.length, 6);
+});
+
 test('stop, delete and recycle reject HTML, ambiguous 200 responses and unknown 404 routes', async t => {
     const { gpm, dolphin, responses } = await loadControllers(t);
     const ambiguous = [

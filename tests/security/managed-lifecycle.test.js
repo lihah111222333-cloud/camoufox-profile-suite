@@ -360,6 +360,32 @@ test('borrowed sessions retain the connection until a failed owned page close ca
     }
 });
 
+test('borrowed sessions reject a closed cached page without opening or adopting another tab', async t => {
+    const sandbox = await fixture(t);
+    const { default: state } = await sandbox.load('src/fixture.cjs');
+    t.mock.method(globalThis, 'setTimeout', callback => queueMicrotask(callback));
+    let existingCloses = 0;
+    let createdPages = 0;
+    state.existingPages = [{
+        isClosed: () => false,
+        async close() { existingCloses++; }
+    }];
+    state.onNewPage = () => { createdPages++; };
+    for (const service of ['gpmlogin', 'dolphin']) {
+        const { default: Profile } = await sandbox.load(`src/${service}/profile.js`);
+        const profile = await new Profile(service + '-existing', 'wss://borrowed-controller.invalid/devtools/browser/supplied').start();
+        const owned = await profile.getPage();
+        const initialPageCount = createdPages;
+        assert.equal(owned.isClosed(), false);
+        await owned.close();
+
+        await assert.rejects(profile.getPage(), /Managed page is unavailable because it has been closed/);
+        assert.equal(createdPages, initialPageCount);
+        assert.equal(await profile.stop(), false);
+        assert.equal(existingCloses, 0);
+    }
+});
+
 test('cancelling after page creation closes the owned borrowed page while still attached', async t => {
     const sandbox = await fixture(t);
     const { default: state } = await sandbox.load('src/fixture.cjs');
@@ -406,7 +432,7 @@ test('managed stop waits for an in-flight start and coalesces shutdown requests'
     assert.equal(profile.remoteDebuggingAddress, null);
 });
 
-test('GPM deletion requires its own stop confirmation and stays deleted after confirmation', async t => {
+test('GPM preserves uncertain and confirmed deletion states before any restart', async t => {
     const sandbox = await fixture(t);
     const { default: state } = await sandbox.load('src/fixture.cjs');
     t.mock.method(globalThis, 'setTimeout', callback => queueMicrotask(callback));
@@ -416,22 +442,21 @@ test('GPM deletion requires its own stop confirmation and stays deleted after co
     state.events.length = 0;
     state.deleteOK = false;
     await assert.rejects(profile.delete(), { profileCleanup: 'delete-unconfirmed' });
-    const cancellation = new AbortController();
-    const cancelledRestart = profile.start({ signal: cancellation.signal });
-    cancellation.abort(new Error('fixture cancelled before launch'));
-    await assert.rejects(cancelledRestart, /cancelled before launch/);
     state.deleteOK = true;
-    await assert.rejects(profile.delete(), { profileCleanup: 'stop-unconfirmed' });
-    assert.deepEqual(state.events.filter(([action]) => action === 'stop' || action === 'delete'), [
+    const unresolved = { profileId: id, profileCleanup: 'delete-unconfirmed' };
+    await assert.rejects(profile.start(), unresolved);
+    await assert.rejects(profile.delete(), unresolved);
+    assert.deepEqual(state.events.filter(([, profileId]) => profileId === id), [
         ['stop', id], ['delete', id]
     ]);
-    await profile.start();
-    assert.equal(await profile.delete(), true);
-    assert.equal(await profile.delete(), true);
-    assert.equal(await profile.stop(), true);
-    await assert.rejects(profile.start(), /has been deleted/);
-    assert.deepEqual(state.events.filter(([action]) => action === 'stop' || action === 'delete'), [
-        ['stop', id], ['delete', id], ['stop', id], ['delete', id]
+
+    const confirmed = await new Profile('gpmlogin-confirmed').start();
+    assert.equal(await confirmed.delete(), true);
+    assert.equal(await confirmed.delete(), true);
+    assert.equal(await confirmed.stop(), true);
+    await assert.rejects(confirmed.start(), /has been deleted/);
+    assert.deepEqual(state.events.filter(([, id]) => id === confirmed.profileId), [
+        ['start', confirmed.profileId], ['stop', confirmed.profileId], ['delete', confirmed.profileId]
     ]);
 
     const restarted = await new Profile('gpmlogin-restart').start();
@@ -716,8 +741,8 @@ test('CLI persists an allocated profile ID when initialization and shutdown are 
     assert.equal(summary.results[0].profileId, result.profileId);
 });
 
-test('CLI retains the profile ID when output writing and cleanup both fail', async t => {
-    for (const phase of ['result', 'initialization', 'cleanup', 'summary']) {
+test('CLI retains the profile ID when result writing and cleanup both fail', async t => {
+    for (const phase of ['result', 'initialization', 'cleanup']) {
         const sandbox = await fixture(t);
         const completed = sandbox.run(['bin/gmail-account-creator.js'], {
             LOG_LEVEL: 'ERROR',
@@ -731,6 +756,23 @@ test('CLI retains the profile ID when output writing and cleanup both fail', asy
         assert.match(completed.stderr, /gpmlogin-fixture.*stop-unconfirmed/);
         assert.doesNotMatch(completed.stderr, /controller\.invalid|account@example\.invalid|proxy\.invalid/);
     }
+});
+
+test('CLI identifies the saved result when cleanup is unconfirmed and summary writing fails', async t => {
+    const sandbox = await fixture(t);
+    const completed = sandbox.run(['bin/gmail-account-creator.js'], {
+        LOG_LEVEL: 'ERROR',
+        FIXTURE_STOP_OK: 'false',
+        FIXTURE_OUTPUT_FAILURE: 'summary'
+    });
+    assert.equal(completed.status, 1, completed.stderr);
+    const [result] = JSON.parse(await readFile(path.join(sandbox.root, 'results.json')));
+    assert.equal(result.profileCleanup, 'stop-unconfirmed');
+    assert.equal(typeof result.resultId, 'string');
+    assert.match(completed.stderr, /Run summary could not be saved safely in summary\.json/);
+    assert.match(completed.stderr, /profile cleanup is unconfirmed.*results\.json/i);
+    assert.ok(completed.stderr.includes('resultId ' + result.resultId + ' (stop-unconfirmed)'));
+    assert.ok(!completed.stderr.includes(result.profileId), completed.stderr);
 });
 
 test('CLI retains every unconfirmed profile when one task prevents the run summary from being written', async t => {
@@ -862,9 +904,15 @@ test('routine logs redact identity and startup details in console and file outpu
             profileType: 'GPM Login',
             profileId: 'fixture-controller-id',
             title: 'fixture-account-title',
+            status: 'fixture-ready',
+            attempt: 2,
             metadata: {
                 fullName: 'Fixture Account Name',
                 email: 'fixture-account@example.invalid',
+                phone: 'Fixture Contact Phone',
+                'phone-number': 'Fixture Alternate Phone',
+                recoveryEmail: 'fixture-recovery@example.invalid',
+                'date_of_birth': 'Fixture Birth Date',
                 profileDir: '/fixture/private/profile',
                 source: 'file:///fixture/private/source',
                 gpuPerformance: { hostChipModel: 'Fixture Physical GPU' },
@@ -877,7 +925,9 @@ test('routine logs redact identity and startup details in console and file outpu
     const [logFile] = await readdir(logs);
     for (const output of [completed.stdout, await readFile(path.join(logs, logFile), 'utf8')]) {
         assert.match(output, /Profile started.*GPM Login/);
+        assert.match(output, /"status":"fixture-ready","attempt":2/);
         assert.doesNotMatch(output, /fixture-controller-id|fixture-account-title|Fixture Account Name|example\.invalid|\/fixture\/private|Fixture Physical/);
+        assert.doesNotMatch(output, /Fixture (?:Contact Phone|Alternate Phone|Birth Date)/);
     }
 });
 

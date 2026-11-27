@@ -91,11 +91,18 @@ echo "   After creating the repository, run:"
 echo ""
 cat <<'EOF'
    expected_origin=https://github.com/YOUR_USERNAME/REPO_NAME.git
-   git remote add origin "$expected_origin" &&
+   if first_push_ref=$(git symbolic-ref --quiet HEAD) &&
+      main_refs=$(git for-each-ref --format='%(refname)' refs/heads/main) &&
+      { [ "$first_push_ref" = refs/heads/main ] || [ -z "$main_refs" ]; }; then
+     git remote add origin "$expected_origin" &&
      push_origin=$(git remote get-url --push --all origin) &&
      test "$push_origin" = "$expected_origin" &&
-     git branch -M main &&
-     git push -u origin main
+     { [ "$first_push_ref" = refs/heads/main ] || git branch -m -- "${first_push_ref#refs/heads/}" main; } &&
+     git push -u origin refs/heads/main
+   else
+     printf '%s\n' 'Check out local main or a named branch when main is available.' >&2
+     false
+   fi
 
    استخدم git@github.com:YOUR_USERNAME/REPO_NAME.git لعنوان SSH.
    For SSH, set expected_origin to git@github.com:YOUR_USERNAME/REPO_NAME.git.

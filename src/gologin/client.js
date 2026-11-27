@@ -15,7 +15,7 @@ import {
 import { loadApplicationEnvironment } from '../utils/private-env.js';
 import { requireProxyProtocol } from '../utils/proxy-protocol.js';
 
-loadApplicationEnvironment();
+loadApplicationEnvironment({ includeGoLoginFallback: true });
 
 const GOLOGIN_API_ORIGIN = 'https://api.gologin.com';
 const supportedProfileOs = new Set(['lin', 'mac', 'win']);

@@ -2,22 +2,15 @@
  * Camoufox Fingerprint Coherence Diagnostic CLI
  * أداة تشخيص وفحص تناسق البصمة الرقمية لمحرك Camoufox
  *
- * Usage:
- *   node scripts/verify-camoufox-coherence.js [--dry-run] [--check-env] [--os=windows|macos|linux]
+ * Run with --help for usage.
  * Normal invocation requires live evidence. The dry-run and check-env modes evaluate fixtures.
  */
 
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { writeCaptureExport } from '../src/camoufox/capture-io.js';
-import { isCamoufoxModuleResolvable } from '../src/camoufox/sdk-resolution.js';
-import {
-    auditProfileCoherence,
-    evaluatePlatformCoherence,
-    computeGpuPerformanceScalingWeights
-} from '../src/camoufox/coherence-auditor.js';
 
+const USAGE = 'Usage: node scripts/verify-camoufox-coherence.js [--help | -h] [--dry-run | --check-env] [--os=windows|macos|linux]';
 const REPORT_NAME = 'camoufox-audit-report.json';
 const SUPPORTED_OS_TARGETS = ['windows', 'macos', 'linux'];
 const SYNTHETIC_GPU_BASELINE = {
@@ -39,7 +32,7 @@ function float64ToHex(val) {
 /**
  * Build realistic C++-level Camoufox browser telemetry for dry-run / pre-binary coherence auditing
  */
-function getSyntheticCamoufoxTelemetry(targetOs) {
+function getSyntheticCamoufoxTelemetry(targetOs, computeGpuPerformanceScalingWeights) {
     const profiles = {
         windows: {
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0',
@@ -339,8 +332,7 @@ function getSyntheticCamoufoxTelemetry(targetOs) {
  * Create a synthetic Playwright-compatible Page wrapper that returns C++-level Camoufox
  * telemetry snapshot in dry-run mode (when the Camoufox binary has not been fetched yet).
  */
-function createSyntheticPage(targetOs) {
-    const telemetry = getSyntheticCamoufoxTelemetry(targetOs);
+function createSyntheticPage(telemetry) {
     return {
         isSynthetic: true,
         async evaluate() {
@@ -350,31 +342,13 @@ function createSyntheticPage(targetOs) {
 }
 
 /**
- * Inspect local Camoufox SDK and Playwright dependency availability
- */
-function checkEnvironment() {
-    const envStatus = {
-        camoufoxSdkInstalled: isCamoufoxModuleResolvable(),
-        playwrightCoreInstalled: false
-    };
-
-    try {
-        import.meta.resolve('playwright-core');
-        envStatus.playwrightCoreInstalled = true;
-    } catch {}
-
-    return envStatus;
-}
-
-/**
  * Run negative control adversarial test to prove the coherence auditor catches:
  * 1. JS `stealth` prototype overrides on `navigator`
  * 2. Chrome User-Agent / `navigator.userAgentData` spoofed on a Firefox engine
  * 3. Dedicated Worker thread `hardwareConcurrency` / `platform` mismatch
  * 4. Windows identity claiming a non-ANGLE macOS/Linux GPU renderer
  */
-function runAdversarialNegativeControl() {
-    const tampered = getSyntheticCamoufoxTelemetry('windows');
+function runAdversarialNegativeControl(tampered, evaluatePlatformCoherence) {
     tampered.navigator.userAgent =
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36';
     tampered.navigator.hasUserAgentData = true;
@@ -405,7 +379,7 @@ function runAdversarialNegativeControl() {
     };
 }
 
-async function auditLiveTarget(targetOs) {
+async function auditLiveTarget(targetOs, auditProfileCoherence) {
     let profilesDir = null;
     let session = null;
     let auditReport = null;
@@ -459,6 +433,20 @@ async function auditLiveTarget(targetOs) {
  */
 async function runDiagnostic() {
     const args = process.argv.slice(2);
+    if (args.includes('--help') || args.includes('-h')) {
+        console.log(USAGE);
+        return;
+    }
+
+    const [
+        { writeCaptureExport },
+        { isCamoufoxModuleResolvable, isPackageEntryResolvable },
+        { auditProfileCoherence, evaluatePlatformCoherence, computeGpuPerformanceScalingWeights }
+    ] = await Promise.all([
+        import('../src/camoufox/capture-io.js'),
+        import('../src/camoufox/sdk-resolution.js'),
+        import('../src/camoufox/coherence-auditor.js')
+    ]);
     const forceDryRun = args.includes('--dry-run') || args.includes('--check-env');
     const osArg = args.find(arg => arg.startsWith('--os='));
     const requestedOs = osArg ? osArg.split('=')[1]?.toLowerCase() : null;
@@ -470,7 +458,10 @@ async function runDiagnostic() {
     console.log('🦊 Camoufox Cross-OS Fingerprint Coherence Diagnostic CLI');
     console.log('================================================================================\n');
 
-    const envStatus = checkEnvironment();
+    const envStatus = {
+        camoufoxSdkInstalled: isCamoufoxModuleResolvable(),
+        playwrightCoreInstalled: isPackageEntryResolvable('playwright-core', import.meta)
+    };
     console.log(`📚 camoufox-js SDK      : ${envStatus.camoufoxSdkInstalled ? 'Resolvable' : 'Unavailable'}`);
     console.log(`🎭 playwright-core      : ${envStatus.playwrightCoreInstalled ? 'Resolvable' : 'Unavailable'}`);
     console.log(`🎯 Target OS Profiles   : ${osTargets.join(', ')}\n`);
@@ -492,11 +483,12 @@ async function runDiagnostic() {
         let cleanupStatus = null;
 
         if (forceDryRun) {
-            auditReport = await auditProfileCoherence(createSyntheticPage(targetOs), targetOs);
+            const telemetry = getSyntheticCamoufoxTelemetry(targetOs, computeGpuPerformanceScalingWeights);
+            auditReport = await auditProfileCoherence(createSyntheticPage(telemetry), targetOs);
         } else if (!envStatus.camoufoxSdkInstalled) {
             unavailableReason = 'Camoufox SDK is unavailable';
         } else {
-            ({ auditReport, unavailableReason, cleanupStatus } = await auditLiveTarget(targetOs));
+            ({ auditReport, unavailableReason, cleanupStatus } = await auditLiveTarget(targetOs, auditProfileCoherence));
         }
 
         const status = auditReport?.status ?? 'not-tested';
@@ -531,7 +523,12 @@ async function runDiagnostic() {
         });
     }
 
-    const negativeControl = forceDryRun ? runAdversarialNegativeControl() : null;
+    const negativeControl = forceDryRun
+        ? runAdversarialNegativeControl(
+            getSyntheticCamoufoxTelemetry('windows', computeGpuPerformanceScalingWeights),
+            evaluatePlatformCoherence
+        )
+        : null;
     if (negativeControl) {
         console.log('--------------------------------------------------------------------------------');
         console.log(`   Synthetic negative control: ${negativeControl.caughtAll ? 'PASS' : 'FAIL'}`);

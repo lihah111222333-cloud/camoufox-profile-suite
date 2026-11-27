@@ -581,3 +581,63 @@ test('closing a page releases its open socket listeners while other pages keep r
     assert.equal(recorder.webSocketDisposers.size, 0);
     assert.equal((await recorder.stop()).totals.wsFramesSent, 1);
 });
+
+test('reset removes the previous session’s verified custom wire log', async (t) => {
+    const { trafficDir, recorder, create } = fixture(t, { recordWireLog: false });
+    await recorder.stop();
+    const wirePath = path.join(trafficDir, 'previous wire.log');
+    const previous = create({ recordWireLog: true, preTlsWireLogPath: wirePath });
+    previous.recordSecurityBlock({ type: 'fixture', url: 'https://example.test/previous' });
+    const oldIndex = await previous.stop();
+    assert.equal(oldIndex.integrity.preTlsWireLogFile, path.basename(wirePath));
+    assert.ok(fs.statSync(wirePath).size > 0);
+
+    const unrelatedPath = path.join(trafficDir, 'unrelated.log');
+    fs.writeFileSync(unrelatedPath, 'unrelated fixture\n');
+    const current = create({ resetTrafficOnStart: true });
+    const summary = await current.stop();
+    assert.equal(fs.existsSync(wirePath), false);
+    assert.equal(fs.readFileSync(unrelatedPath, 'utf8'), 'unrelated fixture\n');
+    assert.equal(summary.integrity.eventCount, 0);
+    assert.equal(summary.captureLimits.bytes, 0);
+    assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+});
+
+test('reset refuses an indexed custom wire whose bytes now differ', async (t) => {
+    const { trafficDir, recorder, create, ledgerPath, indexPath } = fixture(t, { recordWireLog: false });
+    await recorder.stop();
+    const wirePath = path.join(trafficDir, 'previous wire.log');
+    const previous = create({ recordWireLog: true, preTlsWireLogPath: wirePath });
+    previous.recordSecurityBlock({ type: 'fixture', url: 'https://example.test/previous' });
+    await previous.stop();
+    const ledger = fs.readFileSync(ledgerPath);
+    const index = fs.readFileSync(indexPath);
+    const changed = fs.readFileSync(wirePath);
+    changed[0] ^= 1;
+    fs.writeFileSync(wirePath, changed);
+
+    assert.throws(() => create({ resetTrafficOnStart: true }), /SHA-256 mismatch/);
+    assert.deepEqual(fs.readFileSync(wirePath), changed);
+    assert.deepEqual(fs.readFileSync(ledgerPath), ledger);
+    assert.deepEqual(fs.readFileSync(indexPath), index);
+});
+
+test('stopped recorder launch environments cannot restore retired log files', async (t) => {
+    const { recorder, create } = fixture(t, { neckoMozLog: true });
+    const inherited = { PATH: '/synthetic/runtime', MOZ_LOG: 'nsHttp:5' };
+    assert.equal(recorder.getLaunchEnv(inherited).MOZ_LOG_FILE, recorder.neckoMozLogPath);
+    await recorder.stop();
+    fs.unlinkSync(recorder.neckoMozLogPath);
+    const current = create({ resetTrafficOnStart: true, neckoMozLog: false, recordWireLog: false });
+    assert.equal(current.getLaunchEnv(inherited).MOZ_LOG_FILE, '');
+    assert.equal(fs.existsSync(recorder.preTlsWireLogPath), false);
+
+    const retired = recorder.getLaunchEnv(inherited);
+    assert.equal(retired.PATH, inherited.PATH);
+    assert.equal(retired.MOZ_LOG_FILE, '');
+    assert.equal(retired.MOZ_LOG, '');
+    assert.equal(retired.SSLKEYLOGFILE, '');
+    assert.equal(fs.existsSync(recorder.neckoMozLogPath), false);
+    assert.equal(fs.existsSync(recorder.preTlsWireLogPath), false);
+    await current.stop();
+});

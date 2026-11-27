@@ -38,6 +38,7 @@ function finalizeDetectedPage(page, detected) {
  * اكتشاف نوع صفحة Gmail الحالية
  */
 export async function detectGmailPage(page) {
+    let scope;
     try {
         const address = page.url();
         const url = new URL(address);
@@ -119,31 +120,69 @@ export async function detectGmailPage(page) {
             detectFlow = detectVerificationPage;
         } else return unknownPage();
 
-        const initial = await detectFlow(page);
+        scope = await page.evaluateHandle(({ address, origin, textSelectors }) => {
+            const observedDocument = document;
+            const isCurrent = () => document === observedDocument && window.top === window &&
+                window.origin === origin && location.href === address;
+            if (!isCurrent()) return null;
+            return {
+                get currentDocument() { return isCurrent() ? observedDocument : null; },
+                textSelectors
+            };
+        }, { address, origin: url.origin, textSelectors: typeof page.getByText === 'function' });
+        if (page.url() !== address) return unknownPage();
+        const initial = await detectFlow(scope);
         if (page.url() !== address) return unknownPage();
         if (initial) return finalizeDetectedPage(page, initial);
 
         // Detect by class names (more reliable for Google pages)
-        const pageTypeByClass = await detectByClassNames(page);
+        const pageTypeByClass = await detectByClassNames(page, scope, address);
         if (page.url() !== address) return unknownPage();
-        if (pageTypeByClass && pageTypeByClass.type !== 'UNKNOWN') {
-            return finalizeDetectedPage(page, pageTypeByClass);
-        }
+        if (pageTypeByClass) return finalizeDetectedPage(page, pageTypeByClass);
 
         // Detect by page elements as fallback
-        const pageType = await detectByElements(page);
+        const pageType = await detectByElements(page, scope, address);
         return page.url() === address ? finalizeDetectedPage(page, pageType) : unknownPage();
     } catch (error) {
         logger.error('Error detecting Gmail page', { error: error.message });
         return unknownPage();
+    } finally {
+        if (scope) {
+            try {
+                await scope.dispose();
+            } catch {
+                // Navigation can invalidate the document handle.
+            }
+        }
     }
+}
+
+function readFlowElements(scope, selectors, extra = null) {
+    return scope.evaluate((guard, { selectors, extra }) => {
+        const document = guard?.currentDocument;
+        if (!document) return null;
+
+        const found = selectors.filter(selector => {
+            const text = /^button:has-text\("([^"]+)"\)$/.exec(selector)?.[1];
+            if (!text) return document.querySelector(selector) !== null;
+            return guard.textSelectors && Array.from(document.querySelectorAll('button')).some(button =>
+                button.textContent.trim().replace(/\s+/g, ' ').toLowerCase().includes(text.toLowerCase()));
+        });
+        if (extra) {
+            const matched = extra.xpath
+                ? document.evaluate(extra.xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue
+                : document.querySelector(extra.selector);
+            if (matched) found.push(extra.label);
+        }
+        return found;
+    }, { selectors, extra });
 }
 
 /**
  * Detect sign in page
  * اكتشاف صفحة تسجيل الدخول
  */
-async function detectSignInPage(page) {
+async function detectSignInPage(scope) {
     try {
         const selectors = [
             'input[type="email"]',
@@ -153,17 +192,8 @@ async function detectSignInPage(page) {
             'button:has-text("التالي")'
         ];
 
-        const foundElements = [];
-        for (const selector of selectors) {
-            try {
-                const element = await page.$(selector);
-                if (element) {
-                    foundElements.push(selector);
-                }
-            } catch (e) {
-                // Continue
-            }
-        }
+        const foundElements = await readFlowElements(scope, selectors);
+        if (foundElements === null) return unknownPage();
 
         if (foundElements.length > 0) {
             logger.info('Detected: Sign In page');
@@ -175,6 +205,7 @@ async function detectSignInPage(page) {
         }
     } catch (error) {
         logger.debug('Error detecting sign in page', { error: error.message });
+        return unknownPage();
     }
 
     return null;
@@ -184,7 +215,7 @@ async function detectSignInPage(page) {
  * Detect sign up page
  * اكتشاف صفحة إنشاء حساب
  */
-async function detectSignUpPage(page) {
+async function detectSignUpPage(scope) {
     try {
         // Check for "Create account" button or sign up form
         const selectors = [
@@ -198,27 +229,11 @@ async function detectSignUpPage(page) {
             'input[type="text"][aria-label*="Last name" i]'
         ];
 
-        const foundElements = [];
-        for (const selector of selectors) {
-            try {
-                const element = await page.$(selector);
-                if (element) {
-                    foundElements.push(selector);
-                }
-            } catch (e) {
-                // Continue
-            }
-        }
-
-        // Also check for "Create account" button using XPath
-        try {
-            const createAccountButton = await page.$x('//button[contains(text(), "Create account") or contains(text(), "إنشاء حساب")]');
-            if (createAccountButton.length > 0) {
-                foundElements.push('create_account_button');
-            }
-        } catch (e) {
-            // Continue
-        }
+        const foundElements = await readFlowElements(scope, selectors, {
+            xpath: '//button[contains(text(), "Create account") or contains(text(), "إنشاء حساب")]',
+            label: 'create_account_button'
+        });
+        if (foundElements === null) return unknownPage();
 
         if (foundElements.length > 0) {
             logger.info('Detected: Sign Up page');
@@ -230,6 +245,7 @@ async function detectSignUpPage(page) {
         }
     } catch (error) {
         logger.debug('Error detecting sign up page', { error: error.message });
+        return unknownPage();
     }
 
     return null;
@@ -239,7 +255,7 @@ async function detectSignUpPage(page) {
  * Detect verification page
  * اكتشاف صفحة التحقق
  */
-async function detectVerificationPage(page) {
+async function detectVerificationPage(scope) {
     try {
         const selectors = [
             'input[type="tel"]',
@@ -250,23 +266,11 @@ async function detectVerificationPage(page) {
             'button:has-text("Verify")'
         ];
 
-        const foundElements = [];
-        for (const selector of selectors) {
-            try {
-                const element = await page.$(selector);
-                if (element) {
-                    foundElements.push(selector);
-                }
-            } catch (e) {
-                // Continue
-            }
-        }
-
-        // Check for verification code input
-        const codeInputs = await page.$$('input[type="text"][maxlength="6"], input[type="text"][maxlength="8"]');
-        if (codeInputs.length > 0) {
-            foundElements.push('verification_code_input');
-        }
+        const foundElements = await readFlowElements(scope, selectors, {
+            selector: 'input[type="text"][maxlength="6"], input[type="text"][maxlength="8"]',
+            label: 'verification_code_input'
+        });
+        if (foundElements === null) return unknownPage();
 
         if (foundElements.length > 0) {
             logger.info('Detected: Verification page');
@@ -278,6 +282,7 @@ async function detectVerificationPage(page) {
         }
     } catch (error) {
         logger.debug('Error detecting verification page', { error: error.message });
+        return unknownPage();
     }
 
     return null;
@@ -287,11 +292,14 @@ async function detectVerificationPage(page) {
  * Detect page by class names (Google Material Design classes)
  * اكتشاف الصفحة بناءً على أسماء الفئات (فئات Google Material Design)
  */
-async function detectByClassNames(page) {
+async function detectByClassNames(page, scope, address) {
     try {
         await page.waitForTimeout(1000);
+        if (page.url() !== address) return unknownPage();
 
-        const classChecks = await page.evaluate(() => {
+        const classChecks = await scope.evaluate(guard => {
+            const document = guard?.currentDocument;
+            if (!document) return null;
             // Cache common queries for performance
             const body = document.body;
             const allButtons = Array.from(document.querySelectorAll('button, a, span'));
@@ -398,6 +406,7 @@ async function detectByClassNames(page) {
 
             return checks;
         });
+        if (!classChecks || page.url() !== address) return unknownPage();
 
         // Detect page type based on class combinations
         if (classChecks.hasAccountTypeMenu) {
@@ -481,20 +490,10 @@ async function detectByClassNames(page) {
         }
 
         logger.debug('Could not detect page type by class names');
-        return {
-            type: 'UNKNOWN',
-            elements: [],
-            action: 'wait',
-            method: 'class_names'
-        };
+        return null;
     } catch (error) {
         logger.error('Error detecting page by class names', { error: error.message });
-        return {
-            type: 'UNKNOWN',
-            elements: [],
-            action: 'wait',
-            method: 'class_names'
-        };
+        return unknownPage();
     }
 }
 
@@ -502,13 +501,16 @@ async function detectByClassNames(page) {
  * Detect page by elements
  * اكتشاف الصفحة بناءً على العناصر
  */
-async function detectByElements(page) {
+async function detectByElements(page, scope, address) {
     try {
         // Wait a bit for page to load
         await page.waitForTimeout(1000);
+        if (page.url() !== address) return unknownPage();
 
         // Check for various page indicators
-        const checks = await page.evaluate(() => {
+        const checks = await scope.evaluate(guard => {
+            const document = guard?.currentDocument;
+            if (!document) return null;
             const indicators = {
                 hasEmailInput: !!document.querySelector('input[type="email"], input[name="identifier"], #identifierId'),
                 hasPasswordInput: !!document.querySelector('input[type="password"]'),
@@ -525,9 +527,12 @@ async function detectByElements(page) {
             };
             return indicators;
         });
+        if (!checks || page.url() !== address) return unknownPage();
 
         // Check for birthday/gender inputs
-        const hasBirthdayInputs = await page.evaluate(() => {
+        const hasBirthdayInputs = await scope.evaluate(guard => {
+            const document = guard?.currentDocument;
+            if (!document) return null;
             return !!(
                 document.querySelector('input[name="day"], input[aria-label*="day" i]') &&
                 document.querySelector('#month, select[name="month"]') &&
@@ -535,6 +540,7 @@ async function detectByElements(page) {
                 document.querySelector('#gender, select[name="gender"]')
             );
         });
+        if (hasBirthdayInputs === null || page.url() !== address) return unknownPage();
 
         if (hasBirthdayInputs) {
             logger.info('Detected: Birthday/Gender form');

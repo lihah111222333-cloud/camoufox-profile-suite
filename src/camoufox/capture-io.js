@@ -275,6 +275,21 @@ export function hashCaptureFile(trafficDir, fileName, {
     });
 }
 
+/**
+ * Remove a capture file whose size and digest still match the checkpoint.
+ * Check the directory and file identity immediately before unlink.
+ */
+export function removeVerifiedCaptureFile(trafficDir, fileName, { sha256, bytes, trustedLocal = false }) {
+    const options = { optional: true, trustedLocal, maxBytes: MAX_CAPTURE_BYTES };
+    return accessCaptureArtifact(trafficDir, fileName, options, (fd, size, verifyFile, entry) => {
+        if (size !== bytes) throw captureError('Capture file byte length mismatch');
+        if (hashFileBytes(fd, size, size, verifyFile).sha256 !== sha256) {
+            throw captureError('Capture file SHA-256 mismatch');
+        }
+        fs.unlinkSync(entry);
+    });
+}
+
 function hashFileBytes(fd, size, length, verifyFile) {
     const hash = createHash('sha256');
     const buffer = Buffer.allocUnsafe(Math.min(length, 64 * 1024));
@@ -365,8 +380,16 @@ export function truncateCaptureFile(trafficDir, fileName, expectedBytes, length,
         });
 }
 
+/** Describe the current regular archive so HAR recovery can detect a changed target. */
+export function captureExportTargetVersion(outputPath) {
+    const info = fs.lstatSync(resolveFilesystemPath(outputPath), { ...STAT_OPTIONS, throwIfNoEntry: false });
+    return info?.isFile() ? [info.dev, info.ino, info.size, info.ctimeNs, info.mtimeNs].join(':') : null;
+}
+
 /** Publish a private file through a temporary inode in the destination directory. */
-export function writeCaptureExport(outputPath, content, { replace = true, protectedPaths = [], recordedWirePath } = {}) {
+export function writeCaptureExport(outputPath, content, {
+    replace = true, protectedPaths = [], recordedWirePath, expectedTargetVersion
+} = {}) {
     const resolvedOutput = resolveFilesystemPath(outputPath);
     const protectedFiles = [...protectedPaths];
     // An archived wire path can only veto publication at the selected destination.
@@ -422,6 +445,9 @@ export function writeCaptureExport(outputPath, content, { replace = true, protec
             if (directory) assertDirectory(directory);
             if (!sameNode(created, fs.lstatSync(temporary, STAT_OPTIONS))) {
                 throw captureError('Capture export temporary file changed during writing');
+            }
+            if (expectedTargetVersion !== undefined && captureExportTargetVersion(target) !== expectedTargetVersion) {
+                throw captureError('Capture export target changed before publication', 'ERR_CAPTURE_OUTPUT_CHANGED');
             }
             if (replace) fs.renameSync(temporary, target);
             else fs.linkSync(temporary, target);

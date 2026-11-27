@@ -4,15 +4,19 @@ import { fileURLToPath } from 'node:url';
 
 const CAMOUFOX_PACKAGE = 'camoufox';
 
-export function isCamoufoxModuleResolvable() {
+export function isPackageEntryResolvable(packageName, source = import.meta) {
     try {
-        const packagePath = typeof import.meta.resolve === 'function'
-            ? fileURLToPath(import.meta.resolve(CAMOUFOX_PACKAGE))
-            : createRequire(import.meta.url).resolve(CAMOUFOX_PACKAGE);
+        const packagePath = typeof source.resolve === 'function'
+            ? fileURLToPath(source.resolve(packageName))
+            : createRequire(source.url).resolve(packageName);
         return fs.statSync(packagePath).isFile();
     } catch {
         return false;
     }
+}
+
+export function isCamoufoxModuleResolvable() {
+    return isPackageEntryResolvable(CAMOUFOX_PACKAGE);
 }
 
 export function loadCamoufoxModule() {

@@ -304,6 +304,39 @@ test('standalone native logging opts in, excludes inherited destinations and rej
     assert.equal(fs.existsSync(capturePath), false);
 });
 
+test('Camoufox diagnostic help runs without its diagnostic modules or state', (t) => {
+    const root = fixture(t);
+    const script = 'verify-camoufox-coherence.mjs';
+    const home = path.join(root, 'home');
+    const state = path.join(root, 'state');
+    const temporary = path.join(root, 'temporary');
+    fs.mkdirSync(home);
+    fs.mkdirSync(temporary);
+    fs.copyFileSync(path.join(repo, 'scripts', 'verify-camoufox-coherence.js'), path.join(root, script));
+
+    for (const help of ['--help', '-h']) {
+        const run = spawnSync(process.execPath, [script, help], {
+            cwd: root,
+            encoding: 'utf8',
+            timeout: 5000,
+            env: {
+                ...process.env,
+                HOME: home,
+                USERPROFILE: home,
+                GMAIL_CREATOR_STATE_DIR: state,
+                TMPDIR: temporary,
+                TMP: temporary,
+                TEMP: temporary
+            }
+        });
+        assert.equal(run.status, 0, run.error?.message || run.stderr + run.stdout);
+        assert.match(run.stdout.trim(), /^Usage: [^\r\n]*verify-camoufox-coherence\.js[^\r\n]*$/);
+        assert.equal(run.stderr, '');
+        assert.equal(fs.existsSync(state), false);
+        assert.deepEqual(fs.readdirSync(temporary), []);
+    }
+});
+
 test('Camoufox diagnostic separates live evidence, unavailable data, and synthetic reports', (t) => {
     const root = fixture(t);
     const stateDir = path.join(root, 'state');
@@ -324,12 +357,14 @@ test('Camoufox diagnostic separates live evidence, unavailable data, and synthet
         'src/camoufox/gpu-performance-scaler.js',
         'src/camoufox/hardware-models.js',
         'src/camoufox/network-policy.js',
+        'src/camoufox/profile-storage.js',
         'src/camoufox/sdk-resolution.js',
         'src/camoufox/traffic-redaction.js',
         'src/camoufox/ziniao-security.js',
         'src/utils/logger.js',
         'src/utils/private-env.js',
         'src/utils/private-storage.js',
+        'src/utils/process-owner.js',
         'src/utils/proxy-protocol.js',
         'src/utils/state-paths.js'
     ];
@@ -396,8 +431,19 @@ test('Camoufox diagnostic separates live evidence, unavailable data, and synthet
         assert.equal(fs.statSync(reportFile).mode & 0o777, 0o600);
     }
     fs.writeFileSync(path.join(stateDir, 'logs'), 'Fixture unavailable log directory');
+    const playwright = path.join(root, 'node_modules', 'playwright-core');
+    fs.mkdirSync(playwright);
+    fs.writeFileSync(path.join(playwright, 'package.json'), '{"type":"module","exports":"./index.js"}');
+    const missingPlaywright = runWithTemporaryReport('--check-env');
+    assert.equal(missingPlaywright.run.status, 0);
+    assert.match(missingPlaywright.run.stdout, /playwright-core\s+: Unavailable/);
+    assert.equal(missingPlaywright.report.environment.playwrightCoreInstalled, false);
+
+    fs.writeFileSync(path.join(playwright, 'index.js'), 'throw new Error("Unexpected Playwright evaluation");');
     const check = runWithTemporaryReport('--check-env');
     assert.equal(check.run.status, 0, check.run.error?.message || check.run.stderr + check.run.stdout);
+    assert.match(check.run.stdout, /playwright-core\s+: Resolvable/);
+    assert.equal(check.report.environment.playwrightCoreInstalled, true);
     assert.equal(check.report.results[0].mode, 'dry-run-synthetic');
     assert.equal(fs.readFileSync(path.join(stateDir, 'logs'), 'utf8'), 'Fixture unavailable log directory');
 

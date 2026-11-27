@@ -45,6 +45,10 @@ export function captureEventTraceId(event) {
     return event?.attribution?.traceId ?? event?.traceId ?? null;
 }
 
+export function captureEventProfileId(event) {
+    return event?.attribution?.profileId ?? event?.profileId ?? null;
+}
+
 export function capturePolicyAllowsBody(bodyPolicy, event) {
     return Boolean(event && bodyPolicy.recordBodies && captureEventTraceId(event) === bodyPolicy.traceId);
 }

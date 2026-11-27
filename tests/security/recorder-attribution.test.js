@@ -206,6 +206,39 @@ test('legacy cookie scopes use available path and time evidence without exposing
     assert.equal(uncertain.matchesLatestSetCookie, null);
 });
 
+test('ordinary cookie lineage masks identifying names and retains all colliding instances', async (t) => {
+    const { recorder, context, trafficDir, profilesDir } = fixture(t);
+    const url = 'https://fixture.invalid/cart/view';
+    const names = ['prefs-sample-one%40fixture.invalid', 'prefs-sample-two%40fixture.invalid'];
+    setCookie(context, url, [
+        'Ordinary=sample; Path=/',
+        names[0] + '=first; Path=/',
+        names[0] + '=scoped; Path=/cart',
+        names[1] + '=second; Path=/'
+    ]);
+    await recorder.flushSummary();
+    emitCookie(context, url, 'Ordinary=sample; ' + names[0] + '=scoped; ' + names[1] + '=second');
+    await recorder.stop();
+
+    const ordinary = execFileSync(process.execPath, [
+        cliPath, '--profiles-dir=' + profilesDir, '--profile=fixture', '--json'
+    ], { encoding: 'utf8' });
+    assert.equal(names.some((name) => ordinary.includes(name)), false, 'raw name present in ordinary JSON');
+    assert.doesNotMatch(ordinary, /valueSha256|lastValueSha256/);
+    const lineage = JSON.parse(ordinary).cookieLineage;
+    assert.deepEqual(Object.keys(lineage).sort(), ['Ordinary', '[REDACTED]']);
+    assert.equal(lineage.Ordinary.name, 'Ordinary');
+    const masked = lineage['[REDACTED]'];
+    assert.equal(masked.name, '[REDACTED]');
+    assert.deepEqual(masked.instances.map(({ name, path, sentCount }) => [name, path, sentCount]), [
+        ['[REDACTED]', '/', 0], ['[REDACTED]', '/cart', 1], ['[REDACTED]', '/', 1]
+    ]);
+    const privateReport = queryProfileTraffic({ trafficDir, cookie: names[0] });
+    assert.equal(privateReport.privacy, 'private');
+    assert.equal(privateReport.cookie.name, names[0]);
+    assert.equal(privateReport.cookie.instances.length, 2);
+});
+
 test('recorder bounds repeated cookie history while the ledger keeps the complete lineage', async (t) => {
     const { recorder, context, trafficDir, options } = fixture(t);
     const url = 'https://repeat.test/';
@@ -279,6 +312,40 @@ test('late cookie observations preserve observation order and correct earlier se
     assert.equal(lineage.matchesLatestSetCookie, true);
     assert.deepEqual(queryProfileTraffic({ trafficDir, cookie: 'Sample' }).cookie, lineage);
     assert.deepEqual((await new CamoufoxTrafficRecorder(options).stop()).cookieLineage.Sample, lineage);
+});
+
+test('recorded cookie order survives wall-clock rollback in summaries and queries', async (t) => {
+    let clock;
+    t.mock.method(Date, 'now', () => clock);
+    const url = 'https://fixture.invalid/';
+    for (const shift of [250, -250]) {
+        clock = Date.parse('2026-05-01T10:00:00Z');
+        const { recorder, context, trafficDir, options } = fixture(t);
+        emitCookie(context, url, 'Before=sample');
+        await recorder.flushSummary();
+        clock += shift;
+        setCookie(context, url, ['Before=sample', 'After=sample', 'Timed=sample; Max-Age=1']);
+        await recorder.flushSummary();
+        clock += shift;
+        emitCookie(context, url, 'After=sample; Timed=sample');
+        const summary = await recorder.stop();
+
+        const observed = events(recorder).filter(({ cookieObservations }) => cookieObservations?.length);
+        assert.deepEqual(observed.map(({ type }) => type), ['egress', 'ingress', 'egress']);
+        assert.ok(observed[0].observationSequence < observed[1].observationSequence);
+        assert.equal(observed[1].epochMs - observed[0].epochMs, shift);
+
+        const queried = queryProfileTraffic({ trafficDir }).cookieLineage;
+        const reopened = (await new CamoufoxTrafficRecorder(options).stop()).cookieLineage;
+        const sent = (entry) => (entry.instances ?? [entry]).find(({ sentCount }) => sentCount > 0);
+        for (const lineage of [summary.cookieLineage, queried, reopened]) {
+            assert.equal(sent(lineage.Before).scopeStatus, 'unmatched');
+            assert.equal(sent(lineage.Before).matchesLatestSetCookie, null);
+            assert.equal(sent(lineage.After).matchesLatestSetCookie, true);
+            assert.equal(sent(lineage.Timed).matchesLatestSetCookie, shift < 0 ? null : true);
+            assert.equal(sent(lineage.Timed).scopeStatus, shift < 0 ? 'unknown' : 'set-cookie');
+        }
+    }
 });
 
 test('legacy cookie events with equal timestamps keep their stored order', () => {

@@ -9,10 +9,10 @@ import path from 'path';
 import { isDeepStrictEqual } from 'node:util';
 import logger from '../utils/logger.js';
 import { getConfiguredProfilesDirectory, resolveRecordingOptions } from '../utils/private-env.js';
-import { formatProxyHost, parseProxyAddress, parseProxyPort } from '../utils/proxy-protocol.js';
+import { formatProxyHost, parseProxyAddress, parseProxyPort, requireProxyProtocol } from '../utils/proxy-protocol.js';
 import { getDefaultProfilesDirectory } from '../utils/state-paths.js';
 import { ensurePrivateDirectory, writePrivateFile } from '../utils/private-storage.js';
-import { listCaptureDirectory } from './capture-io.js';
+import { captureExportTargetVersion, listCaptureDirectory } from './capture-io.js';
 import {
     assertManagedProxyLaunchEnvironment,
     assertManagedProxyReuse,
@@ -98,7 +98,7 @@ export {
 };
 
 const VALID_TARGET_OS = new Set(['windows', 'macos', 'linux']);
-const VALID_PROXY_PROTOCOLS = new Set(['http', 'https', 'socks4', 'socks5', 'socks5h']);
+const VALID_PROXY_PROTOCOLS = ['http', 'https', 'socks4', 'socks5', 'socks5h'];
 const FORBIDDEN_UA_PATTERNS =
     /\b(Chrome|CriOS|Chromium|Safari|AppleWebKit|WebKit|Edg|Edge|EdgA|EdgiOS|OPR|Opera|Vivaldi|Brave|FxiOS|Android|iPhone|iPad|iPod|Mobile|Tablet|Touch|IEMobile|BlackBerry|SamsungBrowser|UCBrowser|Trident|MSIE)\b/i;
 
@@ -258,12 +258,17 @@ export function assertFirefoxCoherence(options = {}) {
 }
 
 function camoufoxProxy({ type, ip, port, username, password }) {
-    if (!VALID_PROXY_PROTOCOLS.has(type)) throw new Error('Unsupported proxy protocol');
+    if (!VALID_PROXY_PROTOCOLS.includes(type)) throw new Error('Unsupported proxy protocol');
     return {
         server: type + '://' + ip + ':' + port,
         ...(username && { username }),
         ...(password && { password })
     };
+}
+
+function normalizeProxyProtocolSetting(value) {
+    if (typeof value !== 'string') return value;
+    return value.trim().replace(/:\/\/$/, '') || value;
 }
 
 /**
@@ -280,16 +285,22 @@ export function normalizeProxy(proxy) {
     }
 
     if (typeof proxy !== 'object' || Array.isArray(proxy)) throw new Error('Invalid proxy configuration');
+    const protocols = {
+        type: normalizeProxyProtocolSetting(proxy.type),
+        protocol: normalizeProxyProtocolSetting(proxy.protocol)
+    };
     let normalized;
     if (proxy.server) {
         if (typeof proxy.server !== 'string') throw new Error('Invalid proxy server');
         normalized = normalizeProxy(proxy.server);
         if (!normalized) throw new Error('Invalid proxy server');
+        const [scheme] = normalized.server.split(':', 1);
+        requireProxyProtocol({ ...protocols, mode: scheme }, VALID_PROXY_PROTOCOLS, 'Camoufox');
     } else {
         const ip = formatProxyHost(proxy.ip || proxy.host);
         const port = parseProxyPort(proxy.port);
         if (!ip || !port) throw new Error('Invalid proxy host or port');
-        const type = String(proxy.type || proxy.protocol || 'http').trim().toLowerCase().replace(/:\/\/$/, '');
+        const type = requireProxyProtocol(protocols, VALID_PROXY_PROTOCOLS, 'Camoufox');
         normalized = camoufoxProxy({ type, ip, port });
     }
 
@@ -942,6 +953,30 @@ function cleanAbandonedHarScratch(storage, profileId, directory, generation) {
     });
 }
 
+function publishHarScratch({ directory, index, harPath, storageGeneration, uncertainPublication = false }, writeArchive) {
+    const recovery = index.harRecovery ?? { storageGeneration, ready: true, finalized: true };
+    const publication = recovery.publication;
+    if (publication?.published === true) return;
+
+    const previousTarget = captureExportTargetVersion(harPath);
+    if (previousTarget !== null &&
+        (publication ? publication.previousTarget !== previousTarget : uncertainPublication)) {
+        throw new Error('Could not confirm the previous HAR publication. Target and capture were preserved.');
+    }
+
+    const savePublication = (published) => {
+        const harRecovery = { ...recovery, publication: { previousTarget, published } };
+        const updated = { ...index, harRecovery };
+        writePrivateFile(path.join(directory, 'attribution-index.json'), `${JSON.stringify(updated, null, 2)}\n`);
+        index.harRecovery = harRecovery;
+    };
+    // Persist the old target's version before publishing so an interrupted rename
+    // leaves enough evidence to refuse replacing a different archive on retry.
+    savePublication(false);
+    writeArchive(previousTarget);
+    savePublication(true);
+}
+
 function recoverPendingHar(location) {
     const { profileDir, id: profileId } = location;
     const directory = path.join(profileDir, '.native', '~har-scratch');
@@ -960,10 +995,17 @@ function recoverPendingHar(location) {
                 if (!hasHarScratchData(directory) && (pending || !hasHarScratchIndex(directory))) return true;
                 throw new Error('Could not validate the pending Camoufox HAR capture');
             }
-            exportTrafficToHar(directory, pending.harPath, { profileId }, {
+            publishHarScratch({
+                directory,
+                harPath: pending.harPath,
+                index: pending.index,
+                storageGeneration: identity.generation,
+                uncertainPublication: pending.phase === 'finalized'
+            }, (expectedTargetVersion) => exportTrafficToHar(directory, pending.harPath, { profileId }, {
                 trustedLocal: true,
-                recordBodies: pending.recordBodies
-            });
+                recordBodies: pending.recordBodies,
+                expectedTargetVersion
+            }));
             published = true;
             return true;
         });
@@ -971,7 +1013,7 @@ function recoverPendingHar(location) {
     } catch (error) {
         if (error.code === 'ERR_CAMOUFOX_PROFILE_BUSY') throw error;
         logger.warn(published ? 'Could not remove published Camoufox HAR scratch' :
-            'Camoufox HAR archive was not published. Capture preserved for retry.', {
+            'Could not confirm Camoufox HAR publication. Capture preserved for retry.', {
             profileId,
             error: redactDiagnosticText(error.message)
         });
@@ -1600,10 +1642,23 @@ export async function stopProfile(profileId, options = {}) {
 async function finalizeProfileRecording(session) {
     if (!session.closed) throw new Error('Camoufox has not confirmed browser closure');
     if (session.identity) assertProfileOwner(session);
-    const summary = await session.recording.stop({ nativeLogsClosed: true });
+    let summary = await session.recording.stop({ nativeLogsClosed: true });
     if (session.harPath && !session.startFailed) {
         try {
-            session.recording.exportHar(session.harPath, { recordBodies: session.harBodies });
+            if (session.harTemporaryDir) {
+                summary = session.harPublicationIndex ??= summary;
+                publishHarScratch({
+                    directory: session.harTemporaryDir,
+                    harPath: session.harPath,
+                    index: summary,
+                    storageGeneration: session.identity.generation
+                }, (expectedTargetVersion) => session.recording.exportHar(session.harPath, {
+                    recordBodies: session.harBodies,
+                    expectedTargetVersion
+                }));
+            } else {
+                session.recording.exportHar(session.harPath, { recordBodies: session.harBodies });
+            }
         } catch (cause) {
             throw Object.assign(new Error('Camoufox HAR archive was not published. Capture preserved for retry.', {
                 cause
@@ -1898,11 +1953,15 @@ function deleteProfileAt(location, expected = null) {
 
 /**
  * Update proxy configuration for one or more profile IDs.
+ * A write failure reports which profile updates were confirmed.
  */
 export async function updateProfileProxy(profileIds, proxy, options = {}) {
     const ids = (Array.isArray(profileIds) ? profileIds : [profileIds]).map(validateProfileId);
+    if (ids.length === 0) throw new Error('At least one Camoufox profile ID is required');
+
     const profilesDir = options.profilesDir || getConfiguredProfilesDirectory();
     const leases = [];
+    const updatedProfileIds = [];
     let normalizedProxy;
     try {
         const profiles = [...new Set(ids)].map((id) => {
@@ -1923,11 +1982,22 @@ export async function updateProfileProxy(profileIds, proxy, options = {}) {
                 geoip: normalizedProxy ? true : Boolean(existing?.geoip),
                 updatedAt: new Date().toISOString()
             };
-            if (existing) {
-                writePrivateFile(getProfileMetadataPath(location.id, location.profilesDir), JSON.stringify(updated, null, 2));
-            } else {
-                initializeProfileStorageAt(location, updated);
+            try {
+                if (existing) {
+                    writePrivateFile(getProfileMetadataPath(location.id, location.profilesDir), JSON.stringify(updated, null, 2));
+                } else {
+                    initializeProfileStorageAt(location, updated);
+                }
+            } catch {
+                const remainingProfileIds = profiles.slice(updatedProfileIds.length).map(({ location }) => location.id);
+                throw Object.assign(new Error('Could not complete the Camoufox proxy update'), {
+                    code: 'ERR_CAMOUFOX_PROXY_UPDATE_FAILED',
+                    updatedProfileIds,
+                    failedProfileId: location.id,
+                    remainingProfileIds
+                });
             }
+            updatedProfileIds.push(location.id);
         }
     } finally {
         for (const lease of leases) releaseProfileLease(lease);
