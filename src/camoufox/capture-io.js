@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants as bufferLimits } from 'node:buffer';
+import { assertPrivateAcl, syncDirectory } from '../utils/private-storage.js';
 
 const MAX_CAPTURE_BYTES = 128 * 1024 * 1024;
 const MAX_PAYLOAD_BYTES = 32 * 1024 * 1024;
@@ -59,6 +60,11 @@ function closeDirectory(fd) {
     if (fd !== null) fs.closeSync(fd);
 }
 
+function syncCaptureDirectory(fd, directoryPath) {
+    if (fd == null) syncDirectory(directoryPath);
+    else fs.fsyncSync(fd);
+}
+
 function directoryStat(directory) {
     return directory.fd === null ? fs.lstatSync(directory.path, STAT_OPTIONS) : fs.fstatSync(directory.fd, STAT_OPTIONS);
 }
@@ -89,6 +95,7 @@ function openDirectory(directoryPath, { create = false, trustedLocal = false } =
                 } catch (mkdirError) {
                     if (mkdirError.code !== 'EEXIST') throw mkdirError;
                 }
+                syncCaptureDirectory(fd, parent);
                 next = openDirectoryEntry(entry);
             }
             closeDirectory(fd);
@@ -261,17 +268,19 @@ function accessCaptureArtifact(trafficDir, fileName, { optional, trustedLocal, m
     }
 }
 
-/** Hash a bounded capture file or its checkpointed prefix without loading it into memory. */
+/** Hash a bounded capture file or prefix, optionally verifying an earlier checkpoint on the same read. */
 export function hashCaptureFile(trafficDir, fileName, {
-    optional = false, trustedLocal = false, maxBytes = MAX_CAPTURE_BYTES, prefixBytes
+    optional = false, trustedLocal = false, maxBytes = MAX_CAPTURE_BYTES, prefixBytes, checkpoint
 } = {}) {
     return accessCaptureArtifact(trafficDir, fileName, { optional, trustedLocal, maxBytes, prefixBytes }, (fd, size, verifyFile) => {
         const length = prefixBytes ?? size;
-        if (length > size) {
+        const checkpointLength = checkpoint?.hashedBytes ?? checkpoint?.bytes;
+        if (length > size || (checkpoint && (checkpoint.bytes > size || checkpointLength > length))) {
             throw captureError(`${fileName} byte length mismatch`);
         }
 
-        return hashFileBytes(fd, size, length, verifyFile);
+        const prior = checkpoint && { length: checkpointLength, sha256: checkpoint.sha256, fileName };
+        return hashFileBytes(fd, size, length, verifyFile, prior);
     });
 }
 
@@ -290,16 +299,25 @@ export function removeVerifiedCaptureFile(trafficDir, fileName, { sha256, bytes,
     });
 }
 
-function hashFileBytes(fd, size, length, verifyFile) {
+function hashFileBytes(fd, size, length, verifyFile, prior) {
     const hash = createHash('sha256');
     const buffer = Buffer.allocUnsafe(Math.min(length, 64 * 1024));
     let offset = 0;
-    while (offset < length) {
-        const count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, length - offset), offset);
-        if (count === 0) throw captureError('Capture file changed during access');
-        hash.update(buffer.subarray(0, count));
-        offset += count;
+    const updateThrough = (end) => {
+        while (offset < end) {
+            const count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, end - offset), offset);
+            if (count === 0) throw captureError('Capture file changed during access');
+            hash.update(buffer.subarray(0, count));
+            offset += count;
+        }
+    };
+    if (prior) {
+        updateThrough(prior.length);
+        if (hash.copy().digest('hex') !== prior.sha256) {
+            throw captureError(`${prior.fileName} SHA-256 mismatch`);
+        }
     }
+    updateThrough(length);
     verifyFile();
     return { sha256: hash.digest('hex'), bytes: size };
 }
@@ -429,12 +447,14 @@ export function writeCaptureExport(outputPath, content, {
             })) {
                 throw captureError('Capture export destination overlaps the input capture');
             }
+            if (replace && existing) assertPrivateAcl(target, existing, true);
         }
+        let bytes = 0;
         const fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT |
             fs.constants.O_EXCL | FILE_FLAGS, 0o600);
         try {
             const created = fs.fstatSync(fd, STAT_OPTIONS);
-            let bytes = 0;
+            assertPrivateAcl(temporary, created);
             const chunks = typeof content === 'string' || ArrayBuffer.isView(content) ? [content] : content;
             for (const chunk of chunks) {
                 const buffer = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk;
@@ -451,7 +471,6 @@ export function writeCaptureExport(outputPath, content, {
             }
             if (replace) fs.renameSync(temporary, target);
             else fs.linkSync(temporary, target);
-            return bytes;
         } finally {
             try {
                 const existing = fs.lstatSync(temporary, { ...STAT_OPTIONS, throwIfNoEntry: false });
@@ -460,6 +479,8 @@ export function writeCaptureExport(outputPath, content, {
                 fs.closeSync(fd);
             }
         }
+        syncCaptureDirectory(directory?.fd, lookup);
+        return bytes;
     } finally {
         if (directory) closeDirectory(directory.fd);
     }

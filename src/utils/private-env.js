@@ -1,12 +1,13 @@
 import { createDecipheriv } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { isMainThread } from 'node:worker_threads';
 import { readPrivateFile } from './private-storage.js';
-import { getDefaultProfilesDirectory, LEGACY_DIRECTORY, STATE_DIRECTORY, validateExistingStateDirectory } from './state-paths.js';
+import {
+    configurationError, getDefaultProfilesDirectory, getLegacyDirectory, getStateDirectory, validateExistingStateDirectory
+} from './state-paths.js';
 
-export function configurationError(message) {
-    return Object.assign(new Error(message), { code: 'PRIVATE_ENV_CONFIGURATION_ERROR' });
-}
+export { configurationError };
 
 function parseEnvironment(content) {
     const values = Object.create(null);
@@ -67,27 +68,33 @@ function createVaultParser(value) {
     };
 }
 
-const configFiles = ['.env', '.emv'];
+const configFiles = ['.env', '.emv', '.env.vault', '.emv.vault'];
 
-function selectEnvironmentDirectory(useVault) {
-    if (!validateExistingStateDirectory()) return LEGACY_DIRECTORY;
+function hasEnvironmentFile(directory, filename) {
+    try {
+        return Boolean(fs.lstatSync(path.join(directory, filename), { throwIfNoEntry: false }));
+    } catch {
+        throw configurationError('Could not inspect private configuration file ' + filename);
+    }
+}
+
+function selectEnvironmentDirectory() {
+    const stateDirectory = getStateDirectory();
+    const legacyDirectory = getLegacyDirectory();
+    if (!validateExistingStateDirectory()) return legacyDirectory;
 
     // A current configuration owns the selection even when the caller only
     // needs some of its fields. A legacy file never fills in a current file.
-    const candidates = useVault ? [...configFiles, ...configFiles.map(file => file + '.vault')] : configFiles;
-    for (const file of candidates) {
-        try {
-            if (fs.lstatSync(path.join(STATE_DIRECTORY, file), { throwIfNoEntry: false })) return STATE_DIRECTORY;
-        } catch {
-            throw configurationError('Could not inspect private configuration in GMAIL_CREATOR_STATE_DIR');
-        }
+    if (configFiles.some(filename => hasEnvironmentFile(stateDirectory, filename))) {
+        return stateDirectory;
     }
-    return LEGACY_DIRECTORY;
+    return legacyDirectory;
 }
 
-function applyEnvironment(env, values, onlyKey) {
+function applyEnvironment(env, values, caseInsensitive, onlyKey) {
     if (!values) return;
-    for (const [key, value] of Object.entries(values)) {
+    for (const [name, value] of Object.entries(values)) {
+        const key = caseInsensitive ? name.toUpperCase() : name;
         if (onlyKey !== undefined && key !== onlyKey) continue;
         // The vault key is supplied by the launch environment.
         if (key === 'DOTENV_KEY') continue;
@@ -99,7 +106,7 @@ export function loadApplicationEnvironment({ env = process.env, readOnly = false
     const vaultKey = env.DOTENV_KEY;
     let directory;
     try {
-        directory = selectEnvironmentDirectory(Boolean(vaultKey));
+        directory = selectEnvironmentDirectory();
     } catch (error) {
         throw configurationError(error.message);
     }
@@ -107,31 +114,41 @@ export function loadApplicationEnvironment({ env = process.env, readOnly = false
 
     let parseVault;
     const read = filename => {
-        const filePath = path.join(directory, filename);
+        const vaultFilename = filename + '.vault';
         if (vaultKey) {
-            const vault = readEnvironmentFile(filePath + '.vault', readOnly);
+            const vault = readEnvironmentFile(path.join(directory, vaultFilename), readOnly);
             if (vault !== undefined) {
                 parseVault ??= createVaultParser(vaultKey);
                 try {
                     return parseVault(vault);
                 } catch {
-                    throw configurationError('Could not parse environment configuration in ' + filename + '.vault');
+                    throw configurationError('Could not parse environment configuration in ' + vaultFilename);
                 }
             }
         }
-        const plaintext = readEnvironmentFile(filePath, readOnly);
-        return plaintext === undefined ? undefined : parseEnvironment(plaintext);
+        const plaintext = readEnvironmentFile(path.join(directory, filename), readOnly);
+        if (plaintext !== undefined) return parseEnvironment(plaintext);
+        if (!vaultKey && hasEnvironmentFile(directory, vaultFilename)) {
+            // A plaintext .emv can still provide the usual same-source fallback.
+            if (filename === '.env' && hasEnvironmentFile(directory, '.emv')) return undefined;
+            throw configurationError('DOTENV_KEY is required to read ' + vaultFilename);
+        }
     };
 
-    applyEnvironment(env, read('.env'));
-    if (!env.PROFILE_SERVICE?.trim()) {
-        applyEnvironment(env, read('.emv'));
-    } else if (includeGoLoginFallback && !('GOLOGIN_API_KEY' in env)) {
+    // Stage additions until all required files have been read. Fall back to
+    // the original environment for precedence checks without copying its keys.
+    const staged = Object.create(env);
+    // Only Windows' main-thread process environment ignores key casing.
+    const caseInsensitive = process.platform === 'win32' && isMainThread && env === process.env;
+    applyEnvironment(staged, read('.env'), caseInsensitive);
+    if (!staged.PROFILE_SERVICE?.trim()) {
+        applyEnvironment(staged, read('.emv'), caseInsensitive);
+    } else if (includeGoLoginFallback && !('GOLOGIN_API_KEY' in staged)) {
         // Keep support for a legacy GoLogin key without activating unrelated
         // fallback settings once the application service is configured.
-        applyEnvironment(env, read('.emv'), 'GOLOGIN_API_KEY');
+        applyEnvironment(staged, read('.emv'), caseInsensitive, 'GOLOGIN_API_KEY');
     }
-    return env;
+    return Object.assign(env, staged);
 }
 
 export function getConfiguredProfilesDirectory() {

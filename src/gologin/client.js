@@ -9,19 +9,23 @@ import logger from '../utils/logger.js';
 import { profileIdPathComponent, requireControllerProfileId } from '../utils/controller-id.js';
 import { controllerRequestOptions } from '../utils/controller-url.js';
 import {
-    ControllerRequestError, controllerAcknowledged, controllerErrorDetails, controllerRejected,
-    controllerRequestFailedBeforeDispatch, parseControllerPayload, profileAllocationUnconfirmed, sendControllerRequest
+    ControllerRequestError, controllerAcknowledged, controllerErrorDetails, controllerProfileMatches,
+    controllerRejected, controllerRequestFailedBeforeDispatch, parseControllerPayload, profileAllocationUnconfirmed,
+    sendControllerRequest
 } from '../utils/controller-request.js';
 import { loadApplicationEnvironment } from '../utils/private-env.js';
 import { requireProxyProtocol } from '../utils/proxy-protocol.js';
 
-loadApplicationEnvironment({ includeGoLoginFallback: true });
-
 const GOLOGIN_API_ORIGIN = 'https://api.gologin.com';
 const supportedProfileOs = new Set(['lin', 'mac', 'win']);
 const createProfileOptions = new Set(['name', 'os', 'browserType', 'proxy']);
+let defaultEnvironmentLoaded = false;
 
 export function getGoLoginApiKey() {
+    if (!defaultEnvironmentLoaded) {
+        loadApplicationEnvironment({ includeGoLoginFallback: true });
+        defaultEnvironmentLoaded = true;
+    }
     const apiKey = process.env.GOLOGIN_API_KEY;
     if (!apiKey) throw new Error('GOLOGIN_API_KEY is not set');
     return apiKey;
@@ -82,6 +86,10 @@ export class GoLoginClient {
             throw new Error('A GoLogin API key is required');
         }
         this.#apiKey = apiKey;
+    }
+
+    get hasBoundCredential() {
+        return this.#apiKey !== undefined;
     }
 
     /**
@@ -145,10 +153,13 @@ export class GoLoginClient {
         return response;
     }
 
-    async #readProfileData(endpoint) {
+    async #readProfileData(endpoint, profileId) {
         const data = parseControllerPayload(await this.request('GET', endpoint));
         if (controllerRejected(data)) throw new Error('GoLogin API rejected the profile read');
-        if (!data || typeof data !== 'object') throw new Error('GoLogin returned an invalid profile response');
+        if (!data || typeof data !== 'object' ||
+            (profileId !== undefined && Object.hasOwn(data, 'id') && !controllerProfileMatches(data, profileId))) {
+            throw new Error('GoLogin returned an invalid profile response');
+        }
         return data;
     }
 
@@ -189,21 +200,14 @@ export class GoLoginClient {
         const proxy = formatGoLoginProxy(proxyData);
         const client = this.#apiKey === undefined ? new GoLoginClient(getGoLoginApiKey()) : this;
         if (testProxyConnection && proxy?.mode === 'http') {
-            const address = `${proxy.host}:${proxy.port}`;
-            logger.info('Checking proxy TCP reachability before creating profile', { proxy: address });
+            logger.info('Checking GoLogin HTTP proxy TCP reachability before creating profile');
             try {
                 const result = await this.testProxy(proxy);
                 if (!result.valid) {
-                    logger.warn('Proxy preflight unsuccessful, continuing with profile creation', {
-                        proxy: address,
-                        error: result.error
-                    });
+                    logger.warn('GoLogin proxy preflight unsuccessful, continuing with profile creation');
                 }
-            } catch (error) {
-                logger.warn('Proxy test failed, but continuing with profile creation', {
-                    proxy: address,
-                    error: error.message
-                });
+            } catch {
+                logger.warn('GoLogin proxy test failed, but continuing with profile creation');
             }
         }
 
@@ -268,7 +272,7 @@ export class GoLoginClient {
      */
     async getProfile(profileId) {
         try {
-            return await this.#readProfileData(`/browser/${profileIdPathComponent(profileId)}`);
+            return await this.#readProfileData(`/browser/${profileIdPathComponent(profileId)}`, profileId);
         } catch (error) {
             throw new Error(`Failed to get profile: ${error.message}`);
         }
@@ -280,7 +284,7 @@ export class GoLoginClient {
      */
     async startProfile(profileId) {
         try {
-            return await this.#readProfileData(`/browser/${profileIdPathComponent(profileId)}`);
+            return await this.#readProfileData(`/browser/${profileIdPathComponent(profileId)}`, profileId);
         } catch (error) {
             throw new Error(`Failed to start profile: ${error.message}`);
         }

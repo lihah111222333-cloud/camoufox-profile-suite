@@ -22,17 +22,59 @@ function hostDigest() {
     return host ??= digest(`${process.platform}:${os.hostname()}`);
 }
 
+function readLinuxScope() {
+    try {
+        // A single NSpid also rules out a parent namespace with a coincidentally equal PID.
+        const pid = String(process.pid);
+        if (fs.readlinkSync('/proc/self') !== pid) return null;
+        const status = fs.readFileSync('/proc/self/status', 'utf8');
+        if (/^NSpid:[ \t]*([0-9]+)[ \t]*$/m.exec(status)?.[1] !== pid) return null;
+    } catch {
+        return null;
+    }
+
+    const scope = {};
+    try {
+        const bootId = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+        if (BOOT_ID.test(bootId)) {
+            scope.bootId = bootId;
+            const namespace = fs.readlinkSync('/proc/self/ns/pid');
+            if (/^pid:\[[0-9]+\]$/.test(namespace)) {
+                scope.boot = digest('linux:' + bootId.toLowerCase());
+                scope.namespace = digest(namespace);
+            }
+        }
+    } catch {
+        // Keep the validated PID view available for compatibility with earlier markers.
+    }
+    return scope;
+}
+
+function readLinuxProcess(pid, bootId) {
+    if (!bootId) return {};
+    try {
+        const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+        const commandEnd = stat.lastIndexOf(')');
+        if (!stat.startsWith(`${pid} (`) || commandEnd <= String(pid).length + 1) return {};
+        // The command can contain spaces and parentheses. Fields 3, 20 and 22 follow it.
+        const fields = stat.slice(commandEnd + 1).trim().split(/\s+/);
+        const [state] = fields;
+        const threads = fields[17];
+        const start = fields[19];
+        if (!/^[a-zA-Z]$/.test(state) || !/^[1-9][0-9]*$/.test(threads) || !/^[0-9]+$/.test(start)) return {};
+        return {
+            generation: digest(`${bootId}:${start}`),
+            // A zombie thread-group leader can still have live worker threads.
+            exited: state === 'Z' && threads === '1'
+        };
+    } catch {
+        return {};
+    }
+}
+
 function readProcessScope() {
     try {
-        if (process.platform === 'linux') {
-            // The procfs view must use the same PIDs as process.kill().
-            if (fs.readlinkSync('/proc/self') !== String(process.pid)) return {};
-            const boot = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-            const namespace = fs.readlinkSync('/proc/self/ns/pid');
-            if (BOOT_ID.test(boot) && /^pid:\[[0-9]+\]$/.test(namespace)) {
-                return { boot: digest('linux:' + boot.toLowerCase()), namespace: digest(namespace) };
-            }
-        } else if (process.platform === 'darwin') {
+        if (process.platform === 'darwin') {
             const boot = childProcess.execFileSync('/usr/sbin/sysctl', ['-n', 'kern.bootsessionuuid'], {
                 encoding: 'utf8', env: { LC_ALL: 'C' }, stdio: ['ignore', 'pipe', 'ignore'], timeout: 1_000
             }).trim();
@@ -46,15 +88,7 @@ function readProcessScope() {
 
 function processGeneration(pid) {
     try {
-        if (process.platform === 'linux') {
-            const boot = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-            const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-            // The command name can contain spaces and closing parentheses. Starttime is field 22.
-            const start = stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)[19];
-            if (/^[a-f0-9-]{36}$/.test(boot) && /^[0-9]+$/.test(start || '')) {
-                return digest(`${boot}:${start}`);
-            }
-        } else if (process.platform === 'darwin' || process.platform === 'freebsd') {
+        if (process.platform === 'darwin' || process.platform === 'freebsd') {
             const start = childProcess.execFileSync('/bin/ps', ['-p', String(pid), '-o', 'lstart='], {
                 encoding: 'utf8', env: { LC_ALL: 'C', TZ: 'UTC0' }, stdio: ['ignore', 'pipe', 'ignore'], timeout: 1_000
             }).trim();
@@ -73,10 +107,12 @@ function processGeneration(pid) {
 }
 
 export function describeProcessOwner() {
-    const generation = ownGeneration ??= processGeneration(process.pid);
-    const { boot, namespace } = ownScope ??= readProcessScope();
-    const scope = boot ? ` ${boot} ${namespace}` : '';
-    return `${hostDigest()} ${generation}${scope}\n`;
+    const linux = process.platform === 'linux';
+    const scope = linux ? readLinuxScope() : (ownScope ??= readProcessScope());
+    const generation = linux ? readLinuxProcess(process.pid, scope?.bootId).generation ?? '-'
+        : (ownGeneration ??= processGeneration(process.pid));
+    const coordinates = scope?.boot ? ` ${scope.boot} ${scope.namespace}` : '';
+    return `${hostDigest()} ${generation}${coordinates}\n`;
 }
 
 export function readProcessOwner(filePath) {
@@ -93,7 +129,9 @@ export function readProcessOwner(filePath) {
 }
 
 export function processOwnerStatus(pid, identity) {
-    const scope = identity.boot ? (ownScope ??= readProcessScope()) : {};
+    const linux = process.platform === 'linux';
+    const scope = linux ? readLinuxScope() : identity.boot ? (ownScope ??= readProcessScope()) : {};
+    if (!scope || (linux && identity.boot && !scope.boot)) return 'unverified';
     const sameBoot = identity.boot && identity.boot === scope.boot;
     // A boot match can establish ownership after a rename, within the same PID namespace.
     if (sameBoot && identity.namespace !== scope.namespace) return 'unverified';
@@ -106,6 +144,13 @@ export function processOwnerStatus(pid, identity) {
         throw error;
     }
     if (identity.generation === '-') return 'unverified';
+    if (linux) {
+        const { generation, exited } = readLinuxProcess(pid, scope.bootId);
+        if (!generation) return 'unverified';
+        if (generation === identity.generation) return exited ? 'dead' : 'active';
+        // Earlier markers can contain a generation sampled from an unrelated procfs view.
+        return sameBoot ? 'dead' : 'unverified';
+    }
     const current = pid === process.pid ? (ownGeneration ??= processGeneration(pid)) : processGeneration(pid);
     if (current === '-') return 'unverified';
     return current === identity.generation ? 'active' : 'dead';

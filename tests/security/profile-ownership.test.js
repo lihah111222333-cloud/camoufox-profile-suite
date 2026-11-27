@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -18,7 +18,8 @@ import {
     unregisterProcessCleanupHooks,
     updateProfileProxy
 } from '../../src/camoufox/client.js';
-import { createAndStartProfile } from '../../src/camoufox/profile.js';
+import { CamoufoxProfile, createAndStartProfile } from '../../src/camoufox/profile.js';
+import { PROFILE_LEASE_DIRECTORY } from '../../src/camoufox/profile-storage.js';
 import { CamoufoxTrafficRecorder } from '../../src/camoufox/traffic-recorder.js';
 
 const OPTIONS = {
@@ -33,10 +34,10 @@ const OPTIONS = {
 function mockLauncher(onLaunch = () => {}) {
     return {
         async Camoufox() {
-            onLaunch();
             let connected = true;
             const browser = {
                 isConnected: () => connected,
+                disconnect() { connected = false; },
                 async close() { connected = false; },
                 async newContext({ storageState }) {
                     const initialState = typeof storageState === 'string'
@@ -59,6 +60,7 @@ function mockLauncher(onLaunch = () => {}) {
                     return context;
                 }
             };
+            onLaunch(browser);
             return browser;
         }
     };
@@ -79,32 +81,45 @@ function setup(t, onLaunch) {
     return { ...OPTIONS, profilesDir };
 }
 
-function runOwnerProcess(operation, profilesDir) {
+function runOwnerProcess(operation, profilesDir, expectedExit = 0) {
     const script = `
         import assert from 'node:assert/strict';
         import fs from 'node:fs';
         import {
-            deleteProfile, saveProfileStorageState, setCamoufoxModule, startProfile, stopProfile
+            deleteProfile, ensureProfileStorage, saveProfileStorageState, setCamoufoxModule, startProfile, stopProfile
         } from ${JSON.stringify(new URL('../../src/camoufox/client.js', import.meta.url).href)};
         const makeLauncher = ${mockLauncher.toString()};
-        setCamoufoxModule(makeLauncher());
+        let browser;
+        setCamoufoxModule(makeLauncher((launched) => { browser = launched; }));
         const [operation, profilesDir] = process.argv.slice(1);
         const options = { ...${JSON.stringify(OPTIONS)}, profilesDir };
         if (operation === 'check-exclusive') {
             const busy = { code: 'ERR_CAMOUFOX_PROFILE_BUSY' };
             await assert.rejects(startProfile('owner', options), busy);
+            assert.throws(() => ensureProfileStorage('owner', profilesDir), busy);
             assert.equal(await stopProfile('owner', options), false);
             await assert.rejects(deleteProfile('owner', options), busy);
         } else if (operation === 'check-inactive') {
             assert.equal(await stopProfile('owner', options), true);
         } else if (operation === 'abandon-har') {
             await startProfile('owner', { ...options, recordHar: true });
+        } else if (operation === 'disconnect-and-exit') {
+            await startProfile('owner', options);
+            browser.disconnect();
+            assert.equal(await stopProfile('owner', options), false);
         } else {
             const session = await startProfile('owner', options);
             session.context.nextState.origins = [{
                 origin: 'https://fixture.invalid',
                 localStorage: [{ name: 'sample', value: 'saved-before-process-exit' }]
             }];
+            if (operation === 'interrupt-snapshot') {
+                const rename = fs.renameSync;
+                fs.renameSync = (source, target) => {
+                    if (target === session.storageStatePath) process.exit(17);
+                    return rename(source, target);
+                };
+            }
             await saveProfileStorageState('owner', session.context);
         }
     `;
@@ -113,7 +128,7 @@ function runOwnerProcess(operation, profilesDir) {
         timeout: 10000
     });
     assert.ifError(result.error);
-    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.equal(result.status, expectedExit, result.stderr + result.stdout);
 }
 
 test('profile deletion preserves capture data while a standalone recorder owns it', async (t) => {
@@ -148,16 +163,16 @@ test('a standalone recorder cannot join a profile whose deletion has already sta
     const id = 'concurrent-capture';
     await createProfile(id, null, { ...options, profileId: id });
     const profileDir = path.join(options.profilesDir, id);
-    const remove = fs.rmSync;
+    const rename = fs.renameSync;
     let attempted = false;
-    const hooked = t.mock.method(fs, 'rmSync', (target, flags) => {
-        if (target === profileDir && !attempted) {
+    const hooked = t.mock.method(fs, 'renameSync', (from, to) => {
+        if (from === profileDir && !attempted) {
             attempted = true;
             assert.throws(() => new CamoufoxTrafficRecorder({ profilesDir: options.profilesDir, profileId: id }), {
                 code: 'ERR_CAMOUFOX_PROFILE_BUSY'
             });
         }
-        return remove(target, flags);
+        return rename(from, to);
     });
     try {
         assert.equal(await deleteProfile(id, options), true);
@@ -165,6 +180,128 @@ test('a standalone recorder cannot join a profile whose deletion has already sta
     } finally {
         hooked.mock.restore();
     }
+});
+
+test('legacy migration waits for nested capture leases and excludes a new writer during the move', async (t) => {
+    const options = setup(t);
+    const profileId = 'archive';
+    const { profileDir } = await createProfile(profileId, null, { ...options, profileId });
+    const trafficDir = path.join(profileDir, 'traffic');
+    const nativeLog = 'necko-pre-tls.moz_log';
+    const legacyBytes = 'synthetic legacy log\n';
+    fs.writeFileSync(path.join(trafficDir, nativeLog), legacyBytes);
+    const childOptions = {
+        profileId, trafficDir: path.join(trafficDir, 'copies', 'capture'),
+        trustedLocal: true, recordWireLog: false
+    };
+    const nested = new CamoufoxTrafficRecorder(childOptions);
+    nested.setStep('before migration attempt');
+    const busy = { code: 'ERR_CAMOUFOX_PROFILE_BUSY' };
+    await assert.rejects(startProfile(profileId, options), busy);
+    assert.throws(() => new CamoufoxTrafficRecorder({ ...options, profileId }), busy);
+    assert.equal(fs.readFileSync(path.join(trafficDir, nativeLog), 'utf8'), legacyBytes);
+    nested.setStep('after refused migration');
+    await nested.stop();
+    const ledgerBytes = fs.readFileSync(nested.trafficNdjsonPath);
+
+    const sibling = new CamoufoxTrafficRecorder({ ...childOptions, trafficDir: path.join(profileDir, 'other') });
+    const rename = fs.renameSync;
+    let attempted = false;
+    const hooked = t.mock.method(fs, 'renameSync', (from, to) => {
+        if (from === trafficDir) {
+            assert.throws(() => new CamoufoxTrafficRecorder(childOptions), busy);
+            attempted = true;
+        }
+        return rename(from, to);
+    });
+    try {
+        await startProfile(profileId, options);
+    } finally {
+        hooked.mock.restore();
+        await sibling.stop();
+    }
+    assert.equal(attempted, true);
+    const nativeDir = path.join(profileDir, '.native');
+    const [archived] = fs.readdirSync(nativeDir);
+    const preserved = path.join(nativeDir, archived, 'traffic');
+    assert.equal(fs.readFileSync(path.join(preserved, nativeLog), 'utf8'), legacyBytes);
+    assert.deepEqual(fs.readFileSync(path.join(preserved, 'copies', 'capture', 'traffic.ndjson')), ledgerBytes);
+    assert.equal(fs.existsSync(path.join(trafficDir, 'copies')), false);
+    const reopened = new CamoufoxTrafficRecorder(childOptions);
+    await reopened.stop();
+});
+
+test('a bound deletion can retry partial cleanup without stopping a replacement profile', async (t) => {
+    const options = setup(t);
+    const profileId = 'partial-delete';
+    const original = await new CamoufoxProfile(profileId, options).start();
+    const live = path.dirname(original.storageStatePath);
+    let staged;
+    const remove = fs.rmSync;
+    const hooked = t.mock.method(fs, 'rmSync', (target, flags) => {
+        const metadataPath = path.join(target, 'profile.json');
+        if (flags?.recursive && fs.existsSync(metadataPath)) {
+            staged = target;
+            fs.unlinkSync(metadataPath);
+            throw Object.assign(new Error('Fixture removal failed after unlinking metadata'), { code: 'EIO' });
+        }
+        return remove(target, flags);
+    });
+    try {
+        await assert.rejects(original.delete(), { code: 'EIO' });
+    } finally {
+        hooked.mock.restore();
+    }
+    assert.ok(staged);
+    assert.equal(fs.existsSync(live), false);
+    assert.equal(fs.existsSync(path.join(staged, 'profile.json')), false);
+    assert.equal(fs.existsSync(path.join(staged, 'storage-state.json')), true);
+    assert.equal(original.context, null);
+
+    const replacement = await new CamoufoxProfile(profileId, options).start();
+    const replacementMetadata = fs.readFileSync(path.join(live, 'profile.json'));
+    assert.equal(await original.delete(), true);
+    assert.equal(fs.existsSync(staged), false);
+    assert.deepEqual(fs.readFileSync(path.join(live, 'profile.json')), replacementMetadata);
+    assert.equal(replacement.browser.isConnected(), true);
+    assert.equal(await replacement.delete(), true);
+    assert.equal(fs.existsSync(live), false);
+});
+
+test('an interrupted staged deletion can be retried by ID while a replacement is active', async (t) => {
+    const options = setup(t);
+    const profileId = 'interrupted-delete';
+    const { profileDir } = await createProfile(profileId, null, { ...options, profileId });
+    const script = `
+        import fs from 'node:fs';
+        import path from 'node:path';
+        import { deleteProfile } from ${JSON.stringify(new URL('../../src/camoufox/client.js', import.meta.url).href)};
+        const [id, profilesDir] = process.argv.slice(1);
+        const rename = fs.renameSync;
+        fs.renameSync = (from, to) => {
+            rename(from, to);
+            if (from === path.join(profilesDir, id)) {
+                process.stdout.write(to + '\\n');
+                process.exit(17);
+            }
+        };
+        await deleteProfile(id, { profilesDir });
+    `;
+    const interrupted = spawnSync(process.execPath,
+        ['--input-type=module', '-e', script, profileId, options.profilesDir],
+        { encoding: 'utf8', timeout: 10000 });
+    assert.ifError(interrupted.error);
+    assert.equal(interrupted.status, 17, interrupted.stderr);
+    const staged = interrupted.stdout.trim().split('\n').at(-1);
+    assert.ok(staged && fs.existsSync(path.join(staged, 'storage-state.json')));
+    assert.equal(fs.existsSync(profileDir), false);
+
+    const replacement = await startProfile(profileId, { ...options, recordTraffic: true });
+    const replacementMetadata = fs.readFileSync(path.join(profileDir, 'profile.json'));
+    assert.equal(await deleteProfile(profileId, options), true);
+    assert.equal(fs.existsSync(staged), false);
+    assert.deepEqual(fs.readFileSync(path.join(profileDir, 'profile.json')), replacementMetadata);
+    assert.equal(replacement.browser.isConnected(), true);
 });
 
 test('an existing directory needs matching metadata before profile operations can prepare it', async (t) => {
@@ -275,6 +412,118 @@ test('a legacy profile can start after snapshot repair and routine reads preserv
     }
 });
 
+test('reopening a profile discards a verified interrupted snapshot and preserves legacy staging', async (t) => {
+    const options = setup(t);
+    const storage = ensureProfileStorage('owner', options.profilesDir);
+    const committed = JSON.stringify({ cookies: [{ name: 'fixture', value: 'last-good' }], origins: [] });
+    fs.writeFileSync(storage.storageStatePath, committed);
+    const legacy = path.join(storage.profileDir, '.storage-state.json.32bb47b8-dce1-4fa6-a565-1e87c924a984.tmp');
+    fs.writeFileSync(legacy, committed, { mode: 0o600 });
+    const unrelated = path.join(storage.profileDir, 'operator-notes.txt');
+    fs.writeFileSync(unrelated, 'unrelated local fixture');
+
+    const previousEntries = fs.readdirSync(storage.profileDir);
+    runOwnerProcess('interrupt-snapshot', options.profilesDir, 17);
+    const newEntries = fs.readdirSync(storage.profileDir).filter((name) => !previousEntries.includes(name));
+    assert.equal(newEntries.length, 2);
+    const temporary = path.join(storage.profileDir, newEntries.find((name) => name.endsWith('.tmp')));
+    const staged = JSON.parse(fs.readFileSync(temporary, 'utf8'));
+    assert.equal(staged.origins[0].localStorage[0].value, 'saved-before-process-exit');
+    assert.equal(fs.readFileSync(storage.storageStatePath, 'utf8'), committed);
+
+    const session = await startProfile('owner', options);
+    assert.equal(session.context.initialState.cookies[0].value, 'last-good');
+    assert.deepEqual(fs.readdirSync(storage.profileDir), previousEntries);
+    assert.equal(fs.readFileSync(storage.storageStatePath, 'utf8'), committed);
+    assert.equal(fs.readFileSync(legacy, 'utf8'), committed);
+    assert.equal(fs.readFileSync(unrelated, 'utf8'), 'unrelated local fixture');
+
+    session.context.nextState.cookies[0].value = 'new-state';
+    await saveProfileStorageState('owner', session.context);
+    assert.deepEqual(fs.readdirSync(storage.profileDir), previousEntries);
+    assert.equal(JSON.parse(fs.readFileSync(storage.storageStatePath, 'utf8')).cookies[0].value, 'new-state');
+    assert.equal(await stopProfile('owner', options), true);
+});
+
+test('snapshot recovery preserves a file that replaced the interrupted temporary inode', (t) => {
+    const options = setup(t);
+    const storage = ensureProfileStorage('owner', options.profilesDir);
+    const before = fs.readdirSync(storage.profileDir);
+    runOwnerProcess('interrupt-snapshot', options.profilesDir, 17);
+    const added = fs.readdirSync(storage.profileDir).filter((name) => !before.includes(name));
+    const temporary = path.join(storage.profileDir, added.find((name) => name.endsWith('.tmp')));
+    const savedByOperator = path.join(storage.profileDir, 'operator-copy.json');
+    fs.renameSync(temporary, savedByOperator);
+    fs.writeFileSync(temporary, 'unrelated file at the same path', { mode: 0o600 });
+    const saved = fs.readFileSync(savedByOperator);
+    const entries = fs.readdirSync(storage.profileDir);
+
+    ensureProfileStorage('owner', options.profilesDir);
+    assert.deepEqual(fs.readdirSync(storage.profileDir), entries);
+    assert.deepEqual(fs.readFileSync(savedByOperator), saved);
+    assert.equal(fs.readFileSync(temporary, 'utf8'), 'unrelated file at the same path');
+});
+
+test('the SDK refuses grant ACLs on existing macOS profile directories and snapshots', {
+    skip: process.platform !== 'darwin'
+}, async (t) => {
+    const options = setup(t, () => assert.fail('storage ACL must be checked before launch'));
+    const storage = ensureProfileStorage('owner', options.profilesDir);
+    const committed = fs.readFileSync(storage.storageStatePath);
+    const error = { code: 'PRIVATE_STORAGE_ACL_ERROR' };
+    execFileSync('/bin/chmod', ['+a', 'group:everyone allow search,list', storage.profileDir]);
+    assert.throws(() => ensureProfileStorage('owner', options.profilesDir), error);
+    await assert.rejects(startProfile('owner', options), error);
+    execFileSync('/bin/chmod', ['-N', storage.profileDir]);
+
+    execFileSync('/bin/chmod', ['+a', 'group:everyone allow read', storage.storageStatePath]);
+    assert.throws(() => loadStorageState('owner', options.profilesDir), error);
+    await assert.rejects(startProfile('owner', options), error);
+    assert.equal(fs.statSync(storage.storageStatePath).mode & 0o777, 0o600);
+    assert.deepEqual(fs.readFileSync(storage.storageStatePath), committed);
+});
+
+test('macOS snapshot saves reject grant ACLs before writing a temporary file and preserve deny ACLs', {
+    skip: process.platform !== 'darwin'
+}, async (t) => {
+    const options = setup(t);
+    const session = await startProfile('owner', options);
+    const { storageStatePath } = session;
+    const committed = fs.readFileSync(storageStatePath);
+    session.context.nextState.cookies = [{ name: 'fixture', value: 'updated' }];
+    const error = { code: 'PRIVATE_STORAGE_ACL_ERROR' };
+    const files = fs.readdirSync(path.dirname(storageStatePath));
+
+    execFileSync('/bin/chmod', ['+a', 'group:everyone deny execute', storageStatePath]);
+    await assert.rejects(saveProfileStorageState('owner', session.context), error);
+    const listing = execFileSync('/bin/ls', ['-ledbn', storageStatePath], { encoding: 'utf8' });
+    assert.match(listing, /deny execute/);
+    execFileSync('/bin/chmod', ['-N', storageStatePath]);
+
+    const open = fs.openSync;
+    const tempFiles = [];
+    const opened = t.mock.method(fs, 'openSync', (file, flags, mode) => {
+        const fd = open(file, flags, mode);
+        if (flags === 'wx' && typeof file === 'string' && file.endsWith('.tmp')) {
+            tempFiles.push(file);
+            execFileSync('/bin/chmod', ['+a', 'group:everyone allow read', file]);
+        }
+        return fd;
+    });
+    const writes = t.mock.method(fs, 'writeFileSync', fs.writeFileSync);
+    try {
+        await assert.rejects(saveProfileStorageState('owner', session.context), error);
+        assert.equal(tempFiles.length, 1);
+        assert.equal(writes.mock.callCount(), 0);
+        assert.deepEqual(fs.readFileSync(storageStatePath), committed);
+        assert.deepEqual(fs.readdirSync(path.dirname(storageStatePath)), files);
+    } finally {
+        opened.mock.restore();
+        writes.mock.restore();
+    }
+    assert.equal(await stopProfile('owner', options), true);
+});
+
 test('another local process cannot start or delete an active profile and dead ownership can be recovered', async (t) => {
     const outer = setup(t);
     const firstRoot = path.join(outer.profilesDir, 'first');
@@ -301,6 +550,29 @@ test('another local process cannot start or delete an active profile and dead ow
     const replacement = await createProfile('replacement', null, { ...first, profileId: 'owner' });
     await assert.rejects(saveProfileStorageState('owner', active.context), /does not belong/);
     assert.deepEqual(JSON.parse(fs.readFileSync(replacement.storageStatePath, 'utf8')), { cookies: [], origins: [] });
+});
+
+test('an unconfirmed native exit remains blocked after the controller process exits', async (t) => {
+    let launches = 0;
+    const options = setup(t, () => { launches += 1; });
+    const profileId = 'owner';
+    runOwnerProcess('disconnect-and-exit', options.profilesDir);
+    const unconfirmed = { code: 'ERR_CAMOUFOX_NATIVE_EXIT_UNCONFIRMED' };
+    await assert.rejects(startProfile(profileId, options), unconfirmed);
+    assert.equal(await stopProfile(profileId, options), false);
+    await assert.rejects(deleteProfile(profileId, options), unconfirmed);
+    assert.throws(() => ensureProfileStorage(profileId, options.profilesDir), unconfirmed);
+    assert.equal(launches, 0);
+    assert.ok(loadStorageState(profileId, options.profilesDir));
+
+    // This fixture has no separate browser process. The controller above has exited,
+    // so the lock can be archived using the documented, operator-verified recovery.
+    const archive = fs.mkdtempSync(path.join(os.tmpdir(), 'camoufox-lease-archive-'));
+    t.after(() => fs.rmSync(archive, { recursive: true, force: true }));
+    fs.renameSync(path.join(options.profilesDir, PROFILE_LEASE_DIRECTORY, profileId), path.join(archive, profileId));
+    await startProfile(profileId, options);
+    assert.equal(launches, 1);
+    assert.equal(await stopProfile(profileId, options), true);
 });
 
 test('a new process removes only the abandoned HAR scratch under the recovered lease', async (t) => {

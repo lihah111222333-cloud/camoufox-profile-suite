@@ -14,7 +14,7 @@
 
 بعد إنشاء المستودع، عيّن `expected_origin` إلى عنوان المستودع المطلوب ونفّذ الكتلة كاملة. استخدم عنوان HTTPS أو SSH. يتوقف التسلسل إذا فشل الفحص أو تعذّر إعداد `origin` أو اختلف عنوان الدفع الفعلي.
 
-يفحص سكريبت الدفع الأول سجل أمثلة OpenAPI في الفرع قبل تجهيز الالتزام. إذا أبلغ عن أمثلة قديمة، نسّق مع مالك المستودع لمعالجة السجل قبل نقله إلى وجهة جديدة.
+يفحص سكريبت الدفع الأول الالتزام المراد دفعه وكل أسلافه بحثًا عن المسارات الخاصة المعروفة وبيانات اعتماد npm وأمثلة OpenAPI القديمة. إذا أبلغ عن سجل حساس، نسّق مع مالك المستودع لمعالجته قبل نقله إلى وجهة جديدة. أكمِل أي عملية دمج معلّقة أو ألغها قبل تشغيل السكريبت.
 
 إذا حصلت على المشروع من أرشيف مصدر بلا مستودع Git، نفّذ `git init` من جذر المشروع أولًا. عندما يحتاج المساعد إلى إنشاء التزام، اضبط الاسم والبريد الإلكتروني في إعدادات المستودع. استبدل القيم التالية باسمك وعنوان بريد توافق على ظهوره في سجل Git، مثل عنوان `noreply` من GitHub.
 
@@ -23,7 +23,7 @@ git config --local user.name "Your GitHub display name"
 git config --local user.email "YOUR_GITHUB_COMMIT_EMAIL"
 ```
 
-بعد نجاح الفحص، يستخدم المساعد الالتزام الحالي إذا لم توجد تغييرات جاهزة للالتزام.
+بعد نجاح الفحص، يستخدم المساعد الالتزام الحالي إذا لم توجد تغييرات جاهزة للالتزام. عند تغيير الفرع أو الالتزام أو الملفات الجاهزة أثناء التأكيد، أعد تشغيل الفحص والتأكيد. تدفع الكتلة الالتزام الذي أعدّه المساعد إلى الفرع `main` وحده.
 
 ابدأ من فرع محلي. إذا كان لديك فرع `main` محلي، انتقل إليه عندما يكون هو الفرع المراد دفعه. إذا كان الاسم `main` متاحًا، تعيد الكتلة تسمية الفرع الحالي إليه قبل الدفع.
 
@@ -32,12 +32,18 @@ expected_origin=https://github.com/YOUR_USERNAME/REPO_NAME.git
 if first_push_ref=$(git symbolic-ref --quiet HEAD) &&
    main_refs=$(git for-each-ref --format='%(refname)' refs/heads/main) &&
    { [ "$first_push_ref" = refs/heads/main ] || [ -z "$main_refs" ]; }; then
-  bash PUSH_TO_GITHUB.sh &&
+  prepared_commit=$(bash PUSH_TO_GITHUB.sh --prepare-for "$first_push_ref") &&
+    { [ "$(git symbolic-ref --quiet HEAD)" = "$first_push_ref" ] &&
+      [ "$(git rev-parse --verify --quiet 'HEAD^{commit}')" = "$prepared_commit" ] ||
+      { printf '%s\n' 'The prepared branch or commit changed. Run the setup again.' >&2; false; }; } &&
+    main_refs=$(git for-each-ref --format='%(refname)' refs/heads/main) &&
+    { [ "$first_push_ref" = refs/heads/main ] || [ -z "$main_refs" ]; } &&
     git remote add origin "$expected_origin" &&
     push_origin=$(git remote get-url --push --all origin) &&
     test "$push_origin" = "$expected_origin" &&
     { [ "$first_push_ref" = refs/heads/main ] || git branch -m -- "${first_push_ref#refs/heads/}" main; } &&
-    git push -u origin refs/heads/main
+    git push --no-follow-tags origin "$prepared_commit:refs/heads/main" &&
+    git branch --set-upstream-to=origin/main main
 else
   printf '%s\n' 'Check out local main or a named branch when main is available.' >&2
   false
@@ -102,16 +108,9 @@ LOG_LEVEL=info
 
 يشير الوسم المحلي `v1.0.0` إلى الالتزام `6392824`. تتضمن نسخة OpenAPI في ذلك الالتزام أمثلة قديمة لقيم ملفات تعريف الارتباط ومفتاح ورمز مميز. يرفض فاحص الإصدار الحالي هذا الوسم. يلزم التنسيق بشأن الوسم والسجل السابقين، والتحقق من حالة النشر وصلاحية بيانات الاعتماد لدى مالك المستودع. أبقِ تفاصيل القيم خارج التقارير والإصدارات.
 
-حضّر التزامًا خضع للمراجعة يتضمن إصدارًا جديدًا في `package.json`. نفّذ الفحوص التالية من نسخة عمل نظيفة لذلك الالتزام، واستبدل `v1.0.1` بالوسم المطابق للإصدار:
+حضّر التزامًا خضع للمراجعة يتضمن إصدارًا جديدًا في `package.json`، ثم نفّذ [فحص الإصدار المشترك](README.md#preflight-for-every-release) قبل دفع الوسم أو النشر من واجهة GitHub. يفحص الأمر الالتزام الذي يشير إليه الوسم محليًا ويعيد معرّف كائن الوسم الذي اجتاز الفحص. استخدم ذلك المعرّف عند الدفع، أو قارنه بالوسم الموجود على GitHub قبل اختياره في الواجهة.
 
-```bash
-set -o pipefail
-node scripts/check-distribution.mjs tag v1.0.1 &&
-  node scripts/check-distribution.mjs source HEAD &&
-  npm pack --json | node scripts/check-distribution.mjs archive
-```
-
-نفّذ الفحوص قبل دفع الوسم أو النشر من واجهة GitHub. يُنشئ GitHub أرشيف المصدر من الالتزام الذي يشير إليه الوسم، ويمكن أن يصبح متاحًا عند دفع الوسم قبل انتهاء سير العمل. افحص السجل كذلك إذا كانت الوجهة جديدة. احتفظ بالوسم والسجل الحاليين إلى أن ينسق المالك بشأنهما.
+ينشئ GitHub أرشيف المصدر من الالتزام الموسوم، ويمكن أن يصبح متاحًا قبل انتهاء سير العمل. عند [إنشاء الحزمة محليًا](README.md#if-github-actions-are-blocked-eg-billing)، استخدم نسخة عمل نظيفة للالتزام الذي اجتاز الفحص. افحص السجل كذلك إذا كانت الوجهة جديدة. احتفظ بالوسم والسجل الحاليين إلى أن ينسق المالك بشأنهما.
 
 ## إذا رفعت ملفًا حساسًا بالخطأ
 

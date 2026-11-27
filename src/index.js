@@ -8,7 +8,7 @@
 
 import {
     appendAccountResultAsync, migrateExistingAccountOutputsAsync, needsProfileCleanupReview,
-    recordAccountCleanupAsync, writeRunSummaryAsync
+    readSavedAccountCleanup, recordAccountCleanupAsync, writeRunSummaryAsync
 } from './utils/account-results.js';
 import { parseRunCountOptions, resolveRunCounts } from './utils/cli-counts.js';
 import { requireControllerProfileId } from './utils/controller-id.js';
@@ -39,14 +39,15 @@ function accountOutputDiagnostic(error) {
 }
 
 async function prepareAccountOutputs(signal) {
-    const { ensureStateDirectory, LEGACY_DIRECTORY, STATE_DIRECTORY } = await import('./utils/state-paths.js');
+    const { ensureStateDirectory, getLegacyDirectory } = await import('./utils/state-paths.js');
     signal?.throwIfAborted();
-    const resultsFile = path.join(STATE_DIRECTORY, 'results.json');
-    const summaryFile = path.join(STATE_DIRECTORY, 'summary.json');
     try {
-        ensureStateDirectory();
+        const legacyDirectory = getLegacyDirectory();
+        const stateDirectory = ensureStateDirectory();
+        const resultsFile = path.join(stateDirectory, 'results.json');
+        const summaryFile = path.join(stateDirectory, 'summary.json');
         const cleanupReview = await migrateExistingAccountOutputsAsync(resultsFile, summaryFile, {
-            legacyDirectory: LEGACY_DIRECTORY, signal
+            legacyDirectory, signal
         });
         return { resultsFile, summaryFile, cleanupReview };
     } catch (error) {
@@ -68,6 +69,7 @@ class AccountOutputWriteError extends Error {
         this.#outputMessage = message;
         this.code = 'ACCOUNT_OUTPUT_WRITE_FAILED';
         this.unconfirmedProfiles = [];
+        this.savedCleanupFailures = [];
     }
 
     addUnconfirmedProfiles(outcomes, { savedResults = false } = {}) {
@@ -88,6 +90,21 @@ class AccountOutputWriteError extends Error {
             }
             this.unconfirmedProfiles.push(report);
         }
+        this.#refreshMessage();
+    }
+
+    addSavedCleanupFailure({ resultId, profileCleanup: recordedCleanup }, observedCleanup) {
+        this.savedCleanupFailures.push({ resultId, recordedCleanup, observedCleanup });
+        this.#refreshMessage();
+    }
+
+    #refreshMessage() {
+        const messages = [this.#outputMessage];
+        if (this.savedCleanupFailures.length) {
+            const details = this.savedCleanupFailures.map(({ resultId, recordedCleanup, observedCleanup }) =>
+                `resultId ${resultId} (recorded cleanup ${recordedCleanup ?? 'unknown'}, observed cleanup ${observedCleanup})`);
+            messages.push(`Review results.json for ${details.join(', ')}.`);
+        }
         if (this.unconfirmedProfiles.length) {
             const details = new Set(this.unconfirmedProfiles.map(({ profileId, profileType, profileCleanup, resultId }) => {
                 const reference = resultId
@@ -95,8 +112,9 @@ class AccountOutputWriteError extends Error {
                     : `${profileType} ${profileId ?? '(profile ID unavailable)'}`;
                 return `${reference} (${profileCleanup})`;
             }));
-            this.message = `${this.#outputMessage} Managed profile cleanup is unconfirmed. ${[...details].join(', ')}.`;
+            messages.push(`Managed profile cleanup is unconfirmed. ${[...details].join(', ')}.`);
         }
+        this.message = messages.join(' ');
     }
 }
 
@@ -354,7 +372,12 @@ async function createAccountWithRuntime(runtime, accountNumber, { signal, active
             const writeError = new AccountOutputWriteError(
                 'Could not save profile cleanup in results.json.' + accountOutputDiagnostic(error), error
             );
-            writeError.addUnconfirmedProfiles([{ profileId: profile.profileId, profileType: serviceName, profileCleanup }]);
+            const savedCleanup = readSavedAccountCleanup(resultsFile, savedResult);
+            if (savedCleanup) {
+                writeError.addSavedCleanupFailure(savedCleanup, profileCleanup);
+            } else {
+                writeError.addUnconfirmedProfiles([{ profileId: profile.profileId, profileType: serviceName, profileCleanup }]);
+            }
             throw writeError;
         }
     }
@@ -397,6 +420,7 @@ async function processQueue(total, concurrency, createTask, logger, signal) {
             if (error instanceof AccountOutputWriteError) {
                 if (outputWriteError) {
                     additionalUnconfirmedProfiles.push(...error.unconfirmedProfiles);
+                    outputWriteError.savedCleanupFailures.push(...error.savedCleanupFailures);
                 } else {
                     outputWriteError = error;
                 }

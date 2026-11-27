@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -147,10 +148,15 @@ test('active audit ignores prior traces and does not fall back after ledger dama
     const current = { ...historical, attribution: { traceId: 'current-fixture-trace' } };
     const profile = new CamoufoxProfile('diagnostic-fixture', { os: 'windows' });
     let consistencyWrites = 0;
-    profile.getPage = () => ({ evaluate: async () => telemetry });
+    const page = { evaluate: async () => telemetry };
+    profile.getPage = () => page;
     profile.fingerprintLedger = { recordOrVerify() { consistencyWrites += 1; } };
     profile.trafficPaths = { trafficDir };
-    profile.trafficRecorder = { traceId: 'current-fixture-trace', transactions: [current] };
+    profile.trafficRecorder = {
+        traceId: 'current-fixture-trace',
+        transactions: [current],
+        hasSingleRequestSource: (source) => source === page
+    };
 
     fs.writeFileSync(ledger, JSON.stringify(historical) + '\n');
     const priorOnly = await profile.auditCoherence();
@@ -167,6 +173,55 @@ test('active audit ignores prior traces and does not fall back after ledger dama
     assert.equal(invalid.wireToDomCoherence.captureIssue, 'invalid-capture-record');
     assert.equal(invalid.passed, false);
     assert.equal(consistencyWrites, 0);
+});
+
+test('active page audit requires recorded observations from its own page', { skip: !supportsCaptureReads }, async (t) => {
+    const { CamoufoxProfile } = await import('../../src/camoufox/profile.js');
+    const { CamoufoxTrafficRecorder } = await import('../../src/camoufox/traffic-recorder.js');
+    const root = fixture(t);
+    const { telemetry } = resolveDeterministicDeviceProfile('diagnostic-fixture', { os: 'windows' });
+    const profile = new CamoufoxProfile('diagnostic-fixture', { os: 'windows' });
+    const page = { evaluate: async () => telemetry };
+    const otherPage = {};
+    profile.getPage = () => page;
+
+    async function check(name, owners, expectedStatus, inspectedRequests) {
+        const trafficDir = path.join(root, name);
+        const recorder = new CamoufoxTrafficRecorder({
+            profileId: 'diagnostic-fixture', trafficDir, trustedLocal: true,
+            recordBodies: false, recordWireLog: false, sslKeyLog: false
+        });
+        try {
+            profile.trafficPaths = { trafficDir };
+            profile.trafficRecorder = recorder;
+            const context = new EventEmitter();
+            recorder.attachContext(context);
+            const url = 'https://diagnostic.invalid/';
+            // Use the same URL for both tabs to exercise object ownership, not URL matching.
+            for (const owner of owners) {
+                context.emit('request', {
+                    url: () => url,
+                    frame: () => ({ url: () => url, page: () => owner }),
+                    headers: () => ({
+                        'User-Agent': telemetry.navigator.userAgent, 'Accept-Language': telemetry.navigator.language
+                    })
+                });
+            }
+            await recorder.flushSummary();
+            const result = (await profile.auditCoherence()).wireToDomCoherence;
+            assert.equal(result.status, expectedStatus, name);
+            assert.equal(result.inspectedRequests, inspectedRequests, name);
+            if (expectedStatus === 'not-tested') assert.equal(result.captureIssue, 'missing-page-provenance');
+            assert.equal(readCoherenceCaptureEvents(trafficDir).length, owners.length);
+        } finally {
+            await recorder.stop();
+        }
+    }
+
+    await check('other-tab', [otherPage], 'not-tested', 0);
+    await check('current-tab', [page], 'passed', 1);
+    await check('mixed-tabs', [page, otherPage], 'not-tested', 0);
+    await check('unknown-page', [page, undefined], 'not-tested', 0);
 });
 
 test('AdsPower reports incomplete caches and omits cache values from terminal rows', { skip: !supportsCaptureReads }, (t) => {
@@ -359,6 +414,7 @@ test('Camoufox diagnostic separates live evidence, unavailable data, and synthet
         'src/camoufox/network-policy.js',
         'src/camoufox/profile-storage.js',
         'src/camoufox/sdk-resolution.js',
+        'src/camoufox/traffic-body.js',
         'src/camoufox/traffic-redaction.js',
         'src/camoufox/ziniao-security.js',
         'src/utils/logger.js',

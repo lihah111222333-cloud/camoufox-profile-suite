@@ -5,6 +5,14 @@ function cleanupError(profileId, profileCleanup, message, cause) {
     return Object.assign(new Error(message, { cause }), { profileId, profileCleanup });
 }
 
+class ManagedStartupCleanupError extends Error {
+    constructor(profileId, cause) {
+        super('Managed profile startup cancelled after controller launch. Shutdown is unconfirmed.', { cause });
+        this.profileId = profileId;
+        this.profileCleanup = 'stop-unconfirmed';
+    }
+}
+
 export default class ManagedProfile {
     #client;
     #addressField;
@@ -16,10 +24,10 @@ export default class ManagedProfile {
     #deleting = null;
     #recycling = null;
     #recycleDispatched = false;
-    #stopConfirmed = false;
+    #stopState = null;
     #deleted = false;
     #deleteUnconfirmed = false;
-    #ownedPages = new Set();
+    #ownedPages = new Map();
     #openingPage = null;
     #borrowedCleanupBrowser = null;
 
@@ -40,8 +48,13 @@ export default class ManagedProfile {
 
     async start({ signal } = {}) {
         signal?.throwIfAborted();
-        while (this.#stopping) await this.#stopping;
-        signal?.throwIfAborted();
+        while (this.#stopping) {
+            const stopped = await this.#stopping;
+            signal?.throwIfAborted();
+            if (this.#client && stopped !== true) {
+                throw cleanupError(this.profileId, 'stop-unconfirmed', 'Managed profile shutdown unconfirmed');
+            }
+        }
         if (this.#deleted) throw new Error('Managed profile has been deleted');
         if (this.#deleting) throw new Error('Managed profile deletion is in progress');
         if (this.#deleteUnconfirmed) {
@@ -49,21 +62,40 @@ export default class ManagedProfile {
         }
         if (this.#recycling) throw new Error('Managed profile recycling has been requested');
         if (this.#starting) return this.#starting;
-        if (this.#borrowedCleanupBrowser) throw new Error('Borrowed browser cleanup is incomplete. Retry stop before reconnecting.');
+        if (this.#stopState === 'unconfirmed') {
+            throw cleanupError(this.profileId, 'stop-unconfirmed', 'Managed profile shutdown unconfirmed');
+        }
+        if (this.#borrowedCleanupBrowser) {
+            if (this.#ownedPages.size && this.#borrowedCleanupBrowser.isConnected?.() === false) {
+                throw this.#borrowedPagesUnconfirmed();
+            }
+            throw new Error('Borrowed browser cleanup is incomplete. Retry stop before reconnecting.');
+        }
         if (this.browser) return this;
 
         const cancellation = new AbortController();
         const abort = () => cancellation.abort(signal.reason);
+        let launchAcknowledged = false;
+        const startProfile = this.#client && (async () => {
+            // Await a dispatched launch even when the caller cancels the local attachment.
+            const receipt = await this.#client.startProfile(this.profileId);
+            launchAcknowledged = true;
+            return receipt;
+        });
         signal?.addEventListener('abort', abort, { once: true });
         this.#startCancellation = cancellation;
         this.#starting = Promise.resolve().then(async () => {
             cancellation.signal.throwIfAborted();
-            this.#stopConfirmed = false;
-            const profile = await this.#startBrowser(this.#client, this.#borrowedAddress, cancellation.signal);
+            this.#stopState = null;
+            const profile = await this.#startBrowser(startProfile, this.#borrowedAddress, cancellation.signal);
             cancellation.signal.throwIfAborted();
             return profile;
         }).catch(async error => {
-            await this.#detachBrowser();
+            await this.#detachBrowser(error);
+            if (launchAcknowledged && signal?.aborted) {
+                this.#stopState = 'unconfirmed';
+                throw new ManagedStartupCleanupError(this.profileId, error);
+            }
             throw error;
         }).finally(() => {
             signal?.removeEventListener('abort', abort);
@@ -75,7 +107,11 @@ export default class ManagedProfile {
 
     async getBrowser() {
         await this.start();
-        return this.browser;
+        const browser = this.browser;
+        if (this.#borrowedAddress && (!browser || browser.isConnected?.() === false)) {
+            throw new Error('Borrowed browser connection is unavailable');
+        }
+        return browser;
     }
 
     async getPage() {
@@ -96,7 +132,18 @@ export default class ManagedProfile {
         const browser = this.browser;
         if (!browser) throw new Error('Managed browser is unavailable');
         this.#openingPage ??= browser.newPage().then(page => {
-            this.#ownedPages.add(page);
+            this.#ownedPages.set(page, null);
+            if (!this.#client) {
+                try {
+                    // Capture the Chromium target ID from this page's Puppeteer target while attached.
+                    const targetId = page.target?.()?._targetId;
+                    if (typeof targetId === 'string' && /^[a-f0-9]{32}$/i.test(targetId)) {
+                        this.#ownedPages.set(page, targetId);
+                    }
+                } catch {
+                    // Retain page ownership even when target metadata is unavailable.
+                }
+            }
             return page;
         }).finally(() => {
             this.#openingPage = null;
@@ -104,16 +151,30 @@ export default class ManagedProfile {
         return this.#openingPage;
     }
 
-    async #detachBrowser() {
+    #borrowedPagesUnconfirmed(cause) {
+        return Object.assign(cleanupError(
+            this.profileId, 'stop-unconfirmed',
+            'Borrowed browser disconnected with managed pages pending cleanup. Check the original browser.',
+            cause
+        ), {
+            targetIds: [...this.#ownedPages.values()].filter(Boolean),
+            unresolvedPageCount: this.#ownedPages.size
+        });
+    }
+
+    async #detachBrowser(cause) {
         const browser = this.#borrowedCleanupBrowser ?? this.browser;
         this.browser = null;
         this.page = null;
         this[this.#addressField] = null;
 
         await this.#openingPage?.catch(() => {});
-        for (const page of this.#ownedPages) {
+        for (const page of this.#ownedPages.keys()) {
             try {
-                if (!page.isClosed()) await page.close();
+                if (!page.isClosed()) {
+                    if (!this.#client && browser?.isConnected?.() === false) continue;
+                    await page.close();
+                }
                 this.#ownedPages.delete(page);
             } catch {
                 logger.warn('Could not close a page opened by the profile manager', { profileId: this.profileId });
@@ -121,7 +182,12 @@ export default class ManagedProfile {
         }
         if (!this.#client) {
             this.#borrowedCleanupBrowser = browser;
-            if (this.#ownedPages.size) return;
+            if (this.#ownedPages.size) {
+                if (browser?.isConnected?.() === false) {
+                    throw this.#borrowedPagesUnconfirmed(cause);
+                }
+                return;
+            }
         }
         this.#ownedPages.clear();
 
@@ -139,10 +205,11 @@ export default class ManagedProfile {
             await this.#starting?.catch(() => {});
             await this.#detachBrowser();
             if (!this.#client) return false;
-            if (this.#stopConfirmed) return true;
+            if (this.#stopState === 'confirmed') return true;
+            this.#stopState = 'unconfirmed';
             try {
                 if (await this.#client.stopProfile(this.profileId) === true) {
-                    this.#stopConfirmed = true;
+                    this.#stopState = 'confirmed';
                     return true;
                 }
             } catch {
@@ -158,7 +225,7 @@ export default class ManagedProfile {
 
     async #stopBeforeCleanup() {
         // An earlier stop cannot attest to the state of a browser reopened by another operator.
-        if (this.#stopConfirmed) {
+        if (this.#stopState === 'confirmed') {
             throw cleanupError(this.profileId, 'stop-unconfirmed', 'Managed profile shutdown confirmation is stale. Check the profile in its controller.');
         }
         if (await this.stop() !== true) {
@@ -227,5 +294,6 @@ export async function rollbackNewManagedProfile(profile, cause, operation = 'del
         profileCleanup = error.profileCleanup ?? 'stop-unconfirmed';
     }
     logger.warn('Managed profile initialization failed', { profileId: profile.profileId, profileCleanup });
-    return cleanupError(profile.profileId, profileCleanup, 'Managed profile initialization failed', cause);
+    const startupCause = cause instanceof ManagedStartupCleanupError ? cause.cause : cause;
+    return cleanupError(profile.profileId, profileCleanup, 'Managed profile initialization failed', startupCause);
 }

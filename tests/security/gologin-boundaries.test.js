@@ -110,6 +110,7 @@ async function loadGoLogin(t, configure, entry = 'client.js') {
     await load(entry);
     const client = await load('client.js');
     if (!configure) {
+        assert.equal(client.getGoLoginApiKey(), 'fixture-import-key');
         assert.equal(process.env.GOLOGIN_API_KEY, 'fixture-import-key');
         if (process.platform !== 'win32') assert.equal((await stat(envFile)).mode & 0o777, 0o600);
     }
@@ -148,6 +149,49 @@ async function readLogs(state) {
     const dir = path.join(state, 'logs');
     return (await Promise.all((await readdir(dir)).map(file => readFile(path.join(dir, file), 'utf8')))).join('');
 }
+
+test('GoLogin factory reports HTTP proxy preflight without logging the endpoint', async t => {
+    const previousTestProxy = process.env.TEST_PROXY;
+    delete process.env.TEST_PROXY;
+    t.after(() => {
+        if (previousTestProxy !== undefined) process.env.TEST_PROXY = previousTestProxy;
+    });
+    const { createAndStartProfile, requests, responses, state } = await loadGoLogin(t);
+    mockGoLoginTimers(t);
+    delete process.env.LOG_LEVEL;
+    const lines = [];
+    t.mock.method(console, 'log', message => { lines.push(message); });
+    const preflights = [];
+    t.mock.method(net, 'createConnection', options => {
+        preflights.push(options);
+        const socket = new EventEmitter();
+        socket.destroy = () => {};
+        const result = preflights.length === 1 ? 'connect' : 'timeout';
+        queueMicrotask(() => socket.emit(result));
+        return socket;
+    });
+
+    const httpProxy = { mode: 'http', host: 'private-proxy.invalid', port: 38157 };
+    for (const id of ['fixture-connected', 'fixture-timeout']) {
+        responses.push(reply(201, { id }), reply(200, { id }));
+        const profile = await createAndStartProfile('fixture', httpProxy);
+        assert.equal(profile.profileId, id);
+        assert.equal(await profile.stop(), true);
+    }
+    assert.deepEqual(preflights, [
+        { host: httpProxy.host, port: httpProxy.port, timeout: 5000 },
+        { host: httpProxy.host, port: httpProxy.port, timeout: 5000 }
+    ]);
+    assert.deepEqual(requests.filter(({ method }) => method === 'POST').map(({ data }) => data.proxy),
+        [httpProxy, httpProxy]);
+    const outputs = [lines.join('\n'), await readLogs(state)];
+    for (const output of outputs) {
+        assert.equal([...output.matchAll(/Checking .*proxy TCP reachability/g)].length, 2);
+        assert.match(output, /proxy preflight unsuccessful/i);
+        assert.equal([...output.matchAll(/GoLogin profile created/g)].length, 2);
+    }
+    assert.deepEqual(outputs.map(output => /private-proxy\.invalid|38157/.test(output)), [false, false]);
+});
 
 test('GoLogin credential and lifecycle boundaries', async t => {
     const { client, Profile, createAndStartProfile, requests, responses, launches, stops } = await loadGoLogin(t);
@@ -344,6 +388,34 @@ test('GoLogin profile reads reject failure envelopes and non-JSON without exposi
         assert.deepEqual(await read(), data);
         assert.deepEqual(await read(), data);
     }
+});
+
+test('GoLogin profile detail reads reject explicitly mismatched IDs', async t => {
+    const { client, responses, requests } = await loadGoLogin(t);
+    const id = 'fixture-requested-profile';
+    const unrelatedId = 'fixture-unrelated-profile';
+    const valid = { id, name: 'fixture' };
+    const legacy = { success: true };
+    for (const read of [client.getProfile.bind(client), client.startProfile.bind(client)]) {
+        responses.push(
+            reply(200, { id: unrelatedId }),
+            reply(200, JSON.stringify({ id: unrelatedId })),
+            reply(200, JSON.stringify(valid)),
+            reply(200, legacy)
+        );
+        for (let receipt = 0; receipt < 2; receipt++) {
+            await assert.rejects(read(id), error => {
+                assert.match(error.message, /invalid profile response/);
+                assert.doesNotMatch(error.message, new RegExp(unrelatedId));
+                return true;
+            });
+        }
+        assert.deepEqual(await read(id), valid);
+        assert.deepEqual(await read(id), legacy);
+    }
+    assert.equal(requests.length, 8);
+    assert.ok(requests.every(request => request.method === 'GET' &&
+        new URL(request.url).pathname === '/browser/fixture-requested-profile'));
 });
 
 test('GoLogin honors file log levels in both standalone import orders', async t => {
@@ -545,6 +617,7 @@ test('GoLogin retains the original REST client of an injected session', async t 
     const session = new Session(original);
     const profile = await new Profile('fixture-owned', null, session).start();
     session.client = replacement;
+    process.env.GOLOGIN_API_KEY = 'fixture-other-tenant';
     responses.push(reply(204, ''));
     assert.equal(await profile.delete(), true);
     assert.deepEqual(requests.map(request => [request.method, request.headers.Authorization]), [
@@ -557,6 +630,67 @@ test('GoLogin retains the original REST client of an injected session', async t 
     await assert.rejects(borrowed.delete(), { profileCleanup: 'delete-rejected', message: /requires a bound REST credential/ });
     assert.equal(requests.length, 1);
     assert.equal(await borrowed.stop(), true);
+    assert.equal(deadlines.size, 0);
+});
+
+test('GoLogin rejects ambient REST credentials for external profile deletion', async t => {
+    const { Profile, client, browser, requests } = await loadGoLogin(t);
+    const deadlines = mockGoLoginTimers(t);
+    const sdk = { async launch() { return { browser }; } };
+    process.env.GOLOGIN_API_KEY = 'fixture-owner';
+    const active = await new Profile('fixture-owned', null, { client, createSdk: () => sdk }).start();
+    const cold = new Profile('fixture-cold', sdk, { client: new client.constructor() });
+
+    process.env.GOLOGIN_API_KEY = 'fixture-other-tenant';
+    for (const profile of [active, cold]) {
+        await assert.rejects(profile.delete(), {
+            profileCleanup: 'delete-rejected',
+            message: /requires a bound REST credential/
+        });
+    }
+    assert.equal(active.browser, browser);
+    assert.deepEqual(requests, []);
+    assert.equal(await active.stop(), true);
+    assert.equal(deadlines.size, 0);
+});
+
+test('GoLogin rejects an externally changed session client before binding its SDK', async t => {
+    const { Profile, client, browser, requests, responses } = await loadGoLogin(t);
+    const deadlines = mockGoLoginTimers(t);
+    const original = new client.constructor('fixture-paired-client');
+    const replacement = new client.constructor('fixture-replacement-client');
+    const sdkOwners = [];
+    const session = {
+        client: original,
+        createSdk() {
+            sdkOwners.push(this.client);
+            return { async launch() { return { browser }; } };
+        }
+    };
+    const profile = new Profile('fixture-owned', null, session);
+
+    session.client = replacement;
+    await assert.rejects(profile.start(), /session client changed before SDK binding/);
+    session.client = original;
+    const pending = profile.start();
+    session.client = replacement;
+    await assert.rejects(pending, /session client changed before SDK binding/);
+    await assert.rejects(profile.delete(), {
+        profileId: 'fixture-owned',
+        profileCleanup: 'delete-rejected'
+    });
+    assert.deepEqual(sdkOwners, []);
+    assert.equal(requests.length, 0);
+
+    session.client = original;
+    await profile.start();
+    session.client = replacement;
+    responses.push(reply(204, ''));
+    assert.equal(await profile.delete(), true);
+    assert.deepEqual(sdkOwners, [original]);
+    assert.deepEqual(requests.map(request => [request.method, request.headers.Authorization]), [
+        ['DELETE', 'Bearer fixture-paired-client']
+    ]);
     assert.equal(deadlines.size, 0);
 });
 
@@ -580,7 +714,7 @@ test('GoLogin rejects another owner of the same borrowed browser handle', async 
     };
 
     const owner = await new Profile('fixture-shared', sharedSdk).start();
-    const alias = new Profile('fixture-shared', sharedSdk, { client });
+    const alias = new Profile('fixture-shared', sharedSdk, { client: new client.constructor('fixture-owner') });
     const distinct = await new Profile('fixture-distinct', sharedSdk).start();
     await assert.rejects(alias.start(), /browser is already managed by another profile/);
     assert.equal(await alias.stop(), false);
@@ -650,6 +784,48 @@ test('GoLogin factory compensates building a page only for its allocated profile
             assert.equal(deadlines.size, 0);
         });
     }
+});
+
+test('GoLogin factory does not repeat a close whose result is unknown', async t => {
+    for (const ambiguous of [false, true]) {
+        await t.test(ambiguous ? 'rejected close with unknown result' : 'confirmed close control', async t => {
+            const { createAndStartProfile, requests, responses, browser, stops } = await loadGoLogin(t);
+            const deadlines = mockGoLoginTimers(t);
+            let closes = 0;
+            browser.newPage = async () => { throw new Error('fixture page unavailable'); };
+            browser.close = async () => {
+                closes++;
+                if (ambiguous && closes === 1) {
+                    throw Object.assign(new Error('fixture close result unavailable'), { code: 'ETIMEDOUT' });
+                }
+            };
+            responses.push(reply(201, { id: 'fixture-owned' }), reply(200, { id: 'fixture-owned' }), reply(204, ''));
+
+            await assert.rejects(createAndStartProfile('fixture'), {
+                profileId: 'fixture-owned',
+                profileCleanup: ambiguous ? 'stop-unconfirmed' : 'deleted'
+            });
+            assert.equal(closes, 1);
+            assert.deepEqual(stops, ['fixture-import-key']);
+            assert.deepEqual(requests.map(request => request.method), ambiguous ? ['POST', 'GET'] : ['POST', 'GET', 'DELETE']);
+            assert.equal(responses.length, ambiguous ? 1 : 0);
+            assert.equal(deadlines.size, 0);
+        });
+    }
+});
+
+test('GoLogin can explicitly stop again after a known browser close refusal', async t => {
+    const { Profile, browser, stops } = await loadGoLogin(t);
+    const deadlines = mockGoLoginTimers(t);
+    let closes = 0;
+    browser.close = async () => ++closes > 1;
+    const profile = await new Profile('fixture-owned').start();
+    assert.equal(await profile.stop(), false);
+    assert.equal(closes, 1);
+    assert.equal(await profile.stop(), true);
+    assert.equal(closes, 2);
+    assert.deepEqual(stops, ['fixture-import-key']);
+    assert.equal(deadlines.size, 0);
 });
 
 test('GoLogin coalesces lifecycle calls and discards a page that resolves after deletion', async t => {

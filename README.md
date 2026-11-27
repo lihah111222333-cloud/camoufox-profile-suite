@@ -34,6 +34,7 @@
 
 **Releases & Packages (subsections)**
 
+- [Preflight for every release](#preflight-for-every-release)
 - [Option A — Automated release (recommended)](#option-a--automated-release-recommended)
 - [Option B — “Create a new release” in the GitHub UI](#option-b--create-a-new-release-in-the-github-ui)
 - [Install from GitHub Packages](#install-from-github-packages)
@@ -550,32 +551,61 @@ On the repository home page, GitHub shows **Releases** (right sidebar / [`…/re
 | **Releases** | [github.com/code-root/gmail-account-creator/releases](https://github.com/code-root/gmail-account-creator/releases) | Version tags, changelog-style notes, downloadable **`npm pack` `.tgz`** (from Actions) |
 | **Packages** | [GitHub Packages — npm](https://github.com/code-root/gmail-account-creator/pkgs/npm/gmail-account-creator) | Installable **`@code-root/gmail-account-creator`** after `npm publish` from the release workflow |
 
+### Preflight for every release
+
+Prepare a reviewed commit with a new `package.json` version. From that checkout, create a matching local tag, for example `git tag v1.0.1 HEAD`. For an existing release tag, verify the actual local tag using the same command below. The historical `v1.0.0` tag contains old credential examples and is blocked.
+
+```bash
+release_tag=v1.0.1
+release_tag_object=$(node scripts/check-distribution.mjs tag "$release_tag") &&
+  release_commit=$(git --no-replace-objects rev-parse --verify --end-of-options "${release_tag_object}^{commit}")
+```
+
+Continue when the check succeeds and `release_commit` is the intended reviewed commit. The checker reads the version and source files from the tag's commit. Run this check before pushing the tag or publishing in the GitHub UI, since GitHub can expose the source archive before Actions runs. Use the same GitHub repository for `origin` and the release, and keep published tags fixed.
+
 ### Option A — Automated release (recommended)
 
-1. Bump `version` in `package.json` (commit and push to `main`).
-2. Create and push a tag: `git tag v1.0.1 && git push origin v1.0.1`
-3. **Release** (`.github/workflows/release.yml`) checks that the tag matches `package.json`, runs the security tests, and verifies the exact contents of the npm tarball.
-4. The same workflow attaches that tarball to the GitHub Release and publishes it to GitHub Packages.
+Complete the preflight above, then push the reviewed version commit to `main` through your usual branch workflow. Push the exact verified tag object.
+
+```bash
+test -n "${release_tag_object:-}" &&
+  git push --no-follow-tags origin "$release_tag_object:refs/tags/$release_tag"
+```
+
+The **Release** workflow checks the tagged commit, runs the security tests, verifies the npm tarball, and sends the same archive to GitHub Releases and GitHub Packages.
 
 ### Option B — “Create a new release” in the GitHub UI
 
-1. Open [**Releases**](https://github.com/code-root/gmail-account-creator/releases) → **“Create a new release”** (or **Draft a new release**).
-2. Choose a tag that matches `package.json` at the tagged commit, set a title, and add release notes.
-3. Publish the release. The workflow verifies and publishes the npm tarball to GitHub Packages. Use Option A to attach the tarball to the release automatically.
+Use this route when the tag already exists on GitHub and still needs a release. Run the preflight above and confirm the remote tag is the exact verified object.
+
+```bash
+test -n "${release_tag_object:-}" &&
+  remote_tag=$(git ls-remote --exit-code --refs origin "refs/tags/$release_tag") &&
+  test "$remote_tag" = "$(printf '%s\trefs/tags/%s' "$release_tag_object" "$release_tag")"
+```
+
+After the comparison succeeds, choose that existing tag in [**Releases**](https://github.com/code-root/gmail-account-creator/releases), add the title and notes, and publish. The workflow verifies and publishes the npm tarball to GitHub Packages. For a new remote tag, use Option A and edit the resulting release in the UI.
 
 This repository is published as **`@code-root/gmail-account-creator`** on [GitHub Packages](https://github.com/features/packages) (npm registry).
 
 #### If GitHub Actions are blocked (e.g. billing)
 
-To build locally, use a clean checkout of the matching tag. These commands print the verified archive filename.
+Run the same release preflight. Build from a clean checkout of the verified commit.
 
 ```bash
-node scripts/check-distribution.mjs tag v1.2.3 &&
-  npm pack --json | node scripts/check-distribution.mjs archive
+set -o pipefail
+release_archive=
+checkout_commit=$(git rev-parse --verify HEAD) &&
+  checkout_status=$(git status --porcelain) &&
+  test "$checkout_commit" = "$release_commit" &&
+  test -z "$checkout_status" &&
+  release_archive=$(npm pack --json | node scripts/check-distribution.mjs archive) &&
+  printf '%s\n' "$release_archive"
 ```
 
-1. Attach the verified `.tgz` in the GitHub UI or run `gh release create v1.2.3 code-root-gmail-account-creator-1.2.3.tgz --title "v1.2.3" --generate-notes`.
-2. After authenticating to GitHub Packages, run `npm publish ./code-root-gmail-account-creator-1.2.3.tgz` using a token with `write:packages`. [GitHub Packages authentication](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-npm-registry#authenticating-with-a-personal-access-token)
+1. If the tag is new on GitHub, push the verified tag object using Option A's push command. Confirm the remote tag matches using Option B's comparison.
+2. Attach the verified `.tgz` to a release for that existing tag in the UI, or run `gh release create "$release_tag" "$release_archive" --verify-tag --generate-notes`.
+3. After authenticating to GitHub Packages, run `test -n "$release_archive" && npm publish "./$release_archive"` using a token with `write:packages`. [GitHub Packages authentication](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-npm-registry#authenticating-with-a-personal-access-token)
 
 ### Install from GitHub Packages
 

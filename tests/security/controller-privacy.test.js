@@ -519,9 +519,20 @@ test('Dolphin only returns a complete folder list when pagination supports it', 
     const full = Array.from({ length: 100 }, (_, i) => ({ id: 'folder-' + i }));
     const takePages = () => requests.splice(0).map(request => request.data.page);
 
-    responses.push({ data: [first] });
-    assert.deepEqual(await dolphin.getAllFolders(), [first]);
+    const zero = { folderId: 0, name: 'Zero' };
+    responses.push({ data: [first, zero] });
+    assert.deepEqual(await dolphin.getAllFolders(), [first, zero]);
     assert.deepEqual(takePages(), [1]);
+
+    for (const [data, reason] of [
+        [[{ id: 42 }, { folderId: '42' }], /duplicate folder IDs/],
+        [[{ folderId: ' ' }], /folder without a valid ID/],
+        [{ list: [{ name: 'Missing ID' }], total: 1 }, /folder without a valid ID/]
+    ]) {
+        responses.push({ data });
+        await assert.rejects(dolphin.getAllFolders(), reason);
+        assert.deepEqual(takePages(), [1]);
+    }
 
     for (const data of [full, { list: [first], totalNum: 2 }, { data: [first], pageSize: '1' }]) {
         responses.push({ data });
@@ -610,6 +621,17 @@ test('Dolphin folder command reports a safe failure from the controller', async 
     assert.ok(!listing.includes(syntheticKey));
     assert.ok(!listing.includes(proxy.password));
     assert.equal(process.exitCode, 1);
+});
+
+test('Dolphin folder command rejects duplicate IDs before printing any folder rows', async t => {
+    const { load, output, responses } = await loadControllers(t, { LOG_LEVEL: 'silent' });
+    responses.push({ data: [{ id: 'duplicate-fixture-id' }, { folderId: 'duplicate-fixture-id' }] });
+    await load('scripts/list-dolphin-folders.js');
+    const listing = output.join('\n');
+    assert.match(listing, /❌ خطأ في جلب المجلدات/);
+    assert.doesNotMatch(listing, /✅|duplicate-fixture-id/);
+    assert.equal(process.exitCode, 1);
+    assert.deepEqual(responses, []);
 });
 
 test('controller clients require a positive stop, delete or recycle acknowledgement', async t => {

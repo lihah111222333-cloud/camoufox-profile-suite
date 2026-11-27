@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
     appendAccountResult, migrateExistingAccountOutputs, writeRunSummary
 } from '../../src/utils/account-results.js';
@@ -477,6 +477,22 @@ test('npm tarball contains exactly the public files from a checkout with local s
 
     const specPath = path.join(packageRoot, 'docs', 'openapi-default.json');
     const specification = JSON.parse(fs.readFileSync(specPath, 'utf8'));
+    for (const name of ['local_storage_import', 'cookies_import', 'cookie_robot_start', 'browser_profile_start']) {
+        const password = specification.components.schemas[name].properties.browserProfilePassword;
+        assert.equal(password.example, 'REPLACE_WITH_BROWSER_PROFILE_PASSWORD');
+        password.example = FAKE_PASSWORD;
+        fs.writeFileSync(specPath, JSON.stringify(specification));
+        const prepack = spawnSync(process.execPath, ['scripts/check-distribution.mjs', 'pack'], {
+            cwd: packageRoot,
+            env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, GMAIL_CREATOR_STATE_DIR: stateDirectory },
+            encoding: 'utf8'
+        });
+        assert.equal(prepack.status, 1, name);
+        assert.match(prepack.stderr, /Use synthetic identifiers and credential placeholders/);
+        assert.ok(!prepack.stderr.includes(FAKE_PASSWORD));
+        password.example = 'REPLACE_WITH_BROWSER_PROFILE_PASSWORD';
+    }
+
     const profile = specification.paths['/api/profile/detail'].post.responses['200'].content['application/json'].example;
     profile.fingerprint.computerName = 'FIXTURE-NONPLACEHOLDER-HOST';
     fs.writeFileSync(specPath, JSON.stringify(specification));
@@ -484,27 +500,6 @@ test('npm tarball contains exactly the public files from a checkout with local s
     assert.notEqual(identifyingExample.status, 0);
     assert.match(identifyingExample.stderr, /Use synthetic identifiers and credential placeholders/);
     assert.doesNotMatch(identifyingExample.stderr, /FIXTURE-NONPLACEHOLDER-HOST/);
-});
-
-test('release checker blocks the historical tag and requires the new package version', (t) => {
-    const directory = temporaryDirectory(t);
-    copyProjectFile(directory, 'scripts/check-distribution.mjs');
-    const manifestPath = path.join(directory, 'package.json');
-    fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, version: '1.0.0' }));
-    const checkTag = (candidate) => spawnSync(process.execPath, ['scripts/check-distribution.mjs', 'tag', candidate], {
-        cwd: directory, env: { PATH: process.env.PATH }, encoding: 'utf8'
-    });
-    const historical = checkTag('v1.0.0');
-    assert.notEqual(historical.status, 0);
-    assert.match(historical.stderr, /v1\.0\.0 retains historical OpenAPI example data/);
-
-    const tag = 'v9.9.9';
-    fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, version: tag.slice(1) }));
-    const valid = checkTag(tag);
-    assert.equal(valid.status, 0, valid.stderr);
-    const invalid = checkTag(`${tag}-fixture`);
-    assert.notEqual(invalid.status, 0);
-    assert.ok(invalid.stderr.includes(`Release tag must be ${tag}`));
 });
 
 const commitFixtureFiles = ['PUSH_TO_GITHUB.sh', 'scripts/check-distribution.mjs', 'package.json',
@@ -537,6 +532,66 @@ function temporaryRepository(t, includeIgnore = true) {
     });
     return { root, git, prepareCommit, env };
 }
+
+test('release checker uses the exact tagged commit, version and source files', { skip: process.platform === 'win32' }, (t) => {
+    const { root, git, env } = temporaryRepository(t);
+    const checkTag = (...args) => spawnSync(process.execPath, ['scripts/check-distribution.mjs', 'tag', ...args], {
+        cwd: root, env, encoding: 'utf8'
+    });
+    const historical = checkTag('v1.0.0');
+    assert.equal(historical.status, 1);
+    assert.match(historical.stderr, /v1\.0\.0 retains historical OpenAPI example data/);
+
+    const writeVersion = (version) => fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ ...manifest, version }));
+    const identity = ['-c', 'user.name=Local Fixture', '-c', 'user.email=fixture@example.test'];
+    const commit = (message) => {
+        assert.equal(git('add', '.').status, 0);
+        const result = git(...identity, 'commit', '-m', message);
+        assert.equal(result.status, 0, result.stderr);
+        return git('rev-parse', 'HEAD').stdout.trim();
+    };
+
+    copyProjectFile(root, 'docs/openapi-default.json');
+    const tag = 'v9.9.9';
+    writeVersion(tag.slice(1));
+    const reviewedCommit = commit('Reviewed release fixture');
+    const annotated = git(...identity, 'tag', '-a', tag, '-m', 'Fixture release', reviewedCommit);
+    assert.equal(annotated.status, 0, annotated.stderr);
+    const tagObject = git('rev-parse', `refs/tags/${tag}`).stdout.trim();
+    assert.notEqual(tagObject, reviewedCommit);
+
+    const unsafeTag = 'v9.9.8';
+    writeVersion(unsafeTag.slice(1));
+    const privateFile = 'local-fixture.log';
+    fs.writeFileSync(path.join(root, privateFile), FAKE_PASSWORD);
+    assert.equal(git('add', '-f', '--', privateFile).status, 0);
+    const unsafeCommit = commit('Different version with a private fixture');
+    assert.equal(git('tag', unsafeTag, unsafeCommit).status, 0);
+
+    const checked = checkTag(tag, reviewedCommit);
+    assert.equal(checked.status, 0, checked.stderr);
+    assert.equal(checked.stdout.trim(), tagObject);
+    const changedTarget = checkTag(tag, unsafeCommit);
+    assert.equal(changedTarget.status, 1);
+    assert.match(changedTarget.stderr, /does not point to the expected commit/);
+    assert.equal(changedTarget.stdout, '');
+
+    assert.equal(git('checkout', '--detach', reviewedCommit).status, 0);
+    const rejected = checkTag(unsafeTag);
+    assert.equal(rejected.status, 1);
+    assert.match(rejected.stderr, /Sensitive file in the source archive.*local-fixture\.log/);
+    assert.ok(!rejected.stderr.includes(FAKE_PASSWORD));
+    assert.equal(rejected.stdout, '');
+
+    const wrongVersion = `${tag}-fixture`;
+    assert.equal(git('tag', wrongVersion, reviewedCommit).status, 0);
+    const invalid = checkTag(wrongVersion);
+    assert.equal(invalid.status, 1);
+    assert.ok(invalid.stderr.includes(`Release tag must be ${tag}.`));
+
+    assert.equal(git('branch', 'v9.9.7', reviewedCommit).status, 0);
+    assert.equal(checkTag('v9.9.7').status, 1);
+});
 
 test('source guard checks the selected commit used by a real Git archive', { skip: process.platform === 'win32' }, (t) => {
     const { root, git, env } = temporaryRepository(t);
@@ -600,6 +655,133 @@ test('the first push helper rejects a clean tree with earlier identifying exampl
     assert.match(blocked.stderr, /The branch retains earlier OpenAPI examples/);
     assert.ok(!blocked.stderr.includes(FAKE_PASSWORD));
     assert.equal(git('status', '--porcelain').stdout, '');
+});
+
+test('first push rejects private paths and registry credentials in removed historical files', {
+    skip: process.platform === 'win32'
+}, (t) => {
+    const fixtures = [
+        ['.env', `FIXTURE=${FAKE_PASSWORD}\n`],
+        ['config/proxies.txt', FAKE_PROXY],
+        ['.npmrc', `//registry.example.test/:_authToken=${FAKE_PASSWORD}\n`]
+    ];
+    for (const [file, contents] of fixtures) {
+        const { root, git, prepareCommit } = temporaryRepository(t);
+        const fullPath = path.join(root, file);
+        fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+        fs.writeFileSync(fullPath, contents, { mode: 0o600 });
+        assert.equal(git('config', 'user.name', 'Local Fixture').status, 0);
+        assert.equal(git('config', 'user.email', 'fixture@example.test').status, 0);
+        assert.equal(git('add', '.').status, 0);
+        assert.equal(git('add', '--force', '--', file).status, 0);
+        assert.equal(git('commit', '-qm', 'Fixture with private output').status, 0);
+        assert.equal(git('rm', '--', file).status, 0);
+        assert.equal(git('commit', '-qm', 'Remove private output').status, 0);
+        const head = git('rev-parse', 'HEAD').stdout;
+
+        const blocked = prepareCommit('y\n');
+        assert.equal(blocked.status, 1);
+        assert.ok(blocked.stderr.includes(`Sensitive file in the first-push history: ${JSON.stringify(file)}`), blocked.stderr);
+        assert.ok(!blocked.stderr.includes(contents));
+        assert.doesNotMatch(blocked.stdout, /expected_origin=/);
+        assert.equal(git('rev-parse', 'HEAD').stdout, head);
+        assert.equal(git('status', '--porcelain').stdout, '');
+    }
+});
+
+test('first push preserves a pending merge and checks a completed merge through all parents', {
+    skip: process.platform === 'win32'
+}, (t) => {
+    const { root, git, prepareCommit } = temporaryRepository(t);
+    assert.equal(git('symbolic-ref', 'HEAD', 'refs/heads/reviewed').status, 0);
+    assert.equal(git('config', 'user.name', 'Local Fixture').status, 0);
+    assert.equal(git('config', 'user.email', 'fixture@example.test').status, 0);
+    assert.equal(git('add', '.').status, 0);
+    assert.equal(git('commit', '-qm', 'Reviewed base').status, 0);
+    const reviewed = git('rev-parse', 'HEAD').stdout;
+
+    assert.equal(git('checkout', '-qb', 'topic').status, 0);
+    fs.writeFileSync(path.join(root, 'local-fixture.log'), FAKE_PASSWORD);
+    assert.equal(git('add', '--force', '--', 'local-fixture.log').status, 0);
+    assert.equal(git('commit', '-qm', 'Local diagnostics fixture').status, 0);
+    assert.equal(git('rm', '--', 'local-fixture.log').status, 0);
+    fs.writeFileSync(path.join(root, 'merge-note.txt'), 'Public topic fixture');
+    assert.equal(git('add', '--', 'merge-note.txt').status, 0);
+    assert.equal(git('commit', '-qm', 'Clean topic tree').status, 0);
+    const topic = git('rev-parse', 'HEAD').stdout;
+
+    assert.equal(git('checkout', '-q', 'reviewed').status, 0);
+    const clean = prepareCommit('y\n');
+    assert.equal(clean.status, 0, clean.stderr);
+    const merge = git('merge', '--no-commit', '--no-ff', 'topic');
+    assert.equal(merge.status, 0, merge.stderr);
+
+    const pending = prepareCommit('y\n');
+    assert.equal(pending.status, 1);
+    assert.match(pending.stderr, /Finish or abort the pending merge/);
+    assert.doesNotMatch(pending.stdout, /expected_origin=/);
+    assert.equal(git('rev-parse', 'HEAD').stdout, reviewed);
+    assert.equal(git('rev-parse', 'MERGE_HEAD').stdout, topic);
+    assert.equal(git('diff', '--cached', '--name-only').stdout.trim(), 'merge-note.txt');
+
+    assert.equal(git('commit', '-qm', 'Completed topic merge').status, 0);
+    assert.equal(git('rev-parse', 'HEAD^2').stdout, topic);
+    const blocked = prepareCommit('y\n');
+    assert.equal(blocked.status, 1);
+    assert.match(blocked.stderr, /Sensitive file in the first-push history: "local-fixture\.log"/);
+    assert.ok(!blocked.stderr.includes(FAKE_PASSWORD));
+    assert.doesNotMatch(blocked.stdout, /expected_origin=/);
+    assert.equal(git('status', '--porcelain').stdout, '');
+});
+
+test('custom captures keep recorder attachments out of staging and source delivery', {
+    skip: process.platform === 'win32'
+}, (t) => {
+    const { root, git, env, prepareCommit } = temporaryRepository(t);
+    const metadata = 'custom capture/traffic.ndjson';
+    const generated = 'custom capture/payloads/res-1-0123456789ab.bin';
+    const nested = 'another/traffic/payloads/local-body.bin';
+    const source = 'fixtures/payloads/example.json';
+    const writeFile = (file, contents) => {
+        const fullPath = path.join(root, file);
+        fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+        fs.writeFileSync(fullPath, contents);
+    };
+    writeFile(metadata, '{}\n');
+    writeFile(generated, FAKE_PASSWORD);
+    writeFile(nested, FAKE_PASSWORD);
+    writeFile(source, '{}\n');
+    for (const file of [metadata, generated, nested]) {
+        assert.equal(git('check-ignore', '--', file).status, 0, file);
+    }
+    assert.equal(git('config', 'user.name', 'Local Fixture').status, 0);
+    assert.equal(git('config', 'user.email', 'fixture@example.test').status, 0);
+    const normal = prepareCommit('y\n');
+    assert.equal(normal.status, 0, normal.stderr);
+    assert.equal(git('ls-files', '--', source).stdout.trim(), source);
+    assert.equal(git('ls-files', '--', metadata, generated, nested).stdout, '');
+
+    const imported = 'custom capture/payloads/nested/imported-body.txt';
+    writeFile(imported, FAKE_PASSWORD);
+    const blocked = prepareCommit('y\n');
+    assert.equal(blocked.status, 1);
+    assert.ok(blocked.stderr.includes(`Sensitive file would be included in the commit: ${JSON.stringify(imported)}`));
+    assert.ok(!blocked.stderr.includes(FAKE_PASSWORD));
+    assert.equal(git('ls-files', '--', imported).stdout, '');
+    fs.unlinkSync(path.join(root, imported));
+    fs.unlinkSync(path.join(root, metadata));
+
+    assert.equal(git('add', '--force', '--', generated).status, 0);
+    const blockedIndex = prepareCommit('y\n');
+    assert.equal(blockedIndex.status, 1);
+    assert.ok(blockedIndex.stderr.includes(`Sensitive file would be included in the commit: ${JSON.stringify(generated)}`));
+    assert.equal(git('commit', '-qm', 'Source tree fixture with attachment').status, 0);
+    const blockedSource = spawnSync(process.execPath, ['scripts/check-distribution.mjs', 'source', 'HEAD'], {
+        cwd: root, env, encoding: 'utf8'
+    });
+    assert.equal(blockedSource.status, 1);
+    assert.ok(blockedSource.stderr.includes(`Sensitive file in the source archive: ${JSON.stringify(generated)}`));
+    assert.ok(!blockedSource.stderr.includes(FAKE_PASSWORD));
 });
 
 test('commit helper rejects credential files already in its index', { skip: process.platform === 'win32' }, (t) => {
@@ -743,19 +925,60 @@ function githubSetupBlock() {
     return block;
 }
 
-function runGithubSetup(root, env, block) {
-    const setup = `git() {
+function fixtureGithubSetup(block) {
+    return `git() {
         if [ "$1" = push ]; then
-            echo "fixture push attempted"
-            return 0
+            local refspec="\${@: -1}"
+            echo "fixture push attempted $refspec"
+            command git update-ref refs/remotes/origin/main "\${refspec%%:*}"
+            return $?
         fi
         command git "$@"
     }
     ${block.replace(/^\s*expected_origin=.*$/m, 'expected_origin=file:///fixture-remote.git')}`;
-    return spawnSync('bash', ['-c', setup], {
+}
+
+function printedGithubSetup(prepared) {
+    assert.equal(prepared.status, 0, prepared.stderr);
+    const handoff = /^ {3}expected_origin=[\s\S]*?(?=\n\n)/m.exec(prepared.stdout)?.[0];
+    assert.ok(handoff);
+    return handoff;
+}
+
+function runGithubSetup(root, env, block) {
+    return spawnSync('bash', ['-c', fixtureGithubSetup(block)], {
         cwd: root, env: { ...env, GIT_ALLOW_PROTOCOL: 'file' }, input: 'y\n', encoding: 'utf8'
     });
 }
+
+test('documented and printed first-push commands send only the reviewed branch with followTags enabled', {
+    skip: process.platform === 'win32'
+}, (t) => {
+    for (const printed of [false, true]) {
+        const { root, git, env, prepareCommit } = temporaryRepository(t);
+        assert.equal(git('symbolic-ref', 'HEAD', 'refs/heads/reviewed').status, 0);
+        assert.equal(git('config', 'user.name', 'Local Fixture').status, 0);
+        assert.equal(git('config', 'user.email', 'fixture@example.test').status, 0);
+        assert.equal(git('config', 'push.followTags', 'true').status, 0);
+        assert.equal(git('add', '.').status, 0);
+        assert.equal(git('commit', '-qm', 'Reviewed branch fixture').status, 0);
+        assert.equal(git('tag', '-a', 'v9.9.9', '-m', 'Local release fixture').status, 0);
+        const head = git('rev-parse', 'HEAD').stdout.trim();
+        const destination = path.join(path.dirname(root), 'destination.git');
+        assert.equal(git('init', '-q', '--bare', destination).status, 0);
+
+        const block = printed ? printedGithubSetup(prepareCommit('y\n')) : githubSetupBlock();
+        const localBlock = block.replace(/^\s*expected_origin=.*$/m, `expected_origin=${pathToFileURL(destination).href}`);
+        const pushed = spawnSync('bash', ['-c', localBlock], {
+            cwd: root, env: { ...env, GIT_ALLOW_PROTOCOL: 'file' }, input: 'y\n', encoding: 'utf8'
+        });
+        assert.equal(pushed.status, 0, pushed.stderr || pushed.stdout);
+        const delivered = git('--git-dir', destination, 'for-each-ref', '--format=%(objectname) %(refname)');
+        assert.equal(delivered.status, 0, delivered.stderr);
+        assert.equal(delivered.stdout.trim(), `${head} refs/heads/main`);
+        assert.equal(git('tag', '--list').stdout.trim(), 'v9.9.9');
+    }
+});
 
 test('the GitHub setup command stops after a failed preflight or an existing origin', {
     skip: process.platform === 'win32'
@@ -791,10 +1014,7 @@ test('first-push commands preserve a separate main and require a named branch be
     assert.equal(git('config', 'user.email', 'fixture@example.test').status, 0);
     assert.equal(git('add', '.').status, 0);
     assert.equal(git('commit', '-qm', 'Shared fixture').status, 0);
-    const prepared = prepareCommit('y\n');
-    assert.equal(prepared.status, 0, prepared.stderr);
-    const handoff = /^ {3}expected_origin=[\s\S]*?(?=\n\n)/m.exec(prepared.stdout)?.[0];
-    assert.ok(handoff);
+    const handoff = printedGithubSetup(prepareCommit('y\n'));
     const documented = githubSetupBlock();
 
     assert.equal(git('checkout', '-qb', 'main').status, 0);
@@ -832,10 +1052,122 @@ test('first-push commands preserve a separate main and require a named branch be
     assert.equal(git('rev-parse', 'refs/heads/prior-main').stdout, existingMain);
 
     assert.equal(git('remote', 'remove', 'origin').status, 0);
-    const onMain = runGithubSetup(root, env, handoff);
+    const obsolete = runGithubSetup(root, env, handoff);
+    assert.notEqual(obsolete.status, 0);
+    assert.match(obsolete.stderr, /The prepared branch or commit changed/);
+    assert.doesNotMatch(obsolete.stdout, /fixture push attempted/);
+    assert.equal(git('remote').stdout, '');
+
+    const onMain = runGithubSetup(root, env, printedGithubSetup(prepareCommit('y\n')));
     assert.equal(onMain.status, 0, onMain.stderr);
     assert.match(onMain.stdout, /fixture push attempted/);
     assert.equal(git('rev-parse', 'refs/heads/main').stdout, review);
+});
+
+test('first-push confirmation stops before committing when the checked out branch changes', {
+    skip: process.platform === 'win32', timeout: 10000
+}, async (t) => {
+    const { root, git, env } = temporaryRepository(t);
+    assert.equal(git('symbolic-ref', 'HEAD', 'refs/heads/reviewed').status, 0);
+    assert.equal(git('config', 'user.name', 'Local Fixture').status, 0);
+    assert.equal(git('config', 'user.email', 'fixture@example.test').status, 0);
+    assert.equal(git('add', '.').status, 0);
+    assert.equal(git('commit', '-qm', 'Shared fixture').status, 0);
+    const reviewed = git('rev-parse', 'HEAD').stdout;
+    assert.equal(git('checkout', '-qb', 'alternate').status, 0);
+    fs.writeFileSync(path.join(root, 'alternate.txt'), 'Alternate branch fixture');
+    assert.equal(git('add', 'alternate.txt').status, 0);
+    assert.equal(git('commit', '-qm', 'Alternate fixture').status, 0);
+    const alternate = git('rev-parse', 'HEAD').stdout;
+    assert.equal(git('checkout', '-q', 'reviewed').status, 0);
+    fs.writeFileSync(path.join(root, 'release-note.txt'), 'Release note fixture');
+
+    const block = githubSetupBlock();
+    const rejected = await new Promise((resolve, reject) => {
+        const child = spawn('bash', ['-c', fixtureGithubSetup(block)], {
+            cwd: root, env: { ...env, GIT_ALLOW_PROTOCOL: 'file' }
+        });
+        t.after(() => child.kill());
+        let stdout = '';
+        let stderr = '';
+        let confirmed = false;
+        const confirm = () => {
+            if (confirmed || !(stdout + stderr).includes('Make sure sensitive files are NOT in the list above!')) return;
+            confirmed = true;
+            try {
+                assert.equal(git('checkout', '-q', 'alternate').status, 0);
+                child.stdin.end('y\n');
+            } catch (error) {
+                child.kill();
+                reject(error);
+            }
+        };
+        child.stdout.setEncoding('utf8').on('data', (chunk) => {
+            stdout += chunk;
+            confirm();
+        });
+        child.stderr.setEncoding('utf8').on('data', (chunk) => {
+            stderr += chunk;
+            confirm();
+        });
+        child.once('error', reject);
+        child.once('close', (status) => {
+            if (confirmed) resolve({ status, stdout, stderr });
+            else reject(new Error('The first-push helper exited before confirmation'));
+        });
+    });
+    assert.notEqual(rejected.status, 0, rejected.stdout);
+    assert.match(rejected.stderr, /The selected branch or commit changed during confirmation/);
+    assert.doesNotMatch(rejected.stdout, /fixture push attempted/);
+    assert.equal(git('rev-parse', 'refs/heads/reviewed').stdout, reviewed);
+    assert.equal(git('rev-parse', 'refs/heads/alternate').stdout, alternate);
+    assert.equal(git('rev-parse', 'HEAD').stdout, alternate);
+    assert.equal(git('diff', '--cached', '--name-only').stdout.trim(), 'release-note.txt');
+    assert.equal(git('remote').stdout, '');
+
+    assert.equal(git('checkout', '-q', 'reviewed').status, 0);
+    const delivered = runGithubSetup(root, env, block);
+    assert.equal(delivered.status, 0, delivered.stderr);
+    const prepared = git('rev-parse', 'refs/heads/main').stdout.trim();
+    assert.ok(delivered.stdout.includes(`fixture push attempted ${prepared}:refs/heads/main`));
+    assert.equal(git('show', 'refs/heads/main:release-note.txt').stdout, 'Release note fixture');
+    assert.equal(git('rev-parse', '--abbrev-ref', '@{upstream}').stdout.trim(), 'origin/main');
+});
+
+test('first-push handoff verifies the resulting tree and parent after Git commits', {
+    skip: process.platform === 'win32'
+}, (t) => {
+    for (const hook of ['pre-commit', 'post-commit']) {
+        const { root, git, env } = temporaryRepository(t);
+        assert.equal(git('symbolic-ref', 'HEAD', 'refs/heads/reviewed').status, 0);
+        assert.equal(git('config', 'user.name', 'Local Fixture').status, 0);
+        assert.equal(git('config', 'user.email', 'fixture@example.test').status, 0);
+        assert.equal(git('add', '.').status, 0);
+        assert.equal(git('commit', '-qm', 'Reviewed base').status, 0);
+        const reviewed = git('rev-parse', 'HEAD').stdout;
+        fs.writeFileSync(path.join(root, 'release-note.txt'), 'Reviewed release note');
+
+        const action = hook === 'pre-commit'
+            ? "printf 'generated note' > generated-note.txt\ngit add -- generated-note.txt"
+            : "git -c core.hooksPath=.git/empty-hooks commit --allow-empty -qm 'Separate Git commit'";
+        fs.writeFileSync(path.join(root, '.git', 'hooks', hook), `#!/bin/sh\nset -e\n${action}\n`, { mode: 0o700 });
+
+        const outcome = runGithubSetup(root, env, githubSetupBlock());
+        assert.notEqual(outcome.status, 0, outcome.stdout);
+        assert.match(outcome.stderr, /The resulting commit differs from the reviewed tree or parent/);
+        assert.doesNotMatch(outcome.stdout, /fixture push attempted/);
+        assert.equal(git('remote').stdout, '');
+        assert.equal(git('symbolic-ref', 'HEAD').stdout.trim(), 'refs/heads/reviewed');
+        assert.equal(git('show', 'HEAD:release-note.txt').stdout, 'Reviewed release note');
+
+        if (hook === 'pre-commit') {
+            assert.equal(git('rev-parse', 'HEAD^1').stdout, reviewed);
+            assert.equal(git('show', 'HEAD:generated-note.txt').stdout, 'generated note');
+        } else {
+            assert.equal(git('rev-parse', 'HEAD^^').stdout, reviewed);
+            assert.equal(git('rev-parse', 'HEAD^{tree}').stdout, git('rev-parse', 'HEAD^1^{tree}').stdout);
+        }
+    }
 });
 
 test('commit helper checks .npmrc in both the worktree and index and accepts environment references', {
@@ -883,6 +1215,7 @@ test('OpenAPI includes placeholders in profile, proxy and token examples', () =>
     assert.match(specification.info.description, /generate -i docs\/openapi-default\.json/);
     assert.match(specification.info.description, /readFileSync\('docs\/openapi-default\.json'/);
     assert.match(specification.info.description, /verify the exact API origin/);
+    assert.match(specification.info.description, /axiosConfigDefaults: \{ maxRedirects: 0, proxy: false \}/);
     assert.doesNotMatch(specification.info.description, /http:\/\/[^\s]+\/openapi/);
     const profile = specification.paths['/api/profile/detail'].post.responses['200'].content['application/json'].example;
     assert.ok(profile.sk === 'REPLACE_WITH_SECRET_KEY');

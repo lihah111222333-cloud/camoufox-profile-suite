@@ -8,6 +8,7 @@ import axios from 'axios';
 import logger from '../utils/logger.js';
 import gpmClient from './client.js';
 import ManagedProfile, { rollbackNewManagedProfile } from '../utils/managed-profile.js';
+import { sendControllerRequest } from '../utils/controller-request.js';
 import {
     ControllerConnectionError,
     ControllerUrlError,
@@ -34,10 +35,13 @@ async function discoverBrowserEndpoint(controller, paths, timeout, signal) {
         url.pathname = originalPath + path;
         let data;
         try {
-            ({ data } = await axios.get(url.href, { ...controllerRequestOptions, timeout, signal }));
+            const response = await sendControllerRequest('GPM browser endpoint discovery', () =>
+                axios.get(url.href, { ...controllerRequestOptions, timeout, signal })
+            );
+            data = response.data;
         } catch (error) {
             signal.throwIfAborted();
-            if (error.response?.status !== 404 && !discoveryRetryCodes.has(error.code)) {
+            if (error.status !== 404 && !discoveryRetryCodes.has(error.transportCode)) {
                 throw error;
             }
             logger.debug('Could not discover GPM browser endpoint', { path });
@@ -63,20 +67,19 @@ async function discoverBrowserEndpoint(controller, paths, timeout, signal) {
 class GPMLoginProfile extends ManagedProfile {
     constructor(profileId, remoteDebuggingAddress = null) {
         super(profileId, gpmClient, 'remoteDebuggingAddress', remoteDebuggingAddress,
-            (client, address, signal) => this.#startBrowser(client, address, signal));
+            (startProfile, address, signal) => this.#startBrowser(startProfile, address, signal));
     }
 
     /**
      * Start profile and get browser instance
      * بدء البروفايل والحصول على متصفح
      */
-    async #startBrowser(client, address, signal) {
+    async #startBrowser(startProfile, address, signal) {
         try {
             logger.info('Starting GPM profile', { profileId: this.profileId });
 
-            if (client) {
-                // Let a dispatched launch return before cleanup can stop it by ID.
-                const startData = await client.startProfile(this.profileId);
+            if (startProfile) {
+                const startData = await startProfile();
                 address = startData.remote_debugging_address;
             }
 
@@ -108,14 +111,11 @@ class GPMLoginProfile extends ManagedProfile {
 
                 let connection;
                 try {
-                    logger.info(`Browser connection attempt ${attempt}/${retries}...`, {
-                        profileId: this.profileId,
-                        controller: endpoint.origin
-                    });
+                    logger.info(`GPM browser connection attempt ${attempt}/${retries}...`, { profileId: this.profileId });
                     connection = await connectBrowser(puppeteer, endpoint, { signal });
                     const pages = await connection.pages();
                     browser = connection;
-                    logger.info('Browser connected successfully', {
+                    logger.info('GPM browser connected successfully', {
                         profileId: this.profileId,
                         pagesCount: pages.length
                     });
@@ -125,7 +125,7 @@ class GPMLoginProfile extends ManagedProfile {
                     signal.throwIfAborted();
                     if (error instanceof ControllerUrlError || error instanceof ControllerConnectionError) throw error;
                     lastError = error;
-                    logger.warn(`Browser connection attempt ${attempt} failed`, {
+                    logger.warn(`GPM browser connection attempt ${attempt} failed`, {
                         error: error.message,
                         profileId: this.profileId
                     });

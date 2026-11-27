@@ -15,6 +15,7 @@ import {
 import {
     attachBrowserCompatibility,
     attachElementHandleCompatibility,
+    attachPageCompatibility,
     CamoufoxProfile
 } from '../../src/camoufox/profile.js';
 
@@ -44,6 +45,7 @@ function createMockBrowser() {
                 const frame = { $: newHandle };
                 const page = Object.assign(new EventEmitter(), {
                     context: () => context,
+                    isClosed: () => closed,
                     url: () => url,
                     async goto(nextUrl, options) {
                         navigations.push({ url: nextUrl, options });
@@ -252,4 +254,78 @@ test('locally rejected navigation leaves later request attribution on the prior 
     assert.equal(egress.get(origin + '/after-poll'), actions[0].actionId);
     assert.deepEqual(actions.map(({ actionType }) => actionType), ['page.click', 'page.goto']);
     assert.equal(egress.get(origin + '/accepted-poll'), actions[1].actionId);
+});
+
+test('a page-created view adopts only the first explicit lifecycle for the same browser', async () => {
+    const { browser: native } = createMockBrowser();
+    const context = await native.newContext();
+    const page = attachPageCompatibility(await context.newPage());
+    const view = page.browser();
+    const calls = [];
+    const foreign = {
+        context,
+        async saveStorageState() { assert.fail('foreign browser changed the save callback'); },
+        async closeContext() { assert.fail('foreign browser changed the close callback'); }
+    };
+    assert.equal(attachBrowserCompatibility(createMockBrowser().browser, foreign), view);
+
+    const owner = {
+        context,
+        async saveStorageState() {
+            assert.equal(this, owner);
+            calls.push('save');
+        },
+        async closeContext(close) {
+            assert.equal(this, owner);
+            calls.push('close');
+            await this.saveStorageState();
+            await close();
+        }
+    };
+    assert.equal(attachBrowserCompatibility(native, owner), view);
+    assert.equal(attachBrowserCompatibility(native, foreign), view);
+    await view.disconnect();
+    assert.deepEqual(calls, ['save']);
+    assert.equal(view.isConnected(), true);
+    await context.close();
+    assert.deepEqual(calls, ['save', 'close', 'save']);
+    assert.equal(view.isConnected(), false);
+    assert.equal(native.isConnected(), true);
+});
+
+test('explicit page creation rejects a closed context before delivering the result', async () => {
+    const { browser: native } = createMockBrowser();
+    for (const kind of ['browser', 'context']) {
+        const context = await native.newContext();
+        const create = context.newPage.bind(context);
+        let notifyCreated;
+        let allowDelivery;
+        const created = new Promise((resolve) => { notifyCreated = resolve; });
+        const deliver = new Promise((resolve) => { allowDelivery = resolve; });
+        let delayDelivery = false;
+        context.newPage = async () => {
+            const page = await create();
+            if (delayDelivery) {
+                notifyCreated(page);
+                await deliver;
+            }
+            return page;
+        };
+        const view = attachBrowserCompatibility(native, { context });
+        const endpoint = kind === 'browser' ? view : context;
+        const open = await endpoint.newPage();
+        assert.equal(open.context(), context);
+        assert.equal(open.isClosed(), false);
+
+        delayDelivery = true;
+        const result = assert.rejects(endpoint.newPage(), /closed while opening a page/);
+        const latePage = await created;
+        await context.close();
+        assert.equal(latePage.isClosed(), true);
+        assert.equal(view.isConnected(), false);
+        allowDelivery();
+        await result;
+        assert.deepEqual(await view.pages(), []);
+    }
+    assert.equal(native.isConnected(), true);
 });

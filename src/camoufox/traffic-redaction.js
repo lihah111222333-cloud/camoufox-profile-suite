@@ -27,13 +27,14 @@ const DIAGNOSTIC_CREDENTIAL_HEADER_REGEX = new RegExp(
 
 export const SENSITIVE_URL_PARAM_REGEX = new RegExp(
     '^(?:session[_-]?id|authorization[_-]?code|code|password|passwd|pwd|secret|private[_-]?key|' +
-    '(?:aws|oss)?access[-_]?key[-_]?id|googleaccessid|' + CLOUDFRONT_KEY_ID + '|' +
+    '(?:aws|oss)?access[-_]?key[-_]?id|googleaccessid|id_token_hint|login_hint|logout_hint|' +
+    CLOUDFRONT_KEY_ID + '|' +
     CREDENTIAL_FIELD + '|' + SIGNATURE_FIELD + '|' + CLOUD_SIGNATURE_FIELD + '|' +
     SESSION_TOKEN_FIELD + '|' + PRIVATE_PLATFORM_FIELD + ')$', 'i'
 );
 
 const URL_HEADER_REGEX =
-    /^(?::path|referer|referrer|origin|sec-websocket-origin|location|content-location|destination|.+[-_]ur[il])$/i;
+    /^(?::path|referer|referrer|origin|sec-websocket-origin|location|content-location|destination|(?:x-)?sourcemap|.+[-_]ur[il])$/i;
 const URL_METADATA_KEY_REGEX = /(?:url|uri|href|referrer|referer|location|origin|destination)$/i;
 const AUTHORIZATION_HEADER_REGEX = new RegExp('^' + AUTHORIZATION_HEADER + '$', 'i');
 const INLINE_AUTHORIZATION_REGEX = new RegExp(
@@ -55,10 +56,14 @@ const DIAGNOSTIC_FILE_DESTINATION_REGEX = new RegExp(
 );
 const LINK_HEADER_REGEX = /^link$/i;
 const REFRESH_HEADER_REGEX = /^refresh$/i;
+const CONTENT_DISPOSITION_HEADER_REGEX = /^content-disposition$/i;
+const DISPOSITION_PARAMETER_REGEX =
+    /(;\s*([-\w!#$%&'*+.^`|~]+)\s*=\s*)(?:"((?:\\[^\r\n]|[^"\\\r\n])*)"|([^;"\s]+))/g;
 const LINK_COMPONENT_REGEX =
     /<([^<>]*)>|(;\s*[-\w!#$%&'*+.^`|~]+\s*=\s*)(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([^;,\s]+))/g;
 const MASK = '[REDACTED]';
-const PRIVATE_URL_SCHEME = '(?:(?:blob|filesystem|view-source|jar):){0,4}(?:data|javascript|file):';
+const PRIVATE_URL_SCHEME =
+    '(?:(?:blob|filesystem|view-source|jar):){0,4}(?:data|javascript|file|mailto|sms|tel|geo):';
 const PRIVATE_URL_PREFIX_REGEX = new RegExp('^(\\s*' + PRIVATE_URL_SCHEME + ')', 'i');
 const QUOTED_PRIVATE_URL_REGEX = new RegExp('(["\'])(' + PRIVATE_URL_SCHEME + '[^\\r\\n]*?)\\1', 'gi');
 const URL_REFERENCE_REGEX = new RegExp(
@@ -73,6 +78,7 @@ const PRIVATE_URL_COMPONENTS = Object.freeze({
     searchParams: Object.freeze({})
 });
 const URL_VALUE_REGEX = /^(?:[a-z][a-z\d+.-]*:|\/|\.\.?\/|[?#])|^[^\s?#]+[?#][^#]*=/i;
+const ENCODED_URL_SCHEME_REGEX = /^(?:[a-z\d+.-]|%[\da-f]{2})+%(?:25)*3a/i;
 const ENCODED_URL_SYNTAX_REGEX = /%(?:25)*(?:23|2f|3a|3d|3f|40)/i;
 const ENCODED_EMAIL_SYNTAX_REGEX = /@[^@\s]*%/;
 const MAX_URL_BYTES = 64 * 1024;
@@ -101,6 +107,10 @@ function redactDiagnosticIdentity(text) {
 
 export function redactProfileId(rawId) {
     return typeof rawId === 'string' ? redactDiagnosticIdentity(rawId) : rawId;
+}
+
+export function isAnonymousProfileId(id) {
+    return typeof id === 'string' && /^profile-legacy-\d{13}(?:-\d{1,8})?$/.test(id);
 }
 
 export function redactProxyUrl(proxyInput) {
@@ -152,10 +162,14 @@ function exceedsUrlLimit(value) {
 function redactUrlValue(raw, depth = 0) {
     let value = raw;
     for (let decodingPass = 0; decodingPass <= MAX_URL_DECODING_PASSES; decodingPass += 1) {
-        const isUrl = URL_VALUE_REGEX.test(value.trim());
+        const trimmed = value.trim();
+        const isUrl = URL_VALUE_REGEX.test(trimmed);
         if (isUrl && depth > MAX_NESTED_URL_DEPTH) return MASK;
 
-        const sanitized = isUrl ? redactUrl(value, depth) : redactDiagnosticIdentity(value);
+        // Resolve an encoded scheme before masking email text inside the URL.
+        let sanitized = value;
+        if (isUrl) sanitized = redactUrl(value, depth);
+        else if (!ENCODED_URL_SCHEME_REGEX.test(trimmed)) sanitized = redactDiagnosticIdentity(value);
         if (sanitized !== value) {
             try {
                 let encoded = sanitized;
@@ -176,22 +190,51 @@ function redactUrlValue(raw, depth = 0) {
     return MASK;
 }
 
+/** Project keys without overwriting existing labels or losing repeated occurrences. */
+export function createDiagnosticKeyProjector(names, project) {
+    const usedNames = new Set(names);
+    const replacements = new Map();
+    let maskedKeyCount = 0;
+    return (name) => {
+        if (replacements.has(name)) return replacements.get(name);
+        let projected = project(name);
+        if (projected === name) return name;
+        if (projected === null || usedNames.has(projected)) {
+            do {
+                projected = MASK + ' ' + ++maskedKeyCount;
+            } while (usedNames.has(projected));
+        }
+        usedNames.add(projected);
+        replacements.set(name, projected);
+        return projected;
+    };
+}
+
+function redactIdentityKey(name) {
+    return redactUrlPathIdentity(name) === name ? name : null;
+}
+
 function redactParameters(parameters, depth) {
-    if (!parameters.includes('=')) return parameters;
+    if (!parameters) return parameters;
     const pairs = parameters.split('&').map((pair) => {
         const equals = pair.indexOf('=');
-        const decodedName = equals > 0 ? decodeParameter(pair.slice(0, equals)).trim() : '';
-        return { pair, equals, decodedName };
+        const name = equals === -1 ? pair : pair.slice(0, equals);
+        const decodedName = decodeParameter(name);
+        return { pair, equals, name, decodedName, fieldName: decodedName.trim() };
     });
-    const hasCloudFrontKey = pairs.some(({ decodedName }) => decodedName.toLowerCase() === CLOUDFRONT_KEY_ID);
-    return pairs.map(({ pair, equals, decodedName }) => {
-        if (equals <= 0) return pair;
-        const value = SENSITIVE_URL_PARAM_REGEX.test(decodedName) ||
-            SENSITIVE_HEADER_REGEX.test(decodedName) || ACCOUNT_FIELD_REGEX.test(decodedName) ||
-            (hasCloudFrontKey && /^policy$/i.test(decodedName))
+    const projectName = createDiagnosticKeyProjector(pairs.map(({ decodedName }) => decodedName), redactIdentityKey);
+    const hasCloudFrontKey = pairs.some(({ equals, fieldName }) =>
+        equals > 0 && fieldName.toLowerCase() === CLOUDFRONT_KEY_ID);
+    return pairs.map(({ pair, equals, name, decodedName, fieldName }) => {
+        const projectedName = projectName(decodedName);
+        const key = projectedName === decodedName ? name : encodeURIComponent(projectedName);
+        if (equals === -1) return key;
+        const value = SENSITIVE_URL_PARAM_REGEX.test(fieldName) ||
+            SENSITIVE_HEADER_REGEX.test(fieldName) || ACCOUNT_FIELD_REGEX.test(fieldName) ||
+            (hasCloudFrontKey && /^policy$/i.test(fieldName))
             ? MASK
             : redactUrlValue(pair.slice(equals + 1), depth + 1);
-        return pair.slice(0, equals + 1) + value;
+        return key + '=' + value;
     }).join('&');
 }
 
@@ -225,14 +268,15 @@ function redactUrl(value, depth) {
     const base = queryStart < 0
         ? redactUrlPathIdentity(beforeFragment)
         : redactUrlPathIdentity(beforeFragment.slice(0, queryStart)) + '?' +
-            redactParameters(redactDiagnosticIdentity(beforeFragment.slice(queryStart + 1)), depth);
+            redactParameters(beforeFragment.slice(queryStart + 1), depth);
     if (fragmentStart < 0) return exceedsUrlLimit(base) ? MASK : base;
 
-    const fragment = redactDiagnosticIdentity(url.slice(fragmentStart + 1));
+    const fragment = url.slice(fragmentStart + 1);
     const fragmentQueryStart = fragment.indexOf('?');
     const sanitizedFragment = fragmentQueryStart < 0
         ? redactParameters(fragment, depth)
-        : fragment.slice(0, fragmentQueryStart + 1) + redactParameters(fragment.slice(fragmentQueryStart + 1), depth);
+        : redactUrlPathIdentity(fragment.slice(0, fragmentQueryStart)) + '?' +
+            redactParameters(fragment.slice(fragmentQueryStart + 1), depth);
     const result = base + '#' + sanitizedFragment;
     return exceedsUrlLimit(result) ? MASK : result;
 }
@@ -266,6 +310,33 @@ function redactLinkHeader(value) {
     });
 }
 
+function redactRefreshHeader(value) {
+    // A refresh target can follow the delay directly, with or without an explicit "url=".
+    return value.replace(
+        /(^\s*[\d.]+(?:\s*[;,]\s*|\s+)(?:url\s*=\s*)?|\burl\s*=\s*)(["']?)([\s\S]*)$/i,
+        (_, prefix, quote, target) => {
+            const closingQuote = quote ? target.indexOf(quote) : -1;
+            const url = closingQuote === -1 ? target.trimEnd() : target.slice(0, closingQuote);
+            return prefix + quote + redactUrlSecrets(url) + target.slice(url.length);
+        }
+    );
+}
+
+function redactContentDisposition(value) {
+    return value.replace(DISPOSITION_PARAMETER_REGEX, (parameter, prefix, name, quoted, token) => {
+        if (!/^filename\*?$/i.test(name)) return parameter;
+        const filename = quoted === undefined ? token : quoted.replace(/\\([^\r\n])/g, '$1');
+        const extended = name.endsWith('*') && /^([^']+'[^']*')(.*)$/.exec(filename);
+        const filenameText = extended ? extended[2] : filename;
+        const identityText = extended && /^iso-8859-1'/i.test(extended[1])
+            ? filenameText.replace(/%([\da-f]{2})/gi, (_, byte) => String.fromCharCode(parseInt(byte, 16)))
+            : filenameText;
+        if (redactUrlPathIdentity(identityText) === identityText) return parameter;
+        const replacement = extended ? extended[1] + encodeURIComponent(MASK) : MASK;
+        return prefix + (extended && quoted === undefined ? replacement : '"' + replacement + '"');
+    });
+}
+
 function redactUrlReference(reference) {
     // Closing parentheses from surrounding prose can follow a URL with balanced parentheses of its own.
     let parenthesisEnd = reference.length;
@@ -295,6 +366,9 @@ export function redactDiagnosticText(rawText) {
             (_, indent, name, value) => indent + name + ': ' + redactCredentialHeader(name, value))
         .replace(/^([ \t]*)(:?[\w-]+)(:[ \t]*)([^\r\n]*(?:\r?\n(?![ \t]+:?[\w-]+:)[ \t]+[^\r\n]*)*)/gm,
             (line, indent, name, separator, value) => {
+                if (CONTENT_DISPOSITION_HEADER_REGEX.test(name)) {
+                    return indent + name + separator + redactContentDisposition(value);
+                }
                 if (LINK_HEADER_REGEX.test(name) || URL_HEADER_REGEX.test(name) || REFRESH_HEADER_REGEX.test(name)) {
                     return indent + name + separator + redactHeaderValue(name, value);
                 }
@@ -310,16 +384,34 @@ export function redactDiagnosticText(rawText) {
     return redactDiagnosticIdentity(cleaned);
 }
 
+/** Keep raw correlation IDs for selection and assign display aliases within this report only. */
+export function createCorrelationIdProjection(ids) {
+    const reservedIds = new Set(ids);
+    const aliases = new Map();
+    let sequence = 0;
+    return (id) => {
+        if (typeof id !== 'string') return id;
+        if (aliases.has(id)) return aliases.get(id);
+
+        let displayId = id;
+        if (redactDiagnosticText(id) !== id) {
+            do {
+                sequence += 1;
+                displayId = '[REDACTED-CORRELATION-' + sequence + ']';
+            } while (reservedIds.has(displayId));
+        }
+        aliases.set(id, displayId);
+        return displayId;
+    };
+}
+
 function redactHeaderValue(rawName, rawValue) {
     const name = rawName.trim();
     const value = String(rawValue ?? '');
     if (SENSITIVE_HEADER_REGEX.test(name)) return redactCredentialHeader(name, value);
     if (LINK_HEADER_REGEX.test(name)) return redactLinkHeader(value);
-    if (REFRESH_HEADER_REGEX.test(name)) {
-        return value.replace(/(\burl\s*=\s*)(?:(['"])(.*?)\2|(.*))$/i,
-            (_, prefix, quote, quotedUrl, unquotedUrl) =>
-                `${prefix}${quote ?? ''}${redactUrlSecrets(quotedUrl ?? unquotedUrl)}${quote ?? ''}`);
-    }
+    if (REFRESH_HEADER_REGEX.test(name)) return redactRefreshHeader(value);
+    if (CONTENT_DISPOSITION_HEADER_REGEX.test(name)) return redactDiagnosticText(redactContentDisposition(value));
     if (URL_HEADER_REGEX.test(name)) return value.split(/(\r?\n)/).map(redactUrlSecrets).join('');
     return redactDiagnosticText(value);
 }
@@ -376,7 +468,7 @@ export function redactDiagnosticMetadata(metadata) {
         const searchParams = /^searchParams$/i.test(key);
         const hasCloudFrontKey = searchParams && Object.keys(value)
             .some(name => name.trim().toLowerCase() === CLOUDFRONT_KEY_ID);
-        let maskedKeyCount = 0;
+        const projectName = createDiagnosticKeyProjector(Object.keys(value), redactIdentityKey);
         const copyEntry = ([name, item]) => {
             if (privateUrl && Object.hasOwn(PRIVATE_URL_COMPONENTS, name)) {
                 return [name, PRIVATE_URL_COMPONENTS[name]];
@@ -385,13 +477,7 @@ export function redactDiagnosticMetadata(metadata) {
                 if (name === 'maskedPreview') return [name, MASK];
                 if (/^(?:rawValue|value|valueLength|valueSha256)$/.test(name)) return [name, null];
             }
-            let projectedName = name;
-            if (redactUrlPathIdentity(name) !== name) {
-                // Allocate local labels without overwriting an existing literal or projected key.
-                do {
-                    projectedName = MASK + ' ' + ++maskedKeyCount;
-                } while (Object.hasOwn(value, projectedName));
-            }
+            const projectedName = projectName(name);
             if (searchParams) {
                 const parameterName = name.trim();
                 const sanitize = (param) => hasCloudFrontKey && /^policy$/i.test(parameterName)

@@ -20,7 +20,7 @@ import {
 class DolphinProfile extends ManagedProfile {
     constructor(profileId, webSocketUrl = null) {
         super(profileId, dolphinClient, 'webSocketUrl', webSocketUrl,
-            (client, address, signal) => this.#startBrowser(client, address, signal));
+            (startProfile, address, signal) => this.#startBrowser(startProfile, address, signal));
     }
 
     delete() {
@@ -31,13 +31,12 @@ class DolphinProfile extends ManagedProfile {
      * Start profile and get browser instance
      * بدء البروفايل والحصول على متصفح
      */
-    async #startBrowser(client, address, signal) {
+    async #startBrowser(startProfile, address, signal) {
         try {
             logger.info('Starting Dolphin Anty profile', { profileId: this.profileId });
 
-            if (client) {
-                // Let a dispatched launch return before cleanup can stop it by ID.
-                const startData = await client.startProfile(this.profileId);
+            if (startProfile) {
+                const startData = await startProfile();
                 address = startData.ws || startData.webSocketDebuggerUrl;
             }
 
@@ -60,8 +59,7 @@ class DolphinProfile extends ManagedProfile {
                 let connection;
                 try {
                     logger.info(`Connecting to Dolphin Anty browser (attempt ${attempt}/${retries})...`, {
-                        profileId: this.profileId,
-                        controller: endpoint.origin
+                        profileId: this.profileId
                     });
                     connection = await connectBrowser(puppeteer, endpoint, { signal });
                     const pages = await connection.pages();
@@ -87,11 +85,11 @@ class DolphinProfile extends ManagedProfile {
                         logger.info(`Waiting ${waitTime / 1000}s before retry...`);
                         await controllerDelay(waitTime, signal);
 
-                        if (!client) continue;
+                        if (!startProfile) continue;
                         signal.throwIfAborted();
                         let address;
                         try {
-                            const startData = await client.startProfile(this.profileId);
+                            const startData = await startProfile();
                             address = startData.ws || startData.webSocketDebuggerUrl;
                         } catch (refreshError) {
                             signal.throwIfAborted();

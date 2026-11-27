@@ -3,7 +3,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { CamoufoxTrafficRecorder, verifyTrafficIntegrity } from '../../src/camoufox/traffic-recorder.js';
+import {
+    CamoufoxTrafficRecorder, selectProfileNativeLogPaths, verifyTrafficIntegrity
+} from '../../src/camoufox/traffic-recorder.js';
 
 const nativeRequest = 'http request [\nGET /synthetic HTTP/1.1\nHost: fixture.invalid\n]\n';
 const nativeName = 'necko-pre-tls.moz_log';
@@ -126,4 +128,52 @@ test('an explicitly selected external native log is visible as unverified beside
     assert.equal(verdict.valid, true);
     assert.deepEqual(verdict.unverifiedNativeArtifacts, ['necko-pre-tls.moz_log (external log)']);
     assert.equal(fs.readFileSync(external, 'utf8'), nativeRequest);
+});
+
+test('Necko generation selection preserves previously unassigned child logs', async (t) => {
+    const cases = [
+        { label: 'retained child without parent', name: nativeName, child: '.child-1' },
+        {
+            label: 'retained child at a supported rotated path',
+            name: nativeName + '.generation-00000000-0000-4000-8000-000000000001',
+            child: '.child-2.0'
+        },
+        { label: 'retained empty parent and child', name: nativeName, child: '.child-1', hasParent: true },
+        { label: 'first recording with no historical logs', name: nativeName }
+    ];
+
+    for (const { label, name, child, hasParent } of cases) {
+        await t.test(label, async (t) => {
+            const { nativeDir, trafficDir, indexPath, create, verify } = fixture(t);
+            const selectedPath = path.join(nativeDir, name);
+            const historicalChild = selectedPath + (child ?? '');
+            const historicalRequest = nativeRequest.replace('/synthetic', '/historical');
+            if (child) {
+                fs.mkdirSync(nativeDir, { mode: 0o700 });
+                fs.writeFileSync(historicalChild, historicalRequest, { mode: 0o600 });
+            }
+            if (hasParent) fs.writeFileSync(selectedPath, '', { mode: 0o600 });
+
+            const nativeOnly = selectProfileNativeLogPaths(trafficDir, nativeDir, { neckoMozLogPath: selectedPath });
+            assert.equal(nativeOnly.neckoMozLogPath !== selectedPath, Boolean(child));
+            assert.equal(fs.existsSync(indexPath), false);
+            const recorder = create({ neckoMozLogPath: selectedPath });
+            assert.equal(recorder.neckoMozLogPath !== selectedPath, Boolean(child));
+            assert.equal((await recorder.flushSummary()).neckoMozLog.requestBlockCount, 0);
+
+            const currentChild = recorder.neckoMozLogPath + '.child-1';
+            fs.writeFileSync(currentChild, nativeRequest, { mode: 0o600 });
+            const final = await recorder.stop();
+            const artifact = final.integrity.nativeArtifacts.neckoMozLog;
+            assert.equal(final.neckoMozLog.requestBlockCount, 1);
+            assert.equal(artifact.closed, true);
+            assert.deepEqual(artifact.children.map(({ file }) => file), [path.basename(currentChild)]);
+
+            const verdict = verify();
+            assert.equal(verdict.valid, true);
+            assert.deepEqual(verdict.unverifiedNativeArtifacts, child
+                ? [...(hasParent ? [name] : []), path.basename(historicalChild)] : []);
+            if (child) assert.equal(fs.readFileSync(historicalChild, 'utf8'), historicalRequest);
+        });
+    }
 });

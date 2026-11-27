@@ -28,6 +28,7 @@ async function fixture(t, { productionLogger = false } = {}) {
             events: [],
             stops: [],
             starts: 0,
+            targets: 0,
             allocations: 0,
             consumers: 0,
             stopOK: process.env.FIXTURE_STOP_OK !== 'false',
@@ -76,6 +77,17 @@ async function fixture(t, { productionLogger = false } = {}) {
                             state.trace('saved-at-stop', saved[0].success, saved[0].profileCleanup);
                         }
                         if (process.env.FIXTURE_OUTPUT_FAILURE === 'cleanup') state.breakOutput('results.json');
+                        if (process.env.FIXTURE_OUTPUT_FAILURE === 'cleanup-replacement') {
+                            const output = path.join(process.env.GMAIL_CREATOR_STATE_DIR, 'results.json');
+                            fs.writeFileSync(output + '.before-cleanup', fs.readFileSync(output), { mode: 0o600 });
+                            const rename = fs.renameSync;
+                            fs.renameSync = (from, to) => {
+                                if (to === output) {
+                                    throw Object.assign(new Error('Fixture replacement failure'), { code: 'EIO' });
+                                }
+                                rename(from, to);
+                            };
+                        }
                         if (process.env.FIXTURE_OUTPUT_FAILURE === 'summary') state.breakOutput('summary.json');
                         return state.stops.length ? state.stops.shift() : state.stopOK;
                     },
@@ -127,14 +139,17 @@ async function fixture(t, { productionLogger = false } = {}) {
                 let attached = true;
                 transport.onclose = () => { attached = false; };
                 return {
+                    isConnected: () => attached,
                     pages: async () => state.existingPages ?? [],
                     async newPage() {
                         if (process.env.FIXTURE_OUTPUT_FAILURE === 'initialization') state.breakOutput('results.json');
                         if (state.pageError) throw state.pageError;
                         let closed = false;
+                        const targetId = (++state.targets).toString(16).padStart(32, '0');
                         const page = {
                             evaluateOnNewDocument: async () => {},
                             url: () => 'about:blank',
+                            target: () => ({ _targetId: targetId }),
                             evaluate: async () => null,
                             isClosed: () => closed,
                             async close() {
@@ -271,6 +286,10 @@ test('managed stop discards debug addresses and retries unconfirmed shutdown by 
         assert.equal(profile[addressField], null);
         assert.equal(profile.browser, null);
         assert.equal(profile.page, null);
+        const unresolved = { profileId: id, profileCleanup: 'stop-unconfirmed' };
+        await assert.rejects(profile.start(), unresolved);
+        await assert.rejects(profile.getBrowser(), unresolved);
+        assert.deepEqual(state.events.filter(([, profileId]) => profileId === id), [['stop', id]]);
         assert.equal(await profile.stop(), true);
 
         const freshBrowser = await profile.getBrowser();
@@ -386,6 +405,59 @@ test('borrowed sessions reject a closed cached page without opening or adopting 
     }
 });
 
+test('borrowed sessions reject an already disconnected browser without reconnecting', async t => {
+    const sandbox = await fixture(t);
+    const { default: state } = await sandbox.load('src/fixture.cjs');
+    t.mock.method(globalThis, 'setTimeout', callback => queueMicrotask(callback));
+    let existingCloses = 0;
+    state.existingPages = [{
+        isClosed: () => false,
+        async close() { existingCloses++; }
+    }];
+    for (const service of ['gpmlogin', 'dolphin']) {
+        const { default: Profile } = await sandbox.load(`src/${service}/profile.js`);
+        const address = 'wss://borrowed-controller.invalid/devtools/browser/supplied?key=fixture-private';
+        const profile = new Profile(service + '-existing', address);
+
+        const browser = await profile.getBrowser();
+        assert.equal(browser.isConnected(), true);
+        assert.equal(await profile.getBrowser(), browser);
+        const ownedPage = profile.page;
+        const closedPage = await profile.createOwnedPage();
+        await closedPage.close();
+        let closeAttempts = 0;
+        const close = ownedPage.close.bind(ownedPage);
+        ownedPage.close = async () => {
+            closeAttempts++;
+            await close();
+        };
+        state.events.length = 0;
+        await browser.disconnect();
+        assert.equal(browser.isConnected(), false);
+
+        const expected = { message: 'Borrowed browser connection is unavailable' };
+        await assert.rejects(profile.getBrowser(), expected);
+        await assert.rejects(profile.getPage(), expected);
+        const unresolved = {
+            profileId: profile.profileId,
+            profileCleanup: 'stop-unconfirmed',
+            targetIds: [ownedPage.target()._targetId],
+            unresolvedPageCount: 1
+        };
+        await assert.rejects(profile.stop(), error => {
+            assert.deepEqual({ ...error }, unresolved);
+            assert.ok(!error.message.includes('fixture-private'));
+            return true;
+        });
+        await assert.rejects(profile.stop(), unresolved);
+        await assert.rejects(profile.start(), unresolved);
+        assert.equal(ownedPage.isClosed(), false);
+        assert.equal(closeAttempts, 0);
+        assert.deepEqual(state.events, [['disconnect']]);
+        assert.equal(existingCloses, 0);
+    }
+});
+
 test('cancelling after page creation closes the owned borrowed page while still attached', async t => {
     const sandbox = await fixture(t);
     const { default: state } = await sandbox.load('src/fixture.cjs');
@@ -407,6 +479,39 @@ test('cancelling after page creation closes the owned borrowed page while still 
         assert.equal(allocated.isClosed(), true);
         assert.deepEqual(state.events, [['attach', address], ['close-page'], ['disconnect']]);
         assert.equal(profile.page, null);
+    }
+});
+
+test('queued startup needs a confirmed controller stop for owned profiles', async t => {
+    const sandbox = await fixture(t);
+    const { default: state } = await sandbox.load('src/fixture.cjs');
+    t.mock.method(globalThis, 'setTimeout', callback => queueMicrotask(callback));
+    for (const service of ['gpmlogin', 'dolphin']) {
+        const { default: Profile } = await sandbox.load(`src/${service}/profile.js`);
+        const id = service + '-queued';
+        const profile = await new Profile(id).start();
+        state.events.length = 0;
+        state.stops.push(false, true);
+        const unconfirmed = profile.stop();
+        await assert.rejects(profile.start(), { profileId: id, profileCleanup: 'stop-unconfirmed' });
+        assert.equal(await unconfirmed, false);
+        assert.deepEqual(state.events.filter(([, profileId]) => profileId === id), [['stop', id]]);
+
+        const confirmed = profile.stop();
+        const restarted = profile.start();
+        assert.equal(await confirmed, true);
+        assert.equal(await restarted, profile);
+        assert.deepEqual(state.events.filter(([, profileId]) => profileId === id), [
+            ['stop', id], ['stop', id], ['start', id]
+        ]);
+
+        const borrowedId = service + '-borrowed-queued';
+        const borrowed = await new Profile(borrowedId, 'wss://borrowed-controller.invalid/devtools/browser/fixture').start();
+        const detached = borrowed.stop();
+        const attached = borrowed.start();
+        assert.equal(await detached, false);
+        assert.equal(await attached, borrowed);
+        assert.deepEqual(state.events.filter(([, profileId]) => profileId === borrowedId), []);
     }
 });
 
@@ -538,6 +643,36 @@ test('managed startup cancellation terminates a pending handshake and cleans an 
         await attachedExisting;
         assert.equal(await existing.stop(), true);
         await starting;
+        assert.deepEqual(state.events.map(([action]) => action), ['start', 'attach', 'terminate', 'stop']);
+    }
+});
+
+test('cancelling a directly started managed profile reports its unresolved controller shutdown', async t => {
+    const sandbox = await fixture(t);
+    const { default: state } = await sandbox.load('src/fixture.cjs');
+    t.mock.method(globalThis, 'setTimeout', callback => queueMicrotask(callback));
+    state.holdHandshake = true;
+    for (const service of ['gpmlogin', 'dolphin']) {
+        const { default: Profile } = await sandbox.load(`src/${service}/profile.js`);
+        const profileId = service + '-direct';
+        const profile = new Profile(profileId);
+        const reason = new Error('fixture cancelled the direct start');
+        state.events.length = 0;
+        await assert.rejects(profile.start({ signal: AbortSignal.abort(reason) }), error => error === reason);
+        assert.deepEqual(state.events, []);
+
+        const cancellation = new AbortController();
+        const attaching = new Promise(resolve => { state.onAttach = resolve; });
+        const unresolved = { profileId, profileCleanup: 'stop-unconfirmed' };
+        const stoppingRequired = assert.rejects(profile.start({ signal: cancellation.signal }), {
+            ...unresolved, cause: reason
+        });
+        await attaching;
+        cancellation.abort(reason);
+        await stoppingRequired;
+        assert.equal(profile.browser, null);
+        await assert.rejects(profile.getBrowser(), unresolved);
+        assert.equal(await profile.stop(), true);
         assert.deepEqual(state.events.map(([action]) => action), ['start', 'attach', 'terminate', 'stop']);
     }
 });
@@ -775,6 +910,33 @@ test('CLI identifies the saved result when cleanup is unconfirmed and summary wr
     assert.ok(!completed.stderr.includes(result.profileId), completed.stderr);
 });
 
+test('CLI locates the unchanged result when a cleanup update cannot replace it', async t => {
+    for (const stopOK of [true, false]) {
+        await t.test(stopOK ? 'confirmed stop' : 'unconfirmed stop', async t => {
+            const sandbox = await fixture(t);
+            const completed = sandbox.run(['bin/gmail-account-creator.js'], {
+                LOG_LEVEL: 'ERROR',
+                FIXTURE_CONSUMER_OUTCOME: 'manual',
+                FIXTURE_STOP_OK: String(stopOK),
+                FIXTURE_OUTPUT_FAILURE: 'cleanup-replacement'
+            });
+            assert.equal(completed.status, 1);
+            const filename = path.join(sandbox.root, 'results.json');
+            const bytes = await readFile(filename);
+            assert.deepEqual(bytes, await readFile(filename + '.before-cleanup'));
+            const [saved] = JSON.parse(bytes);
+            assert.equal(saved.profileCleanup, 'pending');
+            const diagnostic = completed.stderr;
+            assert.equal(diagnostic.includes('Could not save profile cleanup in results.json.'), true);
+            assert.equal(diagnostic.includes('resultId ' + saved.resultId), true);
+            assert.equal(diagnostic.includes('recorded cleanup pending'), true);
+            assert.equal(diagnostic.includes('observed cleanup ' + (stopOK ? 'stopped' : 'stop-unconfirmed')), true);
+            assert.equal(diagnostic.includes(saved.profileId), false);
+            assert.equal((await readdir(sandbox.root)).includes('results.json.lock'), false);
+        });
+    }
+});
+
 test('CLI retains every unconfirmed profile when one task prevents the run summary from being written', async t => {
     for (const phase of ['concurrent', 'concurrent-persisted']) {
         const sandbox = await fixture(t);
@@ -928,6 +1090,87 @@ test('routine logs redact identity and startup details in console and file outpu
         assert.match(output, /"status":"fixture-ready","attempt":2/);
         assert.doesNotMatch(output, /fixture-controller-id|fixture-account-title|Fixture Account Name|example\.invalid|\/fixture\/private|Fixture Physical/);
         assert.doesNotMatch(output, /Fixture (?:Contact Phone|Alternate Phone|Birth Date)/);
+    }
+});
+
+test('GPM and Dolphin debugging logs show retries and results without controller endpoints', async t => {
+    const sandbox = await fixture(t, { productionLogger: true });
+    const completed = sandbox.run(['--input-type=module', '-e', `
+        import assert from 'node:assert/strict';
+        import state from './src/fixture.cjs';
+        import GPMProfile from './src/gpmlogin/profile.js';
+        import DolphinProfile from './src/dolphin/profile.js';
+
+        globalThis.setTimeout = callback => queueMicrotask(callback);
+        GPMProfile.prototype.injectAntiDetectionScripts = async () => {};
+        const endpoint = 'wss://private-controller.invalid:37491/devtools/browser/fixture';
+        for (const Profile of [GPMProfile, DolphinProfile]) {
+            state.onAttach = () => {
+                state.onAttach = null;
+                throw new Error('Synthetic browser connection failure');
+            };
+            const profile = await new Profile('fixture-profile', endpoint).start();
+            assert.equal(await profile.stop(), false);
+            assert.equal(profile.browser, null);
+        }
+        assert.deepEqual(state.events.filter(([event]) => event === 'attach'),
+            Array.from({ length: 4 }, () => ['attach', endpoint]));
+    `], { FIXTURE_TRACE: '' });
+    assert.equal(completed.status, 0, completed.stderr);
+    assert.equal(completed.stderr, '');
+    const logs = path.join(sandbox.root, 'logs');
+    const [logFile] = await readdir(logs);
+    const outputs = [completed.stdout, await readFile(path.join(logs, logFile), 'utf8')];
+    for (const output of outputs) {
+        assert.match(output, /Browser connection attempt 2\/8/i);
+        assert.match(output, /Connecting to Dolphin Anty browser \(attempt 2\/5\)/);
+        assert.match(output, /\[WARN\] (?:GPM )?Browser connection attempt 1 failed/i);
+        assert.match(output, /Dolphin Anty browser connection attempt 1 failed/);
+        assert.equal([...output.matchAll(/browser connected successfully/gi)].length, 2);
+    }
+    assert.deepEqual(outputs.map(output => /private-controller\.invalid|37491|\/devtools\/browser\//.test(output)),
+        [false, false]);
+});
+
+test('log levels normalize padding and diagnose unknown values without echoing them', async t => {
+    const sandbox = await fixture(t, { productionLogger: true });
+    const defaultLevels = ['ERROR', 'WARN', 'INFO'];
+    const source = `
+        import logger from './src/utils/logger.js';
+        for (const level of ['error', 'warn', 'info', 'debug']) {
+            logger[level]('Logging level fixture');
+        }
+    `;
+    for (const [label, level, expected, invalid] of [
+        ['default', undefined, defaultLevels, false],
+        ['empty', '', defaultLevels, false],
+        ['padded-error', '  eRrOr  ', ['ERROR'], false],
+        ['padded-silent', '  SiLeNt  ', [], false],
+        ['invalid', 'fixture-private-invalid-level', defaultLevels, true],
+        ['whitespace-only', ' \t ', defaultLevels, true]
+    ]) {
+        await t.test(label, async () => {
+            const state = path.join(sandbox.root, label);
+            const completed = sandbox.run(['--input-type=module', '-e', source], {
+                GMAIL_CREATOR_STATE_DIR: state, LOG_LEVEL: level
+            });
+            assert.equal(completed.status, 0, completed.stderr);
+            assert.equal(completed.stderr, invalid ? 'Invalid LOG_LEVEL. Using INFO.\n' : '');
+            const loggedLevels = output => [...output.matchAll(/\[(ERROR|WARN|INFO|DEBUG)\] Logging level fixture/g)]
+                .map(([, loggedLevel]) => loggedLevel);
+            assert.deepEqual(loggedLevels(completed.stdout), expected);
+            assert.doesNotMatch(completed.stdout, /fixture-private-invalid-level/);
+            const logs = path.join(state, 'logs');
+            if (expected.length === 0) {
+                assert.equal(completed.stdout, '');
+                await assert.rejects(readdir(logs), { code: 'ENOENT' });
+                return;
+            }
+            const [file] = await readdir(logs);
+            const contents = await readFile(path.join(logs, file), 'utf8');
+            assert.deepEqual(loggedLevels(contents), expected);
+            assert.doesNotMatch(contents, /fixture-private-invalid-level/);
+        });
     }
 });
 

@@ -873,7 +873,7 @@ export class CanvasWebglConsistencyLedger {
         try {
             const bytes = readLedgerBytes(this.ledgerPath);
             if (bytes === null) return false;
-            const raw = JSON.parse(bytes.toString('utf8'));
+            const raw = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes));
             if (!Array.isArray(raw?.entries) ||
                 (raw.profileId !== undefined && raw.profileId !== this.profileId) ||
                 (raw.driftAlerts !== undefined && !Array.isArray(raw.driftAlerts)) ||
@@ -945,10 +945,16 @@ export class CanvasWebglConsistencyLedger {
                 });
             }
             writePrivateFile(filePath, content);
+            this.#storageRevision = ledgerRevision(content);
         } finally {
-            releaseProfileLease(lease);
+            try {
+                releaseProfileLease(lease);
+            } catch {
+                process.emitWarning('Could not release the fingerprint ledger lease', {
+                    code: 'CAMOUFOX_FINGERPRINT_LEDGER_LEASE_CLEANUP_FAILED'
+                });
+            }
         }
-        this.#storageRevision = ledgerRevision(content);
     }
 }
 

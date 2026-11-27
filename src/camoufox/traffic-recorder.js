@@ -25,15 +25,20 @@ import {
     writeCaptureExport
 } from './capture-io.js';
 import {
-    captureEventProfileId, captureEventTraceId, capturePolicyAllowsBody, readCaptureExportIndex
+    captureEventProfileId, captureEventTraceId, capturePolicyAllowsBody,
+    createCaptureProfileContinuityCheck, createCaptureRedirectBodyCheck, observedProfileIdentity, readCaptureExportIndex
 } from './capture-export-policy.js';
-import { CookieLineage, deriveCookieObservations } from './cookie-lineage.js';
+import { CookieLineage, deriveCookieObservations, PRIMARY_COOKIE_JAR } from './cookie-lineage.js';
 import {
-    acquireDirectoryLease, archiveLegacyNativeLogs, assertExternalNativePath, assertProfileLease, inspectProfileDirectory,
-    locateProfile, PROFILE_LEASE_DIRECTORY, releaseProfileLease, validateProfileId
+    acquireTrafficDirectoryLease, archiveLegacyNativeLogs, assertExternalNativePath, assertProfileLease,
+    captureWriterLeaseDirectory, inspectProfileDirectory, locateProfile, releaseProfileLease, validateProfileId
 } from './profile-storage.js';
-import { allowsTrafficBody, projectTrafficBody, sampleTrafficBody, shareableBodyFormat } from './traffic-body.js';
 import {
+    allowsTrafficBody, isBodylessHttpResponse, projectTrafficBody, redirectDropsUpload, sampleTrafficBody, shareableBodyFormat
+} from './traffic-body.js';
+import {
+    createCorrelationIdProjection,
+    isAnonymousProfileId,
     redactDiagnosticMetadata,
     redactDiagnosticText,
     redactProfileId,
@@ -45,6 +50,7 @@ import {
 } from './traffic-redaction.js';
 
 export { ANTI_BOT_COOKIE_REGEX, parseSetCookieHeader, parseCookieHeader } from './cookie-lineage.js';
+export { acquireProfileTrafficDeletionLease, acquireTrafficDirectoryLease } from './profile-storage.js';
 export {
     redactDiagnosticMetadata,
     redactDiagnosticText,
@@ -155,6 +161,14 @@ export function observedWebSocketPayloadBytes(event) {
     if (event?.payloadBytes === 0 && (event.bodyOmittedReason === 'body-recording-disabled' ||
         event.bodyOmittedReason === 'sensitive-or-unsupported-url')) return null;
     return Number.isSafeInteger(event?.payloadBytes) && event.payloadBytes >= 0 ? event.payloadBytes : null;
+}
+
+/** Return observed content length or a zero known from the HTTP response semantics. */
+export function observedHttpResponseBodyBytes(event, method = event?.method) {
+    if (!event) return null;
+    if (event.bodyOmittedReason === 'response-without-body' || isBodylessHttpResponse(method, event.status)) return 0;
+    if (event.bodyBytes === 0 && event.bodyOmittedReason) return null;
+    return isByteCount(event.bodyBytes) ? event.bodyBytes : null;
 }
 
 /**
@@ -1343,6 +1357,14 @@ function getPayloadCaptureIssues(events) {
     return { writeFailures, storageOmissions };
 }
 
+function pendingPayloadReference(trafficDir, pendingFile, manifest, storage) {
+    const match = PENDING_PAYLOAD_PATTERN.exec(pendingFile);
+    if (!match || Object.hasOwn(manifest, pendingFile) ||
+        Object.hasOwn(manifest, `${pendingFile}.tmp`) ||
+        measureCapturePayload(trafficDir, pendingFile, storage) !== 0) return null;
+    return `payloads/${match[1]}`;
+}
+
 function verifyPayloads(trafficDir, manifest, events, { trustedLocal, check, recoverAfter = null }) {
     const byPath = new Map(Object.keys(manifest).map((relativePath) => [relativePath, []]));
     const unverifiedPayloads = [];
@@ -1469,7 +1491,9 @@ function validNativeGenerations(prefix, entry) {
     });
 }
 
-function verifyArtifact(trafficDir, integrity, prefix, { describe, allowAppendedBytes = false, trustedLocal = false } = {}) {
+function verifyArtifact(trafficDir, integrity, prefix, {
+    describe, allowAppendedBytes = false, allowMissing = false, trustedLocal = false
+} = {}) {
     const isWire = prefix === 'preTlsWireLog';
     const fileName = isWire ? getCaptureWireLogFileName(integrity) : INTEGRITY_ARTIFACTS[prefix];
     const digest = integrity[`${prefix}Sha256`];
@@ -1492,7 +1516,10 @@ function verifyArtifact(trafficDir, integrity, prefix, { describe, allowAppended
     const file = describe ? readCaptureFile(trafficDir, location, options) : hashCaptureFile(trafficDir, location, {
         ...options, prefixBytes
     });
-    if (!file) throw new Error(`Missing ${location} on disk`);
+    if (!file) {
+        if (allowMissing) return null;
+        throw new Error(`Missing ${location} on disk`);
+    }
     const actual = describe
         ? { sha256: hashPayload(file.subarray(0, prefixBytes)).sha256, bytes: file.length }
         : file;
@@ -1518,15 +1545,20 @@ function omittedNativeSummary(describe, bytes) {
     return { ...describe(null), exists: true, bytes, diagnosticsOmitted: 'size-limit' };
 }
 
-function captureNativeFile(nativeDir, file, trustedLocal, describe) {
+function captureNativeFile(nativeDir, file, trustedLocal, describe, checkpoint) {
     const options = { trustedLocal, maxBytes: MAX_INTEGRITY_LOG_BYTES };
     const raw = readNativeFileForSummary(nativeDir, file, options);
     if (raw) {
+        if (checkpoint) {
+            if (raw.length < checkpoint.bytes) throw new Error(`${file} byte length mismatch`);
+            const prefix = raw.subarray(0, checkpoint.hashedBytes ?? checkpoint.bytes);
+            if (hashPayload(prefix).sha256 !== checkpoint.sha256) throw new Error(`${file} SHA-256 mismatch`);
+        }
         const summary = describe(raw);
         return { evidence: { file, sha256: summary.sha256, bytes: summary.bytes }, summary };
     }
     const hashedBytes = MAX_INTEGRITY_LOG_BYTES;
-    const { sha256, bytes } = hashCaptureFile(nativeDir, file, { ...options, prefixBytes: hashedBytes });
+    const { sha256, bytes } = hashCaptureFile(nativeDir, file, { ...options, prefixBytes: hashedBytes, checkpoint });
     return {
         evidence: { file, sha256, bytes, ...(hashedBytes < bytes ? { hashedBytes } : {}) },
         summary: omittedNativeSummary(describe, bytes)
@@ -1645,11 +1677,16 @@ function verifyProfileNativeGenerations(index, nativeDir, { trustedLocal, check,
     return { artifacts, unverified: [...unverified], summaries };
 }
 
-function nextProfileNativePath(nativeDir, prefix, pathName, existing) {
+function nextProfileNativePath(nativeDir, prefix, pathName, existing, trustedLocal) {
     if (!nativeDir || !pathName || path.dirname(pathName) !== nativeDir) return pathName;
-    if (!existing && !fs.lstatSync(pathName, { throwIfNoEntry: false })) return pathName;
     const file = path.basename(pathName);
     if (!profileNativeArtifactName(prefix, file)) return pathName;
+
+    // A retained child still occupies the generation when the parent log is absent.
+    const occupied = existing || fs.lstatSync(pathName, { throwIfNoEntry: false }) ||
+        (prefix === 'neckoMozLog' && fs.lstatSync(nativeDir, { throwIfNoEntry: false }) &&
+            profileNativeEntries(nativeDir, trustedLocal).some(({ name }) => isNeckoChildLog(file, name)));
+    if (!occupied) return pathName;
     return path.join(nativeDir, `${INTEGRITY_ARTIFACTS[prefix]}.generation-${crypto.randomUUID()}`);
 }
 
@@ -1661,73 +1698,11 @@ export function selectProfileNativeLogPaths(trafficDir, nativeDir, paths) {
         trustedLocal, check: (verify) => verify()
     });
     return {
-        sslKeyLogPath: nextProfileNativePath(nativeDir, 'sslKeyLog', paths.sslKeyLogPath, artifacts.sslKeyLog),
-        neckoMozLogPath: nextProfileNativePath(nativeDir, 'neckoMozLog', paths.neckoMozLogPath, artifacts.neckoMozLog)
+        sslKeyLogPath: nextProfileNativePath(nativeDir, 'sslKeyLog', paths.sslKeyLogPath,
+            artifacts.sslKeyLog, trustedLocal),
+        neckoMozLogPath: nextProfileNativePath(nativeDir, 'neckoMozLog', paths.neckoMozLogPath,
+            artifacts.neckoMozLog, trustedLocal)
     };
-}
-
-function captureWriterLeaseDirectory(trafficDir) {
-    const key = crypto.createHash('sha256').update(path.basename(trafficDir)).digest('hex');
-    return path.join(path.dirname(trafficDir), `.camoufox-traffic-${key}~`);
-}
-
-function profileDeletionLease(profileDir) {
-    const key = crypto.createHash('sha256').update(path.basename(profileDir)).digest('hex');
-    return path.join(path.dirname(profileDir), PROFILE_LEASE_DIRECTORY, `~delete-${key}`);
-}
-
-function requireLeaseIdle(directory) {
-    if (!fs.lstatSync(directory, { throwIfNoEntry: false })) return;
-    // The existing lease protocol rejects a live owner and reclaims a dead owner.
-    releaseProfileLease(acquireDirectoryLease(directory));
-}
-
-function checkDeletingAncestors(directory) {
-    for (let current = path.resolve(directory); current !== path.dirname(current); current = path.dirname(current)) {
-        requireLeaseIdle(profileDeletionLease(current));
-    }
-}
-
-/** Hold this outside the profile while checking writers and removing its directory. */
-export function acquireProfileTrafficDeletionLease(profileDir) {
-    const deletion = acquireDirectoryLease(profileDeletionLease(profileDir));
-    try {
-        // Explicit trafficDir may name the profile itself or any of its subdirectories.
-        requireLeaseIdle(captureWriterLeaseDirectory(profileDir));
-        const pending = [profileDir];
-        while (pending.length) {
-            const directory = pending.pop();
-            const entries = listCaptureDirectory(directory, { trustedLocal: true });
-            for (const entry of entries) {
-                if (!entry.isDirectory()) continue;
-                const child = path.join(directory, entry.name);
-                if (/^\.camoufox-traffic-[a-f0-9]{64}~$/.test(entry.name)) requireLeaseIdle(child);
-                else pending.push(child);
-            }
-        }
-        return deletion;
-    } catch (error) {
-        releaseProfileLease(deletion);
-        throw error;
-    }
-}
-
-/** Lock the capture at its pathname across both appends and whole-directory migration. */
-export function acquireTrafficDirectoryLease(trafficDir) {
-    checkDeletingAncestors(trafficDir);
-    ensurePrivateDirectory(trafficDir);
-    const directory = fs.realpathSync.native(trafficDir);
-    const lease = acquireDirectoryLease(captureWriterLeaseDirectory(directory));
-    try {
-        // Check after publishing the writer too. A concurrent delete must see this
-        // writer or this writer must see the deletion before it can append any data.
-        checkDeletingAncestors(directory);
-        assertProfileLease(lease);
-        return lease;
-    } catch (error) {
-        releaseProfileLease(lease);
-        throw error;
-    }
 }
 
 function recordedArtifactPath(trafficDir, reference) {
@@ -1769,9 +1744,24 @@ export function inspectHarScratch(trafficDir, profileId, harDirectory, storageGe
         const { events } = parseTrafficLedger(raw, { recover: true });
         if (!events.every((event) => ownsId(event.attribution?.profileId) &&
             captureEventTraceId(event) === session.traceId)) return null;
+        const recording = phase === 'recording';
+        verifyLedgerCheckpoint(index.integrity, events, { allowLaterEvents: recording });
+        const manifest = { ...getPayloadManifest(index.integrity) };
+        // Validate the private source before it can be deleted after publication.
+        // The shareable HAR projection only reads eligible bodies.
+        verifyPayloads(trafficDir, manifest, events, {
+            trustedLocal: true,
+            check: (verify) => verify(),
+            recoverAfter: recording ? index.integrity.eventCount : index.integrity.payloadManifest == null ? 0 : null
+        });
         const payloads = new Set(events.map((event) => event.payloadFile));
-        if (listCapturePayloads(trafficDir, options).some((file) => !payloads.has(file))) return null;
-        verifyLedgerCheckpoint(index.integrity, events, { allowLaterEvents: phase === 'recording' });
+        if (listCapturePayloads(trafficDir, options).some((file) => {
+            if (payloads.has(file)) return false;
+            // A complete append can survive an exit before its empty marker is removed.
+            // Keep that marker until publication succeeds and the scratch is cleaned up.
+            const attachment = recording && pendingPayloadReference(trafficDir, file, manifest, options);
+            return !attachment || !payloads.has(attachment);
+        })) return null;
         return pending;
     } catch {
         return null;
@@ -1816,8 +1806,14 @@ export class CamoufoxTrafficRecorder {
     #nativeLogsClosed = false;
     #nativeLogsAreClosed;
     #nativeLogCheckpoint;
+    #wireLogCheckpoint;
     #harRecovery;
     #observationSequence = 0;
+    #cookieJarIds = new WeakMap();
+    #hasPrimaryCookieJar = false;
+    // Undefined until a request is recorded. Null means a single source cannot be established.
+    #singleRequestPage;
+    #profileChangedAfterCapture = false;
 
     /**
      * @param {object} [options]
@@ -2031,16 +2027,19 @@ export class CamoufoxTrafficRecorder {
                 trafficDir: this.trafficDir,
                 payloadsDir: this.payloadsDir,
                 nativeDir: this.profileNativeDir
-            });
+            }, this.#captureLease);
 
             this.resetTrafficOnStart = options.resetTrafficOnStart === true;
             if (this.resetTrafficOnStart) {
-                const removedWirePath = this.#removeIndexedWireForReset();
-                for (const artifactPath of new Set([
-                    this.trafficNdjsonPath,
-                    this.preTlsWireLogPath,
-                    this.attributionIndexPath
-                ])) {
+                const previousWire = this.#verifyIndexedWireForReset();
+                fs.rmSync(this.trafficNdjsonPath, { force: true });
+                if (previousWire) {
+                    removeVerifiedCaptureFile(this.trafficDir, previousWire.fileName, {
+                        sha256: previousWire.sha256, bytes: previousWire.bytes, trustedLocal: this.trustedLocal
+                    });
+                }
+                const removedWirePath = previousWire && path.join(this.trafficDir, previousWire.fileName);
+                for (const artifactPath of new Set([this.preTlsWireLogPath, this.attributionIndexPath])) {
                     if (artifactPath !== removedWirePath) fs.rmSync(artifactPath, { force: true });
                 }
                 fs.rmSync(this.payloadsDir, { recursive: true, force: true });
@@ -2048,9 +2047,9 @@ export class CamoufoxTrafficRecorder {
                 this._resumeExistingChainIfPresent(configuredWirePath);
             }
             this.sslKeyLogPath = nextProfileNativePath(this.profileNativeDir, 'sslKeyLog', this.sslKeyLogPath,
-                this.profileNativeArtifacts.sslKeyLog);
+                this.profileNativeArtifacts.sslKeyLog, this.trustedLocal);
             this.neckoMozLogPath = nextProfileNativePath(this.profileNativeDir, 'neckoMozLog', this.neckoMozLogPath,
-                this.profileNativeArtifacts.neckoMozLog);
+                this.profileNativeArtifacts.neckoMozLog, this.trustedLocal);
             this.harStartEventCount = this.chainedEventCount;
             this._ensureDirectories();
 
@@ -2073,7 +2072,7 @@ export class CamoufoxTrafficRecorder {
         }
     }
 
-    #removeIndexedWireForReset() {
+    #verifyIndexedWireForReset() {
         const { trafficDir, trustedLocal } = this;
         const { integrity } = readTrafficIndex(trafficDir, { optional: true, trustedLocal }) ?? {};
         if (integrity?.preTlsWireLogFile === undefined) return;
@@ -2086,8 +2085,10 @@ export class CamoufoxTrafficRecorder {
         if (!isSha256(sha256) || !isByteCount(bytes)) {
             throw new Error('Missing or invalid capture wire log checkpoint');
         }
-        removeVerifiedCaptureFile(trafficDir, fileName, { sha256, bytes, trustedLocal });
-        return path.join(trafficDir, fileName);
+        // Reject known mismatches before resetting any files. Deletion checks the
+        // checkpoint again because the wire may have changed after this read.
+        verifyArtifact(trafficDir, integrity, 'preTlsWireLog', { allowMissing: true, trustedLocal });
+        return { fileName, sha256, bytes };
     }
 
     /**
@@ -2127,6 +2128,7 @@ export class CamoufoxTrafficRecorder {
                         throw new Error('Configured wire log differs from the capture checkpoint');
                     }
                     this.priorWireLogFile = fileName;
+                    this.#wireLogCheckpoint = { file: fileName, sha256: verified.sha256, bytes: checkpointBytes };
                     if (!configuredWirePath) {
                         this.preTlsWireLogPath = recordedWirePath;
                         this.preTlsWireLogFile = fileName;
@@ -2609,16 +2611,12 @@ export class CamoufoxTrafficRecorder {
         const storage = { trustedLocal: this.trustedLocal };
         const inventory = new Set(listCapturePayloads(this.trafficDir, storage));
         for (const pendingFile of inventory) {
-            const match = PENDING_PAYLOAD_PATTERN.exec(pendingFile);
-            const temporaryFile = `${pendingFile}.tmp`;
-            if (!match || Object.hasOwn(this.payloadManifest, pendingFile) ||
-                Object.hasOwn(this.payloadManifest, temporaryFile) ||
-                measureCapturePayload(this.trafficDir, pendingFile, storage) !== 0) continue;
-            const payloadFile = `payloads/${match[1]}`;
+            const payloadFile = pendingPayloadReference(this.trafficDir, pendingFile, this.payloadManifest, storage);
+            if (!payloadFile) continue;
             const keepPayload = Object.hasOwn(this.payloadManifest, payloadFile);
             this._resolvePendingPayload(payloadFile, pendingFile, keepPayload);
             inventory.delete(pendingFile);
-            inventory.delete(temporaryFile);
+            inventory.delete(`${pendingFile}.tmp`);
             if (!keepPayload) inventory.delete(payloadFile);
         }
         // Older unindexed files lack a write marker. Preserve them and account for their disk space.
@@ -2754,6 +2752,11 @@ export class CamoufoxTrafficRecorder {
         };
     }
 
+    /** Only certify page scope when the recorded requests have one proven source page. */
+    hasSingleRequestSource(page) {
+        return page != null && !this.ledgerWriteError && this.#singleRequestPage?.deref() === page;
+    }
+
     /**
      * Return a shallow immutable snapshot of the current attribution envelope.
      */
@@ -2761,6 +2764,9 @@ export class CamoufoxTrafficRecorder {
         return {
             traceId: this.attribution.traceId,
             profileId: this.attribution.profileId,
+            ...(isAnonymousProfileId(this.attribution.profileId)
+                ? { profileContinuityUnproven: this.harStartEventCount > 0 || this.#profileChangedAfterCapture }
+                : {}),
             accountId: this.attribution.accountId,
             accountEmail: null,
             os: this.attribution.os,
@@ -2782,8 +2788,11 @@ export class CamoufoxTrafficRecorder {
         }
 
         if (partial.profileId !== undefined && partial.profileId !== null) {
-            this.profileId = String(partial.profileId);
-            this.attribution.profileId = redactProfileId(this.profileId);
+            const profileId = String(partial.profileId);
+            this.#profileChangedAfterCapture ||= profileId !== this.profileId &&
+                this.chainedEventCount > this.harStartEventCount;
+            this.profileId = profileId;
+            this.attribution.profileId = redactProfileId(profileId);
         }
         if (partial.accountId !== undefined) {
             this.attribution.accountId = partial.accountId ?? null;
@@ -3246,7 +3255,7 @@ export class CamoufoxTrafficRecorder {
     /**
      * Register the capture before its handler calls methods on the event target.
      */
-    _trackTask(handler, target) {
+    _trackTask(handler, target, cookieJarId) {
         if (!this._canStartRecording()) return;
         if (this.pendingTasks.size >= this.maxPendingEvents) {
             this.pendingEventLimitReached = true;
@@ -3283,7 +3292,7 @@ export class CamoufoxTrafficRecorder {
             frame = request?.frame?.() ?? null;
         } catch {}
         const triggerSnapshot = this.getActiveTriggerSnapshot(epochMs, frame);
-        const eventContext = { request, frame, epochMs, observationSequence, attributionSnapshot, triggerSnapshot };
+        const eventContext = { request, frame, epochMs, observationSequence, attributionSnapshot, triggerSnapshot, cookieJarId };
         const run = async () => {
             if (this._canRecordEvent()) return handler.call(this, target, eventContext);
         };
@@ -3459,6 +3468,16 @@ export class CamoufoxTrafficRecorder {
         return dispose;
     }
 
+    #cookieJarFor(source, isContext) {
+        if (!this.#cookieJarIds.has(source)) {
+            // Preserve profile history for the first known context and keep other stores isolated.
+            const primary = isContext && !this.#hasPrimaryCookieJar;
+            this.#hasPrimaryCookieJar ||= primary;
+            this.#cookieJarIds.set(source, primary ? PRIMARY_COOKIE_JAR : crypto.randomUUID());
+        }
+        return this.#cookieJarIds.get(source);
+    }
+
     /**
      * Attach pre-TLS egress & post-TLS ingress listeners to a Playwright `BrowserContext`.
      * Also attaches WebSocket listeners to all existing and future pages in the context.
@@ -3472,8 +3491,9 @@ export class CamoufoxTrafficRecorder {
         }
         this.attachedContexts.add(context);
 
-        const onRequest = (request) => this._trackTask(this._handleRequest, request);
-        const onResponse = (response) => this._trackTask(this._handleResponse, response);
+        const cookieJarId = this.#cookieJarFor(context, true);
+        const onRequest = (request) => this._trackTask(this._handleRequest, request, cookieJarId);
+        const onResponse = (response) => this._trackTask(this._handleResponse, response, cookieJarId);
         const onRequestFinished = (request) => this._trackTask(this._handleRequestFinished, request);
         const onRequestFailed = (request) => this._trackTask(this._handleRequestFailed, request);
         const onPage = (page) => {
@@ -3521,23 +3541,18 @@ export class CamoufoxTrafficRecorder {
         this._attachPageWebSocketsOnly(page);
 
         // Check if parent BrowserContext is already capturing HTTP events
-        let parentContextAttached = false;
+        let context = null;
         try {
-            if (typeof page.context === 'function') {
-                const ctx = page.context();
-                if (ctx && this.attachedContexts.has(ctx)) {
-                    parentContextAttached = true;
-                }
-            }
-        } catch {
-            parentContextAttached = false;
-        }
+            const parent = page.context?.();
+            if (parent && typeof parent === 'object') context = parent;
+        } catch {}
 
-        if (parentContextAttached || this.attachedPagesHttp.has(page)) {
+        if (this.attachedContexts.has(context) || this.attachedPagesHttp.has(page)) {
             return this;
         }
-        const onRequest = (request) => this._trackTask(this._handleRequest, request);
-        const onResponse = (response) => this._trackTask(this._handleResponse, response);
+        const cookieJarId = this.#cookieJarFor(context ?? page, context !== null);
+        const onRequest = (request) => this._trackTask(this._handleRequest, request, cookieJarId);
+        const onResponse = (response) => this._trackTask(this._handleResponse, response, cookieJarId);
         const onRequestFinished = (request) => this._trackTask(this._handleRequestFinished, request);
         const onRequestFailed = (request) => this._trackTask(this._handleRequestFailed, request);
 
@@ -3705,8 +3720,10 @@ export class CamoufoxTrafficRecorder {
                 recordBodies: this.recordBodies, trustedLocal
             });
             const currentPolicy = { recordBodies: this.recordBodies, traceId: this.traceId };
+            const redirects = this.recordBodies ? createCaptureRedirectBodyCheck(events) : undefined;
             const ownsCurrentEvents = this.chainedEventCount > 0 &&
                 events[this.chainedEventCount - 1]?.eventHash === this.chainHeadHash;
+            const displayCorrelationId = createCorrelationIdProjection([correlationId])(correlationId);
             const parts = [];
             for (const { index, event } of matching) {
                 const currentEvent = ownsCurrentEvents && index >= this.harStartEventCount &&
@@ -3720,6 +3737,7 @@ export class CamoufoxTrafficRecorder {
                 if (event.type === 'egress' || event.type === 'ingress') {
                     const { text: bodyPreview } = readCaptureExportBody(this.trafficDir, event, {
                         recordBodies: bodyAllowed,
+                        redirects,
                         trustedLocal,
                         url: requestUrl || event.url,
                         maxBytes: this.maxInlinePreviewBytes,
@@ -3727,7 +3745,7 @@ export class CamoufoxTrafficRecorder {
                     });
                     const common = {
                         timestamp: event.timestamp,
-                        correlationId,
+                        correlationId: displayCorrelationId,
                         headersArray: harHeaders(event),
                         bodyPreview
                     };
@@ -3750,9 +3768,9 @@ export class CamoufoxTrafficRecorder {
                         }));
                     }
                 } else if (event.type === 'ws-egress' || event.type === 'ws-ingress') {
-                    parts.push(this._formatWebSocketWireBlock(event));
+                    parts.push(this._formatWebSocketWireBlock({ ...event, correlationId: displayCorrelationId }));
                 } else if (event.type === 'security-block') {
-                    parts.push(this._formatSecurityBlockWireBlock(event));
+                    parts.push(this._formatSecurityBlockWireBlock({ ...event, correlationId: displayCorrelationId }));
                 }
             }
             return parts.join('\n');
@@ -3767,9 +3785,8 @@ export class CamoufoxTrafficRecorder {
             for (let source = request.redirectedFrom?.(); source; source = source.redirectedFrom?.()) {
                 if (visited.has(source)) return false;
                 visited.add(source);
-                // A redirect that switches to GET or HEAD drops the upload.
                 const sourceMethod = source.method?.();
-                if ((method === 'GET' || method === 'HEAD') && sourceMethod && sourceMethod !== method) return true;
+                if (redirectDropsUpload(method, sourceMethod)) return true;
                 if (!allowsTrafficBody(source.url?.())) return false;
             }
             return true;
@@ -3783,7 +3800,9 @@ export class CamoufoxTrafficRecorder {
      *
      * @param {object} request - Playwright Request
      */
-    async _handleRequest(request, { epochMs, observationSequence, attributionSnapshot: eventAttribution, triggerSnapshot: eventTrigger, frame }) {
+    async _handleRequest(request, {
+        epochMs, observationSequence, attributionSnapshot: eventAttribution, triggerSnapshot: eventTrigger, frame, cookieJarId
+    }) {
         if (!request || this.recordedRequests.has(request)) return;
         this.recordedRequests.add(request);
 
@@ -3860,7 +3879,11 @@ export class CamoufoxTrafficRecorder {
                 postDataBytes > body.buffer.byteLength;
             if (!payload?.event.payloadTruncated && !bodyPreviewTruncated) {
                 const format = shareableBodyFormat({ headers, headersArray });
-                bodyPreview = projectTrafficBody(body.buffer, format, previewLimit);
+                const projected = projectTrafficBody(body.buffer, format, previewLimit);
+                if (projected !== null) {
+                    bodyPreviewTruncated = Buffer.byteLength(projected) > previewLimit;
+                    if (!bodyPreviewTruncated) bodyPreview = projected;
+                }
             }
 
             // The existing signal detectors receive a bounded in-memory prefix. Only their
@@ -3906,7 +3929,7 @@ export class CamoufoxTrafficRecorder {
             headers,
             headersArray,
             cookieObservations,
-            ...(cookieObservations.length > 0 && { observationSequence }),
+            ...(cookieObservations.length > 0 && { observationSequence, cookieJarId }),
             postData: bodyPreview,
             bodyPreview,
             bodyPreviewTruncated,
@@ -3920,6 +3943,18 @@ export class CamoufoxTrafficRecorder {
         };
 
         if (!this._appendNdjsonEvent(egressEvent, payload?.buffer)) return;
+        if (this.#singleRequestPage !== null) {
+            let sourcePage;
+            try {
+                sourcePage = frame?.page?.();
+            } catch {}
+            if (!sourcePage || typeof sourcePage !== 'object' ||
+                (this.#singleRequestPage && this.#singleRequestPage.deref() !== sourcePage)) {
+                this.#singleRequestPage = null;
+            } else {
+                this.#singleRequestPage ??= new WeakRef(sourcePage);
+            }
+        }
         const { payloadFile } = egressEvent;
 
         // Estimate header byte size + body bytes for pre-TLS egress accounting
@@ -4061,7 +4096,9 @@ export class CamoufoxTrafficRecorder {
      *
      * @param {object} response - Playwright Response
      */
-    async _handleResponse(response, { request, epochMs, observationSequence, attributionSnapshot: eventAttribution }) {
+    async _handleResponse(response, {
+        request, epochMs, observationSequence, attributionSnapshot: eventAttribution, cookieJarId
+    }) {
         if (!response) return;
 
         const timestamp = new Date(epochMs).toISOString();
@@ -4131,11 +4168,10 @@ export class CamoufoxTrafficRecorder {
 
         // Playwright's response.body() and response.text() acquire an entire decoded body.
         // The wire size and Content-Length cannot bound that read, so keep response metadata only.
-        const isBodylessResponse = method === 'HEAD' || (status >= 100 && status < 200) ||
-            status === 204 || status === 205 || status === 304;
-        const bodyOmittedReason = !this.capturePayloads
-            ? 'body-recording-disabled'
-            : isBodylessResponse ? 'response-without-body' : 'unbounded-response-reader';
+        const isBodylessResponse = isBodylessHttpResponse(method, status);
+        const bodyOmittedReason = isBodylessResponse
+            ? 'response-without-body'
+            : this.capturePayloads ? 'unbounded-response-reader' : 'body-recording-disabled';
 
         const headerByteEstimate = headersArray.reduce(
             (acc, h) => acc + Buffer.byteLength(`${h.name}: ${h.value}\r\n`, 'utf8'),
@@ -4167,13 +4203,13 @@ export class CamoufoxTrafficRecorder {
             headers,
             headersArray,
             cookieObservations,
-            ...(cookieObservations.length > 0 && { observationSequence }),
+            ...(cookieObservations.length > 0 && { observationSequence, cookieJarId }),
             serverAddr,
             securityDetails,
             recordBodies: this.capturePayloads,
             bodyOmittedReason,
             bodySha256: null,
-            bodyBytes: 0,
+            bodyBytes: isBodylessResponse ? 0 : null,
             bodyPreview: null,
             bodyPreviewTruncated: false,
             payloadFile: null,
@@ -4740,9 +4776,8 @@ export class CamoufoxTrafficRecorder {
             replay.observeAll(events);
             this.cookieLineage = replay;
         }
-        const endedAtIso = this.endedAt || new Date().toISOString();
-        const endedAtMs = this.endedAt ? Date.parse(this.endedAt) : Date.now();
-        const totalDurationMs = Math.max(0, endedAtMs - this.startedAtEpochMs);
+        const elapsedUntilMs = this.endedAt ? Date.parse(this.endedAt) : Date.now();
+        const totalDurationMs = Math.max(0, elapsedUntilMs - this.startedAtEpochMs);
 
         const byActionStepObj = Object.create(null);
         for (const [stepName, stats] of this.byActionStep.entries()) {
@@ -4806,20 +4841,25 @@ export class CamoufoxTrafficRecorder {
             const file = logPath && path.basename(logPath);
             if (this.profileNativeDir && logPath && path.dirname(logPath) === this.profileNativeDir &&
                 profileNativeArtifactName(type, file)) {
-                const { evidence, summary } = captureNativeFile(this.profileNativeDir, file, this.trustedLocal, describe);
+                const lastGeneration = this.#nativeLogCheckpoint?.nativeArtifacts?.[type];
+                const priorEvidence = lastGeneration?.file === file ? lastGeneration : undefined;
+                const { evidence, summary } = captureNativeFile(
+                    this.profileNativeDir, file, this.trustedLocal, describe, priorEvidence
+                );
                 const childNames = type === 'neckoMozLog'
                     ? profileNativeEntries(this.profileNativeDir, this.trustedLocal)
                         .map(({ name }) => name).filter((name) => isNeckoChildLog(file, name))
                     : [];
-                const previousCheckpoint = this.#nativeLogCheckpoint?.nativeArtifacts?.[type];
-                if (previousCheckpoint?.file === file) {
+                const previousChildren = new Map(priorEvidence?.children?.map((child) => [child.file, child]));
+                if (previousChildren.size > 0) {
                     const present = new Set(childNames);
-                    for (const child of previousCheckpoint.children ?? []) {
-                        if (!present.has(child.file)) throw new Error(`Missing ${child.file} on disk`);
+                    for (const name of previousChildren.keys()) {
+                        if (!present.has(name)) throw new Error(`Missing ${name} on disk`);
                     }
                 }
-                const children = childNames.map((name) =>
-                    captureNativeFile(this.profileNativeDir, name, this.trustedLocal, describe));
+                const children = childNames.map((name) => captureNativeFile(
+                    this.profileNativeDir, name, this.trustedLocal, describe, previousChildren.get(name)
+                ));
                 const prior = this.profileNativeArtifacts[type];
                 const { previous = [], ...generation } = prior ?? {};
                 nativeArtifacts[type] = {
@@ -4853,7 +4893,8 @@ export class CamoufoxTrafficRecorder {
         const wirePath = this.recordWireLog ? this.preTlsWireLogPath
             : wireFile ? path.join(this.trafficDir, wireFile) : null;
         const wire = wireFile ? hashCaptureFile(this.trafficDir, wireFile, {
-            trustedLocal: this.trustedLocal, maxBytes: MAX_INTEGRITY_LOG_BYTES
+            trustedLocal: this.trustedLocal, maxBytes: MAX_INTEGRITY_LOG_BYTES,
+            checkpoint: this.#wireLogCheckpoint?.file === wireFile ? this.#wireLogCheckpoint : undefined
         }) : null;
 
         const signatures = this.platformSignatures.map(redactDiagnosticMetadata);
@@ -4874,7 +4915,7 @@ export class CamoufoxTrafficRecorder {
                 proxyServer: this.attribution.proxyServer,
                 recordBodies: this.recordBodies,
                 startedAt: this.startedAt,
-                endedAt: endedAtIso,
+                endedAt: this.endedAt,
                 totalDurationMs
             },
             ...(this.#harRecovery ? { harRecovery: { ...this.#harRecovery, finalized: this.stopped } } : {}),
@@ -4984,13 +5025,16 @@ export class CamoufoxTrafficRecorder {
      *   har: { log: object }
      * }}
      */
-    exportHar(outputPath = this.harPath, { recordBodies = this.recordBodies, expectedTargetVersion } = {}) {
+    exportHar(outputPath = this.harPath, {
+        recordBodies = this.recordBodies, destinationTrafficDir, expectedTargetVersion
+    } = {}) {
         return exportTrafficToHar(this.trafficDir, outputPath ?? this.harPath, {
             ...this.getAttributionSnapshot(),
             startedAt: this.startedAt
         }, {
             recordBodies: this.recordBodies && recordBodies === true,
             trustedLocal: this.trustedLocal,
+            destinationTrafficDir,
             expectedTargetVersion,
             [HAR_SESSION_RANGE]: this.#harSessionRange(),
             [HAR_PROTECTED_PATHS]: [
@@ -5029,6 +5073,8 @@ export class CamoufoxTrafficRecorder {
 
             summary = this.buildAttributionSummary({ nativeLogsClosed: logsClosed });
             writePrivateFile(this.attributionIndexPath, `${JSON.stringify(summary, null, 2)}\n`);
+            const { preTlsWireLogFile: file, preTlsWireLogSha256: sha256, preTlsWireLogBytes: bytes } = summary.integrity;
+            if (file) this.#wireLogCheckpoint = { file, sha256, bytes };
             if (!finalizing && this.#nativeLogsAreClosed?.() !== null &&
                 (this.sslKeyLogPath || this.neckoMozLogPath)) {
                 this.#nativeLogCheckpoint = structuredClone({
@@ -5181,7 +5227,12 @@ export function verifyTrafficIntegrity(trafficDir, {
             check(() => verifyLedgerCheckpoint(integrity, ledger.events));
         }
         if (validateCaptureProfile && errors.length === 0) {
-            validateCaptureProfile(new Set(ledger.events.map(captureEventProfileId)), summary?.session);
+            validateCaptureProfile(
+                new Set(ledger.events.map(captureEventProfileId)),
+                summary?.session,
+                new Set(ledger.events.map(captureEventTraceId)),
+                ledger.events.some(createCaptureProfileContinuityCheck())
+            );
         }
     }
 
@@ -5269,6 +5320,7 @@ export { MAX_HAR_EVENT_BYTES as MAX_HAR_RECORD_BYTES };
 /** Project a complete recorded HTTP body without returning the original bytes. */
 export function readCaptureExportBody(trafficDir, event, {
     recordBodies = false,
+    redirects,
     trustedLocal = false,
     url = event?.url,
     mimeType,
@@ -5281,6 +5333,7 @@ export function readCaptureExportBody(trafficDir, event, {
         !allowsTrafficBody(url) || (event.url && event.url !== url && !allowsTrafficBody(event.url))) {
         return omitted;
     }
+    if (redirects ? !redirects.allowsBody(event) : event.redirectedFromCorrelationId != null) return omitted;
 
     const format = shareableBodyFormat(event, mimeType);
     if (!format) return omitted;
@@ -5374,6 +5427,7 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
     trustedLocal = false,
     matchTransaction,
     validateCaptureProfile,
+    requiredCorrelationId,
     [HAR_SESSION_RANGE]: sessionRange = null
 } = {}) {
     const resolvedTrafficDir = path.resolve(String(trafficDir));
@@ -5400,6 +5454,7 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
     const payloadManifest = contextual ? sessionRange.payloadManifest : checkpoint?.payloadManifest;
     const stoppedReason = contextual ? sessionRange.stoppedReason : indexData?.captureLimits?.stoppedReason;
     let includesStoppedSession = !matchTransaction || contextual;
+    let foundRequiredCorrelation = requiredCorrelationId == null;
     const log = {
         version: '1.2',
         creator: { name: 'CamoufoxTrafficRecorder', version: '1.0.0' },
@@ -5420,10 +5475,12 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
         reserve(Buffer.byteLength(JSON.stringify(item)) + (items.length ? 1 : 0));
         items.push(item);
     };
+    const redirects = bodyPolicy.recordBodies ? createCaptureRedirectBodyCheck() : undefined;
     const readBody = (event, url, mimeType) => {
         const maxBytes = Math.min(remainingBodyBytes, remainingBytes);
         const body = readCaptureExportBody(resolvedTrafficDir, event, {
-            recordBodies: capturePolicyAllowsBody(bodyPolicy, event), trustedLocal, url, mimeType, maxBytes, payloadManifest
+            recordBodies: capturePolicyAllowsBody(bodyPolicy, event), redirects,
+            trustedLocal, url, mimeType, maxBytes, payloadManifest
         });
         if (body.reason === 'body-byte-limit') throw harLimitError('body byte');
         if (body.reason === 'payload-integrity') {
@@ -5468,6 +5525,10 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
 
     const txMap = new Map();
     const observedProfileIds = validateCaptureProfile ? new Set() : null;
+    const observedProfileTraces = validateCaptureProfile ? new Set() : null;
+    let profileContinuityUnproven = false;
+    const profileContinuity = validateCaptureProfile ? createCaptureProfileContinuityCheck() : null;
+    const correlationIds = new Set();
     let eventCount = 0;
     let chainHead = TRAFFIC_GENESIS_HASH;
     let observedCheckpoint;
@@ -5504,7 +5565,12 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
             if (eventCount === checkpoint?.eventCount) observedCheckpoint = chainHead;
         }
         if (contextual && (eventCount <= sessionStart || traceId !== bodyPolicy.traceId)) continue;
-        observedProfileIds?.add(captureEventProfileId(ev));
+        if (traceId === bodyPolicy.traceId) redirects?.observe(ev);
+        if (validateCaptureProfile) {
+            observedProfileIds.add(captureEventProfileId(ev));
+            observedProfileTraces.add(traceId);
+            profileContinuityUnproven ||= profileContinuity(ev);
+        }
         if (!matchTransaction && ev.payloadStorage) countPayloadIssues([ev]);
         if (ev.type === 'step-transition') {
             if (!matchTransaction) {
@@ -5529,12 +5595,15 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
             continue;
         }
 
+        correlationIds.add(ev.correlationId);
+        if (ev.redirectedFromCorrelationId) correlationIds.add(ev.redirectedFromCorrelationId);
         const txKey = JSON.stringify([traceId, ev.correlationId]);
         if (!txMap.has(txKey)) {
             if (txMap.size >= MAX_HAR_ENTRIES) throw harLimitError('transaction count');
             txMap.set(txKey, {
                 correlationId: ev.correlationId,
                 traceId,
+                profileId: null,
                 egress: null,
                 ingress: null,
                 finished: null,
@@ -5543,6 +5612,11 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
             });
         }
         const tx = txMap.get(txKey);
+        const recorded = observedProfileIdentity([tx.profileId, captureEventProfileId(ev)]);
+        if (recorded.profileIdentity === 'mixed') {
+            throw harIntegrityError('HAR transaction has multiple recorded profile identities');
+        }
+        tx.profileId = recorded.profileId;
         // Retain slices of the bounded ledger. Inflate each transaction only when building its entry.
         if (ev.type === 'egress') tx.egress = rawLine;
         else if (ev.type === 'ingress') tx.ingress = rawLine;
@@ -5562,8 +5636,9 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
         }
     }
 
-    validateCaptureProfile?.(observedProfileIds, indexData?.session);
+    validateCaptureProfile?.(observedProfileIds, indexData?.session, observedProfileTraces, profileContinuityUnproven);
 
+    const displayCorrelationId = createCorrelationIdProjection(correlationIds);
     const decodeEvent = (rawLine) => rawLine ? JSON.parse(rawLine.toString('utf8').trim()) : null;
     for (const tx of txMap.values()) {
         const { correlationId, traceId } = tx;
@@ -5599,6 +5674,7 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
             correlationId, url: rawUrl, actionStep, triggerAction, status
         })) continue;
         if (matchTransaction) countPayloadIssues([egress, ingress]);
+        foundRequiredCorrelation ||= correlationId === requiredCorrelationId;
         includesStoppedSession ||= traceId === (sessionMeta.traceId ?? null);
 
         const startedDateTime =
@@ -5686,14 +5762,12 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
         const responseBody = readBody(ingress, rawUrl, resMimeType);
         const resBodyText = responseBody.text || '';
         const responseStatus = Number(status ?? 0);
-        const responseWithoutBody = method === 'HEAD' || (responseStatus >= 100 && responseStatus < 200) ||
-            responseStatus === 204 || responseStatus === 205 || responseStatus === 304;
+        const responseWithoutBody = isBodylessHttpResponse(method, responseStatus);
         const contentEncoded = resHeaders.some(({ name, value }) =>
             name.toLowerCase() === 'content-encoding' &&
             String(value).toLowerCase().split(',').some((coding) => coding.trim() && coding.trim() !== 'identity')
         );
-        const observedContentSize = responseBody.byteLength ??
-            (ingress?.bodyOmittedReason && ingress.bodyBytes === 0 ? null : harSize(ingress?.bodyBytes));
+        const observedContentSize = responseBody.byteLength ?? observedHttpResponseBodyBytes(ingress, method);
         const wireBodySize = harSize(finished?.sizes?.responseBodySize) ??
             (responseWithoutBody ? 0 : contentEncoded ? null : observedContentSize) ?? -1;
         const contentSize = observedContentSize ?? (responseWithoutBody ? 0 : contentEncoded ? -1 : wireBodySize);
@@ -5774,7 +5848,7 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
                   }
                 : {}),
             _attribution: {
-                correlationId,
+                correlationId: displayCorrelationId(correlationId),
                 actionStep: redactDiagnosticText(actionStep),
                 stepIndex,
                 triggerAction: triggerAction ? redactTriggerAction(redactDiagnosticMetadata(triggerAction)) : null,
@@ -5792,10 +5866,9 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
                     failed?.stage ||
                     securityBlock?.stage ||
                     'pre-tls-necko-channel',
-                redirectedFromCorrelationId:
-                    egress?.redirectedFromCorrelationId ||
-                    ingress?.redirectedFromCorrelationId ||
-                    null,
+                redirectedFromCorrelationId: displayCorrelationId(
+                    egress?.redirectedFromCorrelationId || ingress?.redirectedFromCorrelationId || null
+                ),
                 requestPayloadFile: requestBody.payloadFile,
                 responsePayloadFile: responseBody.payloadFile,
                 ...(egress?.payloadStorage?.status === 'failed' ? { requestPayloadIssue: 'write-failed' } : {}),
@@ -5828,6 +5901,11 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
         reserve(Buffer.byteLength(JSON.stringify({ _payloadCaptureIssues: payloadCaptureIssues })) - 1);
         log._payloadCaptureIssues = payloadCaptureIssues;
     }
+    if (!foundRequiredCorrelation) {
+        throw Object.assign(new Error('Correlation ID not found in the selected HAR transactions'), {
+            code: 'ERR_HAR_CORRELATION_NOT_FOUND'
+        });
+    }
     return { archive: { log }, artifacts: indexData?.artifacts, integrity: checkpoint };
 }
 
@@ -5841,6 +5919,29 @@ function* serializeHar({ log: { pages, entries, ...metadata } }) {
         yield `${index ? ',' : ''}${JSON.stringify(entry)}`;
     }
     yield ']}}\n';
+}
+
+/** Older indexes identify the wire file only through the capture's artifact paths. */
+function legacyCaptureWirePath(trafficDir, captureRoot, artifacts, integrity) {
+    if (integrity?.preTlsWireLogFile !== undefined) return null;
+    const ledger = recordedArtifactPath(trafficDir, artifacts?.trafficNdjsonPath);
+    const inputLedgers = [resolveFilesystemPath(path.join(trafficDir, 'traffic.ndjson')), path.join(captureRoot, 'traffic.ndjson')];
+    return ledger && inputLedgers.includes(resolveFilesystemPath(ledger))
+        ? recordedArtifactPath(trafficDir, artifacts?.preTlsWireLogPath)
+        : null;
+}
+
+function protectedHarDestinationFiles(trafficDir) {
+    const root = resolveFilesystemPath(trafficDir);
+    const { indexData, bodyPolicy } = readCaptureExportIndex(root, { trustedLocal: true });
+    if (!indexData && bodyPolicy.reason !== 'missing-index') {
+        throw harIntegrityError('Could not read the HAR destination capture index');
+    }
+    const integrity = indexData?.integrity;
+    const protectedPaths = [path.join(root, getCaptureWireLogFileName(integrity))];
+    const legacyWire = legacyCaptureWirePath(root, root, indexData?.artifacts, integrity);
+    if (legacyWire && path.dirname(resolveFilesystemPath(legacyWire)) === root) protectedPaths.push(legacyWire);
+    return protectedPaths;
 }
 
 /**
@@ -5878,13 +5979,6 @@ export function exportTrafficToHar(trafficDir, outputPath, fallbackSession = {},
     }
 
     const { archive: harArchive, artifacts, integrity } = buildHarFromTrafficDir(resolvedTrafficDir, fallbackSession, options);
-    if (options.requiredCorrelationId != null && !harArchive.log.entries.some((entry) =>
-        entry._attribution.correlationId === options.requiredCorrelationId
-    )) {
-        throw Object.assign(new Error('Correlation ID not found in the selected HAR transactions'), {
-            code: 'ERR_HAR_CORRELATION_NOT_FOUND'
-        });
-    }
     const current = fs.statSync(resolvedTrafficDir, { bigint: true });
     if (current.dev !== source.dev || current.ino !== source.ino) {
         throw harIntegrityError('Traffic directory changed during HAR export');
@@ -5892,30 +5986,30 @@ export function exportTrafficToHar(trafficDir, outputPath, fallbackSession = {},
     const captureName = path.basename(captureRoot);
     const nativeDir = path.join(path.dirname(captureRoot), captureName === 'traffic' ? '.native' : `.${captureName}-native`);
     const wireFile = getCaptureWireLogFileName(integrity);
-    let recordedWirePath = null;
-    if (integrity?.preTlsWireLogFile === undefined) {
-        // Older indexes use artifact paths for output protection only.
-        const declaredLedger = recordedArtifactPath(resolvedTrafficDir, artifacts?.trafficNdjsonPath);
-        const recordedLedger = declaredLedger ? resolveFilesystemPath(declaredLedger) : null;
-        const inputLedgers = [resolveFilesystemPath(path.join(resolvedTrafficDir, 'traffic.ndjson')),
-            path.join(captureRoot, 'traffic.ndjson')];
-        if (inputLedgers.includes(recordedLedger)) {
-            recordedWirePath = recordedArtifactPath(resolvedTrafficDir, artifacts.preTlsWireLogPath);
-        }
+    const recordedWirePath = legacyCaptureWirePath(resolvedTrafficDir, captureRoot, artifacts, integrity);
+    const protectedPaths = [
+        ...['traffic.ndjson', 'attribution-index.json', 'payloads', '.private', ...Object.values(INTEGRITY_ARTIFACTS)]
+            .map((name) => path.join(captureRoot, name)),
+        captureWriterLeaseDirectory(captureRoot),
+        nativeDir,
+        path.join(captureRoot, wireFile),
+        ...(options[HAR_PROTECTED_PATHS] ?? [])
+    ];
+    // HAR-only records in scratch but publishes into another capture's directory.
+    // Pin that capture's wire registration through publication.
+    const destinationLease = options.destinationTrafficDir ? acquireTrafficDirectoryLease(options.destinationTrafficDir) : null;
+    let bytes;
+    try {
+        if (destinationLease) protectedPaths.push(...protectedHarDestinationFiles(options.destinationTrafficDir));
+        bytes = writeCaptureExport(resolvedOutputPath, serializeHar(harArchive), {
+            replace: Boolean(outputPath),
+            recordedWirePath,
+            expectedTargetVersion: options.expectedTargetVersion,
+            protectedPaths
+        });
+    } finally {
+        if (destinationLease) releaseProfileLease(destinationLease);
     }
-    const bytes = writeCaptureExport(resolvedOutputPath, serializeHar(harArchive), {
-        replace: Boolean(outputPath),
-        recordedWirePath,
-        expectedTargetVersion: options.expectedTargetVersion,
-        protectedPaths: [
-            ...['traffic.ndjson', 'attribution-index.json', 'payloads', '.private', ...Object.values(INTEGRITY_ARTIFACTS)]
-                .map((name) => path.join(captureRoot, name)),
-            captureWriterLeaseDirectory(captureRoot),
-            nativeDir,
-            path.join(captureRoot, wireFile),
-            ...(options[HAR_PROTECTED_PATHS] ?? [])
-        ]
-    });
 
     return {
         harPath: resolvedOutputPath,

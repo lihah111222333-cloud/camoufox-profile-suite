@@ -8,10 +8,11 @@ import path from 'path';
 import logger from './logger.js';
 import { parseProxyAddress } from './proxy-protocol.js';
 import { ensurePrivateDirectory, readPrivateFile } from './private-storage.js';
-import { ensureStateDirectory, LEGACY_DIRECTORY, PACKAGE_ROOT, STATE_DIRECTORY } from './state-paths.js';
+import {
+    ensureStateDirectory, getLegacyDirectory, getStateDirectory, PACKAGE_ROOT, validateExistingStateDirectory
+} from './state-paths.js';
 
 const PROXY_INVENTORY = path.join('config', 'proxies.txt');
-const PROXIES_FILE = path.join(STATE_DIRECTORY, PROXY_INVENTORY);
 const PROXY_FILE_OPTIONS = { requireOwner: true };
 const INVALID_INVENTORY = 'Invalid proxy configuration in config/proxies.txt. Check the indicated lines. ' +
     'Keep the configured scheme and percent-encode credential delimiters in a URL such as ' +
@@ -21,8 +22,8 @@ function proxyConfigurationError(message) {
     return Object.assign(new Error(message), { code: 'PROXY_CONFIGURATION_ERROR' });
 }
 
-function hasUnselectedLegacyInventory() {
-    const selected = [STATE_DIRECTORY, LEGACY_DIRECTORY].filter(Boolean);
+function hasUnselectedLegacyInventory(directories = [getStateDirectory(), getLegacyDirectory()]) {
+    const selected = directories.filter(Boolean);
     if (selected.includes(PACKAGE_ROOT)) return false;
     try {
         fs.lstatSync(path.join(PACKAGE_ROOT, PROXY_INVENTORY));
@@ -38,7 +39,9 @@ function hasUnselectedLegacyInventory() {
 }
 
 function readProxyInventory() {
-    for (const directory of [STATE_DIRECTORY, LEGACY_DIRECTORY]) {
+    const stateDirectory = validateExistingStateDirectory() ? getStateDirectory() : undefined;
+    const directories = [stateDirectory, getLegacyDirectory()];
+    for (const directory of directories) {
         if (!directory) continue;
         try {
             return readPrivateFile(path.join(directory, PROXY_INVENTORY), 'utf8', PROXY_FILE_OPTIONS);
@@ -47,19 +50,19 @@ function readProxyInventory() {
         }
     }
 
-    if (hasUnselectedLegacyInventory()) {
+    if (hasUnselectedLegacyInventory(directories)) {
         // Leave the state path available for explicit legacy adoption.
         return '';
     }
 
-    ensureStateDirectory();
-    ensurePrivateDirectory(path.dirname(PROXIES_FILE), { requireOwner: true });
+    const proxiesFile = path.join(ensureStateDirectory(), PROXY_INVENTORY);
+    ensurePrivateDirectory(path.dirname(proxiesFile), { requireOwner: true });
     let fd;
     try {
-        fd = fs.openSync(PROXIES_FILE, 'wx', 0o600);
+        fd = fs.openSync(proxiesFile, 'wx', 0o600);
     } catch (error) {
         if (error.code !== 'EEXIST') throw error;
-        return readPrivateFile(PROXIES_FILE, 'utf8', PROXY_FILE_OPTIONS);
+        return readPrivateFile(proxiesFile, 'utf8', PROXY_FILE_OPTIONS);
     }
 
     try {

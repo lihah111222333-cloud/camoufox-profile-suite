@@ -225,6 +225,23 @@ test('App diagnostics omit credentials and preserve private log permissions acro
             }
         }
 
+        const calls = [];
+        const element = {};
+        const waited = { element, dispose() { calls.push('dispose'); } };
+        assert.equal(await waitForElement({
+            async waitForSelector(selector, options) {
+                assert.equal(selector, 'main');
+                assert.equal(options.timeout, 20);
+                calls.push('wait');
+                return waited;
+            },
+            async $() {
+                calls.push('query');
+                return { element };
+            }
+        }, 'main', 20), waited);
+        assert.deepEqual(calls, ['wait']);
+
         assert.equal(await waitForElement({
             async waitForSelector() { throw new Error(secret); }
         }, 'input[data-fixture="' + secret + '"]'), null);

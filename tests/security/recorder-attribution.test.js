@@ -15,11 +15,14 @@ import { CamoufoxTrafficRecorder, verifyTrafficIntegrity } from '../../src/camou
 const cliPath = fileURLToPath(new URL('../../scripts/query-traffic-attribution.js', import.meta.url));
 const digest = (value) => createHash('sha256').update(value).digest('hex');
 
-function fixture(t) {
+function fixture(t, recorderOptions = {}) {
     const profilesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'recorder-attribution-'));
     t.after(() => fs.rmSync(profilesDir, { recursive: true, force: true }));
     const trafficDir = path.join(profilesDir, 'fixture', 'traffic');
-    const options = { profileId: 'fixture', trafficDir, sslKeyLog: false, recordBodies: false, recordWireLog: false };
+    const options = {
+        profileId: 'fixture', trafficDir, sslKeyLog: false, recordBodies: false, recordWireLog: false,
+        ...recorderOptions
+    };
     const recorder = new CamoufoxTrafficRecorder(options);
     const context = new EventEmitter();
     recorder.attachContext(context);
@@ -38,13 +41,13 @@ function request(url, headers = {}, frame = null) {
     };
 }
 
-function setCookie(context, url, values, headers) {
+function setCookie(context, url, values, headers, status = 200) {
     const req = request(url, headers);
     context.emit('request', req);
     context.emit('response', {
         request: () => req,
         url: req.url,
-        status: () => 200,
+        status: () => status,
         headersArray: async () => values.map((value) => ({ name: 'Set-Cookie', value }))
     });
 }
@@ -239,6 +242,137 @@ test('ordinary cookie lineage masks identifying names and retains all colliding 
     assert.equal(privateReport.cookie.instances.length, 2);
 });
 
+test('ordinary JSON uses the same distinct correlation aliases in legacy cookie histories and transactions', (t) => {
+    const profilesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'legacy-cookie-correlations-'));
+    t.after(() => fs.rmSync(profilesDir, { recursive: true, force: true }));
+    const trafficDir = path.join(profilesDir, 'fixture', 'traffic');
+    fs.mkdirSync(trafficDir, { recursive: true });
+    const url = 'https://scope.fixture.invalid/';
+    const initialId = 'cookie-initial@example.test';
+    const updateId = 'cookie-update@example.test';
+    const sentId = 'cookie-sent@example.test';
+    const reserved = '[REDACTED-CORRELATION-1]';
+    const settings = { 'Set-Cookie': 'Preference=compact; Path=/' };
+    const ledger = [
+        { type: 'ingress', correlationId: initialId, epochMs: 1, headers: settings },
+        { type: 'ingress', correlationId: updateId, epochMs: 2, headers: settings },
+        {
+            type: 'egress', correlationId: sentId, redirectedFromCorrelationId: updateId,
+            epochMs: 3, headers: { Cookie: 'Preference=compact' }
+        },
+        { type: 'egress', correlationId: reserved, epochMs: 4 }
+    ];
+    fs.writeFileSync(path.join(trafficDir, 'traffic.ndjson'),
+        ledger.map((event) => JSON.stringify({ ...event, url })).join('\n') + '\n');
+
+    const json = execFileSync(process.execPath, [
+        cliPath, '--profiles-dir=' + profilesDir, '--profile=fixture', '--json'
+    ], { encoding: 'utf8' });
+    assert.doesNotMatch(json, /cookie-(?:initial|update|sent)@example\.test/);
+    const report = JSON.parse(json);
+    const [initial, update, sent, normal] = report.events.map(({ correlationId }) => correlationId);
+    assert.equal(new Set([initial, update, sent, normal]).size, 4);
+    for (const alias of [initial, update, sent]) assert.match(alias, /^\[REDACTED-CORRELATION-\d+\]$/);
+    assert.equal(normal, reserved);
+    assert.deepEqual(report.transactions.map(({ correlationId }) => correlationId), [initial, update, sent, normal]);
+    assert.equal(report.transactions[2].redirectedFromCorrelationId, update);
+    const cookie = report.cookieLineage.Preference;
+    assert.equal(cookie.firstSetByCorrelationId, initial);
+    assert.equal(cookie.lastSetByCorrelationId, update);
+    assert.equal(cookie.lastSentByCorrelationId, sent);
+    assert.deepEqual(cookie.sentInCorrelationIds, [sent]);
+    assert.deepEqual(cookie.valueHistory.map(({ correlationId }) => correlationId), [initial, update]);
+    assert.equal(queryProfileTraffic({ trafficDir, cookie: 'Preference' }).cookie.lastSentByCorrelationId, sentId);
+});
+
+test('filtered cookie reports use the full setting history and omit metadata from excluded settings', async (t) => {
+    const { recorder, context, trafficDir } = fixture(t);
+    const origin = 'https://scope.fixture.invalid';
+    setCookie(context, origin + '/start', ['Preference=compact; Path=/']);
+    recorder.setStep('excluded-setting');
+    setCookie(context, origin + '/private-setting', [
+        'Preference=; Path=/; Max-Age=0',
+        'Preference=compact; Path=/desk; Secure; HttpOnly; SameSite=Strict',
+        'Unselected=compact; Path=/'
+    ], undefined, 302);
+    recorder.setStep('selected-send');
+    setCookie(context, origin + '/desk/view', [], { Cookie: 'Preference=compact' });
+    await recorder.stop();
+
+    const excluded = events(recorder).find(({ status }) => status === 302).correlationId;
+    const [fullRoot, fullDesk] = queryProfileTraffic({ trafficDir }).cookieLineage.Preference.instances;
+    assert.equal(fullRoot.path, '/');
+    assert.equal(fullRoot.sentCount, 0);
+    assert.equal(fullDesk.path, '/desk');
+    assert.equal(fullDesk.firstSetByCorrelationId, excluded);
+    assert.equal(fullDesk.sentCount, 1);
+
+    for (const mode of [{}, { cookies: true }, { cookie: 'Preference' }]) {
+        const { cookieLineage } = queryProfileTraffic({ trafficDir, status: '2xx', ...mode });
+        const [root, desk] = cookieLineage.Preference.instances;
+        assert.equal(root.path, '/');
+        assert.equal(root.sentCount, 0);
+        assert.equal(root.valueHistory.length, 1);
+        assert.equal(desk.path, '/desk');
+        assert.equal(desk.sentCount, 1);
+        assert.equal(desk.lastSentByCorrelationId, fullDesk.lastSentByCorrelationId);
+        assert.equal(desk.matchesLatestSetCookie, true);
+        assert.equal(desk.firstSetAt, null);
+        assert.equal(desk.firstSetByCorrelationId, null);
+        assert.equal(desk.firstSetUrl, null);
+        assert.equal(desk.lastSetAtStep, null);
+        assert.equal(desk.sameSite, null);
+        assert.equal(desk.lastValueSha256 ?? null, null);
+        assert.deepEqual(desk.valueHistory, []);
+        assert.deepEqual(Object.keys(cookieLineage), ['Preference']);
+        const serialized = JSON.stringify(cookieLineage);
+        assert.equal(serialized.includes(excluded), false);
+        assert.doesNotMatch(serialized, /(?:private-setting|excluded-setting)/);
+    }
+});
+
+test('cookie stores follow their browser context across attachment and ledger replay', async (t) => {
+    const { recorder, context, trafficDir, options } = fixture(t);
+    const other = new EventEmitter();
+    const page = Object.assign(new EventEmitter(), { context: () => other });
+    other.pages = () => [page];
+    const url = 'https://scope.fixture.invalid/';
+
+    recorder.attachPage(page);
+    setCookie(page, url, ['FromPage=compact; Path=/']);
+    await recorder.flushSummary();
+    recorder.attachContext(other);
+
+    recorder.setStep('primary-store');
+    setCookie(context, url, ['Preference=compact; Path=/', 'OnlyPrimary=compact; Path=/']);
+    recorder.setStep('other-store');
+    setCookie(other, url, ['Preference=compact; Path=/']);
+    emitCookie(context, url, 'Preference=compact');
+    emitCookie(other, url, 'FromPage=compact; OnlyPrimary=compact');
+    const summary = await recorder.stop();
+
+    const observations = events(recorder).filter(({ cookieObservations }) => cookieObservations?.length);
+    assert.equal(new Set(observations.map(({ cookieJarId }) => cookieJarId)).size, 2);
+    const report = queryProfileTraffic({ trafficDir });
+    assert.equal(JSON.stringify(report).includes('cookieJarId'), false);
+    const wire = queryProfileTraffic({ trafficDir, correlation: observations.at(-1).correlationId });
+    assert.equal(JSON.stringify(wire).includes('cookieJarId'), false);
+    const reopened = await new CamoufoxTrafficRecorder(options).stop();
+    assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+
+    for (const lineage of [summary.cookieLineage, report.cookieLineage, reopened.cookieLineage]) {
+        const stores = lineage.Preference.instances;
+        assert.equal(stores.length, 2);
+        assert.equal(stores.find(({ firstSetAtStep }) => firstSetAtStep === 'primary-store').sentCount, 1);
+        assert.equal(stores.find(({ firstSetAtStep }) => firstSetAtStep === 'other-store').sentCount, 0);
+        assert.equal(lineage.FromPage.sentCount, 1);
+        assert.equal(lineage.FromPage.matchesLatestSetCookie, true);
+        const unmatched = lineage.OnlyPrimary.instances.find(({ sentCount }) => sentCount > 0);
+        assert.equal(unmatched.scopeStatus, 'unmatched');
+        assert.equal(unmatched.firstSetByCorrelationId, null);
+    }
+});
+
 test('recorder bounds repeated cookie history while the ledger keeps the complete lineage', async (t) => {
     const { recorder, context, trafficDir, options } = fixture(t);
     const url = 'https://repeat.test/';
@@ -345,6 +479,55 @@ test('recorded cookie order survives wall-clock rollback in summaries and querie
             assert.equal(sent(lineage.Timed).matchesLatestSetCookie, shift < 0 ? null : true);
             assert.equal(sent(lineage.Timed).scopeStatus, shift < 0 ? 'unknown' : 'set-cookie');
         }
+    }
+});
+
+test('cookie lineage keeps different recorded profiles and anonymous labels apart', async (t) => {
+    const url = 'https://fixture.invalid/store/view';
+    const cases = [
+        { setter: 'first', sender: 'second', value: 'compact', status: 'unknown' },
+        { setter: 'first', sender: 'second', value: 'spacious', status: 'unmatched' },
+        { setter: 'first', sender: 'first', value: 'compact', status: 'set-cookie' },
+        {
+            setter: 'Gmail_fixture_first_1700000000000', sender: 'Gmail_fixture_second_1700000000000',
+            value: 'compact', status: 'unknown', traceId: 'same-display-fixture'
+        }
+    ];
+    for (const { setter, sender, value, status, traceId } of cases) {
+        const { recorder, context, options, trafficDir } = fixture(t, { profileId: setter, traceId });
+        setCookie(context, url, ['Preference=compact; Path=/store', 'Independent=sample; Path=/store']);
+        await recorder.stop();
+
+        const next = new CamoufoxTrafficRecorder({ ...options, profileId: sender });
+        const nextContext = new EventEmitter();
+        next.attachContext(nextContext);
+        setCookie(nextContext, url, ['Independent=sample; Path=/store']);
+        await next.flushSummary();
+        emitCookie(nextContext, url, 'Preference=' + value + '; Independent=sample');
+        const summary = await next.stop();
+        assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+
+        const report = queryProfileTraffic({ trafficDir });
+        const privateReport = queryProfileTraffic({ trafficDir, cookie: 'Preference' });
+        for (const lineage of [summary.cookieLineage, report.cookieLineage, privateReport.cookieLineage]) {
+            const cookie = lineage.Preference;
+            const scopes = cookie.instances ?? [cookie];
+            const sent = scopes.find((entry) => entry.sentCount);
+            assert.equal(sent.scopeStatus, status, setter + ' to ' + sender);
+            assert.equal(sent.matchesLatestSetCookie, status === 'set-cookie' ? true : null);
+            assert.equal(Boolean(sent.firstSetByCorrelationId), status === 'set-cookie');
+        }
+        const oldSet = events(next).find(({ type }) => type === 'ingress');
+        const latestSet = events(next).filter(({ type }) => type === 'ingress').at(-1);
+        const observed = report.cookieLineage.Independent;
+        const independentScopes = observed.instances ?? [observed];
+        if (setter === 'first' && sender === 'second') {
+            assert.equal(independentScopes.find(({ firstSetByCorrelationId }) =>
+                firstSetByCorrelationId === oldSet.correlationId).sentCount, 0);
+            assert.equal(independentScopes.find(({ firstSetByCorrelationId }) =>
+                firstSetByCorrelationId === latestSet.correlationId).sentCount, 1);
+        }
+        assert.doesNotMatch(JSON.stringify(report.cookieLineage), /valueSha256|lastValueSha256|profileId|traceId/);
     }
 });
 

@@ -1174,9 +1174,11 @@ const tests = [
             const telemetry = buildCoherentTelemetry('windows');
             const profile = new CamoufoxProfile('unit-test-profile-win', { os: 'windows' });
             profile.metadata = { os: 'windows' };
-            profile.getPage = async () => ({ evaluate: async () => telemetry });
+            const page = { evaluate: async () => telemetry };
+            profile.getPage = async () => page;
             profile.trafficRecorder = {
                 traceId: 'fixture-current-trace',
+                hasSingleRequestSource: (source) => source === page,
                 transactions: new Map([
                     [
                         'tx-1',

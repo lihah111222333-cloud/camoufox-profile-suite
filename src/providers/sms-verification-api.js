@@ -108,8 +108,9 @@ function getLang() {
 async function makeRequest(action, params = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
     const apiKey = getApiKey();
     const isPurchase = action === 'getNumber' || action === 'getNumberV2';
+    const orderOperation = action === 'getStatus' ? 'order status' : 'order change';
     const unconfirmed = () => isPurchase ? unconfirmedPurchase() : new SmsVerifyOrderError(
-        'SMS Verification order change is unconfirmed. Reconcile the order before ordering again.',
+        `SMS Verification ${orderOperation} is unconfirmed. Reconcile the order before ordering again.`,
         params.id,
         'RECONCILIATION_REQUIRED'
     );
@@ -146,8 +147,9 @@ async function makeRequest(action, params = {}, timeoutMs = REQUEST_TIMEOUT_MS) 
         throw new Error('SMS Verification API request failed');
     }
 
-    if ((isPurchase || expectedReceipt) && (response.status === 202 || response.status === 206)) {
-        throw unconfirmed();
+    if (response.status === 202 || response.status === 206) {
+        if (isPurchase || expectedReceipt || action === 'getStatus') throw unconfirmed();
+        if (action === 'getBalance') throw new Error('SMS Verification balance is unconfirmed');
     }
 
     try {
@@ -338,7 +340,7 @@ function classifyOrderStatus(response) {
     if (typeof response === 'string') {
         if (response === ORDER_STATUS.WAIT_CODE) return 'PENDING';
         if (response === ORDER_STATUS.CANCEL) return 'CANCELED';
-        if (response.startsWith(`${ORDER_STATUS.OK}:`)) return 'RECEIVED';
+        if (response.startsWith(`${ORDER_STATUS.OK}:`) && response.split(':', 2)[1].trim()) return 'RECEIVED';
     }
     return 'UNKNOWN';
 }
@@ -485,6 +487,7 @@ async function waitForOrder(orderId, maxWaitTime, checkInterval, apiKey) {
         try {
             result = await readSmsVerifyOrder(orderId, Math.min(REQUEST_TIMEOUT_MS, Math.ceil(remaining)));
         } catch (error) {
+            if (error instanceof SmsVerifyOrderError) throw error;
             if (remainingTime() <= 0) break;
             if (error instanceof SmsVerifyKeyError) throw error;
             console.log('Retrying SMS status request');

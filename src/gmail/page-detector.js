@@ -619,8 +619,7 @@ async function detectByElements(page, scope, address) {
  */
 export async function waitForElement(page, selector, timeout = 10000) {
     try {
-        await page.waitForSelector(selector, { timeout });
-        return await page.$(selector);
+        return (await page.waitForSelector(selector, { timeout })) ?? null;
     } catch {
         logger.debug('Element not found');
         return null;

@@ -1,5 +1,5 @@
 # Publish the same verified npm tarball as a Release asset and to GitHub Packages.
-# Follow the pre-publication checks in GITHUB_SETUP.md before pushing a tag.
+# Follow the README release preflight before pushing a tag or publishing in the UI.
 name: Release
 
 on:
@@ -21,7 +21,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.ref }}
           persist-credentials: false
 
       - name: Setup Node.js
@@ -32,9 +32,17 @@ jobs:
           scope: '@code-root'
 
       - name: Verify the release tag and source files
+        id: tag
+        shell: bash
         run: |
-          node scripts/check-distribution.mjs tag "$GITHUB_REF_NAME"
-          node scripts/check-distribution.mjs source "$GITHUB_SHA"
+          event_commit=$(git rev-parse --verify --end-of-options "${GITHUB_SHA}^{commit}")
+          checkout_commit=$(git rev-parse --verify HEAD)
+          if [[ "$event_commit" != "$checkout_commit" ]]; then
+            echo 'The checked-out tag no longer matches the release event.' >&2
+            exit 1
+          fi
+          node scripts/check-distribution.mjs tag "$GITHUB_REF_NAME" "$event_commit" > /dev/null
+          printf 'commit=%s\n' "$event_commit" >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies
         run: npm install --package-lock=false --ignore-scripts
@@ -54,6 +62,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
+          target_commitish: ${{ steps.tag.outputs.commit }}
           files: ${{ steps.pack.outputs.package }}
           generate_release_notes: true
         env:

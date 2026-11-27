@@ -16,7 +16,7 @@ function privateAclError(message) {
     return Object.assign(new Error(message), { code: 'PRIVATE_STORAGE_ACL_ERROR' });
 }
 
-function assertPrivateAcl(filePath, expected, replacing = false) {
+export function assertPrivateAcl(filePath, expected, replacing = false) {
     if (process.platform !== 'darwin') return;
 
     // Keep permission metadata separate from file contents. Quoted names keep
@@ -119,8 +119,8 @@ function openPrivateFile(filePath, access = fs.constants.O_RDONLY, {
 }
 
 // Only call this for application-owned directories.
-export function ensurePrivateDirectory(directory, { requireOwner = false, checkAcl = requireOwner } = {}) {
-    fs.mkdirSync(directory, { recursive: true, mode: DIRECTORY_MODE });
+export function ensurePrivateDirectory(directory, { requireOwner = false, checkAcl = requireOwner, create = true } = {}) {
+    if (create) fs.mkdirSync(directory, { recursive: true, mode: DIRECTORY_MODE });
     const verifyAcl = checkAcl && process.platform === 'darwin';
     const existing = fs.lstatSync(directory, { bigint: verifyAcl });
     if (!existing.isDirectory()) {
@@ -167,6 +167,15 @@ export function readPrivateFile(filePath, encoding = 'utf8', options) {
     }
 }
 
+export function syncDirectory(directory) {
+    const fd = fs.openSync(directory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0) | OPEN_EXISTING);
+    try {
+        fs.fsyncSync(fd);
+    } finally {
+        fs.closeSync(fd);
+    }
+}
+
 export function writePrivateFile(filePath, data, options) {
     const checkAcl = options?.checkAcl ?? options?.requireOwner;
     try {
@@ -185,11 +194,16 @@ export function writePrivateFile(filePath, data, options) {
             const opened = fs.fstatSync(fd);
             if (checkAcl) assertPrivateAcl(temporaryPath, opened);
             restrictMode(fd, opened, FILE_MODE);
+            if (options?.recordTemporaryFile) {
+                options.recordTemporaryFile(fs.fstatSync(fd, { bigint: true }));
+            }
             fs.writeFileSync(fd, data);
+            if (options?.durable) fs.fsyncSync(fd);
         } finally {
             fs.closeSync(fd);
         }
         fs.renameSync(temporaryPath, filePath);
+        if (options?.durable) syncDirectory(path.dirname(filePath));
     } catch (error) {
         fs.rmSync(temporaryPath, { force: true });
         throw error;

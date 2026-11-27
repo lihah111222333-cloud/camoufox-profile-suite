@@ -281,6 +281,14 @@ test('proxy descriptors project only the recognized endpoint', () => {
     for (const [raw, expected] of fixtures) assert.equal(redactProxyUrl(raw), expected);
 });
 
+test('the inventory proxy descriptor produces an endpoint-only value for logs', async () => {
+    const { default: proxyManager } = await import('../../src/utils/proxy-manager.js');
+    const proxy = proxyManager.parseProxyLine(compactProxy);
+    assert.ok(proxy?.username && proxy?.password);
+    assert.equal(redactProxyUrl(proxy), proxyAddress);
+    assert.equal(redactProxyUrl(proxyManager.parseProxyLine('invalid proxy descriptor')), null);
+});
+
 function legacyFixtureRecords() {
     const attribution = {
         profileId: legacyProfile,
@@ -566,6 +574,255 @@ test('metadata key privacy holds in new recordings and when projecting existing 
     const legacyProfile = queryProfileTraffic({ trafficDir: legacyDir });
     assert.deepEqual(legacyProfile.transactions[0].egress.triggerAction.metadata.contacts, projectedContacts);
     assert.equal(fs.readFileSync(legacyLedger, 'utf8'), original);
+});
+
+test('URL parameter identity keys are projected consistently across capture and export', async (t) => {
+    const root = directory(t);
+    const recorder = new CamoufoxTrafficRecorder({
+        profileDir: root, harPath: path.join(root, 'traffic.har'), recordBodies: false
+    });
+    const transport = new EventEmitter();
+    recorder.attachContext(transport);
+    const internationalEmail = 'fixture-reader@département.invalid';
+    const literalLabel = mask + ' 1';
+    const rawQuery = new URLSearchParams([
+        [internationalEmail, 'first'], ['view', 'compact'], [internationalEmail, 'second'],
+        [literalLabel, 'literal'], [fixtureEmail, 'third'], ['q', internationalEmail], ['access_token', fixtureToken]
+    ]);
+    const url = 'https://fixture.invalid/items?' + rawQuery + '&ordinary=%2B37&compact';
+    const expected = [
+        [mask + ' 2', 'first'], ['view', 'compact'], [mask + ' 2', 'second'],
+        [literalLabel, 'literal'], [mask + ' 3', 'third'], ['q', mask], ['access_token', mask],
+        ['ordinary', '+37'], ['compact', '']
+    ];
+    const sanitized = redactUrlSecrets(url);
+    assert.deepEqual([...new URL(sanitized).searchParams], expected);
+    assert.equal(redactUrlSecrets(sanitized), sanitized);
+    assert.ok(sanitized.endsWith('&ordinary=%2B37&compact'));
+    assert.deepEqual([...new URLSearchParams(redactUrlSecrets('/items#?' + rawQuery).split('#?')[1])],
+        expected.slice(0, 7));
+
+    transport.emit('request', { url: () => url, method: () => 'GET', headers: () => ({}) });
+    await recorder.stop();
+    const ledger = fs.readFileSync(recorder.trafficNdjsonPath, 'utf8').trim().split('\n').map(JSON.parse);
+    const egress = ledger.find(({ type }) => type === 'egress');
+    const har = recorder.exportHar().log.entries[0];
+    const wire = queryProfileTraffic({ trafficDir: recorder.trafficDir, correlation: egress.correlationId });
+    const profile = queryProfileTraffic({ trafficDir: recorder.trafficDir }).transactions[0];
+    for (const recorded of [egress, wire.egress, profile.egress]) {
+        assert.deepEqual([...new URL(recorded.url).searchParams], expected);
+        assert.deepEqual(recorded.searchParams[mask + ' 2'], ['first', 'second']);
+        assert.equal(recorded.searchParams[literalLabel], 'literal');
+        assert.equal(recorded.searchParams[mask + ' 3'], 'third');
+        assert.ok(!Object.hasOwn(recorded.searchParams, internationalEmail));
+        assert.ok(!Object.hasOwn(recorded.searchParams, fixtureEmail));
+    }
+    assert.deepEqual(har.request.queryString, expected.map(([name, value]) => ({ name, value })));
+});
+
+test('OIDC hints are masked without rewriting ordinary query values', () => {
+    const url = 'https://fixture.invalid/logout?id%5Ftoken_hint=fixture.id.token&login_hint=fixture-login' +
+        '&logout_hint=fixture-logout&view=compact&view=full&state=ready';
+    const expected = 'https://fixture.invalid/logout?id%5Ftoken_hint=' + mask + '&login_hint=' + mask +
+        '&logout_hint=' + mask + '&view=compact&view=full&state=ready';
+    assert.equal(redactUrlSecrets(url), expected);
+    assert.equal(redactUrlSecrets(expected), expected);
+});
+
+test('Refresh and SourceMap project relative URL targets and preserve their header syntax', () => {
+    const rawTarget = 'relative?access_token=fixture-refresh-token&view=compact';
+    const safeTarget = 'relative?access_token=' + mask + '&view=compact';
+    const pairs = [
+        ['Refresh', '0; ' + rawTarget, '0; ' + safeTarget],
+        ['Refresh', '2; url="' + rawTarget + '"', '2; url="' + safeTarget + '"'],
+        ['Refresh', "3.5 , URL = '" + rawTarget + "'  ", "3.5 , URL = '" + safeTarget + "'  "],
+        ['Refresh', '4 ' + rawTarget, '4 ' + safeTarget],
+        ['Refresh', '5', '5'],
+        ['Refresh', 'url="' + rawTarget + '"', 'url="' + safeTarget + '"'],
+        ['Refresh', '6; relative?view=compact', '6; relative?view=compact'],
+        ['SourceMap', rawTarget, safeTarget],
+        ['X-SourceMap', 'bundle.js.map?view=compact', 'bundle.js.map?view=compact']
+    ];
+    const headersArray = pairs.map(([name, value]) => ({ name, value }));
+    const expected = pairs.map(([name, , value]) => ({ name, value }));
+    const projected = redactSensitiveHeaders({ headersArray });
+    assert.deepEqual(projected.headersArray, expected);
+    assert.deepEqual(redactSensitiveHeaders(projected), projected);
+    assert.equal(redactDiagnosticText('SourceMap: ' + rawTarget), 'SourceMap: ' + safeTarget);
+});
+
+const routeEmail = 'fixture-route@département.invalid';
+const encodedRouteEmail = encodeURIComponent(routeEmail);
+const routePrefix = 'https://fixture.invalid/app#/inbox/';
+
+test('fragment routes redact encoded identity and keep ordinary paths and queries', () => {
+    const query = '?view=compact&format=a%2Bb';
+    const ordinaryPath = routePrefix + 'quarter%2Ejson' + query;
+    assert.equal(redactUrlSecrets(routePrefix + encodedRouteEmail + query), routePrefix + mask + query);
+    assert.equal(redactUrlSecrets(ordinaryPath), ordinaryPath);
+});
+
+test('Content-Disposition projects plain and extended filename identity values', () => {
+    const filename = 'attachment; filename="Report; ' + routeEmail + '.pdf"; ' +
+        "filename*=UTF-8'en'" + encodedRouteEmail + '.pdf; size=12';
+    const expected = 'attachment; filename="' + mask + '"; ' +
+        "filename*=UTF-8'en'" + encodeURIComponent(mask) + '; size=12';
+    const ordinary = 'inline; filename="Résumé; final.pdf"; ' +
+        "filename*=UTF-8''R%C3%A9sum%C3%A9%20final.pdf";
+    const project = value => redactSensitiveHeaders({ headers: { 'Content-Disposition': value } })
+        .headers['Content-Disposition'];
+    assert.equal(project(filename), expected);
+    assert.equal(project(expected), expected);
+    assert.equal(project(ordinary), ordinary);
+    assert.equal(project("inline; filename*=ISO-8859-1''fixture%40d%E9partement.invalid.pdf"),
+        "inline; filename*=ISO-8859-1''" + encodeURIComponent(mask));
+    assert.equal(redactDiagnosticText('Content-Disposition: ' + filename), 'Content-Disposition: ' + expected);
+});
+
+test('external handler URLs retain scheme names in direct, linked, and nested projections', () => {
+    const links = [
+        ['MaIlTo:', 'fixture@contact.invalid?subject=fixture-subject&body=fixture-message'],
+        ['sms:', '+12025550123?body=fixture-text'],
+        ['tel:', '+12025550124'],
+        ['geo:', '12.3456,76.5432']
+    ];
+    for (const [scheme, content] of links) {
+        const url = scheme + content;
+        const safeUrl = scheme + mask;
+        assert.equal(redactUrlSecrets(url), safeUrl);
+        assert.deepEqual(redactSensitiveHeaders({ headers: {
+            Location: url, Link: '<' + url + '>; rel="author", </public?view=compact>; rel="next"'
+        } }).headers, {
+            Location: safeUrl, Link: '<' + safeUrl + '>; rel="author", </public?view=compact>; rel="next"'
+        });
+        assert.equal(redactUrlSecrets('/next?target=' + encodeURIComponent(url)),
+            '/next?target=' + encodeURIComponent(safeUrl));
+    }
+});
+
+test('new recordings and legacy exports share URL and response-header privacy', async (t) => {
+    const root = directory(t);
+    const recorder = new CamoufoxTrafficRecorder({
+        profileDir: root, harPath: path.join(root, 'traffic.har')
+    });
+    const transport = new EventEmitter();
+    recorder.attachContext(transport);
+
+    const idHint = 'fixture-private-id-hint';
+    const refreshToken = 'fixture-private-refresh';
+    const mapToken = 'fixture-private-map';
+    const message = 'fixture-private-subject';
+    const frameUrl = routePrefix + encodedRouteEmail + '?view=compact';
+    const safeFrameUrl = routePrefix + mask + '?view=compact';
+    const sourceUrl = 'https://fixture.invalid/logout?id_token_hint=' + idHint + '&view=compact';
+    const safeSourceUrl = 'https://fixture.invalid/logout?id_token_hint=' + mask + '&view=compact';
+    const headers = {
+        Refresh: '0; callback?access_token=' + refreshToken + '&view=compact',
+        'X-SourceMap': 'bundle.js.map?token=' + mapToken + '&view=compact',
+        Location: frameUrl,
+        'Content-Disposition': "attachment; filename*=UTF-8''" + encodedRouteEmail + '.pdf',
+        Link: '<mailto:fixture@contact.invalid?subject=' + message + '>; rel=author'
+    };
+    const safeHeaders = {
+        Refresh: '0; callback?access_token=' + mask + '&view=compact',
+        'X-SourceMap': 'bundle.js.map?token=' + mask + '&view=compact',
+        Location: safeFrameUrl,
+        'Content-Disposition': "attachment; filename*=UTF-8''" + encodeURIComponent(mask),
+        Link: '<mailto:' + mask + '>; rel=author'
+    };
+
+    const headersArray = Object.entries(headers).map(([name, value]) => ({ name, value }));
+    const safeHeadersArray = Object.entries(safeHeaders).map(([name, value]) => ({ name, value }));
+    const req = { url: () => sourceUrl, method: () => 'GET', frame: () => ({ url: () => frameUrl }) };
+    transport.emit('request', req);
+    transport.emit('response', {
+        request: () => req, url: req.url, status: () => 302,
+        headers: () => headers, headersArray: async () => headersArray
+    });
+    await recorder.stop();
+
+    const ledger = fs.readFileSync(recorder.trafficNdjsonPath, 'utf8').trim().split('\n').map(JSON.parse);
+    const egress = ledger.find(({ type }) => type === 'egress');
+    const ingress = ledger.find(({ type }) => type === 'ingress');
+    assert.equal(egress.url, safeSourceUrl);
+    assert.equal(egress.frameUrl, safeFrameUrl);
+    assert.equal(egress.recordBodies, false);
+    assert.deepEqual(ingress.headers, safeHeaders);
+    assert.deepEqual(ingress.headersArray, safeHeadersArray);
+
+    const legacyDir = path.join(root, 'legacy', 'traffic');
+    fs.mkdirSync(legacyDir, { recursive: true, mode: 0o700 });
+    const legacyLedger = path.join(legacyDir, 'traffic.ndjson');
+    const archived = [
+        { type: 'egress', timestamp: egress.timestamp, correlationId: 'legacy-url-fields',
+            url: sourceUrl, frameUrl, method: 'GET', searchParams: { id_token_hint: idHint, view: 'compact' } },
+        { type: 'ingress', timestamp: ingress.timestamp, correlationId: 'legacy-url-fields',
+            url: sourceUrl, status: 302, headers, headersArray }
+    ].map(JSON.stringify).join('\n') + '\n';
+    fs.writeFileSync(legacyLedger, archived, { mode: 0o600 });
+
+    const projected = [
+        [recorder.trafficDir, egress.correlationId, recorder.exportHar().log.entries[0]],
+        [legacyDir, 'legacy-url-fields', exportTrafficToHar(legacyDir, path.join(root, 'legacy.har')).log.entries[0]]
+    ];
+    const privateMarkers = [idHint, refreshToken, mapToken, routeEmail, encodedRouteEmail, message];
+    const assertPrivateFieldsAbsent = (value) => {
+        for (const marker of privateMarkers) assert.ok(!value.includes(marker), 'private field in traffic projection');
+    };
+    for (const [trafficDir, correlation, entry] of projected) {
+        const wire = queryProfileTraffic({ trafficDir, correlation });
+        assert.equal(wire.egress.url, safeSourceUrl);
+        assert.equal(wire.egress.searchParams.id_token_hint, mask);
+        assert.equal(wire.egress.frameUrl, safeFrameUrl);
+        assert.deepEqual(wire.ingress.headers, safeHeaders);
+        assert.deepEqual(wire.ingress.headersArray, safeHeadersArray);
+        assert.deepEqual(entry.request.queryString, [
+            { name: 'id_token_hint', value: mask }, { name: 'view', value: 'compact' }
+        ]);
+        assert.equal(entry.response.redirectURL, safeFrameUrl);
+        assert.deepEqual(entry.response.headers, safeHeadersArray);
+        assertPrivateFieldsAbsent(JSON.stringify([entry, wire]));
+    }
+    const wireLog = fs.readFileSync(recorder.preTlsWireLogPath, 'utf8');
+    assert.ok(wireLog.includes('GET /logout?id_token_hint=' + mask + '&view=compact HTTP/1.1'));
+    for (const [name, value] of Object.entries(safeHeaders)) assert.ok(wireLog.includes(name + ': ' + value));
+    for (const file of [recorder.trafficNdjsonPath, recorder.preTlsWireLogPath, recorder.harPath]) {
+        assertPrivateFieldsAbsent(fs.readFileSync(file, 'utf8'));
+    }
+    assert.equal(fs.readFileSync(legacyLedger, 'utf8'), archived);
+});
+
+test('legacy group projection retains a count for each colliding private step', (t) => {
+    const trafficDir = path.join(directory(t), 'traffic');
+    fs.mkdirSync(trafficDir, { mode: 0o700 });
+    const steps = [fixtureEmail, 'another@fixture.invalid', mask, mask + ' 1', 'review'];
+    const stepCounts = [1, 2, 1, 1, 1];
+    const session = { profileId: 'legacy-group-fixture', traceId: 'legacy-group-trace', recordBodies: false };
+    const records = steps.flatMap((actionStep, i) => Array.from({ length: stepCounts[i] }, (_, j) => ({
+        type: 'egress', timestamp: '2025-01-01T00:00:00.000Z', correlationId: 'tx-' + i + '-' + j,
+        url: 'https://fixture.invalid/items', method: 'GET', actionStep, stepIndex: i + 1,
+        attribution: { ...session, actionStep, stepIndex: i + 1 }
+    })));
+    const byActionStep = Object.fromEntries(steps.map((name, i) => [name, { requests: stepCounts[i] }]));
+    const ledgerPath = path.join(trafficDir, 'traffic.ndjson');
+    const indexPath = path.join(trafficDir, 'attribution-index.json');
+    const ledger = records.map(JSON.stringify).join('\n') + '\n';
+    const index = JSON.stringify({ session, byActionStep });
+    fs.writeFileSync(ledgerPath, ledger, { mode: 0o600 });
+    fs.writeFileSync(indexPath, index, { mode: 0o600 });
+
+    const report = queryProfileTraffic({ trafficDir });
+    assert.equal(report.totals.totalRequests, 6);
+    assert.equal(report.transactions.length, 6);
+    assert.deepEqual(report.byActionStep, {
+        [mask + ' 2']: { requests: 1 },
+        [mask + ' 3']: { requests: 2 },
+        [mask]: { requests: 1 },
+        [mask + ' 1']: { requests: 1 },
+        review: { requests: 1 }
+    });
+    assert.equal(fs.readFileSync(ledgerPath, 'utf8'), ledger);
+    assert.equal(fs.readFileSync(indexPath, 'utf8'), index);
 });
 
 test('legacy archive profile lookup, JSON and HAR use the anonymous profile label', (t) => {

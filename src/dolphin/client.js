@@ -509,7 +509,7 @@ export async function getAllFolders() {
     for (let page = 1; ; page++) {
         const { data, folders } = await readFolderPage(page, pageSize);
         const nextLength = allFolders.length + folders.length;
-        const total = data.total === undefined ? expectedTotal : folderCount(data.total);
+        let total = data.total === undefined ? expectedTotal : folderCount(data.total);
         if (data.total === undefined) {
             const returnedPageSize = data.pageSize === undefined ? pageSize : folderCount(data.pageSize);
             const shortPage = Number.isSafeInteger(returnedPageSize) &&
@@ -518,7 +518,7 @@ export async function getAllFolders() {
             if (data.totalNum !== undefined || !complete) {
                 throw new Error('Dolphin Anty API did not confirm that the folder list is complete');
             }
-            if (expectedTotal === undefined) return folders;
+            total ??= nextLength;
         }
 
         if (!Number.isSafeInteger(total) || total < nextLength ||
@@ -529,7 +529,7 @@ export async function getAllFolders() {
         expectedTotal = total;
         for (const folder of folders) {
             const id = readFolderId(folder);
-            if (id === null) continue;
+            if (id === null) throw new Error('Dolphin Anty API returned a folder without a valid ID');
             const key = String(id);
             if (seenIds.has(key)) throw new Error('Dolphin Anty API returned duplicate folder IDs across the list');
             seenIds.add(key);
@@ -550,13 +550,7 @@ export async function findFolderByName(folderName) {
     if (matches.length > 1) {
         throw new Error('Multiple Dolphin Anty folders match the desired name. Set DOLPHIN_FOLDER_ID explicitly.');
     }
-    if (matches.length === 0) return null;
-
-    const id = readFolderId(matches[0]);
-    if (id === null) {
-        throw new Error('The intended Dolphin Anty folder has no valid ID. Set DOLPHIN_FOLDER_ID explicitly.');
-    }
-    return id;
+    return readFolderId(matches[0]);
 }
 
 /**

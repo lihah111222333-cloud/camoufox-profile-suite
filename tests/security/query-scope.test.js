@@ -8,9 +8,9 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
-    formatCliReport, listTrafficProfiles, parseCliArgs, queryProfileTraffic
+    formatCliReport, listTrafficProfiles, parseCliArgs, queryProfileTraffic, reconstructTransactionWireDump
 } from '../../scripts/query-traffic-attribution.js';
-import { CamoufoxTrafficRecorder } from '../../src/camoufox/traffic-recorder.js';
+import { CamoufoxTrafficRecorder, exportTrafficToHar } from '../../src/camoufox/traffic-recorder.js';
 
 const cliPath = fileURLToPath(new URL('../../scripts/query-traffic-attribution.js', import.meta.url));
 const supported = process.platform === 'darwin' || process.platform === 'linux';
@@ -78,6 +78,18 @@ test('scoped query and recorder reject linked directories before touching a capt
     fs.symlinkSync(path.dirname(trafficDir), path.join(profilesDir, 'alternate'), 'dir');
     assert.equal(listTrafficProfiles(profilesDir).length, 1);
     assert.throws(() => queryProfileTraffic({ profilesDir, profile: 'alternate' }), /direct Camoufox profile directory/);
+
+    const brokenProfile = path.join(profilesDir, 'file-traffic');
+    fs.mkdirSync(brokenProfile);
+    fs.writeFileSync(path.join(brokenProfile, 'traffic'), 'synthetic non-directory');
+    for (const profile of ['alternate', 'file-traffic']) {
+        const run = spawnSync(process.execPath, [
+            cliPath, '--profiles-dir=' + profilesDir, '--profile=' + profile
+        ], { encoding: 'utf8' });
+        assert.equal(run.status, 1);
+        assert.equal(run.stdout, '');
+        assert.equal(run.stderr.trim(), 'Error: Expected a direct Camoufox profile directory');
+    }
 
     const recorderOptions = { profilesDir, resetTrafficOnStart: true, sslKeyLog: false, neckoMozLog: false };
     assert.throws(() => new CamoufoxTrafficRecorder({ ...recorderOptions, profileId: 'alternate' }), /direct Camoufox profile directory/);
@@ -186,6 +198,207 @@ test('explicit empty paths and unscoped filters do not fall back to a profile li
     assert.equal(rejected.status, 1);
     assert.match(rejected.stderr, /Profiles root directory must be nonempty/);
     assert.equal(rejected.stdout, '');
+});
+
+test('filtered reports take session identity from the selected recording', { skip: !supported }, async (t) => {
+    const { profilesDir } = fixture(t);
+    const profile = 'fixture';
+    const record = (traceId, accountId, domain) => {
+        const recorder = new CamoufoxTrafficRecorder({
+            profilesDir, profileId: profile, traceId, accountId,
+            recordWireLog: false, sslKeyLog: false, neckoMozLog: false
+        });
+        assert.ok(recorder.recordSecurityBlock({ targetUrl: 'https://' + domain + '/item' }));
+        return recorder;
+    };
+    const firstHost = 'first.scope.example';
+    const secondHost = 'second.scope.example';
+    const firstTrace = 'fixture-first-session';
+    const secondTrace = 'fixture-second-session';
+    await record(firstTrace, 1, firstHost).stop();
+
+    const select = (domain, anomaliesOnly = false) =>
+        queryProfileTraffic({ profilesDir, profile, domain, anomaliesOnly });
+    const firstSession = select(firstHost).session;
+    assert.equal(firstSession.traceId, firstTrace);
+    assert.ok(firstSession.endedAt);
+
+    const resumed = record(secondTrace, 2, secondHost);
+    try {
+        const active = select(secondHost);
+        assert.equal(active.transactions[0].securityBlock.attribution.accountId, 2);
+        assert.equal(active.session.accountId, 2);
+        assert.equal(active.session.traceId, secondTrace);
+        assert.equal(active.session.endedAt, undefined);
+        assert.doesNotMatch(JSON.stringify(active), /fixture-first-session/);
+    } finally {
+        await resumed.stop();
+    }
+
+    const archived = select(firstHost);
+    assert.equal(archived.transactions[0].securityBlock.attribution.accountId, 1);
+    assert.equal(archived.session.accountId, 1);
+    assert.equal(archived.session.traceId, firstTrace);
+    assert.doesNotMatch(JSON.stringify(archived), /fixture-second-session/);
+
+    const anomalies = select(firstHost, true);
+    assert.equal(anomalies.count, 1);
+    assert.equal(anomalies.anomalies[0].traceId, firstTrace);
+    assert.equal(anomalies.session.accountId, 1);
+    assert.equal(anomalies.session.traceId, firstTrace);
+    assert.doesNotMatch(JSON.stringify(anomalies), /fixture-second-session/);
+
+    assert.deepEqual(select('scope.example').session, { profileId: profile });
+    assert.deepEqual(select('empty.example').session, { profileId: profile });
+    assert.equal(queryProfileTraffic({ profilesDir, profile }).session.traceId, secondTrace);
+});
+
+test('mixed captures keep colliding transactions, statuses, and triggers with their sources', { skip: !supported }, (t) => {
+    const { profilesDir } = fixture(t);
+    const traceId = 'shared-trace';
+    const correlationId = 'shared-item';
+    const transaction = (profileId, status, target) => {
+        const url = 'https://' + profileId + '.example/item';
+        const source = { traceId, profileId };
+        return [
+            { type: 'egress', correlationId, attribution: source, url, method: 'GET',
+                triggerAction: { actionType: 'click', target } },
+            { type: 'ingress', correlationId, attribution: source, url, status }
+        ];
+    };
+    const trafficDir = writeProfile(profilesDir, 'fixture', [
+        ...transaction('first-source', 200, '#first'),
+        ...transaction('second-source', 403, '#second'),
+        {
+            type: 'request-failed', correlationId, traceId, url: 'https://unknown.example/item',
+            failureText: 'Unknown source'
+        }
+    ]);
+    const ledgerPath = path.join(trafficDir, 'traffic.ndjson');
+    const originalLedger = fs.readFileSync(ledgerPath);
+    const select = (filters = {}) => queryProfileTraffic({ trafficDir, ...filters });
+    const report = select();
+    assert.equal(report.profileIdentity, 'mixed');
+    assert.equal(report.eventsCount, 5);
+    assert.equal(report.transactionsCount, 3);
+    assert.deepEqual(report.transactions.map(({ egress, ingress, failed, status }) => [
+        egress?.attribution.profileId, ingress?.attribution.profileId, failed?.failureText, status
+    ]), [
+        ['first-source', 'first-source', undefined, 200],
+        ['second-source', 'second-source', undefined, 403],
+        [undefined, undefined, 'Unknown source', null]
+    ]);
+
+    for (const filters of [{ status: '4xx' }, { trigger: '#second' }, { status: '4xx', trigger: '#second' }]) {
+        const selected = select(filters);
+        assert.equal(selected.totals.totalRequests, 1);
+        assert.equal(selected.totals.totalResponses, 1);
+        assert.deepEqual(selected.events.map(({ attribution }) => attribution?.profileId),
+            ['second-source', 'second-source']);
+        assert.equal(selected.transactions[0].ingress.status, 403);
+        assert.equal(selected.anomalies.length, 1);
+        assert.equal(selected.anomalies[0].triggerAction.target, '#second');
+    }
+
+    const displayed = formatCliReport(report);
+    assert.match(displayed, /https:\/\/first-source\.example\/item -> 200/);
+    assert.match(displayed, /https:\/\/second-source\.example\/item -> 403/);
+    assert.match(displayed, /https:\/\/unknown\.example\/item -> Unknown source/);
+    assert.throws(() => select({ correlation: correlationId }), /multiple recorded profile identities/);
+    assert.deepEqual(fs.readFileSync(ledgerPath), originalLedger);
+});
+
+test('anonymous archive rows with repeated transaction phases stay independent', { skip: !supported }, (t) => {
+    const { profilesDir } = fixture(t);
+    const correlationId = 'fixture-overlap';
+    const profileId = 'profile-legacy-1710000000000';
+    const traceId = 'fixture-legacy-trace';
+    const archive = writeProfile(profilesDir, 'fixture', [
+        ...sample(correlationId, 'https://first-archive.example/item'),
+        ...sample(correlationId, 'https://second-archive.example/item')
+    ].map((event) => ({ ...event, attribution: { profileId, traceId, profileContinuityUnproven: true } })),
+    { profileId, traceId });
+
+    const report = queryProfileTraffic({ trafficDir: archive });
+    assert.equal(report.profileIdentity, 'mixed');
+    assert.equal(report.eventsCount, 4);
+    assert.equal(report.transactionsCount, 4);
+    assert.ok(report.transactions.every(({ egress, ingress }) => Number(Boolean(egress)) + Number(Boolean(ingress)) === 1));
+    const forbidden = queryProfileTraffic({ trafficDir: archive, status: 403 });
+    assert.deepEqual(forbidden.events.map(({ type }) => type), ['ingress', 'ingress']);
+});
+
+test('HAR publication rejects cross-profile transaction collisions and preserves legacy pairs', { skip: !supported }, (t) => {
+    const { root, profilesDir } = fixture(t);
+    const traceId = 'shared-trace';
+    const transaction = (profileId, host, status) => sample('shared-item', 'https://' + host + '/item')
+        .map((event) => ({ ...event, attribution: { profileId, traceId }, ...(event.type === 'ingress' && { status }) }));
+    const trafficDir = writeProfile(profilesDir, 'mixed', [
+        ...transaction('first-profile', 'first.example', 200),
+        ...transaction('second-profile', 'second.example', 403)
+    ]);
+    const output = path.join(root, 'previous.har');
+    const previous = Buffer.from('Previous local export');
+    fs.writeFileSync(output, previous);
+
+    const ambiguous = /HAR transaction has multiple recorded profile identities/;
+    assert.throws(() => exportTrafficToHar(trafficDir, output), ambiguous);
+    assert.throws(() => queryProfileTraffic({ trafficDir, exportHar: output }), ambiguous);
+    assert.deepEqual(fs.readFileSync(output), previous);
+
+    const rawProfile = 'Gmail_fixture_person_1710000000000';
+    const displayProfile = 'profile-legacy-1710000000000';
+    const [egress, ingress] = transaction(rawProfile, 'legacy.example', 200);
+    ingress.attribution.profileId = displayProfile;
+    const legacy = writeProfile(profilesDir, 'legacy', [egress, ingress], { profileId: displayProfile, traceId });
+    const { log, entryCount } = exportTrafficToHar(legacy, path.join(root, 'legacy.har'));
+    assert.equal(entryCount, 1);
+    assert.equal(log.entries[0].request.url, egress.url);
+    assert.equal(log.entries[0].response.status, 200);
+    assert.equal(log.entries[0]._attribution.profileId, displayProfile);
+});
+
+test('wire reconstruction checks profile ownership before pairing records or following redirects', { skip: !supported }, (t) => {
+    const { profilesDir } = fixture(t);
+    const traceId = 'shared-trace';
+    const rawProfile = 'Gmail_fixture_person_1710000000000';
+    const displayProfile = 'profile-legacy-1710000000000';
+    const foreignProfile = 'second-profile';
+    const rows = (correlationId, profileId, host, status, parent = null) => sample(correlationId, 'https://' + host + '/item')
+        .map((event) => ({
+            ...event,
+            attribution: { profileId, traceId },
+            ...(event.type === 'ingress' && { status }),
+            ...(parent && { redirectedFromCorrelationId: parent })
+        }));
+    const [parent, parentResponse] = rows('parent', rawProfile, 'local-parent.example', 302);
+    parentResponse.attribution.profileId = displayProfile;
+    const events = [
+        parent, parentResponse,
+        ...rows('parent', foreignProfile, 'foreign-parent.example', 201),
+        ...rows('child', rawProfile, 'local-child.example', 200, 'parent'),
+        ...rows('foreign-child', foreignProfile, 'foreign-child.example', 401, 'child'),
+        ...rows('orphan', rawProfile, 'local-orphan.example', 200, 'foreign-child')
+    ];
+    const trafficDir = writeProfile(profilesDir, 'archive', events, { profileId: foreignProfile, traceId });
+    const direct = (correlationId) => reconstructTransactionWireDump({
+        profileId: displayProfile, trafficDir, correlationId, events, recordBodies: false
+    });
+    const cli = (correlation) => queryProfileTraffic({ trafficDir, correlation });
+    for (const select of [direct, cli]) {
+        assert.throws(() => select('parent'), /multiple recorded profile identities/);
+        const report = select('child');
+        assert.equal(report.profileId, displayProfile);
+        assert.deepEqual(report.redirectChain.map(({ correlationId, url, status }) => [correlationId, url, status]), [
+            ['parent', 'https://local-parent.example/item', 302],
+            ['child', 'https://local-child.example/item', 200]
+        ]);
+        assert.doesNotMatch(JSON.stringify(report), /foreign-(parent|child)\.example/);
+
+        const orphan = select('orphan');
+        assert.deepEqual(orphan.redirectChain.map(({ correlationId }) => correlationId), ['orphan']);
+        assert.equal(orphan.redirectedFromCorrelationId, null);
+    }
 });
 
 test('cookie lineage uses the selected events and the status of their transaction', { skip: !supported }, (t) => {
@@ -350,6 +563,9 @@ test('CLI and JS queries use the private application configuration and keeps hel
     const direct = api('queryProfileTraffic({ trafficDir: ' + JSON.stringify(trafficDir) + ' })');
     assert.equal(direct.status, 0, direct.stderr);
     assert.equal(JSON.parse(direct.stdout).eventsCount, 2);
+    const directCli = run(['--traffic-dir', trafficDir, '--json']);
+    assert.equal(directCli.status, 0, directCli.stderr);
+    assert.equal(JSON.parse(directCli.stdout).eventsCount, 2);
     const invalidConfig = run(['--json']);
     assert.equal(invalidConfig.status, 1);
     assert.match(invalidConfig.stderr, /Could not read \.env as a private configuration file/);

@@ -581,7 +581,7 @@ async function runTests() {
                     assert.equal(ingress.recordBodies, true);
                     assert.equal(ingress.bodyOmittedReason, 'unbounded-response-reader');
                     assert.equal(ingress.bodySha256, null);
-                    assert.equal(ingress.bodyBytes, 0);
+                    assert.equal(ingress.bodyBytes, null);
                     assert.equal(ingress.bodyPreview, null);
                     assert.equal(ingress.payloadFile, null);
                 }
@@ -1500,7 +1500,8 @@ async function runTests() {
                         { name: 'Content-Type', value: 'application/json' },
                         { name: 'X-Audit-Header', value: 'pre-tls-verified' }
                     ],
-                    postData: reqPayload8
+                    postData: reqPayload8,
+                    sizes: { responseBodySize: Buffer.byteLength(resPayload8) }
                 });
                 const res8 = createMockResponse({
                     request: req8,
@@ -1604,6 +1605,8 @@ async function runTests() {
                 assert.equal(cliWireJson.requestPayload, null);
                 assert.equal(cliWireJson.responsePayload, null);
                 assert.equal(cliWireJson.ingress.bodyOmittedReason, 'unbounded-response-reader');
+                assert.equal(cliWireJson.ingress.bodyBytes, null);
+                assert.equal(cliWireJson.sizes.responseBodySize, Buffer.byteLength(resPayload8));
 
                 const cliWireTextRaw = execFileSync(
                     process.execPath,
@@ -1619,7 +1622,7 @@ async function runTests() {
                 assert.equal(cliWireTextRaw.includes('<<< INGRESS [POST-TLS NECKO CHANNEL]'), true);
                 assert.equal(cliWireTextRaw.includes('X-Audit-Header: pre-tls-verified'), true);
                 assert.equal(cliWireTextRaw.includes('[no egress body]'), true);
-                assert.equal(cliWireTextRaw.includes('[no ingress body]'), true);
+                assert.ok(cliWireTextRaw.includes(`[ingress body unavailable (${Buffer.byteLength(resPayload8)} wire bytes)]`));
                 assert.equal(cliWireTextRaw.includes(reqPayload8), false);
                 assert.equal(cliWireTextRaw.includes(resPayload8), false);
 

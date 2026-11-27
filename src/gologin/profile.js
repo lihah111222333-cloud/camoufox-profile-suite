@@ -65,6 +65,7 @@ class GoLoginProfile {
     #launching;
     #ownedBrowser;
     #browserClosed = false;
+    #browserCloseUnconfirmed = false;
     #closing;
     #stopping;
     #stoppingSdk;
@@ -82,6 +83,11 @@ class GoLoginProfile {
             this.#session = {
                 client,
                 createSdk: typeof createSdk === 'function' ? createSdk.bind(session) : undefined,
+                checkClient: () => {
+                    if (session.client !== client) {
+                        throw new GoLoginWaitError('GoLogin session client changed before SDK binding');
+                    }
+                },
                 [internallyBoundSession]: session[internallyBoundSession]
             };
         }
@@ -124,11 +130,6 @@ class GoLoginProfile {
     async #startBrowser(signal) {
         signal.throwIfAborted();
         try {
-            if (!this.#gologinApi) {
-                this.#gologinApi = this.#session.createSdk();
-                this.#ownsSdk = this.#session[internallyBoundSession] === true;
-            }
-
             const browser = await this.#launchBrowser(signal);
             signal.throwIfAborted();
             if (!browser) throw new GoLoginWaitError('GoLogin launch returned no browser');
@@ -154,6 +155,13 @@ class GoLoginProfile {
     #launchBrowser(signal) {
         const launching = Promise.resolve().then(async () => {
             signal.throwIfAborted();
+            if (!this.#gologinApi) {
+                this.#session.checkClient?.();
+                const api = this.#session.createSdk();
+                this.#session.checkClient?.();
+                this.#gologinApi = api;
+                this.#ownsSdk = this.#session[internallyBoundSession] === true;
+            }
             this.#needsCleanup = true;
             this.#stopConfirmed = false;
             const result = await this.#gologinApi.launch({ profileId: String(this.profileId), cloud: true });
@@ -196,12 +204,17 @@ class GoLoginProfile {
     #closeBrowser() {
         const browser = this.#ownedBrowser;
         if (!browser || this.#browserClosed) return Promise.resolve(true);
+        if (this.#browserCloseUnconfirmed) return Promise.resolve(false);
         this.#closing ??= Promise.resolve().then(() => browser.close()).then(result => {
             if (result === false) return false;
             this.#browserClosed = true;
             if (!this.#ownsSdk || typeof this.#gologinApi?.stop !== 'function') this.#stopConfirmed = true;
             return true;
-        }, () => false).finally(() => {
+        }, () => {
+            // Rejection gives no confirmation that the close was never performed.
+            this.#browserCloseUnconfirmed = true;
+            return false;
+        }).finally(() => {
             this.#closing = null;
         });
         return waitFor(this.#closing, browserOperationTimeout, 'GoLogin browser close timed out').catch(() => false);
@@ -212,6 +225,7 @@ class GoLoginProfile {
         if (this.#ownedBrowser) claimedBrowsers.delete(this.#ownedBrowser);
         this.#ownedBrowser = null;
         this.#browserClosed = false;
+        this.#browserCloseUnconfirmed = false;
         this.#needsCleanup = false;
         return true;
     }
@@ -253,11 +267,19 @@ class GoLoginProfile {
             return Promise.reject(cleanupError(this.profileId, 'delete-unconfirmed', 'GoLogin profile deletion is unconfirmed'));
         }
         try {
-            if (!this.#gologinApi) this.#session ??= bindGoLoginSession();
+            if (!this.#gologinApi) {
+                this.#session ??= bindGoLoginSession();
+                this.#session.checkClient?.();
+            }
         } catch (error) {
+            if (error instanceof GoLoginWaitError) {
+                return Promise.reject(cleanupError(this.profileId, 'delete-rejected', error.message));
+            }
             return Promise.reject(error);
         }
-        if (typeof this.#session?.client?.deleteProfile !== 'function') {
+        const client = this.#session?.client;
+        if (typeof client?.deleteProfile !== 'function' ||
+            (client instanceof GoLoginClient && !client.hasBoundCredential)) {
             return Promise.reject(cleanupError(
                 this.profileId, 'delete-rejected', 'Deleting an externally managed GoLogin profile requires a bound REST credential'
             ));

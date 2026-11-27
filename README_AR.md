@@ -455,8 +455,11 @@ flowchart TD
 | `loadProxies` | قراءة الملف. |
 | `getNextProxy` | اختيار عشوائي من غير المستخدم. |
 | `markAsUsed`, `releaseProxy`, `reset` | تتبع التوفر. |
-| `getGPMLoginFormat`, `getGoLoginFormat`, `getStringFormat` | تحويل للصيغ المطلوبة وللسجلات. |
+| `getGPMLoginFormat`, `getGoLoginFormat` | تنسيق إعدادات البروكسي لواجهات إدارة الملفات الشخصية. قد تتضمن القيم بيانات المصادقة. |
+| `getStringFormat` | يعيد السطر الأصلي من قائمة البروكسيات بما فيه بيانات المصادقة عند وجودها. |
 | `getAvailableCount` | عدد تقريبي للبروكسيات المتاحة. |
+
+لعرض عنوان البروكسي في السجلات، استخدم `redactProxyUrl(proxy)` من `src/camoufox/traffic-redaction.js`. يقتصر الناتج على البروتوكول والمضيف والمنفذ.
 
 ### `NameGenerator` في `src/utils/name-generator.js`
 
@@ -509,22 +512,21 @@ flowchart TD
 
 اسم الحزمة على سجل npm الخاص بـ GitHub: **`@code-root/gmail-account-creator`** (نطاق الاسم يطابق مالك المستودع `code-root`).
 
+### فحص كل إصدار قبل النشر
+
+حضّر التزامًا خضع للمراجعة يتضمن إصدارًا جديدًا في `package.json`، ثم نفّذ [فحص الإصدار المشترك](README.md#preflight-for-every-release) قبل دفع الوسم أو النشر من الواجهة. يتحقق الفاحص من الإصدار وشجرة المصدر في الالتزام الذي يشير إليه الوسم فعليًا. قد يتيح GitHub أرشيف المصدر قبل تشغيل سير العمل. يرفض الفاحص الوسم التاريخي `v1.0.0` لاحتوائه على أمثلة قديمة لبيانات اعتماد.
+
 ### الخيار أ — إصدار تلقائي (مُستحسن)
 
-1. حدّث `version` في `package.json` وادفع إلى `main`.  
-2. `git tag v1.0.1 && git push origin v1.0.1`  
-3. يتحقق سير العمل **Release** من مطابقة الوسم لإصدار `package.json`، ويشغّل اختبارات الأمان، ويفحص محتويات حزمة npm.
-4. يرفق سير العمل الحزمة التي تم التحقق منها بصفحة الإصدار وينشر الملف نفسه في GitHub Packages.
+أكمل فحص الإصدار، ثم ادفع الالتزام المراجع إلى `main` بالطريقة المعتادة. استخدم [أمر دفع كائن الوسم الذي اجتاز الفحص](README.md#option-a--automated-release-recommended). يتحقق سير العمل **Release** من الالتزام الموسوم ويشغّل اختبارات الأمان، ثم يرفق حزمة npm التي اجتازت الفحص بصفحة الإصدار وينشر الملف نفسه في GitHub Packages.
 
 ### الخيار ب — من واجهة GitHub: «Create a new release»
 
-1. افتح [**Releases**](https://github.com/code-root/gmail-account-creator/releases) ثم **Create a new release** (أو **Draft a new release**).  
-2. اختر وسمًا يطابق إصدار `package.json` في الالتزام الموسوم، ثم اكتب العنوان والملاحظات.
-3. انشر الإصدار ليبدأ سير العمل التحقق من الحزمة ونشرها في GitHub Packages. لإرفاق ملف **`.tgz`** تلقائيًا بصفحة الإصدار، استخدم الخيار أ.
+استخدم هذا المسار لوسم موجود على GitHub ويحتاج إلى إصدار. أكمل فحص الإصدار، ثم [تحقق من تطابق كائن الوسم البعيد](README.md#option-b--create-a-new-release-in-the-github-ui). بعد نجاح المقارنة، اختر الوسم الموجود في [**Releases**](https://github.com/code-root/gmail-account-creator/releases)، وأضف العنوان والملاحظات وانشر الإصدار. يتحقق سير العمل من الحزمة وينشرها في GitHub Packages. للوسم الجديد على GitHub، استخدم الخيار أ ثم عدّل الإصدار الناتج من الواجهة.
 
 #### إذا كانت GitHub Actions معطّلة (مثلاً بسبب الفوترة)
 
-أنشئ الحزمة وتحقق منها محليًا من نسخة نظيفة من الوسم المطابق. ارفع ملف **`.tgz`** الذي اجتاز التحقق إلى صفحة الإصدار وانشر الملف نفسه في سجل GitHub Packages. [خطوات التحقق والنشر المحلي](README.md#if-github-actions-are-blocked-eg-billing)
+أكمل فحص الإصدار، ثم أنشئ الحزمة من نسخة عمل نظيفة للالتزام الذي اجتاز الفحص. تحقق من تطابق الوسم البعيد قبل إرفاق الحزمة في الواجهة أو نشر الإصدار يدويًا. [خطوات التحقق والنشر المحلي](README.md#if-github-actions-are-blocked-eg-billing)
 
 ### التثبيت من GitHub Packages
 

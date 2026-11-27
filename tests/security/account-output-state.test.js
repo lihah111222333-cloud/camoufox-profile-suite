@@ -6,10 +6,12 @@ import { setTimeout as wait } from 'node:timers/promises';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import {
-    appendAccountResult, migrateExistingAccountOutputs, recordAccountCleanup, writeRunSummary
+    appendAccountResult, migrateExistingAccountOutputs, migrateExistingAccountOutputsAsync,
+    recordAccountCleanup, writeRunSummary, writeRunSummaryAsync
 } from '../../src/utils/account-results.js';
 import { describeProcessOwner, readProcessOwner } from '../../src/utils/process-owner.js';
 import { ensurePrivateDirectory, writePrivateFile } from '../../src/utils/private-storage.js';
@@ -37,6 +39,12 @@ test('concurrent writer processes preserve every result while migrating shared h
     const original = '[{"success":true,"profileId":"previous","password":"fixture-only"}]';
     const legacyResults = path.join(legacy, 'results.json');
     fs.writeFileSync(legacyResults, original, { mode: 0o644 });
+    const legacySummary = path.join(legacy, 'summary.json');
+    const originalSummary = JSON.stringify({
+        timestamp: '2026-01-01T00:00:00.000Z',
+        results: [{ success: false, profileType: 'GPM Login', profileCleanup: 'allocation-unconfirmed' }]
+    });
+    fs.writeFileSync(legacySummary, originalSummary, { mode: 0o600 });
 
     const writeFixtureResults = [
         'const [module, results, summary, legacyDirectory, writer] = process.argv.slice(1);',
@@ -54,10 +62,16 @@ test('concurrent writer processes preserve every result while migrating shared h
     ], { timeout: 12_000 })));
 
     const expectedIds = writers.flatMap((writer) => Array.from({ length: 6 }, (_, i) => writer + '-' + i));
-    assert.deepEqual(readJson(results).map((record) => record.profileId).sort(), ['previous', ...expectedIds].sort());
+    const records = readJson(results);
+    assert.deepEqual(records.filter(({ success }) => success).map(({ profileId }) => profileId).sort(),
+        ['previous', ...expectedIds].sort());
+    const [recovery, ...duplicates] = records.filter(({ success }) => !success);
+    assert.equal(recovery.profileCleanup, 'allocation-unconfirmed');
+    assert.equal(duplicates.length, 0);
     assert.ok(writers.includes(readJson(summary).results[0].profileId));
     assert.doesNotMatch(fs.readFileSync(results, 'utf8'), /fixture-only/);
     assert.equal(fs.readFileSync(legacyResults, 'utf8'), original);
+    assert.equal(fs.readFileSync(legacySummary, 'utf8'), originalSummary);
     assert.deepEqual(fs.readdirSync(state).sort(), ['results.json', 'summary.json']);
     if (process.platform !== 'win32') {
         assert.equal(fs.statSync(results).mode & 0o777, 0o600);
@@ -348,7 +362,7 @@ test('output locks and profile leases distinguish a reused PID from an active ow
         [owner] = fs.readdirSync(lock);
         metadata = fs.readFileSync(path.join(lock, owner), 'utf8');
     });
-    const [host, generation] = metadata.trim().split(' ');
+    const [host, generation, ...scope] = metadata.trim().split(' ');
     assert.match(generation, /^(?:[0-9a-f]{64}|-)$/);
     fs.mkdirSync(lock, { mode: 0o700 });
     const marker = path.join(lock, owner);
@@ -363,9 +377,10 @@ test('output locks and profile leases distinguish a reused PID from an active ow
     }
     waitMethod.mock.restore();
     const olderGeneration = '0'.repeat(64);
+    const reusedMetadata = [host, olderGeneration, ...scope].join(' ') + '\n';
     const reusedMarker = path.join(lock, owner.replace(/^owner-[0-9]+-/, `owner-${active.pid}-`));
     fs.renameSync(marker, reusedMarker);
-    fs.writeFileSync(reusedMarker, `${host} ${olderGeneration}\n`);
+    fs.writeFileSync(reusedMarker, reusedMetadata);
     assert.equal(withAccountOutputLock(output, () => 'acquired'), 'acquired');
     assert.equal(fs.existsSync(lock), false);
     assert.doesNotThrow(() => process.kill(active.pid, 0));
@@ -399,13 +414,163 @@ test('output locks and profile leases distinguish a reused PID from an active ow
         fs.unlinkSync(foreign);
         fs.rmdirSync(liveLease.directory);
 
-        const replaced = installMarker(active.pid, `${host} ${olderGeneration}\n`);
+        const replaced = installMarker(active.pid, reusedMetadata);
         const recovered = acquireProfileLease(location);
         assert.equal(fs.existsSync(replaced), false);
         assert.doesNotThrow(() => assertProfileLease(recovered));
         releaseProfileLease(recovered);
         assert.equal(fs.existsSync(liveLease.directory), false);
     });
+});
+
+test('Linux locks recover an exited child before its parent reaps it', {
+    skip: process.platform !== 'linux'
+}, async (t) => {
+    const root = fs.realpathSync.native(temporaryDirectory(t));
+    const output = path.join(root, 'results.json');
+    const lock = output + '.lock';
+    const location = { id: 'unreaped', profilesDir: root };
+    const profileModule = new URL('../../src/camoufox/profile-storage.js', import.meta.url).href;
+    const { acquireProfileLease, releaseProfileLease } = await import(profileModule);
+    const committed = appendAccountResult(output, { success: true, profileId: 'committed' });
+    const code = `
+        import fs from 'node:fs';
+        const [profileModule, lockModule, root, output] = process.argv.slice(1);
+        const { acquireProfileLease } = await import(profileModule);
+        const { withAccountOutputLock } = await import(lockModule);
+        acquireProfileLease({ id: 'unreaped', profilesDir: root });
+        withAccountOutputLock(output, (snapshot) => {
+            fs.writeFileSync(snapshot, '[]', { mode: 0o600 });
+            process.exit(73);
+        });
+    `;
+    const child = childProcess.spawn(process.execPath, [
+        '--input-type=module', '--eval', code, profileModule, lockModule, root, output
+    ], { stdio: 'inherit' });
+    const exited = once(child, 'exit');
+    const pause = new Int32Array(new SharedArrayBuffer(4));
+    let zombie = false;
+    try {
+        assert.ok(Number.isInteger(child.pid));
+        // Keep this event loop from reaping the child before inspecting its kernel state.
+        const deadline = performance.now() + 5_000;
+        while (!zombie && performance.now() < deadline) {
+            const status = fs.readFileSync(`/proc/${child.pid}/status`, 'utf8');
+            zombie = /^State:[ \t]+Z\b/m.test(status);
+            if (!zombie) Atomics.wait(pause, 0, 0, 10);
+        }
+        assert.equal(zombie, true);
+        assert.doesNotThrow(() => process.kill(child.pid, 0));
+        assert.ok(fs.readdirSync(lock).some((name) => name.endsWith('.snapshot')));
+        const leaseDirectory = path.join(root, '.camoufox-leases~', location.id);
+        assert.ok(fs.readdirSync(leaseDirectory).some((name) => name.startsWith(`${child.pid}-`)));
+
+        const recovered = appendAccountResult(output, { success: true, profileId: 'recovered' });
+        assert.deepEqual(readJson(output), [committed, recovered]);
+        assert.equal(fs.existsSync(lock), false);
+        releaseProfileLease(acquireProfileLease(location));
+        assert.equal(fs.existsSync(leaseDirectory), false);
+        assert.doesNotThrow(() => process.kill(child.pid, 0));
+    } finally {
+        if (!zombie) child.kill();
+        const [code, signal] = await exited;
+        if (zombie) assert.deepEqual([code, signal], [73, null]);
+    }
+});
+
+test('Linux locks preserve owners with unverified PID observations', {
+    skip: process.platform === 'win32'
+}, async (t) => {
+    const root = fs.realpathSync.native(temporaryDirectory(t));
+    const { withAccountOutputLock } = await import(lockModule);
+    const { acquireProfileLease } = await import('../../src/camoufox/profile-storage.js');
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+    t.after(() => Object.defineProperty(process, 'platform', platform));
+
+    const pid = process.pid + 1;
+    let self = String(process.pid);
+    let nsPids = self;
+    let present = true;
+    let incumbentStart = '4321';
+    let incumbentState = 'S';
+    let incumbentThreads = 1;
+    let statReads = 0;
+    const readlink = fs.readlinkSync;
+    t.mock.method(fs, 'readlinkSync', (file, ...options) => {
+        if (file === '/proc/self') return self;
+        if (file === '/proc/self/ns/pid') return 'pid:[4026531836]';
+        return readlink(file, ...options);
+    });
+    const readFile = fs.readFileSync;
+    t.mock.method(fs, 'readFileSync', (file, ...options) => {
+        if (file === '/proc/sys/kernel/random/boot_id') return 'd6cddc5a-ad8b-4e09-aa24-2204fbe92e3c\n';
+        if (file === '/proc/self/status') return `NSpid:\t${nsPids}\n`;
+        if (file === `/proc/${process.pid}/stat` || file === `/proc/${pid}/stat`) {
+            statReads++;
+            const owner = file === `/proc/${pid}/stat`;
+            const running = owner ? incumbentState : 'R';
+            const threads = owner ? incumbentThreads : 1;
+            const start = owner ? incumbentStart : '1234';
+            return `${owner ? pid : process.pid} (test) name) ${running} 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 ${threads} 0 ${start} 1\n`;
+        }
+        return readFile(file, ...options);
+    });
+    t.mock.method(process, 'kill', (observed, signal) => {
+        assert.equal(observed, pid);
+        assert.equal(signal, 0);
+        if (!present) throw Object.assign(new Error('Fixture PID missing'), { code: 'ESRCH' });
+        return true;
+    });
+    const wait = new Error('Fixture owner kept the lock');
+    t.mock.method(Atomics, 'wait', () => { throw wait; });
+
+    const scoped = describeProcessOwner();
+    const [host, generation] = scoped.trim().split(' ');
+    assert.equal(scoped.trim().split(' ').length, 4);
+    const location = { id: 'preserved', profilesDir: root };
+    const output = path.join(root, 'results.json');
+    const lock = output + '.lock';
+    const lease = path.join(root, '.camoufox-leases~', location.id);
+    const uuid = '068fd614-aceb-46c0-90b9-8b329991e448';
+    const owner = path.join(lock, `owner-${pid}-${uuid}`);
+    const leaseOwner = path.join(lease, `${pid}-${uuid}`);
+    const snapshot = owner + '.snapshot';
+    fs.mkdirSync(lock);
+    fs.mkdirSync(lease, { recursive: true });
+    fs.writeFileSync(snapshot, '[]', { mode: 0o600 });
+
+    function assertPreserved(marker, expectedLeaseError = /owner could not be verified/) {
+        fs.writeFileSync(owner, marker, { mode: 0o600 });
+        fs.writeFileSync(leaseOwner, marker, { mode: 0o600 });
+        assert.throws(() => withAccountOutputLock(output, () => assert.fail('owner was replaced')), error => error === wait);
+        assert.throws(() => acquireProfileLease(location), {
+            code: 'ERR_CAMOUFOX_PROFILE_BUSY', message: expectedLeaseError
+        });
+        assert.equal(fs.readFileSync(owner, 'utf8'), marker);
+        assert.equal(fs.readFileSync(leaseOwner, 'utf8'), marker);
+        assert.equal(fs.readFileSync(snapshot, 'utf8'), '[]');
+    }
+
+    const reads = statReads;
+    self = String(pid);
+    assert.equal(describeProcessOwner(), `${host} -\n`);
+    assertPreserved(scoped);
+    present = false;
+    assertPreserved(scoped);
+    present = true;
+    self = String(process.pid);
+    nsPids = `${self}\t${self}`;
+    assertPreserved(scoped);
+    assert.equal(statReads, reads);
+
+    nsPids = self;
+    // Old markers lack the scope needed to distinguish PID reuse from a bad procfs view.
+    assertPreserved(`${host} ${generation}\n`);
+    incumbentStart = '1234';
+    incumbentState = 'Z';
+    incumbentThreads = 2;
+    assertPreserved(scoped, /active owner/);
 });
 
 test('a writer recovers the interrupted replacement snapshot and preserves unrelated files', (t) => {
@@ -470,6 +635,106 @@ test('legacy import preserves the original on failure and gives existing state p
     assert.equal(readJson(summary).stats.skipped, 2);
     migrateExistingAccountOutputs(results, summary, { legacyDirectory: legacy });
     assert.equal(readJson(results)[0].profileId, 'current');
+});
+
+test('summary-only cleanup survives replacement with a stable results entry', async (t) => {
+    for (const [source, migrate, saveSummary] of [
+        ['legacy', migrateExistingAccountOutputs, writeRunSummary],
+        ['current', migrateExistingAccountOutputsAsync, writeRunSummaryAsync]
+    ]) {
+        await t.test(source, async (t) => {
+            const state = temporaryDirectory(t);
+            const legacyDirectory = temporaryDirectory(t);
+            const results = path.join(state, 'results.json');
+            const summary = path.join(state, 'summary.json');
+            const sourceFile = source === 'legacy' ? path.join(legacyDirectory, 'summary.json') : summary;
+            const original = JSON.stringify({
+                timestamp: '2026-01-01T00:00:00.000Z',
+                results: [{
+                    success: true, profileType: 'GPM Login', profileId: 'fixture-profile',
+                    profileCleanup: 'stop-unconfirmed', email: 'private-fixture@example.invalid',
+                    password: 'private-fixture-password'
+                }]
+            });
+            fs.writeFileSync(sourceFile, original, { mode: 0o600 });
+
+            const review = await migrate(results, summary, { legacyDirectory });
+            assert.equal(review.length, 1);
+            const [saved] = readJson(results);
+            assert.deepEqual(review[0], { entry: 1, resultId: saved.resultId, profileCleanup: 'stop-unconfirmed' });
+            assert.equal(saved.profileId, 'fixture-profile');
+            assert.doesNotMatch(fs.readFileSync(results, 'utf8'), /private-fixture/);
+            assert.deepEqual(await migrate(results, summary, { legacyDirectory }), review);
+            if (process.platform !== 'win32') assert.equal(fs.statSync(results).mode & 0o777, 0o600);
+
+            const previousSummary = fs.readFileSync(summary);
+            await saveSummary(summary, { results: [{ success: true, profileId: 'current-run' }] });
+            assert.equal(readJson(summary).results[0].profileId, 'current-run');
+            assert.deepEqual(await migrate(results, summary, { legacyDirectory }), review);
+            assert.deepEqual(readJson(results), [saved]);
+
+            recordAccountCleanup(results, saved.resultId, 'stopped');
+            if (source === 'legacy') fs.unlinkSync(summary);
+            else fs.writeFileSync(summary, previousSummary);
+            assert.deepEqual(await migrate(results, summary, { legacyDirectory }), []);
+            assert.deepEqual(readJson(results), [{ ...saved, profileCleanup: 'stopped' }]);
+            if (source === 'legacy') assert.equal(fs.readFileSync(sourceFile, 'utf8'), original);
+        });
+    }
+});
+
+test('summary cleanup reconciles the same result and preserves a different attempt', (t) => {
+    const state = temporaryDirectory(t);
+    const results = path.join(state, 'results.json');
+    const summary = path.join(state, 'summary.json');
+    const sameResult = {
+        success: false, resultId: '068fd614-aceb-46c0-90b9-8b329991e448',
+        profileId: 'known-profile', profileType: 'GPM Login', timestamp: '2026-01-01T00:00:00.000Z'
+    };
+    const otherAttempt = {
+        success: false, profileId: 'reused-profile', profileType: 'GPM Login',
+        timestamp: '2026-01-01T00:00:01.000Z', profileCleanup: 'stop-unconfirmed'
+    };
+    fs.writeFileSync(results, JSON.stringify([sameResult, otherAttempt]), { mode: 0o600 });
+    fs.writeFileSync(summary, JSON.stringify({
+        results: [
+            { ...sameResult, profileCleanup: 'stop-unconfirmed' },
+            { ...otherAttempt, timestamp: '2026-01-01T00:00:00.000Z' }
+        ]
+    }), { mode: 0o600 });
+
+    const review = migrateExistingAccountOutputs(results, summary);
+    assert.deepEqual(review.map(({ entry }) => entry), [1, 2, 3]);
+    assert.equal(review[0].resultId, sameResult.resultId);
+    assert.equal(readJson(results)[2].timestamp, '2026-01-01T00:00:00.000Z');
+    const inode = fs.statSync(results).ino;
+    assert.deepEqual(migrateExistingAccountOutputs(results, summary), review);
+    assert.equal(fs.statSync(results).ino, inode);
+    recordAccountCleanup(results, sameResult.resultId, 'stopped');
+    assert.deepEqual(migrateExistingAccountOutputs(results, summary), review.slice(1));
+});
+
+test('a failed summary cleanup recovery keeps the source for retry', (t) => {
+    const state = temporaryDirectory(t);
+    const results = path.join(state, 'results.json');
+    const summary = path.join(state, 'summary.json');
+    fs.writeFileSync(summary, JSON.stringify({
+        results: [{ success: false, profileCleanup: 'allocation-unconfirmed', profileType: 'GPM Login' }]
+    }), { mode: 0o600 });
+    const rename = fs.renameSync;
+    const failure = new Error('Synthetic result replacement failure');
+    const stub = t.mock.method(fs, 'renameSync', (from, to) => {
+        if (to === results) throw failure;
+        return rename(from, to);
+    });
+
+    assert.throws(() => migrateExistingAccountOutputs(results, summary), (error) => error === failure);
+    assert.equal(fs.existsSync(results), false);
+    assert.equal(readJson(summary).results[0].profileCleanup, 'allocation-unconfirmed');
+    stub.mock.restore();
+    const review = migrateExistingAccountOutputs(results, summary);
+    assert.equal(review.length, 1);
+    assert.equal(readJson(results)[0].resultId, review[0].resultId);
 });
 
 test('legacy import removes candidate identity from unsuccessful attempts', (t) => {
@@ -603,6 +868,30 @@ function installedCli(t) {
     const start = (args, overrides = {}) => childProcess.spawn(process.execPath, [entry, ...args], options(overrides));
     return { run, start, install, workingDirectory, state: path.join(xdg, 'gmail-account-creator') };
 }
+
+test('installed CLI reports recovered summary-only cleanup before replacing the summary', (t) => {
+    const { run, state } = installedCli(t);
+    const summary = path.join(state, 'summary.json');
+    ensurePrivateDirectory(state);
+    fs.writeFileSync(summary, JSON.stringify({
+        results: [{
+            success: false, profileId: 'fixture-private-profile', profileType: 'GPM Login',
+            profileCleanup: 'stop-unconfirmed'
+        }]
+    }), { mode: 0o600 });
+
+    const completed = run(['--accounts=1']);
+    assert.equal(completed.status, 1, completed.stderr);
+    const records = readJson(path.join(state, 'results.json'));
+    assert.equal(records.length, 2);
+    const [recovered] = records;
+    assert.equal(recovered.profileCleanup, 'stop-unconfirmed');
+    assert.match(completed.stderr, /Profile cleanup was pending or unconfirmed in results\.json/);
+    assert.ok(completed.stderr.includes(`entry 1 (resultId ${recovered.resultId}) (stop-unconfirmed)`));
+    assert.doesNotMatch(completed.stderr, /fixture-private-profile/);
+    assert.equal(readJson(summary).results.length, 1);
+    assert.equal(readJson(summary).results[0].profileId, null);
+});
 
 test('CLI cancels a pending result lock without clearing the active writer', {
     skip: process.platform === 'win32'

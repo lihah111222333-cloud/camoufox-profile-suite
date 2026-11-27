@@ -184,6 +184,39 @@ test('GPM and Dolphin control and proxy transport policies', async t => {
         });
     }
 
+    await run('GPM discovery returns a safe error for a rejected HTTP request', async () => {
+        const controller = 'https://gpm-controller.invalid:9443/cdp';
+        const failure = Object.assign(new Error('Fixture HTTP failure'), {
+            code: 'ERR_BAD_REQUEST',
+            config: { url: controller + '/json/version' },
+            request: { method: 'GET' },
+            response: { status: 403, data: { message: 'Fixture access denied' } }
+        });
+        responses.push(failure);
+        await assert.rejects(new GpmProfile('fixture', controller).start(), error => {
+            assert.equal(error.name, 'ControllerRequestError');
+            assert.equal(error.status, 403);
+            assert.equal(error.message, 'GPM browser endpoint discovery failed (HTTP 403)');
+            for (const field of ['config', 'request', 'response', 'cause']) {
+                assert.equal(error[field], undefined);
+            }
+            return true;
+        });
+        assert.deepEqual(requests.map(request => new URL(request.url).pathname), ['/cdp/json/version']);
+        assert.deepEqual(sockets, []);
+
+        const endpoint = 'wss://gpm-controller.invalid:9443/devtools/browser/fixture';
+        responses.push(
+            Object.assign(new Error('Fixture route missing'), { response: { status: 404 } }),
+            Object.assign(new Error('Fixture timeout'), { code: 'ETIMEDOUT' }),
+            [{ type: 'browser', webSocketDebuggerUrl: endpoint }]
+        );
+        await new GpmProfile('fixture', controller).start();
+        assert.deepEqual(requests.slice(1).map(request => new URL(request.url).pathname),
+            ['/cdp/json/version', '/cdp/json', '/cdp/json/list']);
+        assertWebSockets(sockets, connections, [endpoint]);
+    });
+
     await run('GPM rediscovers a TLS endpoint after an attachment failure', async () => {
         const initial = 'wss://gpm-controller.invalid:9443/devtools/browser/initial';
         const refreshed = 'wss://gpm-controller.invalid:9443/devtools/browser/refreshed';
@@ -219,7 +252,10 @@ test('GPM and Dolphin control and proxy transport policies', async t => {
         const verificationError = new Error('Fixture certificate verification failed');
         verificationError.code = 'UNABLE_TO_VERIFY_LEAF_SIGNATURE';
         responses.push(verificationError);
-        await assert.rejects(new GpmProfile('fixture', address).start(), /certificate verification failed/);
+        await assert.rejects(new GpmProfile('fixture', address).start(), {
+            name: 'ControllerRequestError',
+            transportCode: 'UNABLE_TO_VERIFY_LEAF_SIGNATURE'
+        });
         assert.equal(requests.length, 2);
         assertWebSockets(sockets, connections, []);
     });
@@ -228,8 +264,10 @@ test('GPM and Dolphin control and proxy transport policies', async t => {
         const error = new Error('Unexpected redirect response');
         error.response = { status: 302 };
         responses.push(error);
-        await assert.rejects(new GpmProfile('fixture', 'https://gpm-controller.invalid:9443').start(),
-            /redirect response/);
+        await assert.rejects(new GpmProfile('fixture', 'https://gpm-controller.invalid:9443').start(), {
+            name: 'ControllerRequestError',
+            status: 302
+        });
         assert.equal(requests.length, 1);
         assertSecureHttp(requests[0]);
         assertWebSockets(sockets, connections, []);

@@ -12,9 +12,10 @@ import {
     startProfile,
     stopAllActiveProfiles,
     stopProfile,
-    unregisterProcessCleanupHooks
+    unregisterProcessCleanupHooks,
+    updateProfileProxy
 } from '../../src/camoufox/client.js';
-import { createAndStartProfile } from '../../src/camoufox/profile.js';
+import { CamoufoxProfile, createAndStartProfile } from '../../src/camoufox/profile.js';
 
 const proxy = { server: 'http://proxy.example.invalid:8080', bypass: 'example.invalid' };
 
@@ -143,6 +144,51 @@ test('nested proxy options cannot replace the selected profile proxy', async (t)
     assert.deepEqual(session.metadata.proxy, proxy);
     assert.deepEqual(launches[0].options.proxy, proxy);
     assert.equal(Object.hasOwn(launches[0].contexts[0], 'proxy'), false);
+});
+
+test('factory restarts read rotated credentials under the managed network policy', async (t) => {
+    const { launches, options } = setup(t);
+    const server = 'https://egress.example.invalid:8443';
+    configureEnv(t, { CAMOUFOX_PORT_SCAN_MODE: 'managed-proxy', CAMOUFOX_MANAGED_EGRESS_ORIGIN: server });
+    const original = { server, username: 'fixture-user', password: 'fixture-initial' };
+    const rotated = { ...original, password: 'fixture-rotated' };
+
+    const profile = await createAndStartProfile('rotation', null, { ...options, proxy: original });
+    assert.deepEqual(launches[0].options.proxy, original);
+    assert.equal(await profile.stop(), true);
+
+    await updateProfileProxy(profile.profileId, rotated, options);
+    const bindingRejected = { code: 'ERR_CAMOUFOX_MANAGED_EGRESS_BINDING' };
+    await assert.rejects(updateProfileProxy(profile.profileId, null, options), bindingRejected);
+    const explicitDirect = new CamoufoxProfile(profile.profileId, { ...options, proxy: null });
+    await assert.rejects(explicitDirect.start(), bindingRejected);
+    assert.equal(launches.length, 1);
+
+    await profile.start();
+    assert.deepEqual(launches[1].options.proxy, rotated);
+    assert.equal(profile.securityGuards.getStats().portScanProtectionMode, 'managed-proxy');
+});
+
+test('factory restarts follow proxy addition and removal under the URL-only policy', async (t) => {
+    const { launches, options } = setup(t);
+    configureEnv(t, { CAMOUFOX_PORT_SCAN_MODE: 'url-only' });
+    const profile = await createAndStartProfile('proxy-change', null, options);
+    assert.equal(Object.hasOwn(launches[0].options, 'proxy'), false);
+    assert.equal(await profile.stop(), true);
+
+    await updateProfileProxy(profile.profileId, proxy, options);
+    await profile.start();
+    assert.deepEqual(launches[1].options.proxy, proxy);
+    assert.equal(await profile.stop(), true);
+
+    const explicitDirect = new CamoufoxProfile(profile.profileId, { ...options, proxy: null });
+    await explicitDirect.start();
+    assert.equal(Object.hasOwn(launches[2].options, 'proxy'), false);
+    assert.equal(await explicitDirect.stop(), true);
+
+    await updateProfileProxy(profile.profileId, null, options);
+    await profile.start();
+    assert.equal(Object.hasOwn(launches[3].options, 'proxy'), false);
 });
 
 test('all capture opt-outs reject pending and active reuse under the previous policy', async (t) => {

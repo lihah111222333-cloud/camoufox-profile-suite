@@ -6,6 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import {
     closeSharedBrowser,
+    deleteProfile,
     getActiveProfileIds,
     setCamoufoxModule,
     startProfile,
@@ -67,9 +68,10 @@ function setup(t, configureContext = () => {}, beforeLaunch = () => {}) {
                             return page;
                         },
                         async storageState() {
+                            const state = structuredClone(fixture.state);
                             await fixture.beforeSnapshot?.();
                             assert.equal(fixture.closed, false);
-                            return fixture.state;
+                            return state;
                         },
                         async route(pattern, handler) {
                             fixture.routes.add(handler);
@@ -215,6 +217,75 @@ test('shared browser close saves both live and still-opening contexts before clo
     assert.deepEqual(getActiveProfileIds(), []);
 });
 
+test('an overlapping save reports busy until a new snapshot can actually be sampled', async (t) => {
+    const { contexts, options } = setup(t);
+    const manager = await new CamoufoxProfile('overlapping-saves', options).start();
+    const [fixture] = contexts;
+    fixture.state.cookies = [{ name: 'fixture', value: 'first' }];
+    let signalSample;
+    let allowReturn;
+    let snapshots = 0;
+    const firstSample = new Promise((resolve) => { signalSample = resolve; });
+    const firstHeld = new Promise((resolve) => { allowReturn = resolve; });
+    fixture.beforeSnapshot = () => {
+        snapshots += 1;
+        if (snapshots === 1) {
+            signalSample();
+            return firstHeld;
+        }
+    };
+
+    const first = manager.saveStorageState();
+    await firstSample;
+    fixture.state.cookies[0].value = 'second';
+    const busy = assert.rejects(manager.saveStorageState(), { code: 'ERR_CAMOUFOX_PROFILE_BUSY' });
+    allowReturn();
+
+    await busy;
+    assert.equal(await first, manager.storageStatePath);
+    assert.equal(snapshots, 1);
+    assert.equal(JSON.parse(fs.readFileSync(manager.storageStatePath, 'utf8')).cookies[0].value, 'first');
+    assert.equal(await manager.saveStorageState(), manager.storageStatePath);
+    assert.equal(snapshots, 2);
+    assert.deepEqual(JSON.parse(fs.readFileSync(manager.storageStatePath, 'utf8')), fixture.state);
+});
+
+test('overlapping requests preserve the last good snapshot when an in-flight save fails', async (t) => {
+    const { contexts, options } = setup(t);
+    const manager = await new CamoufoxProfile('save-retry', options).start();
+    const [fixture] = contexts;
+    fixture.state.cookies = [{ name: 'fixture', value: 'saved' }];
+    const savedPath = await manager.saveStorageState();
+    const savedBytes = fs.readFileSync(savedPath);
+
+    let signalSample;
+    let allowFailure;
+    let snapshots = 0;
+    const firstSample = new Promise((resolve) => { signalSample = resolve; });
+    const firstHeld = new Promise((resolve) => { allowFailure = resolve; });
+    fixture.beforeSnapshot = async () => {
+        snapshots += 1;
+        if (snapshots === 1) {
+            signalSample();
+            await firstHeld;
+            throw new Error('Fixture snapshot unavailable');
+        }
+    };
+
+    const failed = assert.rejects(manager.saveStorageState(), /Fixture snapshot unavailable/);
+    await firstSample;
+    fixture.state.cookies[0].value = 'final';
+    const busy = assert.rejects(manager.saveStorageState(), { code: 'ERR_CAMOUFOX_PROFILE_BUSY' });
+    allowFailure();
+    await Promise.all([failed, busy]);
+
+    assert.deepEqual(fs.readFileSync(savedPath), savedBytes);
+    assert.equal(await manager.stop(), true);
+    assert.equal(snapshots, 2);
+    assert.equal(fixture.closed, true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(savedPath, 'utf8')), fixture.state);
+});
+
 test('closing the public context saves the final state before native close', async (t) => {
     const { contexts, options } = setup(t);
     const manager = await new CamoufoxProfile('context-close', options).start();
@@ -239,6 +310,127 @@ test('shared browser shutdown reports a failed final snapshot after closing the 
     assert.deepEqual(getActiveProfileIds(), []);
 });
 
+test('final storage writes can be retried after profile and shared-browser shutdown', async (t) => {
+    for (const closeShared of [false, true]) {
+        await t.test(closeShared ? 'shared-browser shutdown' : 'profile stop', async (t) => {
+            const { contexts, browsers, options } = setup(t);
+            const profileId = 'retry-final-write';
+            const manager = await new CamoufoxProfile(profileId, options).start();
+            const [fixture] = contexts;
+            const snapshotPath = manager.storageStatePath;
+            const previousBytes = fs.readFileSync(snapshotPath);
+            fixture.state.cookies = [{ name: 'fixture', value: 'latest-cookie' }];
+            fixture.state.origins = [{
+                origin: 'https://fixture.invalid', localStorage: [{ name: 'sample', value: 'latest-storage' }]
+            }];
+            const latestState = structuredClone(fixture.state);
+            let captures = 0;
+            fixture.beforeSnapshot = () => { captures += 1; };
+            const rename = fs.renameSync;
+            const blocked = t.mock.method(fs, 'renameSync', (source, target) => {
+                if (target === snapshotPath) throw Object.assign(new Error('Fixture disk is full'), { code: 'ENOSPC' });
+                return rename(source, target);
+            });
+            try {
+                assert.equal(await (closeShared ? closeSharedBrowser() : manager.stop()), false);
+                assert.equal(fixture.closed, true);
+                if (closeShared) assert.equal(browsers[0].isConnected(), false);
+                assert.deepEqual(fs.readFileSync(snapshotPath), previousBytes);
+                assert.equal(await stopProfile(profileId, options), false);
+                await assert.rejects(startProfile(profileId, options), /Previous Camoufox profile session could not be stopped/);
+                assert.deepEqual(getActiveProfileIds(), [profileId]);
+                assert.equal(captures, 1);
+            } finally {
+                blocked.mock.restore();
+            }
+
+            assert.equal(await stopProfile(profileId, options), true);
+            assert.equal(await manager.stop(), true);
+            assert.equal(captures, 1);
+            assert.deepEqual(JSON.parse(fs.readFileSync(snapshotPath, 'utf8')), latestState);
+            assert.deepEqual(getActiveProfileIds(), []);
+            await startProfile(profileId, options);
+            assert.deepEqual(contexts[1].state, latestState);
+        });
+    }
+});
+
+test('explicit deletion can discard a pending snapshot only after confirmed closure', async (t) => {
+    for (const deleteThroughManager of [false, true]) {
+        await t.test(deleteThroughManager ? 'manager delete' : 'client delete', async (t) => {
+            const { contexts, options } = setup(t);
+            const profileId = 'delete-after-final-write';
+            const manager = await new CamoufoxProfile(profileId, options).start();
+            const snapshotPath = manager.storageStatePath;
+            const rename = fs.renameSync;
+            const blocked = t.mock.method(fs, 'renameSync', (source, target) => {
+                if (target === snapshotPath) throw Object.assign(new Error('Fixture write unavailable'), { code: 'EIO' });
+                return rename(source, target);
+            });
+            try {
+                assert.equal(await manager.stop(), false);
+                assert.equal(contexts[0].closed, true);
+                assert.equal(fs.existsSync(snapshotPath), true);
+                assert.equal(await (deleteThroughManager ? manager.delete() : deleteProfile(profileId, options)), true);
+                assert.equal(fs.existsSync(path.dirname(snapshotPath)), false);
+                assert.deepEqual(getActiveProfileIds(), []);
+            } finally {
+                blocked.mock.restore();
+            }
+        });
+    }
+});
+
+test('deleting a profile with a pending snapshot preserves ownership until its generation moves', async (t) => {
+    const { contexts, options } = setup(t);
+    const profileId = 'staged-delete-with-snapshot';
+    const manager = await new CamoufoxProfile(profileId, options).start();
+    const snapshot = manager.storageStatePath;
+    const profileDir = path.dirname(snapshot);
+    contexts[0].state.cookies = [{ name: 'fixture', value: 'final-state' }];
+
+    const rename = fs.renameSync;
+    const remove = fs.rmSync;
+    let rejectStage = true;
+    let staged;
+    const renamed = t.mock.method(fs, 'renameSync', (from, to) => {
+        if (to === snapshot) throw Object.assign(new Error('Fixture snapshot write failed'), { code: 'ENOSPC' });
+        if (from !== profileDir) return rename(from, to);
+        if (rejectStage) throw Object.assign(new Error('Fixture stage move failed'), { code: 'EBUSY' });
+        rename(from, to);
+        staged = to;
+    });
+    const removed = t.mock.method(fs, 'rmSync', (target, flags) => {
+        if (target !== staged) return remove(target, flags);
+        fs.unlinkSync(path.join(target, 'profile.json'));
+        throw Object.assign(new Error('Fixture staged cleanup failed'), { code: 'EIO' });
+    });
+    try {
+        assert.equal(await manager.stop(), false);
+        assert.equal(contexts[0].closed, true);
+
+        await assert.rejects(manager.delete(), { code: 'EBUSY' });
+        assert.equal(fs.existsSync(snapshot), true);
+        assert.deepEqual(getActiveProfileIds(), [profileId]);
+
+        rejectStage = false;
+        await assert.rejects(manager.delete(), { code: 'EIO' });
+        assert.equal(fs.existsSync(profileDir), false);
+        assert.deepEqual(getActiveProfileIds(), []);
+    } finally {
+        renamed.mock.restore();
+        removed.mock.restore();
+    }
+
+    assert.ok(staged);
+    assert.equal(fs.existsSync(path.join(staged, 'storage-state.json')), true);
+    const replacement = await new CamoufoxProfile(profileId, options).start();
+    assert.equal(await manager.delete(), true);
+    assert.equal(fs.existsSync(staged), false);
+    assert.equal(replacement.browser.isConnected(), true);
+    assert.equal(await replacement.delete(), true);
+});
+
 test('public context closure reports a failed final snapshot and shutdown preserves the previous bytes', async (t) => {
     const { contexts, options } = setup(t);
     const manager = await new CamoufoxProfile('context-save-failed', options).start();
@@ -252,6 +444,33 @@ test('public context closure reports a failed final snapshot and shutdown preser
     assert.equal(contexts.length, 1);
     assert.equal(await manager.stop(), false);
     assert.equal(fs.readFileSync(manager.storageStatePath, 'utf8'), snapshot);
+});
+
+test('concurrent starts agree when the previous final snapshot failed', async (t) => {
+    const { contexts, options } = setup(t);
+    const profileId = 'concurrent-reopen-failed';
+    const manager = await new CamoufoxProfile(profileId, options).start();
+    const [fixture] = contexts;
+    fixture.state.cookies = [{ name: 'fixture', value: 'last-good' }];
+    const savedPath = await manager.saveStorageState();
+    const savedBytes = fs.readFileSync(savedPath);
+    fixture.state.cookies[0].value = 'unsaved';
+    fixture.beforeSnapshot = () => { throw new Error('Fixture snapshot unavailable'); };
+    await assert.rejects(manager.context.close(), /Fixture snapshot unavailable/);
+
+    const failure = /Previous Camoufox profile session could not be stopped/;
+    await Promise.all([
+        assert.rejects(startProfile(profileId, options), failure),
+        assert.rejects(startProfile(profileId, options), failure)
+    ]);
+    assert.equal(contexts.length, 1);
+    assert.deepEqual(getActiveProfileIds(), []);
+    assert.deepEqual(fs.readFileSync(savedPath), savedBytes);
+
+    const reopened = await startProfile(profileId, options);
+    assert.equal(contexts[1].state.cookies[0].value, 'last-good');
+    assert.equal(await manager.stop(), false);
+    assert.equal(reopened.browser.isConnected(), true);
 });
 
 test('a context that closes unexpectedly reports the unavailable final snapshot', async (t) => {
@@ -273,7 +492,13 @@ test('getPage reopens a context closed externally from the last saved snapshot',
     contexts[0].state.cookies[0].value = 'unsaved';
     contexts[0].finishClose();
 
+    const [started, joined] = await Promise.all([
+        startProfile('externally-closed', options),
+        startProfile('externally-closed', options)
+    ]);
+    assert.equal(started, joined);
     const reopened = await manager.getPage();
+    assert.equal(reopened, started.page);
     assert.notEqual(reopened, first);
     assert.equal(reopened.isClosed(), false);
     assert.equal(contexts.length, 2);
@@ -368,7 +593,7 @@ test('failed startup keeps a still-live context tracked and filtered until clean
     assert.deepEqual(getActiveProfileIds(), []);
 });
 
-test('final snapshot failure is reported separately from confirmed native closure', async (t) => {
+test('final capture failure reports confirmed native closure and permits later deletion', async (t) => {
     const { contexts, options } = setup(t);
     const manager = await new CamoufoxProfile('save', options).start();
     const [fixture] = contexts;
@@ -382,6 +607,8 @@ test('final snapshot failure is reported separately from confirmed native closur
     assert.equal(fixture.routes.size, 0);
     assert.equal(manager.context, null);
     assert.equal(fs.readFileSync(savedFile, 'utf8'), previousBytes);
+    assert.equal(await manager.delete(), true);
+    assert.equal(fs.existsSync(savedFile), false);
 });
 
 test('an acquired manager lifecycle keeps its canonical storage when an alias changes', async (t) => {

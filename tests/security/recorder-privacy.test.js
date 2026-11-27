@@ -8,6 +8,7 @@ import test from 'node:test';
 import {
     CamoufoxTrafficRecorder, parseNeckoMozLog, redactUrlSecrets
 } from '../../src/camoufox/traffic-recorder.js';
+import { queryProfileTraffic } from '../../scripts/query-traffic-attribution.js';
 
 function fixture(t, options = {}) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'recorder-privacy-'));
@@ -288,12 +289,46 @@ test('an unbounded browser transport is never asked for decoded response bodies'
         assert.equal(event.status, 200);
         assert.equal(event.recordBodies, true);
         assert.equal(event.bodyOmittedReason, 'unbounded-response-reader');
-        assert.equal(event.bodyBytes, 0);
+        assert.equal(event.bodyBytes, null);
         assert.equal(event.bodyPreview, null);
         assert.equal(event.payloadFile, null);
     }
     assert.deepEqual(fs.readdirSync(recorder.payloadsDir), []);
     assertAbsent(recorder, ['response-body-fixture']);
+});
+
+test('response reports distinguish unread, empty, and measured wire bytes', async (t) => {
+    const { recorder, context } = fixture(t);
+    const fixtures = [
+        { name: 'measured', status: 200, wireBytes: 64, contentBytes: null, label: '[ingress body unavailable (64 wire bytes)]' },
+        { name: 'empty', status: 200, wireBytes: 0, contentBytes: null, label: '[no ingress body]' },
+        { name: 'bodyless', status: 204, contentBytes: 0, label: '[no ingress body]' },
+        { name: 'unknown', status: 200, contentBytes: null, label: '[ingress body unavailable]' }
+    ];
+    for (const { name, status, wireBytes } of fixtures) {
+        const req = request(`https://fixture.invalid/${name}`, {}, {
+            sizes: () => wireBytes === undefined ? null : { responseBodySize: wireBytes }
+        });
+        context.emit('request', req);
+        context.emit('response', response(req, {}, { status: () => status }));
+        context.emit('requestfinished', req);
+    }
+    await recorder.stop();
+
+    const archive = recorder.buildHarArchive();
+    const ingress = events(recorder).filter((event) => event.type === 'ingress');
+    for (const { name, wireBytes, contentBytes, label } of fixtures) {
+        const event = ingress.find(({ url }) => url.endsWith('/' + name));
+        const report = queryProfileTraffic({
+            trafficDir: recorder.trafficDir, correlationId: event.correlationId
+        });
+        assert.equal(event.bodyBytes, contentBytes);
+        assert.equal(report.ingress.bodyBytes, contentBytes);
+        assert.equal(report.sizes?.responseBodySize, wireBytes);
+        assert.ok(report.wireDump.includes(label));
+        const { response: entry } = archive.log.entries.find(({ request }) => request.url === event.url);
+        assert.equal(entry.bodySize, wireBytes ?? contentBytes ?? -1);
+    }
 });
 
 test('enabled request and WebSocket capture retain bounded payload files and content digests', async (t) => {
@@ -336,9 +371,11 @@ test('opted-in requests project complete JSON and forms while authentication and
         sensitiveBodyReads += 1;
         return 'private-auth-marker';
     };
-    context.emit('request', request('https://example.test/v2/sign-in', { 'Content-Type': 'application/json' }, {
-        postData: readBody, postDataBuffer: readBody
-    }));
+    for (const route of ['/v2/sign-in', '/api/session', '/api/sessions']) {
+        context.emit('request', request('https://example.test' + route, { 'Content-Type': 'application/json' }, {
+            postData: readBody, postDataBuffer: readBody
+        }));
+    }
 
     const regularSocket = Object.assign(new EventEmitter(), { url: () => 'wss://example.test/events' });
     const authenticationSocket = Object.assign(new EventEmitter(), { url: () => 'wss://example.test/v2/auth/socket' });
@@ -363,10 +400,38 @@ test('opted-in requests project complete JSON and forms while authentication and
     assert.equal(privateFrame.bodyPreview, null);
     assert.equal(fs.readFileSync(path.join(recorder.trafficDir, privateFrame.payloadFile), 'utf8'), 'private-ws-marker');
     assert.equal(ledger.find(({ type }) => type === 'ws-ingress').payloadFile, null);
-    assert.equal(requests[2].payloadFile, null);
-    assert.equal(log.entries[2].request.postData?.text ?? '', '');
+    for (const event of requests.slice(reqs.length)) {
+        assert.equal(event.bodyOmittedReason, 'sensitive-or-unsupported-url');
+        assert.equal(event.payloadFile, null);
+        assert.equal(event.postDataSha256, null);
+        const entry = log.entries.find(({ request }) => request.url === event.url);
+        assert.equal(entry.request.postData?.text ?? '', '');
+    }
     assert.equal(sensitiveBodyReads, 0);
     assertAbsent(recorder, ['private-json-marker', 'private-form-marker', 'private-auth-marker', 'private-ws-marker']);
+});
+
+test('live inline previews enforce their limit after JSON projection', async (t) => {
+    const scientific = '{"count":1e14}';
+    const expanded = '{"count":100000000000000}';
+    const ordinary = '{"count":7}';
+    const { recorder, context } = fixture(t, { recordBodies: true, maxInlinePreviewBytes: Buffer.byteLength(scientific) });
+    const headers = { 'Content-Type': 'application/json' };
+    context.emit('request', request('https://fixture.invalid/scientific', headers, { postData: () => scientific }));
+    context.emit('request', request('https://fixture.invalid/ordinary', headers, { postData: () => ordinary }));
+    await recorder.stop();
+
+    const [limited, available] = events(recorder).sort((a, b) => a.seq - b.seq);
+    assert.equal(limited.bodyPreviewTruncated, true);
+    assert.equal(limited.bodyPreview, null);
+    assert.equal(limited.postData, null);
+    assert.equal(fs.readFileSync(path.join(recorder.trafficDir, limited.payloadFile), 'utf8'), scientific);
+    assert.equal(available.bodyPreview, ordinary);
+    assertAbsent(recorder, [expanded]);
+    assert.ok(fs.readFileSync(recorder.preTlsWireLogPath, 'utf8').includes(ordinary));
+    assert.equal(recorder.formatTransactionWireDump(limited.correlationId).includes(expanded), false);
+    assert.ok(recorder.formatTransactionWireDump(available.correlationId).includes(ordinary));
+    assert.equal(recorder.buildHarArchive().log.entries[0].request.postData.text, expanded);
 });
 
 test('body-preserving redirects retain the source request body restriction', async (t) => {
@@ -468,6 +533,22 @@ test('reopened wire applies current header, URL, trigger and body rules to accep
             url: 'wss://example.test/events',
             payloadBytes: 42,
             bodyPreview: '{"count":5,"label":"legacy-ws-marker"}'
+        },
+        {
+            ...common,
+            type: 'egress',
+            correlationId: 'legacy-auth',
+            method: 'POST',
+            url: 'https://example.test/sign-in'
+        },
+        {
+            ...common,
+            type: 'egress',
+            correlationId: 'legacy-auth-child',
+            redirectedFromCorrelationId: 'legacy-auth',
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            bodyPreview: '{"count":721}'
         }
     ];
     let head = '0'.repeat(64);
@@ -504,5 +585,8 @@ test('reopened wire applies current header, URL, trigger and body rules to accep
     const socketWire = reopened.formatTransactionWireDump('legacy-socket');
     assert.match(socketWire, /WS-EGRESS.*bytes=42/);
     assert.doesNotMatch(socketWire, /legacy-ws-marker/);
+    const redirectedWire = reopened.formatTransactionWireDump('legacy-auth-child');
+    assert.match(redirectedWire, /POST \/items/);
+    assert.doesNotMatch(redirectedWire, /721/);
     assert.equal(fs.readFileSync(recorder.trafficNdjsonPath, 'utf8'), archived);
 });

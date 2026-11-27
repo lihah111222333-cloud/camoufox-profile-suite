@@ -1,12 +1,22 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { formatCliReport, queryProfileTraffic } from '../../scripts/query-traffic-attribution.js';
 import { CamoufoxTrafficRecorder, verifyTrafficIntegrity } from '../../src/camoufox/traffic-recorder.js';
+
+const cliPath = fileURLToPath(new URL('../../scripts/query-traffic-attribution.js', import.meta.url));
+
+function verifyFromCli(trafficDir, ...args) {
+    return spawnSync(process.execPath, [cliPath, '--traffic-dir=' + trafficDir, '--verify-integrity', ...args], {
+        encoding: 'utf8'
+    });
+}
 
 function fixture(t, options = {}) {
     const trafficDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'attachment-verification-'));
@@ -87,6 +97,11 @@ test('legacy payload descriptors without proof remain explicitly unverified', as
     const { trafficDir, open, recorder, indexPath } = fixture(t);
     request(recorder, Buffer.from('synthetic legacy descriptor'));
     const summary = await recorder.stop();
+    const complete = verifyFromCli(trafficDir);
+    assert.equal(complete.status, 0, complete.stderr);
+    assert.equal(complete.stderr, '');
+    assert.match(complete.stdout, /Status\s+: VALID/);
+
     const [relativePath] = Object.keys(summary.integrity.payloadManifest);
     delete summary.integrity.payloadManifest[relativePath].sha256;
     fs.writeFileSync(indexPath, JSON.stringify(summary));
@@ -97,11 +112,34 @@ test('legacy payload descriptors without proof remain explicitly unverified', as
     assert.equal(report.verifiedPayloads, 0);
     assert.deepEqual(report.unverifiedPayloads, [{ path: relativePath, reason: 'missing-manifest-digest-or-length' }]);
     assert.match(formatCliReport(report), /Status\s+: INCOMPLETE/);
+    const incomplete = verifyFromCli(trafficDir);
+    assert.equal(incomplete.status, 2, incomplete.stderr);
+    assert.equal(incomplete.stderr, '');
+    assert.match(incomplete.stdout, /Status\s+: INCOMPLETE/);
+    const json = verifyFromCli(trafficDir, '--json');
+    assert.equal(json.status, 2, json.stderr);
+    assert.equal(json.stderr, '');
+    assert.deepEqual(JSON.parse(json.stdout), report);
 
     summary.integrity.payloadManifest[relativePath].sha256 = 'invalid';
     fs.writeFileSync(indexPath, JSON.stringify(summary));
     assert.equal(verifyTrafficIntegrity(trafficDir).valid, false);
     assert.throws(open, /Payload SHA-256 digest is invalid/);
+});
+
+test('the CLI marks capture-only verification with unverified native files incomplete', async (t) => {
+    const { trafficDir, recorder } = fixture(t, { neckoMozLog: true });
+    request(recorder, Buffer.from('synthetic attachment'));
+    recorder.recordNeckoMozLogBlock('synthetic Necko fixture');
+    await recorder.stop();
+
+    const run = verifyFromCli(trafficDir, '--json');
+    assert.equal(run.status, 2, run.stderr);
+    assert.equal(run.stderr, '');
+    const report = JSON.parse(run.stdout);
+    assert.equal(report.valid, true);
+    assert.equal(report.payloadManifestVerified, true);
+    assert.deepEqual(report.unverifiedNativeArtifacts, ['necko-pre-tls.moz_log']);
 });
 
 test('nested legacy payloads preserve manifest checks and the inventory finds extra files', async (t) => {

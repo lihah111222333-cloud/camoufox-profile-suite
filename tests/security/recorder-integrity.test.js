@@ -303,6 +303,41 @@ test('recovery respects the previous wire checkpoint before trimming a torn appe
     assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
 });
 
+test('wire summary checks preserve the last committed prefix and accept later complete blocks', async (t) => {
+    const { trafficDir, recorder, create, indexPath } = fixture(t);
+    recorder.recordSecurityBlock({ type: 'fixture', url: 'https://example.test/first' });
+    await recorder.flushSummary();
+    const checkpoint = fs.readFileSync(indexPath);
+    const wirePath = recorder.preTlsWireLogPath;
+    const original = fs.readFileSync(wirePath);
+    const altered = Buffer.from(original);
+    altered[0] ^= 1;
+
+    for (const damage of [original.subarray(0, -1), altered]) {
+        fs.writeFileSync(wirePath, damage);
+        await assert.rejects(recorder.flushSummary(), /byte length mismatch|SHA-256 mismatch/);
+        assert.deepEqual(fs.readFileSync(wirePath), damage);
+        assert.deepEqual(fs.readFileSync(indexPath), checkpoint);
+    }
+    fs.writeFileSync(wirePath, original);
+    recorder.recordSecurityBlock({ type: 'fixture', url: 'https://example.test/second' });
+    const summary = await recorder.stop();
+    const extended = fs.readFileSync(wirePath);
+    assert.ok(extended.length > original.length);
+    assert.deepEqual(extended.subarray(0, original.length), original);
+    assert.equal(summary.integrity.preTlsWireLogBytes, extended.length);
+    assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+
+    const resumed = create({ recordWireLog: false });
+    const resumedCheckpoint = fs.readFileSync(indexPath);
+    fs.writeFileSync(wirePath, original);
+    await assert.rejects(resumed.flushSummary(), /byte length mismatch/);
+    assert.deepEqual(fs.readFileSync(indexPath), resumedCheckpoint);
+    fs.writeFileSync(wirePath, extended);
+    await resumed.stop();
+    assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+});
+
 test('verification checks legacy wire, NSS and Necko declarations even when only size is recorded', async (t) => {
     const { trafficDir, recorder, indexPath } = fixture(t);
     const summary = await recorder.stop();
@@ -640,4 +675,46 @@ test('stopped recorder launch environments cannot restore retired log files', as
     assert.equal(fs.existsSync(recorder.neckoMozLogPath), false);
     assert.equal(fs.existsSync(recorder.preTlsWireLogPath), false);
     await current.stop();
+});
+
+test('the first reset removal failure preserves a verified custom wire log', async (t) => {
+    const { trafficDir, recorder, create, ledgerPath, indexPath } = fixture(t, { recordWireLog: false });
+    await recorder.stop();
+    const wirePath = path.join(trafficDir, 'previous wire.log');
+    const previous = create({ recordWireLog: true, preTlsWireLogPath: wirePath });
+    previous.recordSecurityBlock({ type: 'fixture', url: 'https://example.test/previous' });
+    await previous.stop();
+    const before = [ledgerPath, indexPath, wirePath].map(file => fs.readFileSync(file));
+
+    const remove = fs.rmSync;
+    fs.rmSync = (filePath, ...args) => {
+        if (filePath === ledgerPath) throw Object.assign(new Error('fixture reset failure'), { code: 'EACCES' });
+        return remove(filePath, ...args);
+    };
+    try {
+        assert.throws(() => create({ resetTrafficOnStart: true }), { code: 'EACCES' });
+    } finally {
+        fs.rmSync = remove;
+    }
+    assert.deepEqual([ledgerPath, indexPath, wirePath].map(file => fs.readFileSync(file)), before);
+    assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+});
+
+test('active flush reports no ending time and preserves duration and later events', async (t) => {
+    const { recorder, indexPath } = fixture(t, { recordWireLog: false });
+    recorder.setStep('before flush');
+    const lowerDuration = Math.max(0, Date.now() - recorder.startedAtEpochMs);
+    const active = await recorder.flushSummary();
+    const upperDuration = Math.max(0, Date.now() - recorder.startedAtEpochMs);
+    assert.equal(active.session.endedAt, null);
+    assert.equal(JSON.parse(fs.readFileSync(indexPath, 'utf8')).session.endedAt, null);
+    assert.ok(active.session.totalDurationMs >= lowerDuration && active.session.totalDurationMs <= upperDuration);
+    assert.equal(active.integrity.eventCount, 1);
+
+    recorder.setStep('after flush');
+    const final = await recorder.stop();
+    assert.equal(final.integrity.eventCount, 2);
+    assert.ok(Number.isFinite(Date.parse(final.session.endedAt)));
+    assert.equal(JSON.parse(fs.readFileSync(indexPath, 'utf8')).session.endedAt, final.session.endedAt);
+    assert.equal(final.session.totalDurationMs, Math.max(0, Date.parse(final.session.endedAt) - recorder.startedAtEpochMs));
 });

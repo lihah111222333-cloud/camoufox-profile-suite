@@ -5,16 +5,16 @@
 
 import path from 'path';
 import { appendPrivateFile, ensurePrivateDirectory } from './private-storage.js';
-import { ensureStateDirectory, STATE_DIRECTORY } from './state-paths.js';
+import { ensureStateDirectory } from './state-paths.js';
 
 const LOG_LEVELS = {
+    SILENT: -1,
     ERROR: 0,
     WARN: 1,
     INFO: 2,
     DEBUG: 3
 };
-
-const LOG_DIR = path.join(STATE_DIRECTORY, 'logs');
+let warnedInvalidLogLevel = false;
 
 const REDACTED_FIELDS = new Set([
     'code', 'otp', 'otpcode', 'phonecode', 'verificationcode', 'lastcode',
@@ -88,8 +88,15 @@ function formatMessage(timestamp, level, message, data) {
 }
 
 function shouldLog(level) {
-    const configuredLevel = process.env.LOG_LEVEL?.toUpperCase() || 'INFO';
-    return LOG_LEVELS[level] <= LOG_LEVELS[configuredLevel];
+    const configuredLevel = (process.env.LOG_LEVEL || 'INFO').trim().toUpperCase();
+    if (Object.hasOwn(LOG_LEVELS, configuredLevel)) {
+        return LOG_LEVELS[level] <= LOG_LEVELS[configuredLevel];
+    }
+    if (!warnedInvalidLogLevel) {
+        warnedInvalidLogLevel = true;
+        console.warn('Invalid LOG_LEVEL. Using INFO.');
+    }
+    return LOG_LEVELS[level] <= LOG_LEVELS.INFO;
 }
 
 function writeLog(level, message, data = null) {
@@ -110,9 +117,9 @@ function writeLog(level, message, data = null) {
 
     // File output
     try {
-        ensureStateDirectory();
-        ensurePrivateDirectory(LOG_DIR, { requireOwner: true });
-        const logFile = path.join(LOG_DIR, `app-${timestamp.slice(0, 10)}.log`);
+        const logDir = path.join(ensureStateDirectory(), 'logs');
+        ensurePrivateDirectory(logDir, { requireOwner: true });
+        const logFile = path.join(logDir, `app-${timestamp.slice(0, 10)}.log`);
         appendPrivateFile(logFile, formatted, { requireOwner: true });
     } catch {
         console.error('Failed to write to the application log file');

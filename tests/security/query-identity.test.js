@@ -147,6 +147,8 @@ test('standalone captures validate a claimed profile against their recorded iden
     assert.throws(() => queryProfileTraffic({ ...options, profile: 'independent', exportHar: output }),
         /Selected profile ID does not match/);
     fs.unlinkSync(path.join(trafficDir, 'attribution-index.json'));
+    assert.throws(() => queryProfileTraffic({ trafficDir, profile: 'recorded-profile' }),
+        /Selected profile ID does not match/);
     assert.throws(() => queryProfileTraffic({ ...options, profile: 'recorded-profile', exportHar: output }),
         /Selected profile ID does not match/);
     assert.equal(queryProfileTraffic(options).profileId, 'standalone-capture');
@@ -225,4 +227,262 @@ test('a mixed standalone capture cannot be claimed as one profile or mislabeled 
     const archive = queryProfileTraffic({ ...options, exportHar: output });
     assert.equal(archive.profileIdentity, 'mixed');
     assert.equal(archive.entryCount, 2);
+});
+
+test('an active recording can be queried by its matching explicit directory before its first index', async (t) => {
+    const { root, profilesDir } = fixture(t);
+    const profile = 'active-fixture';
+    const settings = { profileId: profile, recordWireLog: false, sslKeyLog: false, neckoMozLog: false };
+    const recorder = new CamoufoxTrafficRecorder({ profilesDir, ...settings });
+    const directPath = { trafficDir: recorder.trafficDir, profile };
+    const explicit = { ...directPath, profilesDir };
+    try {
+        assert.throws(() => queryProfileTraffic(directPath), /Selected profile ID does not match/);
+        const event = recorder.recordSecurityBlock({
+            targetUrl: 'https://fixture.example/item', reason: 'Synthetic observation'
+        });
+        assert.ok(event);
+        assert.equal(fs.existsSync(recorder.attributionIndexPath), false);
+        const scanned = queryProfileTraffic({ profilesDir, profile });
+        assert.equal(scanned.transactionsCount, 1);
+        for (const selection of [directPath, explicit]) {
+            const direct = queryProfileTraffic(selection);
+            assert.equal(direct.profileId, profile);
+            assert.deepEqual(direct.transactions, scanned.transactions);
+            assert.throws(() => queryProfileTraffic({ ...selection, profile: 'other-profile' }),
+                /Selected profile ID does not match/);
+        }
+        assert.throws(() => queryProfileTraffic({ ...explicit, profilesDir: path.join(root, 'other-root') }),
+            /Selected profile ID does not match/);
+        assert.equal(fs.existsSync(recorder.attributionIndexPath), false);
+    } finally {
+        await recorder.stop();
+    }
+    assert.equal(queryProfileTraffic(explicit).profileId, profile);
+
+    const stateDir = path.join(root, 'state');
+    const inDefault = new CamoufoxTrafficRecorder({ profilesDir: path.join(stateDir, 'profiles'), ...settings });
+    try {
+        inDefault.recordSecurityBlock({
+            targetUrl: 'https://fixture.example/default', reason: 'Synthetic observation'
+        });
+        const result = spawnSync(process.execPath, [
+            cliPath, '--traffic-dir=' + inDefault.trafficDir, '--profile=' + profile, '--json'
+        ], {
+            cwd: root, encoding: 'utf8',
+            env: { GMAIL_CREATOR_STATE_DIR: stateDir, GMAIL_CREATOR_LEGACY_DIR: path.join(root, 'legacy') }
+        });
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(JSON.parse(result.stdout).profileId, profile);
+    } finally {
+        await inDefault.stop();
+    }
+});
+
+test('the CLI can disambiguate multiple captures of one profile by traffic directory', async (t) => {
+    const { root, profilesDir, cli } = fixture(t);
+    const profile = 'archive-fixture';
+    const archives = ['first-copy', 'second-copy'];
+    for (const name of archives) {
+        const trafficDir = path.join(profilesDir, name, 'traffic');
+        await record(profilesDir, profile, { trafficDir }, [{
+            targetUrl: 'https://fixture.example/' + name
+        }]);
+    }
+
+    const ambiguous = cli('--profile=' + profile, '--json');
+    assert.equal(ambiguous.status, 1);
+    assert.match(ambiguous.stderr, /multiple directories.*--traffic-dir/);
+    for (const [index, name] of archives.entries()) {
+        const trafficDir = path.join(profilesDir, name, 'traffic');
+        const directory = index === 0 ? ['--traffic-dir', trafficDir] : ['--traffic-dir=' + trafficDir];
+        const selected = cli(...directory, '--profile=' + profile, '--json');
+        assert.equal(selected.status, 0, selected.stderr);
+        const report = JSON.parse(selected.stdout);
+        assert.equal(report.profileId, profile);
+        assert.equal(report.transactions.length, 1);
+        assert.equal(report.transactions[0].url, 'https://fixture.example/' + name);
+        assert.ok(!selected.stdout.includes(root));
+    }
+
+    const trafficDir = path.join(profilesDir, archives[1], 'traffic');
+    const output = path.join(root, 'selected.har');
+    const exportArgs = ['--traffic-dir=' + trafficDir, '--export-har=' + output, '--json'];
+    const archive = cli(...exportArgs, '--profile=' + profile);
+    assert.equal(archive.status, 0, archive.stderr);
+    const original = fs.readFileSync(output);
+    const [entry] = JSON.parse(original).log.entries;
+    assert.equal(entry.request.url, 'https://fixture.example/' + archives[1]);
+    const conflict = cli(...exportArgs, '--profile=' + archives[1]);
+    assert.equal(conflict.status, 1);
+    assert.match(conflict.stderr, /Selected profile ID does not match/);
+    assert.deepEqual(fs.readFileSync(output), original);
+});
+
+test('shared HAR and wire use safe correlation IDs while retaining original selection', async (t) => {
+    const { root, profilesDir } = fixture(t);
+    const profile = 'fixture-correlation-privacy';
+    const privateId = 'fixture-identity@example.test';
+    const normalId = 'fixture-ordinary-correlation';
+    const recorder = await record(profilesDir, profile, {}, [
+        { correlationId: privateId },
+        { correlationId: normalId }
+    ]);
+    const options = { profilesDir, profile };
+    assert.doesNotMatch(JSON.stringify(queryProfileTraffic(options)), /fixture-identity/);
+
+    const wire = queryProfileTraffic({ ...options, correlation: privateId });
+    assert.equal(wire.found, true);
+    assert.equal(wire.correlationId, wire.securityBlock.correlationId);
+    assert.doesNotMatch(JSON.stringify(wire), /fixture-identity/);
+    assert.match(wire.wireDump, /REDACTED-CORRELATION/);
+    const recorderWire = recorder.formatTransactionWireDump(privateId);
+    assert.match(recorderWire, /REDACTED-CORRELATION/);
+    assert.doesNotMatch(recorderWire, /fixture-identity/);
+    assert.equal(queryProfileTraffic({ ...options, correlation: normalId }).correlationId, normalId);
+
+    const harPath = path.join(root, 'shared.har');
+    const exported = queryProfileTraffic({ ...options, exportHar: harPath });
+    assert.equal(exported.entryCount, 2);
+    assert.equal(exported.log.entries[1]._attribution.correlationId, normalId);
+    assert.doesNotMatch(fs.readFileSync(harPath, 'utf8'), /fixture-identity/);
+
+    const selected = queryProfileTraffic({ ...options, exportHar: harPath, correlation: privateId });
+    assert.equal(selected.entryCount, 1);
+    assert.match(selected.log.entries[0]._attribution.correlationId, /REDACTED-CORRELATION/);
+});
+
+test('shared HAR and wire keep distinct correlation references after masking', (t) => {
+    const { root } = fixture(t);
+    const trafficDir = path.join(root, 'legacy', 'traffic');
+    fs.mkdirSync(trafficDir, { recursive: true, mode: 0o700 });
+    const parentId = 'fixture-parent@example.test';
+    const childId = 'fixture-child@example.test';
+    const reserved = '[REDACTED-CORRELATION-1]';
+    const makeRequest = (id, parent = null) => ({
+        type: 'egress',
+        correlationId: id,
+        redirectedFromCorrelationId: parent,
+        method: 'GET',
+        url: 'https://records.example.test/item'
+    });
+    const events = [makeRequest(parentId), makeRequest(childId, parentId), makeRequest(reserved)];
+    fs.writeFileSync(path.join(trafficDir, 'traffic.ndjson'), events.map((event) => JSON.stringify(event)).join('\n') + '\n');
+    const har = exportTrafficToHar(trafficDir, path.join(root, 'redirects.har'));
+    const [parentHar, childHar, normalHar] = har.log.entries.map((entry) => entry._attribution);
+    assert.doesNotMatch(JSON.stringify(har.har), /fixture-(?:parent|child)@/);
+    assert.equal(childHar.redirectedFromCorrelationId, parentHar.correlationId);
+    assert.equal(normalHar.correlationId, reserved);
+    assert.equal(new Set([parentHar.correlationId, childHar.correlationId, normalHar.correlationId]).size, 3);
+
+    const wire = queryProfileTraffic({ trafficDir, correlation: childId });
+    assert.equal(wire.found, true);
+    assert.doesNotMatch(JSON.stringify(wire), /fixture-(?:parent|child)@/);
+    const [parentWire, childWire] = wire.redirectChain;
+    assert.equal(childWire.correlationId, wire.correlationId);
+    assert.equal(childWire.redirectedFromCorrelationId, parentWire.correlationId);
+    assert.equal(wire.redirectedFromCorrelationId, parentWire.correlationId);
+    assert.notEqual(parentWire.correlationId, childWire.correlationId);
+});
+
+test('an anonymous legacy profile label cannot assert ownership across recording traces', async (t) => {
+    const { root, profilesDir } = fixture(t);
+    const firstId = 'Gmail_fixture_owner_alpha_1710000000000';
+    const secondId = 'Gmail_fixture_owner_beta_1710000000000';
+    const label = 'profile-legacy-1710000000000';
+    for (const [captureName, traceId] of [['different-traces', undefined], ['reused-trace', 'shared-trace-fixture']]) {
+        const trafficDir = path.join(profilesDir, captureName, 'traffic');
+        const options = { profilesDir, trafficDir };
+        await record(profilesDir, firstId, { trafficDir, traceId }, [{ correlationId: 'first-legacy-record' }]);
+        assert.equal(queryProfileTraffic({ ...options, profile: label }).eventsCount, 1);
+        const output = path.join(root, captureName + '.har');
+        assert.equal(queryProfileTraffic({ ...options, profile: label, exportHar: output }).entryCount, 1);
+        const original = fs.readFileSync(output);
+
+        await record(profilesDir, secondId, { trafficDir, traceId }, [{ correlationId: 'second-legacy-record' }]);
+        const query = queryProfileTraffic(options);
+        assert.equal(query.profileIdentity, 'mixed');
+        assert.equal(query.eventsCount, 2);
+        assert.ok(listTrafficProfiles(profilesDir).every((entry) => entry.profileIdentity === 'mixed'));
+        assert.equal(queryProfileTraffic({ ...options, verifyIntegrity: true }).valid, true);
+        for (const mode of [{}, { exportHar: output }, { verifyIntegrity: true }]) {
+            assert.throws(() => queryProfileTraffic({ ...options, profile: label, ...mode }), /multiple recording profiles/);
+        }
+        assert.deepEqual(fs.readFileSync(output), original);
+        assert.equal(queryProfileTraffic({ ...options, correlation: 'first-legacy-record' }).found, true);
+    }
+
+    const managedDir = path.join(profilesDir, firstId);
+    const managedTraffic = path.join(managedDir, 'traffic');
+    fs.mkdirSync(managedDir, { mode: 0o700 });
+    fs.writeFileSync(path.join(managedDir, 'profile.json'), JSON.stringify({ id: firstId }), { mode: 0o600 });
+    await record(profilesDir, firstId, { trafficDir: managedTraffic });
+    await record(profilesDir, firstId, { trafficDir: managedTraffic });
+    const managed = queryProfileTraffic({ profilesDir, trafficDir: managedTraffic, profile: firstId });
+    assert.equal(managed.profileId, label);
+    assert.equal(managed.eventsCount, 2);
+});
+
+test('historical anonymous captures detect separate generated namespaces under one trace', (t) => {
+    const { root } = fixture(t);
+    const trafficDir = path.join(root, 'legacy', 'traffic');
+    fs.mkdirSync(trafficDir, { recursive: true, mode: 0o700 });
+    const profile = 'profile-legacy-1710000000000';
+    const traceId = 'archived-trace';
+    const ledger = path.join(trafficDir, 'traffic.ndjson');
+    const index = path.join(trafficDir, 'attribution-index.json');
+    fs.writeFileSync(index, JSON.stringify({ session: { profileId: profile, traceId } }));
+    const event = (namespace, seq) => JSON.stringify({
+        type: 'egress', seq, correlationId: 'corr-archived-' + namespace + '-' + seq,
+        method: 'GET', url: 'https://records.example.test/item',
+        attribution: { profileId: profile, traceId }
+    }) + '\n';
+
+    const options = { trafficDir, profile };
+    fs.writeFileSync(ledger, event('00000000-0000-4000-8000-000000000001', 1));
+    const output = path.join(root, 'historical.har');
+    assert.equal(queryProfileTraffic({ ...options, exportHar: output }).entryCount, 1);
+    const original = fs.readFileSync(output);
+
+    fs.appendFileSync(ledger, event('00000000-0000-4000-8000-000000000002', 2));
+    assert.equal(queryProfileTraffic({ trafficDir }).profileIdentity, 'mixed');
+    assert.throws(() => queryProfileTraffic({ ...options, exportHar: output }), /multiple recording profiles/);
+    assert.deepEqual(fs.readFileSync(output), original);
+});
+
+test('historical anonymous custom transactions require evidence beyond a shared trace', async (t) => {
+    const { root, profilesDir } = fixture(t);
+    const trafficDir = path.join(root, 'old-custom', 'traffic');
+    fs.mkdirSync(trafficDir, { recursive: true, mode: 0o700 });
+    const profile = 'profile-legacy-1710000000000';
+    const traceId = 'archived-trace';
+    const ledger = path.join(trafficDir, 'traffic.ndjson');
+    fs.writeFileSync(path.join(trafficDir, 'attribution-index.json'), JSON.stringify({ session: { profileId: profile, traceId } }));
+    const event = (correlationId, seq) => ({
+        type: 'egress', seq, correlationId, method: 'GET', url: 'https://records.example.test/item',
+        attribution: { profileId: profile, traceId }
+    });
+    const first = event('fixture-custom-first', 1);
+    const writeEvent = (row) => fs.appendFileSync(ledger, JSON.stringify(row) + '\n');
+    writeEvent(first);
+    writeEvent({ ...first, type: 'ingress', seq: 2, status: 200 });
+    const options = { trafficDir, profile };
+    const output = path.join(root, 'previous.har');
+    assert.equal(queryProfileTraffic({ ...options, exportHar: output }).entryCount, 1);
+    const original = fs.readFileSync(output);
+
+    writeEvent(event('fixture-custom-second', 3));
+    const report = queryProfileTraffic({ trafficDir });
+    assert.equal(report.profileIdentity, 'mixed');
+    assert.equal(report.transactionsCount, 2);
+    assert.throws(() => queryProfileTraffic(options), /multiple recording profiles/);
+    assert.throws(() => queryProfileTraffic({ ...options, exportHar: output }), /multiple recording profiles/);
+    assert.deepEqual(fs.readFileSync(output), original);
+
+    const freshDir = path.join(root, 'fresh-custom', 'traffic');
+    await record(profilesDir, 'Gmail_fixture_owner_1710000000000', { trafficDir: freshDir }, [
+        { correlationId: 'fixture-custom-first' },
+        { correlationId: 'fixture-custom-second' }
+    ]);
+    assert.equal(queryProfileTraffic({ trafficDir: freshDir, profile }).transactionsCount, 2);
 });

@@ -262,6 +262,38 @@ test('SMS order wrapper exposes only status when checking preexisting orders', a
     assert.ok(requests.every(request => request.action === 'getStatus' && request.id === String(ORDER_ID)));
 });
 
+test('SMS read-only reconciliation rejects nonfinal status and balance receipts', async t => {
+    const nonfinalStatuses = [202, 206];
+    const requests = mockTransport(t, ...nonfinalStatuses.flatMap(status => [
+        new Response('STATUS_CANCEL', { status }),
+        new Response('12.50', { status })
+    ]), 'STATUS_CANCEL', '12.50', new Response('STATUS_CANCEL', { status: 202 }));
+    const wrapper = await importWrapper(t, 'sms-verification', 'nonfinal-reads');
+    for (const status of nonfinalStatuses) {
+        await assert.rejects(wrapper.getOrderStatus(ORDER_ID), expectOrderError('RECONCILIATION_REQUIRED'), `HTTP ${status}`);
+        await assert.rejects(wrapper.getBalance(), /balance is unconfirmed/, `HTTP ${status}`);
+    }
+    assert.deepEqual(await wrapper.getOrderStatus(ORDER_ID), { status: 'CANCELED' });
+    assert.equal(await wrapper.getBalance(), 12.5);
+    await assert.rejects(wrapper.waitForSMS(ORDER_ID, 1000), expectOrderError('RECONCILIATION_REQUIRED'));
+    assert.deepEqual(requests.map(({ action, id }) => [action, id]), [
+        ['getStatus', String(ORDER_ID)], ['getBalance', null],
+        ['getStatus', String(ORDER_ID)], ['getBalance', null],
+        ['getStatus', String(ORDER_ID)], ['getBalance', null],
+        ['getStatus', String(ORDER_ID)]
+    ]);
+});
+
+test('SMS status reads treat empty received content as unknown', async t => {
+    const requests = mockTransport(t, 'STATUS_OK:', 'STATUS_OK: \t', 'STATUS_OK:', 'STATUS_WAIT_CODE');
+    const wrapper = await importWrapper(t, 'sms-verification', 'empty-received-content');
+    assert.deepEqual(await wrapper.getOrderStatus(ORDER_ID), { status: 'UNKNOWN' });
+    assert.deepEqual(await wrapper.getOrderStatus(ORDER_ID), { status: 'UNKNOWN' });
+    assert.deepEqual(await checkSmsVerifyOrder(ORDER_ID), { status: 'UNKNOWN', code: null });
+    assert.deepEqual(await wrapper.getOrderStatus(ORDER_ID), { status: 'PENDING' });
+    assert.equal(requests.length, 4);
+});
+
 test('SMS status queries require a valid target before dispatch', async t => {
     const requests = mockTransport(t, new Error(PRIVATE_DATA), 'STATUS_CANCEL');
     const wrapper = await importWrapper(t, 'sms-verification', 'invalid-status-target');

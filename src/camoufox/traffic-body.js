@@ -1,6 +1,6 @@
 import { redactUrlSecrets } from './traffic-redaction.js';
 
-const AUTHENTICATION_PATH = /(?:^|\/)(?:auth(?:enticate|entication|orize)?|oauth2?|sign[-_]?(?:in|out|up)|log[-_]?(?:in|out)|register|password|token|session|verify|verification|challenge|otp|mfa)(?:[/;._-]|$)/i;
+const AUTHENTICATION_PATH = /(?:^|\/)(?:auth(?:enticate|entication|orize)?|oauth2?|sign[-_]?(?:in|out|up)|log[-_]?(?:in|out)|register|password|token|sessions?|verify|verification|challenge|otp|mfa)(?:[/;._-]|$)/i;
 const BOOLEAN_FIELDS = new Set(['ok', 'success', 'enabled', 'complete', 'completed', 'done']);
 const COUNT_FIELDS = new Set(['count', 'limit', 'offset', 'page', 'pageSize', 'total']);
 const STATUS_VALUES = new Set([
@@ -22,6 +22,17 @@ export function allowsTrafficBody(url) {
     } catch {
         return false;
     }
+}
+
+/** A redirect that switches to GET or HEAD discards the preceding upload. */
+export function redirectDropsUpload(method, sourceMethod) {
+    return (method === 'GET' || method === 'HEAD') &&
+        typeof sourceMethod === 'string' && sourceMethod.length > 0 && sourceMethod !== method;
+}
+
+export function isBodylessHttpResponse(method, status) {
+    return method === 'HEAD' || (status >= 100 && status < 200) ||
+        status === 204 || status === 205 || status === 304;
 }
 
 /** Bound the recorder's work on a body already delivered by the browser transport. */

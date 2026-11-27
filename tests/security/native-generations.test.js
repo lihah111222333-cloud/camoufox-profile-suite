@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
-    createProfile, rollbackCreatedProfile, setCamoufoxModule, startProfile, stopAllActiveProfiles,
+    createProfile, deleteProfile, rollbackCreatedProfile, setCamoufoxModule, startProfile, stopAllActiveProfiles,
     stopProfile, unregisterProcessCleanupHooks
 } from '../../src/camoufox/client.js';
 import { CamoufoxTrafficRecorder, exportTrafficToHar, verifyTrafficIntegrity } from '../../src/camoufox/traffic-recorder.js';
@@ -257,6 +257,122 @@ test('a failed HAR publication preserves the captured request and retries on sto
     assert.equal(fs.existsSync(scratch), false);
 });
 
+test('HAR-only publication protects the profile’s persistent wire in active and recovered sessions', async (t) => {
+    for (const scenario of ['active', 'recovered', 'legacy registration']) {
+        await t.test(scenario, async (t) => {
+            const { open, stop, options, profileId } = managedFixture(t);
+            const initialized = await open({ ...HAR_ONLY, recordHar: false });
+            const { harPath, trafficDir, attributionIndexPath } = initialized.trafficPaths;
+            assert.equal(await stop(), true);
+
+            const recorder = new CamoufoxTrafficRecorder({
+                profileId, trafficDir, preTlsWireLogPath: harPath, trustedLocal: true
+            });
+            const context = new EventEmitter();
+            recorder.attachContext(context);
+            observeSyntheticRequest({ context });
+            const summary = await recorder.stop();
+            assert.equal(summary.integrity.preTlsWireLogFile, path.basename(harPath));
+            assert.equal(verifyTrafficIntegrity(trafficDir, { trustedLocal: true }).valid, true);
+            if (scenario === 'legacy registration') {
+                delete summary.integrity.preTlsWireLogFile;
+                delete summary.integrity.preTlsWireLogSha256;
+                delete summary.integrity.preTlsWireLogBytes;
+                fs.writeFileSync(attributionIndexPath, JSON.stringify(summary));
+            }
+            const wire = fs.readFileSync(harPath);
+            const index = fs.readFileSync(attributionIndexPath);
+            if (scenario === 'active') {
+                const output = path.join(trafficDir, 'separate.har');
+                const session = await open({ ...HAR_ONLY, contextOptions: { recordHar: { path: output } } });
+                observeSyntheticRequest(session);
+                assert.equal(await stop(), true);
+                assert.equal(JSON.parse(fs.readFileSync(output, 'utf8')).log.entries.length, 1);
+                assert.deepEqual(fs.readFileSync(harPath), wire);
+            }
+
+            const scratch = path.join(path.dirname(trafficDir), '.native', '~har-scratch');
+            const scratchLedger = path.join(scratch, 'traffic.ndjson');
+            const scratchIndex = path.join(scratch, 'attribution-index.json');
+            const sdk = new URL('../../src/camoufox/client.js', import.meta.url).href;
+            const child = `
+                import assert from 'node:assert/strict';
+                import { EventEmitter } from 'node:events';
+                import fs from 'node:fs';
+                import { setCamoufoxModule, startProfile, stopProfile, unregisterProcessCleanupHooks }
+                    from ${JSON.stringify(sdk)};
+                const mockLauncher = ${mockLauncher.toString()};
+                const options = ${JSON.stringify({ ...options, ...HAR_ONLY })};
+                const id = ${JSON.stringify(profileId)};
+                setCamoufoxModule(mockLauncher());
+                const session = await startProfile(id, options);
+                session.context.emit('request', { method: () => 'GET', url: () => 'https://fixture.invalid/resource' });
+                const ledger = ${JSON.stringify(scratchLedger)};
+                for (let attempt = 0; attempt < 50 && !fs.existsSync(ledger); attempt++) {
+                    await new Promise(resolve => setTimeout(resolve, 10));
+                }
+                assert.ok(fs.statSync(ledger).size > 0);
+                if (${scenario === 'active'}) assert.equal(await stopProfile(id, options), false);
+                unregisterProcessCleanupHooks();
+            `;
+            execFileSync(process.execPath, ['--input-type=module', '-e', child], { timeout: 10000 });
+            if (scenario !== 'active') {
+                const ledger = fs.readFileSync(scratchLedger);
+                const checkpoint = fs.readFileSync(scratchIndex);
+                assert.equal(await stop(), false);
+                assert.deepEqual(fs.readFileSync(scratchLedger), ledger);
+                assert.deepEqual(fs.readFileSync(scratchIndex), checkpoint);
+            } else {
+                assert.equal(verifyTrafficIntegrity(scratch, { trustedLocal: true }).valid, true);
+            }
+
+            assert.deepEqual(fs.readFileSync(harPath), wire);
+            assert.deepEqual(fs.readFileSync(attributionIndexPath), index);
+            assert.equal(verifyTrafficIntegrity(trafficDir, { trustedLocal: true }).valid, true);
+            assert.match(fs.readFileSync(scratchLedger, 'utf8'), /fixture\.invalid\/resource/);
+        });
+    }
+});
+
+test('combined capture preserves a newer HAR until the operator moves it aside', async (t) => {
+    const { open, stop, options } = managedFixture(t);
+    const combined = { ...HAR_ONLY, recordTraffic: true };
+    const initial = await open(combined);
+    observeSyntheticRequest(initial);
+    assert.equal(await stop(), true);
+    const unchanged = await open(combined);
+    observeSyntheticRequest(unchanged);
+    assert.equal(await stop(), true);
+
+    const session = await open(combined);
+    const { harPath, trafficDir, trafficNdjsonPath } = session.trafficPaths;
+    observeSyntheticRequest(session);
+    await session.trafficRecorder.flushSummary({ nativeLogsClosed: false });
+    const capture = fs.readFileSync(trafficNdjsonPath);
+    const independent = new CamoufoxTrafficRecorder({
+        trafficDir: path.join(options.profilesDir, 'independent-capture'), recordWireLog: false, trustedLocal: true
+    });
+    const context = new EventEmitter();
+    independent.attachContext(context);
+    context.emit('request', { method: () => 'GET', url: () => 'https://fixture.invalid/newer-archive' });
+    await independent.stop();
+    exportTrafficToHar(independent.trafficDir, harPath);
+    const newer = fs.readFileSync(harPath);
+
+    assert.equal(await stop(), false);
+    assert.deepEqual(fs.readFileSync(harPath), newer);
+    assert.equal(verifyTrafficIntegrity(trafficDir, { trustedLocal: true }).valid, true);
+    assert.deepEqual(fs.readFileSync(trafficNdjsonPath), capture);
+
+    const retained = path.join(path.dirname(harPath), 'retained.har');
+    fs.renameSync(harPath, retained);
+    assert.equal(await stop(), true);
+    assert.deepEqual(fs.readFileSync(retained), newer);
+    assert.deepEqual(fs.readFileSync(trafficNdjsonPath), capture);
+    assert.deepEqual(JSON.parse(fs.readFileSync(harPath, 'utf8')).log.entries.map((entry) => entry.request.url),
+        ['https://fixture.invalid/resource']);
+});
+
 test('an explicit stop recovers a marked HAR after a process exits with publication pending', async (t) => {
     const { open, stop, options, profileId, launches } = managedFixture(t);
     const clientModule = new URL('../../src/camoufox/client.js', import.meta.url).href;
@@ -381,6 +497,86 @@ test('a HAR-only checkpoint recovers recorded events from a previous process bef
     assert.equal(fs.existsSync(scratch), false);
 });
 
+test('HAR-only recovery accepts the empty marker for a committed attachment', async (t) => {
+    const { open, stop, options, profileId } = managedFixture(t);
+    const seed = await open(HAR_ONLY);
+    observeSyntheticRequest(seed);
+    assert.equal(await stop(), true);
+    const { harPath } = seed.trafficPaths;
+    const previousHar = fs.readFileSync(harPath);
+    const scratch = path.join(options.profilesDir, profileId, '.native', '~har-scratch');
+    const sdk = new URL('../../src/camoufox/client.js', import.meta.url).href;
+    const child = `
+        import { EventEmitter } from 'node:events';
+        import fs from 'node:fs';
+        import path from 'node:path';
+        import { setCamoufoxModule, startProfile } from ${JSON.stringify(sdk)};
+        const mockLauncher = ${mockLauncher.toString()};
+        setCamoufoxModule(mockLauncher());
+        const session = await startProfile(${JSON.stringify(profileId)},
+            ${JSON.stringify({ ...options, ...HAR_ONLY, recordBodies: true })});
+        const unlink = fs.unlinkSync;
+        fs.unlinkSync = (file) => {
+            if (path.basename(file).startsWith('.pending-req-')) process.exit(0);
+            return unlink(file);
+        };
+        session.context.emit('request', {
+            method: () => 'POST',
+            url: () => 'https://fixture.invalid/committed',
+            headers: () => ({ 'content-type': 'text/plain' }),
+            postDataBuffer: () => Buffer.from('synthetic committed attachment')
+        });
+        await session.trafficRecorder.flushSummary();
+        throw new Error('Fixture did not reach committed attachment cleanup');
+    `;
+    execFileSync(process.execPath, ['--input-type=module', '-e', child], { timeout: 10000 });
+
+    const ledgerPath = path.join(scratch, 'traffic.ndjson');
+    const indexPath = path.join(scratch, 'attribution-index.json');
+    const ledger = fs.readFileSync(ledgerPath);
+    const index = fs.readFileSync(indexPath);
+    assert.equal(JSON.parse(index).harRecovery.finalized, false);
+    assert.equal(JSON.parse(index).integrity.eventCount, 0);
+    const payloadPath = path.join(scratch, JSON.parse(ledger).payloadFile);
+    const payload = fs.readFileSync(payloadPath);
+    const markerPath = path.join(path.dirname(payloadPath), '.pending-' + path.basename(payloadPath));
+    assert.equal(fs.statSync(markerPath).size, 0);
+
+    const unknown = path.join(path.dirname(markerPath), '.pending-req-2-0123456789ab.txt');
+    fs.writeFileSync(unknown, '', { mode: 0o600 });
+    assert.equal(await stop(), false);
+    assert.equal(fs.existsSync(unknown), true);
+    assert.equal(fs.existsSync(markerPath), true);
+    assert.deepEqual(fs.readFileSync(indexPath), index);
+    fs.unlinkSync(unknown);
+
+    const rename = fs.renameSync;
+    let publicationAttempted = false;
+    fs.renameSync = (from, to) => {
+        if (path.basename(from).startsWith('.capture-export-') && path.basename(to) === path.basename(harPath)) {
+            publicationAttempted = true;
+            throw Object.assign(new Error('Fixture HAR write fault'), { code: 'EIO' });
+        }
+        return rename(from, to);
+    };
+    try {
+        assert.equal(await stop(), false);
+    } finally {
+        fs.renameSync = rename;
+    }
+    assert.equal(publicationAttempted, true);
+    assert.equal(fs.existsSync(markerPath), true);
+    assert.deepEqual(fs.readFileSync(indexPath), index);
+    assert.deepEqual(fs.readFileSync(payloadPath), payload);
+    assert.deepEqual(fs.readFileSync(ledgerPath), ledger);
+    assert.deepEqual(fs.readFileSync(harPath), previousHar);
+
+    assert.equal(await stop(), true);
+    const [entry] = JSON.parse(fs.readFileSync(harPath)).log.entries;
+    assert.equal(entry.request.url, 'https://fixture.invalid/committed');
+    assert.equal(fs.existsSync(scratch), false);
+});
+
 test('a nonempty pre-upgrade scratch without a checkpoint is retained for unknown ownership', async (t) => {
     const { open, stop, options, profileId } = managedFixture(t);
     await open({ ...HAR_ONLY, recordHar: false });
@@ -476,8 +672,48 @@ test('Necko child files are included in the manifest and checked with the parent
     assert.ok(missing.errors.includes(`Missing ${path.basename(child)} on disk`));
 });
 
-test('transport loss keeps the raw native generation unsealed and allows a fresh generation', async (t) => {
-    const { open, stop, browsers } = managedFixture(t);
+test('active native checkpoints reject changed parent and child bytes through finalization', async (t) => {
+    const { open, stop } = managedFixture(t);
+    const session = await open({ sslKeyLog: true });
+    const { trafficDir, attributionIndexPath, neckoMozLogPath, sslKeyLogPath } = session.trafficPaths;
+    const { trafficRecorder: recorder } = session;
+    const child = neckoMozLogPath + '.child-1';
+    recorder.recordNeckoMozLogBlock('synthetic parent');
+    recorder.recordSslKeyLogSecret('CLIENT_RANDOM', 'a'.repeat(64), 'b'.repeat(32));
+    fs.writeFileSync(child, 'synthetic child\n', { mode: 0o600 });
+    await recorder.flushSummary();
+    const checkpoint = fs.readFileSync(attributionIndexPath);
+
+    for (const file of [neckoMozLogPath, child, sslKeyLogPath]) {
+        const original = fs.readFileSync(file);
+        const damaged = Buffer.from(original);
+        damaged[0] ^= 1;
+        fs.writeFileSync(file, damaged);
+        await assert.rejects(recorder.flushSummary(), /SHA-256 mismatch/);
+        assert.deepEqual(fs.readFileSync(file), damaged);
+        assert.deepEqual(fs.readFileSync(attributionIndexPath), checkpoint);
+        fs.writeFileSync(file, original);
+    }
+
+    fs.appendFileSync(neckoMozLogPath, 'parent append\n');
+    fs.appendFileSync(child, 'child append\n');
+    recorder.recordSslKeyLogSecret('CLIENT_RANDOM', 'c'.repeat(64), 'd'.repeat(32));
+    const completeChild = fs.readFileSync(child);
+    fs.truncateSync(child, 1);
+    assert.equal(await stop(), false);
+    assert.equal(fs.statSync(child).size, 1);
+    assert.deepEqual(fs.readFileSync(attributionIndexPath), checkpoint);
+
+    fs.writeFileSync(child, completeChild);
+    assert.equal(await stop(), true);
+    const verified = verifyTrafficIntegrity(trafficDir, { nativeDir: path.dirname(neckoMozLogPath) });
+    assert.equal(verified.valid, true);
+    assert.deepEqual(verified.unverifiedNativeArtifacts, []);
+    assert.equal(verified.sslKeyLog.entryCount, 2);
+});
+
+test('transport loss keeps the raw native generation unsealed and the profile owned', async (t) => {
+    const { open, stop, browsers, options, profileId } = managedFixture(t);
     const first = await open();
     const { neckoMozLogPath, trafficDir, attributionIndexPath } = first.trafficPaths;
     const nativeDir = path.dirname(neckoMozLogPath);
@@ -491,9 +727,11 @@ test('transport loss keeps the raw native generation unsealed and allows a fresh
     const evidence = verifyTrafficIntegrity(trafficDir, { nativeDir });
     assert.equal(evidence.valid, true);
     assert.deepEqual(evidence.unverifiedNativeArtifacts, [path.basename(neckoMozLogPath)]);
-    const next = await open();
-    assert.notEqual(next.trafficPaths.neckoMozLogPath, neckoMozLogPath);
-    assert.equal(await stop(), true);
+    const unconfirmed = { code: 'ERR_CAMOUFOX_NATIVE_EXIT_UNCONFIRMED' };
+    await assert.rejects(open(), unconfirmed);
+    await assert.rejects(deleteProfile(profileId, options), unconfirmed);
+    assert.equal(await stop(), false);
+    assert.equal(browsers.length, 1);
     assert.match(fs.readFileSync(neckoMozLogPath, 'utf8'), /after transport loss/);
 });
 
@@ -513,6 +751,90 @@ test('startup rollback preserves native evidence when physical exit is unconfirm
     assert.match(fs.readFileSync(nativeFile, 'utf8'), /before startup disconnect/);
 });
 
+
+test('HAR-only publication syncs the archive and receipt before removing scratch', {
+    skip: process.platform !== 'darwin' && process.platform !== 'linux'
+}, async (t) => {
+    for (const failure of [null, 'archive directory', 'receipt directory']) {
+        await t.test(failure ?? 'success', async (t) => {
+            const { open, stop, options, profileId } = managedFixture(t);
+            const session = await open(HAR_ONLY);
+            observeSyntheticRequest(session);
+            const { harPath } = session.trafficPaths;
+            const scratch = path.join(options.profilesDir, profileId, '.native', '~har-scratch');
+            const indexPath = path.join(scratch, 'attribution-index.json');
+            const ledgerPath = path.join(scratch, 'traffic.ndjson');
+            const identity = ({ dev, ino }) => `${dev}:${ino}`;
+            const archiveDirId = identity(fs.statSync(path.dirname(harPath), { bigint: true }));
+            const scratchId = identity(fs.statSync(scratch, { bigint: true }));
+            const syncedFiles = new Set();
+            const phases = [];
+            const sync = fs.fsyncSync;
+            const rename = fs.renameSync;
+            const remove = fs.rmSync;
+            const syncMock = t.mock.method(fs, 'fsyncSync', (fd) => {
+                const stat = fs.fstatSync(fd, { bigint: true });
+                const id = identity(stat);
+                let phase = null;
+                if (id === archiveDirId && phases.includes('archive rename')) phase = 'archive directory';
+                if (id === scratchId && phases.includes('receipt rename')) phase = 'receipt directory';
+                if (phase && phase === failure) {
+                    phases.push(`${phase} failure`);
+                    throw Object.assign(new Error('Synthetic directory sync failure'), { code: 'EIO' });
+                }
+                sync(fd);
+                if (stat.isFile()) syncedFiles.add(id);
+                if (phase) phases.push(phase);
+            });
+            const renameMock = t.mock.method(fs, 'renameSync', (from, to) => {
+                let kind = null;
+                if (path.basename(to) === path.basename(harPath)) kind = 'archive';
+                if (to === indexPath && JSON.parse(fs.readFileSync(from)).harRecovery?.publication?.published) {
+                    kind = 'receipt';
+                }
+                if (kind) {
+                    const synced = syncedFiles.has(identity(fs.statSync(from, { bigint: true })));
+                    phases.push(`${kind} ${synced ? 'file synced' : 'file unsynced'}`);
+                }
+                rename(from, to);
+                if (kind) phases.push(`${kind} rename`);
+            });
+            const removeMock = t.mock.method(fs, 'rmSync', (file, ...args) => {
+                if (file === scratch) phases.push('cleanup');
+                return remove(file, ...args);
+            });
+            try {
+                assert.equal(await stop(), !failure);
+            } finally {
+                syncMock.mock.restore();
+                renameMock.mock.restore();
+                removeMock.mock.restore();
+            }
+            const expected = ['archive file synced', 'archive rename', 'archive directory',
+                'receipt file synced', 'receipt rename', 'receipt directory', 'cleanup'];
+            if (failure) {
+                expected.splice(expected.indexOf(failure), expected.length, `${failure} failure`);
+                const index = JSON.parse(fs.readFileSync(indexPath));
+                assert.equal(index.harRecovery.publication.published, failure === 'receipt directory');
+                assert.match(fs.readFileSync(ledgerPath, 'utf8'), /fixture\.invalid\/resource/);
+            }
+            assert.deepEqual(phases, expected);
+            assert.equal(JSON.parse(fs.readFileSync(harPath)).log.entries[0].request.url,
+                'https://fixture.invalid/resource');
+            if (failure === 'archive directory') {
+                const kept = path.join(path.dirname(harPath), 'unconfirmed.har');
+                const archive = fs.readFileSync(harPath);
+                assert.equal(await stop(), false);
+                fs.renameSync(harPath, kept);
+                assert.equal(await stop(), true);
+                assert.deepEqual(fs.readFileSync(kept), archive);
+            } else if (failure) {
+                assert.equal(await stop(), true);
+            }
+            assert.equal(fs.existsSync(scratch), false);
+        });
+    }
+});
 
 test('HAR publication and cleanup keep their distinct states after a process exits', async (t) => {
     for (const failure of ['cleanup', 'partial-cleanup', 'receipt']) {
@@ -594,4 +916,142 @@ test('HAR publication and cleanup keep their distinct states after a process exi
             }
         });
     }
+});
+
+
+test('HAR-only publication preserves recorded attachments that cannot be projected to HAR', async (t) => {
+    const { open, stop, options, profileId } = managedFixture(t);
+    const initial = await open(HAR_ONLY);
+    observeSyntheticRequest(initial);
+    assert.equal(await stop(), true);
+    const { harPath } = initial.trafficPaths;
+    const previous = fs.readFileSync(harPath);
+    const scratch = path.join(options.profilesDir, profileId, '.native', '~har-scratch');
+    const indexPath = path.join(scratch, 'attribution-index.json');
+    const ledgerPath = path.join(scratch, 'traffic.ndjson');
+    const sdk = new URL('../../src/camoufox/client.js', import.meta.url).href;
+    const child = `
+        import assert from 'node:assert/strict';
+        import { EventEmitter } from 'node:events';
+        import fs from 'node:fs';
+        import path from 'node:path';
+        import { setCamoufoxModule, startProfile, stopProfile, unregisterProcessCleanupHooks }
+            from ${JSON.stringify(sdk)};
+        const mockLauncher = ${mockLauncher.toString()};
+        const options = ${JSON.stringify({ ...options, ...HAR_ONLY, recordBodies: true })};
+        const profileId = ${JSON.stringify(profileId)};
+        setCamoufoxModule(mockLauncher());
+        const session = await startProfile(profileId, options);
+        session.context.emit('request', {
+            method: () => 'POST',
+            url: () => 'https://fixture.invalid/upload',
+            headers: () => ({ 'content-type': 'text/plain' }),
+            postDataBuffer: () => Buffer.from('Synthetic upload')
+        });
+        const rename = fs.renameSync;
+        fs.renameSync = (from, to) => {
+            if (path.basename(from).startsWith('.capture-export-') && path.basename(to) === 'trace.har') {
+                throw Object.assign(new Error('Synthetic HAR I/O failure'), { code: 'EIO' });
+            }
+            return rename(from, to);
+        };
+        try {
+            assert.equal(await stopProfile(profileId, options), false);
+        } finally {
+            fs.renameSync = rename;
+            unregisterProcessCleanupHooks();
+        }
+    `;
+    execFileSync(process.execPath, ['--input-type=module', '-e', child], { timeout: 10000 });
+    const index = fs.readFileSync(indexPath);
+    const ledger = fs.readFileSync(ledgerPath);
+    const files = Object.keys(JSON.parse(index).integrity.payloadManifest);
+    assert.equal(files.length, 1);
+    assert.equal(verifyTrafficIntegrity(scratch, { trustedLocal: true }).valid, true);
+    const attachmentPath = path.join(scratch, files[0]);
+    const attachment = fs.readFileSync(attachmentPath);
+    fs.unlinkSync(attachmentPath);
+    assert.equal(await stop(), false);
+    assert.deepEqual(fs.readFileSync(harPath), previous);
+    assert.deepEqual(fs.readFileSync(indexPath), index);
+    assert.deepEqual(fs.readFileSync(ledgerPath), ledger);
+
+    fs.writeFileSync(attachmentPath, Buffer.alloc(attachment.length, 'x'), { mode: 0o600 });
+    assert.equal(await stop(), false);
+    assert.deepEqual(fs.readFileSync(harPath), previous);
+    assert.deepEqual(fs.readFileSync(indexPath), index);
+    assert.deepEqual(fs.readFileSync(ledgerPath), ledger);
+
+    fs.writeFileSync(attachmentPath, attachment);
+    assert.equal(await stop(), true);
+    assert.equal(fs.existsSync(scratch), false);
+    const [entry] = JSON.parse(fs.readFileSync(harPath)).log.entries;
+    assert.equal(entry.request.url, 'https://fixture.invalid/upload');
+    assert.equal(entry.request.postData.text, '');
+});
+
+test('HAR-only recovery uses the target version from the first ready checkpoint', async (t) => {
+    const { open, stop, options, profileId } = managedFixture(t);
+    const seed = await open(HAR_ONLY);
+    observeSyntheticRequest(seed);
+    assert.equal(await stop(), true);
+    const { harPath } = seed.trafficPaths;
+    const scratch = path.join(options.profilesDir, profileId, '.native', '~har-scratch');
+    const indexPath = path.join(scratch, 'attribution-index.json');
+    const ledgerPath = path.join(scratch, 'traffic.ndjson');
+    const sdk = new URL('../../src/camoufox/client.js', import.meta.url).href;
+    const child = `
+        import assert from 'node:assert/strict';
+        import { EventEmitter } from 'node:events';
+        import fs from 'node:fs';
+        import { setCamoufoxModule, startProfile, unregisterProcessCleanupHooks } from ${JSON.stringify(sdk)};
+        const mockLauncher = ${mockLauncher.toString()};
+        const options = ${JSON.stringify({ ...options, ...HAR_ONLY })};
+        setCamoufoxModule(mockLauncher());
+        const session = await startProfile(${JSON.stringify(profileId)}, options);
+        session.context.emit('request', { method: () => 'GET', url: () => 'https://fixture.invalid/recovered' });
+        const ledger = ${JSON.stringify(ledgerPath)};
+        for (let attempt = 0; attempt < 50 && !fs.existsSync(ledger); attempt++) {
+            await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        assert.ok(fs.statSync(ledger).size > 0);
+        unregisterProcessCleanupHooks();
+    `;
+    const interruptedCapture = () => execFileSync(process.execPath, ['--input-type=module', '-e', child], { timeout: 10000 });
+    interruptedCapture();
+    assert.equal(await stop(), true);
+    assert.equal(JSON.parse(fs.readFileSync(harPath)).log.entries[0].request.url, 'https://fixture.invalid/recovered');
+
+    interruptedCapture();
+    const index = fs.readFileSync(indexPath);
+    const ledger = fs.readFileSync(ledgerPath);
+    assert.equal(JSON.parse(index).harRecovery.finalized, false);
+    assert.equal(typeof JSON.parse(index).harRecovery.publication.previousTarget, 'string');
+    const operatorDir = path.join(options.profilesDir, 'operator-capture');
+    const recorder = new CamoufoxTrafficRecorder({ trafficDir: operatorDir, recordWireLog: false, trustedLocal: true });
+    const context = new EventEmitter();
+    recorder.attachContext(context);
+    context.emit('request', { method: () => 'GET', url: () => 'https://fixture.invalid/newer' });
+    await recorder.stop();
+    exportTrafficToHar(operatorDir, harPath);
+    const newer = fs.readFileSync(harPath);
+
+    assert.equal(await stop(), false);
+    assert.deepEqual(fs.readFileSync(harPath), newer);
+    assert.deepEqual(fs.readFileSync(ledgerPath), ledger);
+    assert.deepEqual(fs.readFileSync(indexPath), index);
+
+    const legacyIndex = JSON.parse(index);
+    delete legacyIndex.harRecovery.publication;
+    fs.writeFileSync(indexPath, JSON.stringify(legacyIndex));
+    assert.equal(await stop(), false);
+    assert.deepEqual(fs.readFileSync(harPath), newer);
+    assert.deepEqual(fs.readFileSync(ledgerPath), ledger);
+
+    const backup = path.join(path.dirname(harPath), 'kept.har');
+    fs.renameSync(harPath, backup);
+    assert.equal(await stop(), true);
+    assert.deepEqual(fs.readFileSync(backup), newer);
+    assert.equal(JSON.parse(fs.readFileSync(harPath)).log.entries[0].request.url, 'https://fixture.invalid/recovered');
+    assert.equal(fs.existsSync(scratch), false);
 });

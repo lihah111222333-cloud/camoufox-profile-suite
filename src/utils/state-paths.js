@@ -6,32 +6,51 @@ import { ensurePrivateDirectory } from './private-storage.js';
 
 export const PACKAGE_ROOT = path.resolve(fileURLToPath(new URL('../../', import.meta.url)));
 
-function absoluteOverride(name) {
+export function configurationError(message) {
+    return Object.assign(new Error(message), { code: 'PRIVATE_ENV_CONFIGURATION_ERROR' });
+}
+
+function configuredDirectory(name, fallback) {
     const value = process.env[name];
-    if (value === undefined) return undefined;
-    if (!path.isAbsolute(value)) throw new Error(`${name} must be an absolute path`);
-    return path.resolve(value);
+    if (value === undefined) return { directory: fallback };
+    if (!path.isAbsolute(value)) return { error: name + ' must be an absolute path' };
+    return { directory: path.resolve(value) };
 }
 
 const home = os.homedir();
 const userStateBase = [process.env.XDG_STATE_HOME, process.platform === 'win32' ? process.env.LOCALAPPDATA : undefined]
     .find((value) => value && path.isAbsolute(value)) || path.join(home, '.local', 'state');
 
-// Resolve once, before reading an application .env file.
-export const STATE_DIRECTORY = absoluteOverride('GMAIL_CREATOR_STATE_DIR') ||
-    path.join(userStateBase, 'gmail-account-creator');
-export const LEGACY_DIRECTORY = absoluteOverride('GMAIL_CREATOR_LEGACY_DIR') ||
-    (fs.existsSync(path.join(PACKAGE_ROOT, '.git')) ? PACKAGE_ROOT : undefined);
-
+// Resolve the launch values before reading .env. Keep the published names
+// available for valid configurations and report errors when the paths are used.
+const state = configuredDirectory('GMAIL_CREATOR_STATE_DIR', path.join(userStateBase, 'gmail-account-creator'));
+const checkoutDirectory = fs.existsSync(path.join(PACKAGE_ROOT, '.git')) ? PACKAGE_ROOT : undefined;
+const legacy = configuredDirectory('GMAIL_CREATOR_LEGACY_DIR', checkoutDirectory);
 const DEDICATED_DIRECTORY_REQUIRED = 'GMAIL_CREATOR_STATE_DIR must name a dedicated directory';
-if (STATE_DIRECTORY === path.parse(STATE_DIRECTORY).root || STATE_DIRECTORY === path.resolve(home)) {
-    throw new Error(DEDICATED_DIRECTORY_REQUIRED);
+const stateError = state.error ?? (
+    state.directory === path.parse(state.directory).root || state.directory === path.resolve(home)
+        ? DEDICATED_DIRECTORY_REQUIRED
+        : undefined
+);
+
+export const STATE_DIRECTORY = stateError ? undefined : state.directory;
+export const LEGACY_DIRECTORY = legacy.directory;
+
+export function getStateDirectory() {
+    if (stateError) throw configurationError(stateError);
+    return STATE_DIRECTORY;
+}
+
+export function getLegacyDirectory() {
+    if (legacy.error) throw configurationError(legacy.error);
+    return LEGACY_DIRECTORY;
 }
 
 export function validateExistingStateDirectory() {
+    const stateDirectory = getStateDirectory();
     let existing;
     try {
-        existing = fs.lstatSync(STATE_DIRECTORY, { bigint: true, throwIfNoEntry: false });
+        existing = fs.lstatSync(stateDirectory, { bigint: true, throwIfNoEntry: false });
     } catch (cause) {
         throw new Error('Could not inspect GMAIL_CREATOR_STATE_DIR', { cause });
     }
@@ -48,18 +67,22 @@ export function validateExistingStateDirectory() {
         if (error.code !== 'EACCES' && error.code !== 'EPERM' && error.code !== 'ENOTDIR') throw error;
     }
     if (homeIdentity && existing.dev === homeIdentity.dev && existing.ino === homeIdentity.ino) {
-        throw new Error(DEDICATED_DIRECTORY_REQUIRED);
+        throw configurationError(DEDICATED_DIRECTORY_REQUIRED);
     }
     return true;
 }
 
 export function ensureStateDirectory() {
     validateExistingStateDirectory();
-    ensurePrivateDirectory(STATE_DIRECTORY, { requireOwner: true });
-    return STATE_DIRECTORY;
+    const stateDirectory = getStateDirectory();
+    ensurePrivateDirectory(stateDirectory, { requireOwner: true });
+    return stateDirectory;
 }
 
 export function getDefaultProfilesDirectory(env = process.env) {
-    const configured = env.CAMOUFOX_STORAGE_DIR || env.CAMOUFOX_PROFILES_DIR;
-    return configured ? path.resolve(configured) : path.join(STATE_DIRECTORY, 'profiles');
+    const setting = env.CAMOUFOX_STORAGE_DIR ? 'CAMOUFOX_STORAGE_DIR' : 'CAMOUFOX_PROFILES_DIR';
+    const configured = env[setting];
+    if (!configured) return path.join(getStateDirectory(), 'profiles');
+    if (!configured.trim()) throw configurationError(setting + ' must name a nonempty profiles root directory');
+    return path.resolve(configured);
 }

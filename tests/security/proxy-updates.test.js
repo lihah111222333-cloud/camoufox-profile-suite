@@ -3,7 +3,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { createProfile, getProfile, normalizeProxy, updateProfileProxy } from '../../src/camoufox/client.js';
+import {
+    createProfile, getProfile, getProfileMetadataPath, normalizeProxy, updateProfileProxy
+} from '../../src/camoufox/client.js';
+import { resolveProfileNativeDirectory } from '../../src/camoufox/profile-storage.js';
 
 function profileOptions(t) {
     const profilesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'camoufox-proxy-updates-'));
@@ -80,4 +83,55 @@ test('a partial Camoufox proxy update identifies committed and remaining profile
     const completed = await updateProfileProxy(ids, newProxy, options);
     assert.equal(completed.success, true);
     for (const id of ids) assert.deepEqual((await getProfile(id, options)).proxy, newProxy);
+});
+
+test('invalid private profile JSON is rejected without returning the contents', async (t) => {
+    const options = profileOptions(t);
+    const proxy = { server: 'https://old-proxy.example.invalid:8443' };
+    const replacement = { server: 'https://new-proxy.example.invalid:8443' };
+    await createProfile('first', proxy, { ...options, profileId: 'first' });
+    await createProfile('damaged', proxy, { ...options, profileId: 'damaged' });
+    const firstPath = getProfileMetadataPath('first', options.profilesDir);
+    const originalFirst = fs.readFileSync(firstPath);
+    const metadataPath = getProfileMetadataPath('damaged', options.profilesDir);
+    const password = 'synthp9';
+    const damaged = JSON.stringify({ id: 'damaged', proxy: { ...proxy, password } }).replace(
+        JSON.stringify(password), password
+    );
+    fs.writeFileSync(metadataPath, damaged, 'utf8');
+
+    function safeError(error) {
+        assert.equal(error.name, 'SyntaxError');
+        assert.equal(error.code, 'ERR_CAMOUFOX_PROFILE_METADATA_INVALID');
+        assert.equal(error.message, 'Invalid Camoufox profile metadata JSON');
+        assert.equal(error.cause, undefined);
+        assert.ok(!error.stack.includes(password));
+        return true;
+    }
+    await assert.rejects(updateProfileProxy(['first', 'damaged'], replacement, options), safeError);
+    await assert.rejects(getProfile('damaged', options), safeError);
+    await assert.rejects(createProfile('damaged', proxy, { ...options, profileId: 'damaged' }), safeError);
+    assert.throws(() => resolveProfileNativeDirectory('damaged', options.profilesDir), safeError);
+    assert.deepEqual((await getProfile('first', options)).proxy, proxy);
+    assert.deepEqual(fs.readFileSync(firstPath), originalFirst);
+    assert.equal(fs.readFileSync(metadataPath, 'utf8'), damaged);
+});
+
+test('proxy updates preserve a disabled GeoIP setting and the defaults for missing settings', async (t) => {
+    const options = profileOptions(t);
+    const proxy = { server: 'https://old-proxy.example.invalid:8443' };
+    const replacement = { server: 'https://new-proxy.example.invalid:8443' };
+    await createProfile('disabled', proxy, { ...options, profileId: 'disabled', geoip: false });
+    await createProfile('legacy', null, { ...options, profileId: 'legacy' });
+    const legacyPath = getProfileMetadataPath('legacy', options.profilesDir);
+    const legacy = JSON.parse(fs.readFileSync(legacyPath, 'utf8'));
+    delete legacy.geoip;
+    fs.writeFileSync(legacyPath, JSON.stringify(legacy), 'utf8');
+
+    await updateProfileProxy(['disabled', 'legacy', 'fresh'], replacement, options);
+    const disabled = await getProfile('disabled', options);
+    assert.deepEqual(disabled.proxy, replacement);
+    assert.equal(disabled.geoip, false);
+    assert.equal((await getProfile('legacy', options)).geoip, true);
+    assert.equal((await getProfile('fresh', options)).geoip, true);
 });

@@ -160,6 +160,91 @@ test('metadata-only, disabled-body and known authentication transactions omit st
     assert.doesNotMatch(JSON.stringify(har.har), /private-(attachment|query)-marker/);
 });
 
+test('legacy body exports require eligible redirect ancestry', { skip: !supported }, (t) => {
+    const { trafficDir, payloadsDir, operatorDir } = fixture(t);
+    const traceId = 'legacy-redirect-recording';
+    const body = '{"count":39}';
+    const payloadFile = 'payloads/legacy-body.json';
+    const declaredBody = { recordBodies: true, mimeType: 'application/json', bodyPreview: body };
+    const summary = { session: { recordBodies: true, traceId } };
+    fs.writeFileSync(path.join(trafficDir, 'attribution-index.json'), JSON.stringify(summary));
+    fs.writeFileSync(path.join(payloadsDir, 'legacy-body.json'), body);
+
+    const request = (correlationId, route, redirectedFromCorrelationId, method = 'POST') => ({
+        type: 'egress', correlationId, traceId, profileId: 'fixture', method, redirectedFromCorrelationId,
+        url: 'https://fixture.example' + route
+    });
+    const fixtures = [
+        { id: 'withheld', parent: 'restricted-relay', allowed: false },
+        { id: 'ordinary', parent: 'ordinary-root', allowed: true },
+        { id: 'unproven', parent: 'missing-root', allowed: false },
+        { id: 'foreign', parent: 'foreign-root', allowed: false },
+        { id: 'converted', parent: 'restricted-root', method: 'GET', allowed: true },
+        { id: 'cycle', parent: 'cycle-root', allowed: false }
+    ];
+    const ledger = [
+        request('restricted-root', '/api/sessions'),
+        request('restricted-relay', '/relay', 'restricted-root'),
+        request('ordinary-root', '/resource'),
+        { ...request('foreign-root', '/resource'), profileId: 'foreign-profile' },
+        request('cycle-root', '/relay-two', 'cycle')
+    ];
+    for (const { id, parent, method } of fixtures) {
+        const egress = request(id, '/target/' + id, parent, method);
+        ledger.push(method === 'GET' ? egress : { ...egress, ...declaredBody, payloadFile });
+        ledger.push({
+            ...declaredBody, type: 'ingress', correlationId: id, traceId, profileId: egress.profileId,
+            url: egress.url, status: 200
+        });
+    }
+    writeEvents(trafficDir, ledger);
+
+    const report = queryProfileTraffic({ trafficDir });
+    const output = path.join(operatorDir, 'redirects.har');
+    const { log } = exportTrafficToHar(trafficDir, output);
+    for (const { id, method, allowed } of fixtures) {
+        const expectedRequest = allowed && method !== 'GET' ? body : null;
+        const expectedResponse = allowed ? body : null;
+        const wire = queryProfileTraffic({ trafficDir, correlationId: id });
+        assert.equal(wire.requestPayload, expectedRequest, id);
+        assert.equal(wire.responsePayload, expectedResponse, id);
+        const archived = log.entries.find(({ _attribution }) => _attribution.correlationId === id);
+        assert.equal(archived.request.postData.text, expectedRequest ?? '', id);
+        assert.equal(archived.response.content.text, expectedResponse ?? '', id);
+        const transaction = report.transactions.find(({ correlationId }) => correlationId === id);
+        assert.equal(transaction.egress.bodyPreview ?? null, expectedRequest, id);
+        assert.equal(transaction.ingress.bodyPreview, expectedResponse, id);
+        if (!allowed) assert.equal(wire.requestPayloadFile, null, id);
+    }
+
+    const previousHar = fs.readFileSync(output);
+    const unrelated = request('mispaired', '/target/shared');
+    ledger.push({ ...unrelated, ...declaredBody, payloadFile });
+    ledger.push({ ...unrelated, ...declaredBody, type: 'ingress', profileId: 'foreign-profile', status: 200 });
+    writeEvents(trafficDir, ledger);
+    const mixed = queryProfileTraffic({ trafficDir }).transactions.filter((tx) => tx.correlationId === 'mispaired');
+    assert.equal(mixed.length, 2);
+    for (const tx of mixed) {
+        assert.equal(tx.egress?.bodyPreview ?? null, null);
+        assert.equal(tx.ingress?.bodyPreview ?? null, null);
+    }
+    assert.throws(() => queryProfileTraffic({ trafficDir, correlationId: 'mispaired' }), /multiple recorded profile identities/i);
+    assert.throws(() => exportTrafficToHar(trafficDir, output), /multiple recorded profile identities/i);
+    assert.deepEqual(fs.readFileSync(output), previousHar);
+});
+
+test('wire queries treat legacy zero-byte omission sentinels as unknown content length', { skip: !supported }, (t) => {
+    const { trafficDir } = fixture(t);
+    const [egress, ingress] = transaction({}, { bodyOmittedReason: 'unbounded-response-reader', bodyBytes: 0 });
+    writeEvents(trafficDir, [egress, ingress, {
+        type: 'request-finished', correlationId: egress.correlationId, sizes: { responseBodySize: 19 }
+    }]);
+    const wire = queryProfileTraffic({ trafficDir, correlationId: egress.correlationId });
+    assert.equal(wire.ingress.bodyBytes, null);
+    assert.equal(wire.sizes.responseBodySize, 19);
+    assert.ok(wire.wireDump.includes('[ingress body unavailable (19 wire bytes)]'));
+});
+
 test('HAR and query wire omit unsupported, malformed and truncated legacy bodies', { skip: !supported }, (t) => {
     const { trafficDir, payloadsDir, operatorDir } = fixture(t);
     fs.writeFileSync(path.join(trafficDir, 'attribution-index.json'), JSON.stringify({ session: { recordBodies: true } }));
@@ -318,6 +403,42 @@ test('default CLI export is private and exclusive, and an explicit file may be a
     fs.symlinkSync('ordinary', linkedDirectory, 'dir');
     assert.throws(() => exportTrafficToHar(trafficDir, path.join(linkedDirectory, 'new.har')));
     assert.deepEqual(fs.readdirSync(ordinaryDirectory), []);
+});
+
+test('macOS HAR exports check inherited grants and preserve existing deny ACLs', {
+    skip: process.platform !== 'darwin'
+}, (t) => {
+    const { trafficDir, operatorDir } = fixture(t);
+    writeEvents(trafficDir, transaction());
+    const sharedDir = path.join(operatorDir, 'shared');
+    fs.mkdirSync(sharedDir);
+    execFileSync('/bin/chmod', ['+a', 'group:everyone allow list,search,file_inherit,directory_inherit', sharedDir]);
+
+    const previous = path.join(operatorDir, 'previous.har');
+    fs.writeFileSync(previous, 'previous synthetic archive', { mode: 0o600 });
+    execFileSync('/bin/chmod', ['+a', 'group:everyone deny execute', previous]);
+    const before = fs.readFileSync(previous);
+    const acl = () => execFileSync('/bin/ls', ['-ledbn', previous], { encoding: 'utf8' }).split('\n').slice(1);
+    const beforeAcl = acl();
+    const writes = t.mock.method(fs, 'writeFileSync', fs.writeFileSync);
+    try {
+        assert.throws(() => exportTrafficToHar(trafficDir, path.join(sharedDir, 'new.har')), {
+            code: 'PRIVATE_STORAGE_ACL_ERROR',
+            message: /grants or may grant access/
+        });
+        assert.throws(() => exportTrafficToHar(trafficDir, previous), {
+            code: 'PRIVATE_STORAGE_ACL_ERROR',
+            message: /could remove existing ACL restrictions/
+        });
+        assert.equal(writes.mock.callCount(), 0);
+    } finally {
+        writes.mock.restore();
+    }
+    assert.deepEqual(fs.readdirSync(sharedDir), []);
+    assert.deepEqual(fs.readdirSync(operatorDir).sort(), ['previous.har', 'shared']);
+    assert.deepEqual(fs.readFileSync(previous), before);
+    assert.deepEqual(acl(), beforeAcl);
+    assert.equal(exportTrafficToHar(trafficDir, path.join(operatorDir, 'private.har')).entryCount, 1);
 });
 
 test('explicit HAR destinations preserve reserved source capture storage', { skip: !supported }, (t) => {

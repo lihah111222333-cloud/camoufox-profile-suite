@@ -4,12 +4,13 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
 const root = fs.realpathSync.native(process.cwd());
-const gitEnv = { ...process.env };
+const gitEnv = { ...process.env, GIT_NO_REPLACE_OBJECTS: '1' };
 const openApiPath = 'docs/openapi-default.json';
 const blockedReleaseTag = 'v1.0.0';
+const captureMetadata = ['traffic.ndjson', 'attribution-index.json'];
 const privateNames = new Set([
     'email.txt', 'gmlogin.txt', 'results.json', 'summary.json', 'profiles.json',
-    'profile.json', 'storage-state.json', 'traffic.ndjson', 'attribution-index.json',
+    'profile.json', 'storage-state.json', ...captureMetadata,
     'camoufox-audit-report.json', 'sslkeylog.txt', '_shared_sslkeylog.txt', 'pre-tls-wire.log'
 ]);
 
@@ -28,11 +29,11 @@ function git(args, { showOutput = false, allowMissing = false } = {}) {
 
 async function storagePaths() {
     const { loadApplicationEnvironment } = await import('../src/utils/private-env.js');
-    const { getDefaultProfilesDirectory, STATE_DIRECTORY } = await import('../src/utils/state-paths.js');
+    const { getDefaultProfilesDirectory, getStateDirectory } = await import('../src/utils/state-paths.js');
     const env = loadApplicationEnvironment({ env: { ...process.env }, readOnly: true });
     const storageDir = getDefaultProfilesDirectory(env);
     const roots = new Set();
-    const configuredPaths = [STATE_DIRECTORY, storageDir, env.CAMOUFOX_PROFILES_DIR];
+    const configuredPaths = [getStateDirectory(), storageDir, env.CAMOUFOX_PROFILES_DIR];
     for (const configured of configuredPaths.filter(Boolean)) {
         const absolute = path.resolve(configured);
         roots.add(absolute);
@@ -74,8 +75,18 @@ function isPrivatePath(file) {
     const name = path.posix.basename(file).toLowerCase();
     return privateNames.has(name)
         || /(?:^|\/)(?:logs|data|profiles|\.gpm|gpm-data|\.native|(?:results|summary)\.json\.lock|traffic\/(?:payloads|\.private))\//i.test(file)
+        || /(?:^|\/)payloads\/(?:\.pending-)?(?:req|res|ws)-[1-9]\d*-[a-f\d]{12}\.(?:json|txt|bin)(?:\.tmp)?$/i.test(file)
         || /(?:^|\/)config\/proxies\.txt$/i.test(file)
         || /\.(?:env|emv)(?:\.|$)|\.(?:har|log|tgz)$|\.moz_log/.test(name);
+}
+
+function hasCaptureMetadata(file) {
+    const parts = file.split('/');
+    return parts.slice(0, -1).some((part, index) => {
+        if (!/^(?:payloads|\.private)$/i.test(part)) return false;
+        const captureRoot = path.join(root, ...parts.slice(0, index));
+        return captureMetadata.some((marker) => fs.existsSync(path.join(captureRoot, marker)));
+    });
 }
 
 function hasRegistryCredentials(contents) {
@@ -122,7 +133,10 @@ function checkOpenApiExamples(contents) {
             requestExample('/api/proxy/createBaseProxy')
         ];
         const cookies = JSON.parse(profile.cookie);
-        const token = specification.components.schemas.login_with_token.properties.token.example;
+        const schemas = specification.components.schemas;
+        const token = schemas.login_with_token.properties.token.example;
+        const profilePasswords = ['local_storage_import', 'cookies_import', 'cookie_robot_start', 'browser_profile_start']
+            .map((name) => schemas[name]?.properties?.browserProfilePassword?.example);
         const identifierPattern = /\b(?:[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{2}(?:[:-][0-9a-f]{2}){5})\b/gi;
         const fixedIds = JSON.stringify(specification).match(identifierPattern) ?? [];
         safe = fixedIds.every((identifier) => /^0+(?:[-:]0+)*$/.test(identifier)) &&
@@ -130,6 +144,7 @@ function checkOpenApiExamples(contents) {
             profile.fingerprint.macAddr === '00:00:00:00:00:00' &&
             profile.fingerprint.modelName === 'REPLACE_WITH_MODEL_NAME' &&
             profile.sk === 'REPLACE_WITH_SECRET_KEY' && token === 'REPLACE_WITH_API_TOKEN' &&
+            profilePasswords.every((value) => value === undefined || value === 'REPLACE_WITH_BROWSER_PROFILE_PASSWORD') &&
             cookies.every((cookie) => cookie.domain === 'example.invalid' && cookie.value === 'REPLACE_WITH_COOKIE_VALUE') &&
             proxies.every((proxy) => proxy.host === '192.0.2.10' &&
                 proxy.proxyUsername === 'REPLACE_WITH_PROXY_USERNAME' && proxy.proxyPassword === 'REPLACE_WITH_PROXY_PASSWORD') &&
@@ -158,7 +173,7 @@ function checkGitFiles(stores, staged) {
             if (staged) throw sensitiveCommitFile(file);
             continue;
         }
-        if (isPrivatePath(file)) throw sensitiveCommitFile(file);
+        if (isPrivatePath(file) || hasCaptureMetadata(file)) throw sensitiveCommitFile(file);
         checkFileContents(file, () => {
             if (staged) return git(['cat-file', 'blob', `:${file}`]);
             const stat = fs.lstatSync(file, { throwIfNoEntry: false });
@@ -168,8 +183,11 @@ function checkGitFiles(stores, staged) {
     }
 }
 
-function checkSourceTree(stores, ref) {
-    const commit = git(['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`]).trim();
+function resolveCommit(ref) {
+    return git(['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`]).trim();
+}
+
+function checkSourceTree(stores, commit) {
     const files = git(['ls-tree', '-rz', '--name-only', '--full-tree', commit]).split('\0').filter(Boolean);
     const sensitiveSourceFile = (file) => new Error(`Sensitive file in the source archive: ${JSON.stringify(file)}`);
     // Git archives are built from the selected commit tree. Check the tree's exact
@@ -180,21 +198,69 @@ function checkSourceTree(stores, ref) {
     }
 }
 
-function checkInitialPushHistory() {
+async function checkReleaseTag(tag, expectedCommit) {
+    if (tag === blockedReleaseTag) {
+        throw new Error(`${blockedReleaseTag} retains historical OpenAPI example data. Choose a new version and tag. See GITHUB_SETUP.md.`);
+    }
+    if (!tag) throw new Error('Provide an existing local release tag.');
+
+    const tagObject = git(['show-ref', '--verify', '--hash', '--', `refs/tags/${tag}`]).trim();
+    const commit = resolveCommit(tagObject);
+    if (expectedCommit !== undefined && commit !== resolveCommit(expectedCommit)) {
+        throw new Error('The release tag does not point to the expected commit.');
+    }
+
+    let version;
+    try {
+        ({ version } = JSON.parse(git(['cat-file', 'blob', `${commit}:package.json`])));
+    } catch {
+        throw new Error('The release commit must contain a valid package.json.');
+    }
+    const expectedTag = `v${version}`;
+    if (tag !== expectedTag) throw new Error(`Release tag must be ${expectedTag}.`);
+
+    checkSourceTree(await storagePaths(), commit);
+    console.log(tagObject);
+}
+
+function checkInitialPushHistory(stores, ref) {
     if (git(['rev-parse', '--is-shallow-repository']).trim() === 'true') {
         throw new Error('Inspect the full branch history before its first push to a new remote.');
     }
-    const head = git(['rev-parse', '--verify', '--quiet', 'HEAD'], { allowMissing: true }).trim();
-    if (!head) return;
-    const commits = git([
-        'log', '--full-history', '--no-renames', '--diff-filter=AMT', '--format=%H', head, '--', openApiPath
-    ]).trim().split('\n').filter(Boolean);
-    for (const commit of commits) {
-        const contents = git(['cat-file', 'blob', `${commit}:${openApiPath}`]);
-        try {
-            checkOpenApiExamples(contents);
-        } catch {
-            throw new Error('The branch retains earlier OpenAPI examples. See GITHUB_SETUP.md before its first push to a new remote.');
+    const commit = git(
+        ['rev-parse', '--verify', '--quiet', '--end-of-options', `${ref ?? 'HEAD'}^{commit}`],
+        { allowMissing: ref === undefined }
+    ).trim();
+    if (!commit) return;
+
+    // A first push sends every reachable parent. Check each distinct tree and
+    // only read a known sensitive file's contents once per path type and blob.
+    const trees = new Set(git(['rev-list', '--no-commit-header', '--format=%T', commit, '--']).trim().split('\n'));
+    const checkedPaths = new Set();
+    const checkedContents = new Set();
+    const sensitiveHistoryFile = (file) =>
+        new Error(`Sensitive file in the first-push history: ${JSON.stringify(file)}. See GITHUB_SETUP.md.`);
+    for (const tree of trees) {
+        const entries = git(['ls-tree', '-rz', '--full-tree', tree]).split('\0').filter(Boolean);
+        for (const entry of entries) {
+            const separator = entry.indexOf('\t');
+            const file = entry.slice(separator + 1);
+            if (!checkedPaths.has(file)) {
+                if (isPrivatePath(file) || insideStorage(file, stores)) throw sensitiveHistoryFile(file);
+                checkedPaths.add(file);
+            }
+            try {
+                checkFileContents(file, () => {
+                    const [, , objectId] = entry.slice(0, separator).split(' ');
+                    const key = `${path.posix.basename(file).toLowerCase()}:${objectId}`;
+                    if (checkedContents.has(key)) return undefined;
+                    checkedContents.add(key);
+                    return git(['cat-file', 'blob', objectId]);
+                }, sensitiveHistoryFile);
+            } catch (error) {
+                if (file !== openApiPath) throw error;
+                throw new Error('The branch retains earlier OpenAPI examples. See GITHUB_SETUP.md before its first push to a new remote.');
+            }
         }
     }
 }
@@ -274,10 +340,10 @@ try {
             checkGitFiles(await storagePaths(), true);
             break;
         case 'source':
-            checkSourceTree(await storagePaths(), process.argv[3] ?? 'HEAD');
+            checkSourceTree(await storagePaths(), resolveCommit(process.argv[3] ?? 'HEAD'));
             break;
         case 'history':
-            checkInitialPushHistory();
+            checkInitialPushHistory(await storagePaths(), process.argv[3]);
             break;
         case 'pack':
             checkPackage(await storagePaths());
@@ -285,14 +351,9 @@ try {
         case 'archive':
             checkPackReport();
             break;
-        case 'tag': {
-            if (process.argv[3] === blockedReleaseTag) {
-                throw new Error(`${blockedReleaseTag} retains historical OpenAPI example data. Choose a new version and tag. See GITHUB_SETUP.md.`);
-            }
-            const expectedTag = `v${packageManifest().version}`;
-            if (process.argv[3] !== expectedTag) throw new Error(`Release tag must be ${expectedTag}.`);
+        case 'tag':
+            await checkReleaseTag(process.argv[3], process.argv[4]);
             break;
-        }
         default:
             throw new Error('Use stage, index, source, history, pack, archive or tag to check files before distribution.');
     }

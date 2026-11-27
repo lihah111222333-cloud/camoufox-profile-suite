@@ -79,6 +79,14 @@ function fixture(t, beforeContext = () => {}) {
     return { ledgerPath, profileDir, open };
 }
 
+function standaloneFixture(t) {
+    const directory = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'standalone-fingerprint-ledger-'));
+    t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+    const ledgerPath = path.join(directory, 'ledger.json');
+    const open = () => new CanvasWebglConsistencyLedger({ profileId: 'fixture', ledgerPath });
+    return { ledgerPath, open };
+}
+
 test('retired fingerprint ledgers cannot restore deleted storage or touch the same ID after reuse', async (t) => {
     const { ledgerPath, profileDir, open } = fixture(t);
     const original = await open();
@@ -193,10 +201,7 @@ test('a transient ownership read failure blocks fingerprint writes until the exi
 });
 
 test('standalone fingerprint ledgers reject a stale snapshot and support a fresh reload', (t) => {
-    const directory = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'standalone-fingerprint-ledger-'));
-    t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-    const ledgerPath = path.join(directory, 'ledger.json');
-    const open = () => new CanvasWebglConsistencyLedger({ profileId: 'fixture', ledgerPath });
+    const { ledgerPath, open } = standaloneFixture(t);
     const writer = open();
     const unopened = open();
     assert.equal(writer.recordOrVerify(BASE_OBSERVATION).status, 'recorded-initial');
@@ -223,4 +228,76 @@ test('standalone fingerprint ledgers reject a stale snapshot and support a fresh
     assert.deepEqual(JSON.parse(fs.readFileSync(ledgerPath)).entries.map(({ domain }) => domain), [
         BASE_OBSERVATION.domain, NEW_OBSERVATION.domain, LATE_OBSERVATION.domain
     ]);
+});
+
+test('fingerprint ledgers preserve invalid UTF-8 and still load legacy and valid Unicode data', (t) => {
+    const { ledgerPath, open } = standaloneFixture(t);
+    fs.writeFileSync(ledgerPath, '{"entries":[]}');
+    const legacy = open();
+    assert.equal(legacy.loadFromDisk(), true);
+    assert.equal(legacy.getSummary().totalEntries, 0);
+
+    const observation = { ...BASE_OBSERVATION, drewText: '合成观测记录' };
+    assert.equal(legacy.recordOrVerify(observation).status, 'recorded-initial');
+    const intact = fs.readFileSync(ledgerPath);
+    assert.equal(JSON.parse(intact).entries[0].drewText, observation.drewText);
+
+    const damaged = Buffer.from(intact);
+    const field = Buffer.from('"drewText": "');
+    const fieldOffset = damaged.indexOf(field);
+    assert.notEqual(fieldOffset, -1);
+    damaged[fieldOffset + field.length] = 0xff;
+    fs.writeFileSync(ledgerPath, damaged);
+
+    const restarted = open();
+    assert.equal(restarted.loadFromDisk(), false);
+    assert.equal(restarted.getSummary().totalEntries, null);
+    assert.equal(restarted.saveToDisk(), false);
+    assert.throws(() => restarted.recordOrVerify(LATE_OBSERVATION), UNREADABLE);
+    assert.deepEqual(fs.readFileSync(ledgerPath), damaged);
+
+    fs.writeFileSync(ledgerPath, intact);
+    assert.equal(restarted.loadFromDisk(), true);
+    assert.equal(restarted.recordOrVerify(observation).status, 'consistent');
+    assert.equal(JSON.parse(fs.readFileSync(ledgerPath)).entries[0].drewText, observation.drewText);
+});
+
+test('fingerprint ledger cleanup failures preserve the actual publication outcome', (t) => {
+    const { ledgerPath, open } = standaloneFixture(t);
+    const ledger = open();
+    assert.equal(ledger.recordOrVerify(BASE_OBSERVATION).status, 'recorded-initial');
+
+    const warning = t.mock.method(process, 'emitWarning', () => {});
+    const rmdirSync = fs.rmdirSync;
+    let cleanupFailure = true;
+    t.mock.method(fs, 'rmdirSync', (directory, ...args) => {
+        if (cleanupFailure && directory === ledgerPath + '.ledger-lock') {
+            cleanupFailure = false;
+            throw Object.assign(new Error('Fixture cleanup failed'), { code: 'EIO' });
+        }
+        return rmdirSync(directory, ...args);
+    });
+
+    assert.equal(ledger.recordOrVerify(NEW_OBSERVATION).status, 'recorded-initial');
+    assert.equal(ledger.getSummary().totalEntries, 2);
+    assert.equal(JSON.parse(fs.readFileSync(ledgerPath)).entries.length, 2);
+    assert.equal(warning.mock.calls[0]?.arguments[1].code, 'CAMOUFOX_FINGERPRINT_LEDGER_LEASE_CLEANUP_FAILED');
+
+    cleanupFailure = true;
+    assert.equal(ledger.saveToDisk(), true);
+    assert.equal(warning.mock.callCount(), 2);
+    const written = fs.readFileSync(ledgerPath);
+
+    const renameSync = fs.renameSync;
+    t.mock.method(fs, 'renameSync', (source, target) => {
+        if (target === ledgerPath) {
+            throw Object.assign(new Error('Fixture publication failed'), { code: 'ENOSPC' });
+        }
+        return renameSync(source, target);
+    });
+    cleanupFailure = true;
+    assert.throws(() => ledger.recordOrVerify(LATE_OBSERVATION), { code: 'ENOSPC' });
+    assert.equal(warning.mock.callCount(), 3);
+    assert.equal(ledger.getSummary().totalEntries, 2);
+    assert.deepEqual(fs.readFileSync(ledgerPath), written);
 });

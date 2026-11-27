@@ -71,8 +71,12 @@ profile.json
 storage-state.json
 traffic.ndjson
 attribution-index.json
-traffic/payloads/
-traffic/.private/
+**/traffic/payloads/
+**/traffic/.private/
+# Generated recorder attachments under a custom traffic directory
+**/payloads/req-[1-9]*-????????????.*
+**/payloads/res-[1-9]*-????????????.*
+**/payloads/ws-[1-9]*-????????????.*
 .native/
 sslkeylog.txt
 _shared_sslkeylog.txt

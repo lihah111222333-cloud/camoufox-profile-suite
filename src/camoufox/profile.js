@@ -482,11 +482,11 @@ export function attachPageCompatibility(page, context = null, profile = null) {
 
     if (owningContext) {
         const binding = bindContext(owningContext, profile);
-        if (!binding.browserView) {
-            const owningProfile = profile?.context === owningContext ? profile : null;
-            const browser = owningContext.browser?.() || owningProfile?.browser;
-            if (browser) {
-                attachBrowserCompatibility(browser, owningProfile || { context: owningContext });
+        const owningProfile = profile?.context === owningContext ? profile : null;
+        if (!binding.browserView || (owningProfile && !binding.lifecycleProfile)) {
+            const browser = binding.nativeBrowser || owningContext.browser?.() || owningProfile?.browser;
+            if (browser && browser !== owningProfile) {
+                bindBrowserView(browser, owningContext, owningProfile);
             }
         }
     }
@@ -824,8 +824,21 @@ export function attachBrowserCompatibility(browser, profile = null) {
         typeof profile.contexts !== 'function'
             ? profile
             : null);
-    const binding = context ? bindContext(context, profile) : null;
-    if (binding?.browserView) return binding.browserView;
+    return bindBrowserView(browser, context, profile);
+}
+
+function bindBrowserView(browser, context, profile) {
+    const existing = contextBindings.get(context);
+    if (existing?.browserView && existing.nativeBrowser !== browser) return existing.browserView;
+
+    const binding = context ? bindContext(context, profile ?? { context }) : null;
+    if (binding?.browserView) {
+        // Only a live view created without an explicit owner may adopt one later.
+        if (!binding.lifecycleProfile && profile && isContextUsable(context)) {
+            binding.lifecycleProfile = profile;
+        }
+        return binding.browserView;
+    }
 
     const getPages = context?.pages?.bind(context);
     const createPage = context?.newPage?.bind(context);
@@ -838,6 +851,9 @@ export function attachBrowserCompatibility(browser, profile = null) {
         }
         const page = await createPage(...args);
         await resolveContextRecorder(context)?.attachPage?.(page);
+        if (!isContextUsable(context) || page?.isClosed?.() === true) {
+            throw new Error('Playwright page or context closed while opening a page');
+        }
         return decoratePage(page);
     };
 
@@ -846,7 +862,7 @@ export function attachBrowserCompatibility(browser, profile = null) {
         newPage,
         isConnected: () => isContextUsable(context),
         async disconnect() {
-            if (isContextUsable(context)) await profile.saveStorageState?.();
+            if (isContextUsable(context)) await binding.lifecycleProfile?.saveStorageState?.();
         },
         async userAgent() {
             const [page] = listPages();
@@ -856,8 +872,12 @@ export function attachBrowserCompatibility(browser, profile = null) {
 
     if (binding) {
         binding.browserView = view;
-        binding.isBrowserConnected = () =>
-            (profile === context || profile.context === context) && browser.isConnected?.() !== false;
+        binding.nativeBrowser = browser;
+        binding.lifecycleProfile = profile;
+        binding.isBrowserConnected = () => {
+            const owner = binding.lifecycleProfile;
+            return (!owner || owner === context || owner.context === context) && browser.isConnected?.() !== false;
+        };
         context.browser = () => view;
         if (getPages) context.pages = listPages;
         if (createPage) context.newPage = newPage;
@@ -868,8 +888,9 @@ export function attachBrowserCompatibility(browser, profile = null) {
                         await closeContext(...args);
                         binding.closed = true;
                     };
+                    const owner = binding.lifecycleProfile;
                     binding.closing = Promise.resolve().then(() => (
-                        profile.closeContext ? profile.closeContext(close) : close()
+                        owner?.closeContext ? owner.closeContext(close) : close()
                     )).finally(() => {
                         binding.closing = null;
                     });
@@ -1005,7 +1026,7 @@ export class CamoufoxProfile {
     }
 
     /**
-     * Audit the active page. The overall verdict and score include its wire checks when recording is enabled.
+     * Audit the active page. Wire checks require recording evidence scoped to that page.
      */
     async auditCoherence(expectedOs = null, options = {}) {
         const page = await this.getPage();
@@ -1032,9 +1053,14 @@ export class CamoufoxProfile {
             let captureIssue = null;
             if (typeof traceId === 'string' && traceId.trim()) {
                 try {
-                    events = trafficPaths?.trafficDir
+                    const recordedEvents = trafficPaths?.trafficDir
                         ? readCoherenceCaptureEvents(trafficPaths.trafficDir, { trustedLocal: true })
                         : trafficRecorder;
+                    if (trafficRecorder.hasSingleRequestSource?.(page) === true) {
+                        events = recordedEvents;
+                    } else {
+                        captureIssue = 'missing-page-provenance';
+                    }
                 } catch (error) {
                     captureIssue = error.code === 'ERR_COHERENCE_CAPTURE_INVALID' ? 'invalid-capture-record' : 'unreadable-capture';
                 }
@@ -1225,8 +1251,7 @@ export class CamoufoxProfile {
         try {
             const lifecycle = this.#lifecycle;
             if (!lifecycle) throw new Error('Camoufox manager has no acquired profile session');
-            if (!(await this.stop())) throw new Error('Could not stop Camoufox profile before deletion');
-            await lifecycle.delete();
+            await lifecycle.delete(() => this.#lifecycle === lifecycle && this.stop());
             logger.info('Camoufox profile deleted', { profileId: this.profileId });
             return true;
         } catch (error) {
@@ -1283,10 +1308,11 @@ export async function createAndStartProfile(profileName, proxy = null, options =
 
             logger.info('Creating Camoufox profile...', { name: profileName });
             profileData = await camoufoxClient.createProfile(profileName, proxy, options);
+            // Each start reads the persisted proxy, including any updates since creation.
+            const { proxy: _creationProxy, ...startOptions } = options;
             const profileManager = new CamoufoxProfile(profileData.id, {
-                ...options,
+                ...startOptions,
                 profilesDir: path.dirname(profileData.profileDir),
-                proxy: profileData.proxy,
                 os: profileData.os,
                 geoip: profileData.geoip,
                 humanize: profileData.humanize

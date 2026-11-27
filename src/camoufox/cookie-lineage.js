@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import { domainToASCII } from 'node:url';
+import { captureEventProfileId, captureEventTraceId } from './capture-export-policy.js';
+import { validateProfileId } from './profile-storage.js';
 import { redactDiagnosticText, redactUrlSecrets } from './traffic-redaction.js';
 
 /**
@@ -201,6 +203,19 @@ function collectCookieObservations({ headers = {}, headersArray = [] }, name, ob
 }
 
 const RETAINED_OBSERVATIONS_PER_SCOPE = 256;
+const ANONYMOUS_PROFILE_LABEL = /^profile-legacy-\d{13}(?:-\d{1,8})?$/i;
+export const PRIMARY_COOKIE_JAR = 'primary';
+
+function observationProfile(event) {
+    const profileId = captureEventProfileId(event);
+    if (profileId === null && captureEventTraceId(event) === null) return ''; // Unlabeled legacy ledger.
+    try {
+        const id = validateProfileId(profileId);
+        return ANONYMOUS_PROFILE_LABEL.test(id) ? null : id;
+    } catch {
+        return null;
+    }
+}
 
 function observationClock(event) {
     return Number.isFinite(event.epochMs) ? event.epochMs : Date.parse(event.timestamp);
@@ -304,7 +319,11 @@ function entryFor(entries, observation, scope, key) {
             sent: new Map(),
             sentCount: 0,
             pathEvidence: null,
+            profile: null,
+            cookieJarId: null,
             validDomain: false,
+            secure: false,
+            lastValueSha256: null,
             expiresAt: null,
             lastSetOrder: null,
             hasUntimedSet: false,
@@ -325,7 +344,7 @@ export class CookieLineage {
         this.needsReplay = false;
     }
 
-    observeAll(events) {
+    observeAll(events, includeEvent = () => true) {
         const observations = events.flatMap((event) => {
             if ((event?.type !== 'ingress' && event?.type !== 'egress') ||
                 (Array.isArray(event.cookieObservations) && event.cookieObservations.length === 0)) return [];
@@ -333,12 +352,12 @@ export class CookieLineage {
         });
         // Stable sorting preserves ledger order for legacy events with the same observation time.
         observations.sort((first, second) => compareObservationOrder(first.order, second.order));
-        for (const { event } of observations) this.observe(event);
+        for (const { event } of observations) this.observe(event, includeEvent(event));
     }
 
-    observe(event) {
+    observe(event, include = true) {
         const incoming = event?.type === 'ingress';
-        if (this.needsReplay || (!incoming && event?.type !== 'egress')) return;
+        if (this.needsReplay || (!incoming && (!include || event?.type !== 'egress'))) return;
         const timestamp = event.timestamp || null;
         const clock = observationClock(event);
         const hasClock = Number.isFinite(clock);
@@ -357,6 +376,10 @@ export class CookieLineage {
         const triggerActionId = event.triggerAction?.actionId || event.attribution?.triggerAction?.actionId || null;
         const { hostname, pathname, secure } = requestScope(event);
         const requestPath = observedPath(pathname);
+        const profile = observationProfile(event);
+        const cookieJarId = event.cookieJarId === undefined ? PRIMARY_COOKIE_JAR : event.cookieJarId;
+        const hasSource = profile !== null && typeof cookieJarId === 'string' && cookieJarId.length > 0;
+        const sourceKey = hasSource ? [profile, cookieJarId] : ++this.#unknownScopeCount;
 
         for (const observation of observations) {
             if (typeof observation?.name !== 'string' || !observation.name) continue;
@@ -383,18 +406,32 @@ export class CookieLineage {
                 const pathEvidence = observedPath(rawPath, observation.pathScopeUnknown === true);
                 const partitioned = Boolean(observation.partitioned || partitionKey);
                 const validDomain = matchingDomain(hostname, domain);
-                const scopeStatus = validDomain && pathEvidence.exact !== null ? 'set-cookie' : 'unknown';
+                const scopeStatus = hasSource && validDomain && pathEvidence.exact !== null ? 'set-cookie' : 'unknown';
                 const scope = { domain: domain || hostname, hostOnly, path, partitioned, partitionKey, scopeStatus };
                 // Keep separate settings when the capture cannot prove that their paths are identical.
                 const pathIdentity = pathEvidence.exact ?? ++this.#unknownScopeCount;
-                const scopeKey = JSON.stringify([scopeStatus, domain, hostOnly, pathIdentity, partitioned, partitionKey,
-                    validDomain ? null : hostname]);
+                const scopeKey = JSON.stringify([sourceKey, scopeStatus, domain, hostOnly, pathIdentity, partitioned,
+                    partitionKey, validDomain ? null : hostname]);
                 const state = entryFor(entries, observation, scope, scopeKey);
                 const { entry } = state;
                 const maxAge = observation.maxAge;
                 const expiresAt = Number.isFinite(maxAge) ? clock + maxAge * 1000 : Date.parse(observation.expires);
                 const isDeleted = Boolean(observation.isDeleted || expiresAt <= clock ||
                     (Number.isFinite(maxAge) && maxAge <= 0));
+                const mutated = state.lastValueSha256 !== valueSha256 || state.deleted !== isDeleted;
+                state.secure = Boolean(observation.secure);
+                state.lastValueSha256 = valueSha256;
+                state.pathEvidence = pathEvidence;
+                state.profile = profile;
+                state.cookieJarId = cookieJarId;
+                state.validDomain = validDomain;
+                state.lastSetOrder = order;
+                state.hasUntimedSet ||= !hasClock;
+                state.expiresAt = expiresAt;
+                state.deleted = isDeleted;
+                // Settings outside the report selection still govern later sends.
+                if (!include) continue;
+
                 if (!state.historyCount) {
                     entry.firstSetAt = timestamp;
                     entry.firstSetByCorrelationId = correlationId;
@@ -402,22 +439,14 @@ export class CookieLineage {
                     entry.firstSetByTrigger = triggerActionId;
                     entry.firstSetUrl = event.url ? redactUrlSecrets(event.url) : null;
                 }
-                if (entry.lastValueSha256 !== valueSha256 || state.deleted !== isDeleted) {
-                    entry.mutationsCount += 1;
-                }
-                entry.secure = Boolean(observation.secure);
+                if (mutated) entry.mutationsCount += 1;
+                entry.secure = state.secure;
                 entry.httpOnly = Boolean(observation.httpOnly);
                 entry.sameSite = observation.sameSite == null ? null : redactDiagnosticText(observation.sameSite);
                 entry.lastSetAt = timestamp;
                 entry.lastSetByCorrelationId = correlationId;
                 entry.lastSetAtStep = actionStep;
                 entry.lastValueSha256 = valueSha256;
-                state.pathEvidence = pathEvidence;
-                state.validDomain = validDomain;
-                state.lastSetOrder = order;
-                state.hasUntimedSet ||= !hasClock;
-                state.expiresAt = expiresAt;
-                state.deleted = isDeleted;
                 const historyKey = JSON.stringify([correlationId ?? timestamp, valueSha256, isDeleted]);
                 const stored = remember(state.history, historyKey, {
                     correlationId, actionStep, triggerActionId, timestamp,
@@ -429,16 +458,22 @@ export class CookieLineage {
 
             const candidates = [];
             let hasUncertainCandidate = false;
+            let hasOtherProfile = false;
             for (const state of entries.values()) {
                 const { entry } = state;
-                if (!state.validDomain || state.deleted || state.expiresAt <= clock ||
-                    !valueSha256 || valueSha256 !== entry.lastValueSha256 || (entry.secure && !secure) ||
+                if (state.cookieJarId !== cookieJarId || !state.validDomain || state.deleted || state.expiresAt <= clock ||
+                    !valueSha256 || valueSha256 !== state.lastValueSha256 || (state.secure && !secure) ||
                     !hostname || !(entry.hostOnly ? hostname === entry.domain : matchingDomain(hostname, entry.domain)) ||
                     (entry.partitioned && partitionKey && entry.partitionKey && entry.partitionKey !== partitionKey)) {
                     continue;
                 }
                 const matchesPath = matchingObservedPath(requestPath, state.pathEvidence);
                 if (matchesPath === false) continue;
+                if (!hasSource || state.profile !== profile) {
+                    if (state.profile === null) hasUncertainCandidate = true;
+                    else hasOtherProfile = true;
+                    continue;
+                }
                 const clockMovedBack = state.lastSetOrder.clock > order.clock;
                 const cannotUseClock = clockMovedBack &&
                     (!order.sequence || !state.lastSetOrder.sequence || Number.isFinite(state.expiresAt));
@@ -453,11 +488,13 @@ export class CookieLineage {
                 partitionKey && candidate.entry.partitionKey === partitionKey
             ));
             let scopeStatus = 'unmatched';
-            if (hasUncertainCandidate) scopeStatus = 'unknown';
+            if (hasUncertainCandidate || (!candidates.length && (!hasSource || hasOtherProfile))) {
+                scopeStatus = 'unknown';
+            }
             if (candidates.length > 1 || (candidates.length && !hasUncertainCandidate)) scopeStatus = 'ambiguous';
             const state = matched ? candidate : entryFor(entries, observation, {
                 domain: hostname, hostOnly: null, path: null, partitioned: null, partitionKey, scopeStatus
-            }, JSON.stringify([scopeStatus, hostname, partitionKey]));
+            }, JSON.stringify([sourceKey, scopeStatus, hostname, partitionKey]));
             if (!correlationId || remember(state.sent, correlationId, correlationId, this.limit)) {
                 state.sentCount += 1;
             }
@@ -469,18 +506,24 @@ export class CookieLineage {
     }
 
     snapshot() {
-        return Object.fromEntries(Array.from(this.byName, ([name, entries]) => {
-            const instances = Array.from(entries.values(), ({ entry, history, historyCount, sent, sentCount }) => ({
-                ...entry,
-                sentCount,
-                valueHistory: Array.from(history.values(), (value) => ({ ...value })),
-                valueHistoryOmittedCount: historyCount - history.size,
-                sentInCorrelationIds: Array.from(sent.keys())
-            }));
-            const lineage = instances.length === 1
+        const lineage = [];
+        for (const [name, entries] of this.byName) {
+            const instances = [];
+            for (const { entry, history, historyCount, sent, sentCount } of entries.values()) {
+                if (!historyCount && !sentCount) continue;
+                instances.push({
+                    ...entry,
+                    sentCount,
+                    valueHistory: Array.from(history.values(), (value) => ({ ...value })),
+                    valueHistoryOmittedCount: historyCount - history.size,
+                    sentInCorrelationIds: Array.from(sent.keys())
+                });
+            }
+            if (!instances.length) continue;
+            lineage.push([name, instances.length === 1
                 ? instances[0]
-                : { name, isAntiBotToken: instances.some((entry) => entry.isAntiBotToken), instances };
-            return [name, lineage];
-        }));
+                : { name, isAntiBotToken: instances.some((entry) => entry.isAntiBotToken), instances }]);
+        }
+        return Object.fromEntries(lineage);
     }
 }

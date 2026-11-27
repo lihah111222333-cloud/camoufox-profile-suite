@@ -354,6 +354,82 @@ test('A vault key is validated only for a selected vault and an invalid active k
     assert.equal(selected.status, 0, selected.stderr);
 });
 
+test('A vault-only state source does not fall back to legacy plaintext without a key', async t => {
+    const root = await makeFixture(t);
+    const state = path.join(root, 'operator-state');
+    await mkdir(state, { mode: 0o700 });
+    await writeFile(path.join(root, '.env'), 'PROFILE_SERVICE=dolphin\nCAMOUFOX_STORAGE_DIR=legacy-profiles\n', { mode: 0o600 });
+    const env = { GMAIL_CREATOR_STATE_DIR: state, GMAIL_CREATOR_LEGACY_DIR: root };
+
+    for (const name of ['.env', '.emv']) {
+        const vault = path.join(state, name + '.vault');
+        await writeFile(vault, 'DOTENV_VAULT_PRODUCTION=fixture-encrypted-data\n', { mode: 0o600 });
+
+        const missingKey = runModule(root, `
+            import assert from 'node:assert/strict';
+            import { getConfiguredProfilesDirectory } from './src/utils/private-env.js';
+            const error = {
+                code: 'PRIVATE_ENV_CONFIGURATION_ERROR',
+                message: ${JSON.stringify('DOTENV_KEY is required to read ' + name + '.vault')}
+            };
+            assert.throws(getConfiguredProfilesDirectory, error);
+            await assert.rejects(import('./src/config.js'), error);
+            assert.equal(process.env.CAMOUFOX_STORAGE_DIR, undefined);
+        `, env);
+        assert.equal(missingKey.status, 0, missingKey.stderr);
+
+        const readPlaintext = `
+            import assert from 'node:assert/strict';
+            import path from 'node:path';
+            import { getConfiguredProfilesDirectory } from './src/utils/private-env.js';
+            const profilesDir = path.join(process.cwd(), 'state-profiles');
+            assert.equal(getConfiguredProfilesDirectory(), profilesDir);
+            assert.equal(process.env.CAMOUFOX_STORAGE_DIR, undefined);
+            const { default: config } = await import('./src/config.js');
+            assert.equal(config.profileService, 'camoufox');
+            assert.equal(config.camoufox.storageDir, profilesDir);
+        `;
+        for (const plaintextName of name === '.env' ? ['.env', '.emv'] : ['.emv']) {
+            const plaintext = path.join(state, plaintextName);
+            await writeFile(plaintext, 'PROFILE_SERVICE=camoufox\nCAMOUFOX_STORAGE_DIR=state-profiles\n', { mode: 0o600 });
+            const sameSourcePlaintext = runModule(root, readPlaintext, env);
+            assert.equal(sameSourcePlaintext.status, 0, sameSourcePlaintext.stderr);
+            await rm(plaintext);
+        }
+
+        await rm(vault);
+    }
+});
+
+test('SDK configuration retries use the corrected files after a fallback read fails', async t => {
+    const root = await makeFixture(t);
+    await writeFile(path.join(root, '.env'), 'CAMOUFOX_STORAGE_DIR=initial-profiles\nFIXTURE_LABEL=initial\n', { mode: 0o600 });
+    await mkdir(path.join(root, '.emv'));
+
+    const result = runModule(root, `
+        import assert from 'node:assert/strict';
+        import { rmdirSync, writeFileSync } from 'node:fs';
+        import path from 'node:path';
+        import { getProfileDir, validateCamoufoxNetworkPolicy } from './src/camoufox/client.js';
+
+        assert.throws(() => validateCamoufoxNetworkPolicy({}, null), {
+            code: 'PRIVATE_ENV_CONFIGURATION_ERROR',
+            message: 'Could not read .emv as a private configuration file'
+        });
+        assert.equal(process.env.CAMOUFOX_STORAGE_DIR, undefined);
+        assert.equal(process.env.FIXTURE_LABEL, undefined);
+
+        rmdirSync('.emv');
+        writeFileSync('.env', 'CAMOUFOX_STORAGE_DIR=corrected-profiles\\nFIXTURE_LABEL=corrected\\n');
+        writeFileSync('.emv', 'PROFILE_SERVICE=camoufox\\nFIXTURE_LABEL=fallback\\n', { mode: 0o600 });
+        assert.equal(validateCamoufoxNetworkPolicy({}, null), null);
+        assert.equal(process.env.PROFILE_SERVICE, 'camoufox');
+        assert.equal(process.env.FIXTURE_LABEL, 'corrected');
+        assert.equal(getProfileDir('fixture'), path.join(process.cwd(), 'corrected-profiles', 'fixture'));
+    `);
+    assert.equal(result.status, 0, result.stderr);
+});
+
 test('The GoLogin fallback is read only by callers that need its key', async t => {
     const root = await makeFixture(t);
     const primary = path.join(root, '.env');
@@ -375,7 +451,7 @@ test('The GoLogin fallback is read only by callers that need its key', async t =
     assert.equal(result.status, 0, result.stderr);
 });
 
-test('A symlink state directory is rejected before loading its configuration', { skip: !posix }, async t => {
+test('A symlink state directory is rejected before loading configuration or inventory', { skip: !posix }, async t => {
     const root = await makeFixture(t);
     const target = path.join(root, 'other-state');
     const linked = path.join(root, 'linked-state');
@@ -383,15 +459,23 @@ test('A symlink state directory is rejected before loading its configuration', {
     await mkdir(target);
     await writeFile(path.join(target, '.env'), contents);
     await chmod(path.join(target, '.env'), 0o644);
+    await mkdir(path.join(target, 'config'));
+    const inventory = 'fixture-proxy.invalid:1080\n';
+    await writeFile(path.join(target, proxyFile), inventory);
+    await chmod(path.join(target, proxyFile), 0o644);
     await symlink(target, linked, 'dir');
 
     const result = runModule(root, `
         import assert from 'node:assert/strict';
+        import manager from './src/utils/proxy-manager.js';
         await assert.rejects(import('./src/config.js'), { code: 'PRIVATE_ENV_CONFIGURATION_ERROR' });
         assert.equal(process.env.FIXTURE_LINKED_STATE, undefined);
+        assert.throws(() => manager.loadProxies(), { code: 'PROXY_CONFIGURATION_ERROR' });
     `, { GMAIL_CREATOR_STATE_DIR: linked });
     assert.equal(await permissions(target, '.env'), 0o644);
     assert.equal(await readFile(path.join(target, '.env'), 'utf8'), contents);
+    assert.equal(await permissions(target, proxyFile), 0o644);
+    assert.equal(await readFile(path.join(target, proxyFile), 'utf8'), inventory);
     assert.equal(result.status, 0, result.stderr);
 });
 
@@ -581,17 +665,45 @@ test('Skipping a state fallback file does not allow legacy configuration to take
     assert.equal(legacy.status, 0, legacy.stderr);
 });
 
-async function stubGoLoginModules(root) {
-    for (const [name, content] of Object.entries({
-        axios: 'function request() { throw new Error("Unexpected transport call"); } request.create = () => request; module.exports = request;'
-    })) {
-        const directory = path.join(root, 'node_modules', name);
-        await mkdir(directory, { recursive: true });
-        await writeFile(path.join(directory, 'index.js'), content);
-    }
+async function stubGoLoginModules(root, source = 'module.exports = () => { throw new Error("Unexpected transport call"); };') {
+    const directory = path.join(root, 'node_modules', 'axios');
+    await mkdir(directory, { recursive: true });
+    await writeFile(path.join(directory, 'index.js'), source);
 }
 
-test('Standalone GoLogin startup reads its key from the private state source', async t => {
+test('A GoLogin client with an explicit key ignores an unreadable default fallback', async t => {
+    const root = await makeFixture(t);
+    await writeFile(path.join(root, '.env'), 'PROFILE_SERVICE=camoufox\n', { mode: 0o600 });
+    await mkdir(path.join(root, '.emv'));
+    await stubGoLoginModules(root, `
+        module.exports = async ({ headers }) => ({
+            status: 200,
+            data: headers.Authorization === 'Bearer fixture-explicit-key'
+        });
+    `);
+
+    const result = runModule(root, `
+        import assert from 'node:assert/strict';
+        import { rmdirSync, writeFileSync } from 'node:fs';
+        import defaultClient, { GoLoginClient, getGoLoginApiKey } from './src/gologin/client.js';
+
+        const client = new GoLoginClient('fixture-explicit-key');
+        assert.equal(await client.request('GET', '/browser/v2'), true);
+        assert.equal(process.env.PROFILE_SERVICE, undefined);
+        assert.equal(process.env.GOLOGIN_API_KEY, undefined);
+        await assert.rejects(defaultClient.request('GET', '/browser/v2'), {
+            code: 'PRIVATE_ENV_CONFIGURATION_ERROR',
+            message: 'Could not read .emv as a private configuration file'
+        });
+        assert.equal(process.env.PROFILE_SERVICE, undefined);
+        rmdirSync('.emv');
+        writeFileSync('.emv', 'GOLOGIN_API_KEY=fixture-fallback-key\\n', { mode: 0o600 });
+        assert.equal(getGoLoginApiKey(), 'fixture-fallback-key');
+    `);
+    assert.equal(result.status, 0, result.stderr);
+});
+
+test('Standalone GoLogin resolves its default key from the private state source on first use', async t => {
     const root = await makeFixture(t);
     const state = path.join(root, 'operator-state');
     await mkdir(state, { mode: 0o700 });
@@ -601,7 +713,9 @@ test('Standalone GoLogin startup reads its key from the private state source', a
 
     const result = runModule(root, `
         import assert from 'node:assert/strict';
-        await import('./src/gologin/client.js');
+        const { getGoLoginApiKey } = await import('./src/gologin/client.js');
+        assert.equal(process.env.GOLOGIN_API_KEY, undefined);
+        assert.equal(getGoLoginApiKey(), 'fixture-state-key');
         assert.equal(process.env.GOLOGIN_API_KEY, 'fixture-state-key');
     `, { GMAIL_CREATOR_STATE_DIR: state, GMAIL_CREATOR_LEGACY_DIR: root });
     assert.equal(result.status, 0, result.stderr);
@@ -622,7 +736,8 @@ test('Application and standalone GoLogin imports resolve the same configuration 
     const check = (first, expected, overrides) => {
         const result = runModule(root, `
             import assert from 'node:assert/strict';
-            await import('./src/' + ${JSON.stringify(first)});
+            const firstModule = await import('./src/' + ${JSON.stringify(first)});
+            firstModule.getGoLoginApiKey?.();
             const { default: config } = await import('./src/config.js');
             assert.equal(config.gologin.apiKey, ${JSON.stringify(expected)});
             const { getGoLoginApiKey } = await import('./src/gologin/client.js');
@@ -755,4 +870,102 @@ test('Standalone Camoufox uses the deployment profiles directory and managed pol
         assert.equal(authorized.origin, 'http://proxy.invalid:8080');
     `);
     assert.equal(result.status, 0, result.stderr);
+});
+
+test('Published state-directory constants preserve the valid launch-time paths', async t => {
+    const root = await makeFixture(t);
+    const state = path.join(root, 'state');
+    const legacy = path.join(root, 'legacy');
+    const result = runModule(root, `
+        import assert from 'node:assert/strict';
+        import { STATE_DIRECTORY, LEGACY_DIRECTORY, getStateDirectory, getLegacyDirectory } from './src/utils/state-paths.js';
+        assert.equal(STATE_DIRECTORY, process.env.GMAIL_CREATOR_STATE_DIR);
+        assert.equal(LEGACY_DIRECTORY, process.env.GMAIL_CREATOR_LEGACY_DIR);
+        process.env.GMAIL_CREATOR_STATE_DIR = 'later-configuration';
+        process.env.GMAIL_CREATOR_LEGACY_DIR = 'later-configuration';
+        assert.equal(getStateDirectory(), STATE_DIRECTORY);
+        assert.equal(getLegacyDirectory(), LEGACY_DIRECTORY);
+    `, {
+        HOME: path.join(root, 'separate-home'),
+        GMAIL_CREATOR_STATE_DIR: state,
+        GMAIL_CREATOR_LEGACY_DIR: legacy
+    });
+    assert.equal(result.status, 0, result.stderr);
+    await assert.rejects(stat(state), { code: 'ENOENT' });
+});
+
+test('Audit help and explicit reads do not depend on unused state path overrides', async t => {
+    const root = await makeFixture(t);
+    const profilesDir = path.join(root, 'explicit-profiles');
+    const profileDir = path.join(profilesDir, 'fixture');
+    const trafficDir = path.join(profileDir, 'traffic');
+    const auditCLI = fileURLToPath(new URL('../../scripts/query-traffic-attribution.js', import.meta.url));
+    await mkdir(trafficDir, { recursive: true });
+    await writeFile(path.join(profileDir, 'profile.json'), '{"id":"fixture"}\n', { mode: 0o600 });
+    await writeFile(path.join(trafficDir, 'traffic.ndjson'),
+        '{"type":"egress","correlationId":"fixture","url":"https://example.invalid/","method":"GET"}\n',
+        { mode: 0o600 });
+    const env = {
+        HOME: path.join(root, 'separate-home'),
+        GMAIL_CREATOR_LEGACY_DIR: path.join(root, 'legacy')
+    };
+
+    for (const [field, value] of [
+        ['GMAIL_CREATOR_STATE_DIR', ''],
+        ['GMAIL_CREATOR_LEGACY_DIR', ''],
+        ['GMAIL_CREATOR_LEGACY_DIR', 'fixture-relative-path']
+    ]) {
+        const overrides = { ...env, [field]: value };
+        const help = runNode(root, [auditCLI, '--help'], overrides);
+        assert.equal(help.status, 0, help.stderr);
+        assert.match(help.stdout, /^Usage:/);
+        const explicit = runNode(root, [auditCLI, '--profiles-dir', profilesDir, '--json'], overrides);
+        assert.equal(explicit.status, 0, explicit.stderr);
+        assert.deepEqual(JSON.parse(explicit.stdout).profiles.map(profile => profile.profileId), ['fixture']);
+
+        const read = runModule(root, `
+            import assert from 'node:assert/strict';
+            import { getProfile } from './src/camoufox/client.js';
+            const profile = await getProfile('fixture', { profilesDir: ${JSON.stringify(profilesDir)} });
+            assert.equal(profile.id, 'fixture');
+        `, overrides);
+        assert.equal(read.status, 0, read.stderr);
+
+        const defaults = runNode(root, [auditCLI, '--json'], overrides);
+        assert.equal(defaults.status, 1, defaults.stderr);
+        assert.equal(defaults.stdout, '');
+        assert.equal(defaults.stderr.trim(), 'Error: ' + field + ' must be an absolute path');
+
+        const application = runNode(root, ['bin/gmail-account-creator.js'], overrides);
+        assert.equal(application.status, 1, application.stderr);
+        assert.equal(application.stderr.trim(), field + ' must be an absolute path');
+    }
+    await assert.rejects(stat(path.join(root, 'logs')), { code: 'ENOENT' });
+});
+
+test('Whitespace-only configured profile roots report errors without changing empty and relative roots', async t => {
+    const root = await makeFixture(t);
+    const profilesDir = path.join(root, 'fixture-profiles');
+    const trafficDir = path.join(profilesDir, 'fixture', 'traffic');
+    const auditCLI = fileURLToPath(new URL('../../scripts/query-traffic-attribution.js', import.meta.url));
+    await mkdir(trafficDir, { recursive: true });
+    await writeFile(path.join(trafficDir, 'traffic.ndjson'),
+        '{"type":"egress","correlationId":"fixture","url":"https://example.invalid/","method":"GET"}\n',
+        { mode: 0o600 });
+    const env = {
+        HOME: path.join(root, 'separate-home'),
+        GMAIL_CREATOR_LEGACY_DIR: path.join(root, 'legacy')
+    };
+    for (const field of ['CAMOUFOX_STORAGE_DIR', 'CAMOUFOX_PROFILES_DIR']) {
+        const invalid = runNode(root, [auditCLI, '--json'], { ...env, [field]: ' \t ' });
+        assert.equal(invalid.status, 1, invalid.stderr);
+        assert.equal(invalid.stdout, '');
+        assert.match(invalid.stderr, new RegExp('^Error: ' + field + ' .*directory'));
+    }
+
+    const relative = runNode(root, [auditCLI, '--json'], {
+        ...env, CAMOUFOX_STORAGE_DIR: '', CAMOUFOX_PROFILES_DIR: 'fixture-profiles'
+    });
+    assert.equal(relative.status, 0, relative.stderr);
+    assert.deepEqual(JSON.parse(relative.stdout).profiles.map(profile => profile.profileId), ['fixture']);
 });
