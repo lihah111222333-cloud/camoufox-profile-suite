@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
@@ -39,6 +40,43 @@ function deferred() {
 function readEvents(ledgerPath) {
     return fs.readFileSync(ledgerPath, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line));
 }
+
+test('the capture writer holds one lease through delayed finalization and can be reopened', async (t) => {
+    const { trafficDir, recorder, create, ledgerPath, indexPath } = fixture(t, {
+        recordWireLog: false, neckoMozLog: true
+    });
+    recorder.setStep('first writer');
+    await recorder.flushSummary();
+    const ledger = fs.readFileSync(ledgerPath);
+    assert.throws(() => create({ resetTrafficOnStart: true }), { code: 'ERR_CAMOUFOX_PROFILE_BUSY' });
+    const recorderModule = new URL('../../src/camoufox/traffic-recorder.js', import.meta.url).href;
+    const child = `
+        import assert from 'node:assert/strict';
+        import { CamoufoxTrafficRecorder } from ${JSON.stringify(recorderModule)};
+        assert.throws(() => new CamoufoxTrafficRecorder({ trafficDir: process.argv[1] }),
+            { code: 'ERR_CAMOUFOX_PROFILE_BUSY' });
+    `;
+    execFileSync(process.execPath, ['--input-type=module', '-e', child, trafficDir], { timeout: 5000 });
+    assert.deepEqual(fs.readFileSync(ledgerPath), ledger);
+
+    await recorder.stop({ nativeLogsClosed: false });
+    assert.throws(() => create(), { code: 'ERR_CAMOUFOX_PROFILE_BUSY' });
+    const final = await recorder.flushSummary({ nativeLogsClosed: true });
+    const next = create({ neckoMozLog: false });
+    next.setStep('next writer');
+    await next.flushSummary();
+    const nextIndex = fs.readFileSync(indexPath);
+    assert.deepEqual(await recorder.stop(), final);
+    assert.deepEqual(await recorder.flushSummary(), final);
+    assert.deepEqual(fs.readFileSync(indexPath), nextIndex);
+    await next.stop();
+    assert.deepEqual(readEvents(ledgerPath).map((event) => event.actionStep), ['first writer', 'next writer']);
+
+    const reset = create({ resetTrafficOnStart: true, neckoMozLog: false });
+    reset.setStep('after reset');
+    await reset.stop();
+    assert.deepEqual(readEvents(ledgerPath).map((event) => event.actionStep), ['after reset']);
+});
 
 test('close and stop release recorder listeners and stop drains already accepted HTTP captures', async (t) => {
     const { trafficDir, recorder, ledgerPath } = fixture(t);
@@ -117,6 +155,8 @@ test('recovery drops only a torn append after a valid checkpoint and preserves t
     recorder.setStep('complete event é');
     const prefix = fs.readFileSync(ledgerPath);
     recorder.setStep('interrupted event');
+    await recorder.stop();
+    fs.writeFileSync(indexPath, checkpointIndex);
     fs.truncateSync(ledgerPath, fs.statSync(ledgerPath).size - 9);
 
     const resumed = create();
@@ -134,6 +174,7 @@ test('recovery drops only a torn append after a valid checkpoint and preserves t
 test('recovery keeps a complete final record when only its newline is missing', async (t) => {
     const { trafficDir, recorder, create, ledgerPath } = fixture(t, { recordWireLog: false });
     recorder.setStep('complete event');
+    await recorder.stop();
     const complete = fs.readFileSync(ledgerPath);
     fs.truncateSync(ledgerPath, complete.length - 1);
     const resumed = create();
@@ -170,6 +211,8 @@ test('recovery preserves the ledger and index when recorded evidence is incomple
         assert.deepEqual(fs.readFileSync(indexPath), index);
         assert.equal(verifyTrafficIntegrity(trafficDir).valid, false);
     }
+    fs.writeFileSync(ledgerPath, original);
+    await create().stop();
 });
 
 test('a failed append does not advance the chain or overwrite the existing index', async (t) => {
@@ -204,6 +247,9 @@ test('a failed append does not advance the chain or overwrite the existing index
     const resumed = create();
     assert.deepEqual(fs.readFileSync(ledgerPath), original);
     await resumed.stop();
+    const resumedIndex = fs.readFileSync(indexPath);
+    await assert.rejects(recorder.flushSummary(), /Could not append to traffic.ndjson/);
+    assert.deepEqual(fs.readFileSync(indexPath), resumedIndex);
     assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
 });
 
@@ -236,6 +282,8 @@ test('recovery respects the previous wire checkpoint before trimming a torn appe
     const index = fs.readFileSync(indexPath);
 
     recorder.recordSecurityBlock({ type: 'fixture', url: 'https://example.test/two' });
+    await recorder.stop();
+    fs.writeFileSync(indexPath, index);
     const prefix = fs.readFileSync(ledgerPath);
     fs.appendFileSync(ledgerPath, '{"type":"step-transiti');
     const torn = fs.readFileSync(ledgerPath);
@@ -320,11 +368,10 @@ test('verification accepts absent optional artifacts and checks newly recorded p
 });
 
 test('a private native log outside the capture directory is outside the archive integrity scope', async (t) => {
-    const { trafficDir, create } = fixture(t, { recordWireLog: false });
     const nativeDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'recorder-native-'));
     t.after(() => fs.rmSync(nativeDir, { force: true, recursive: true }));
     const sslKeyLogPath = path.join(nativeDir, 'sslkeylog.txt');
-    const recorder = create({ sslKeyLog: true, sslKeyLogPath });
+    const { trafficDir, recorder } = fixture(t, { recordWireLog: false, sslKeyLog: true, sslKeyLogPath });
     recorder.recordSslKeyLogSecret('CLIENT_RANDOM', 'e'.repeat(64), 'f'.repeat(96));
     const summary = await recorder.stop();
     assert.equal(summary.sslKeyLog.entryCount, 1);
@@ -333,5 +380,26 @@ test('a private native log outside the capture directory is outside the archive 
     assert.equal(summary.integrity.sslKeyLogBytes, 0);
     assert.equal(summary.integrity.sslKeyLogFile, undefined);
     fs.unlinkSync(sslKeyLogPath);
+    assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
+});
+
+test('legacy native archive migration keeps the new capture under its writer lease', async (t) => {
+    const { trafficDir, recorder, create, ledgerPath } = fixture(t, { recordWireLog: false });
+    recorder.setStep('legacy generation');
+    await recorder.stop();
+    const original = fs.readFileSync(ledgerPath);
+    fs.writeFileSync(path.join(trafficDir, 'necko-pre-tls.moz_log'), 'synthetic legacy native file\n');
+
+    const next = create();
+    assert.throws(create, { code: 'ERR_CAMOUFOX_PROFILE_BUSY' });
+    const [archived] = fs.readdirSync(next.profileNativeDir);
+    const preserved = path.join(next.profileNativeDir, archived, 'traffic', 'traffic.ndjson');
+    assert.deepEqual(fs.readFileSync(preserved), original);
+    next.setStep('new generation');
+    await next.stop();
+
+    const reopened = create();
+    await reopened.stop();
+    assert.deepEqual(fs.readFileSync(preserved), original);
     assert.equal(verifyTrafficIntegrity(trafficDir).valid, true);
 });

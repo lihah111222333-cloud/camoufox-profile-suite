@@ -51,11 +51,8 @@ import {
 import {
     GPU_PERFORMANCE_SPEC_CATALOG,
     lookupGpuPerformanceSpec,
-    collectHostMacPerformanceBaseline,
     computeGpuPerformanceScalingWeights,
     scaleGpuExecutionDurationMs,
-    buildGpuPerformanceInitScript,
-    attachGpuPerformanceScalerToContext,
     validateGpuPerformanceScalingCoherence
 } from './gpu-performance-scaler.js';
 
@@ -80,11 +77,8 @@ export {
     attachZiniaoSecurityGuardsToContext,
     GPU_PERFORMANCE_SPEC_CATALOG,
     lookupGpuPerformanceSpec,
-    collectHostMacPerformanceBaseline,
     computeGpuPerformanceScalingWeights,
     scaleGpuExecutionDurationMs,
-    buildGpuPerformanceInitScript,
-    attachGpuPerformanceScalerToContext,
     validateGpuPerformanceScalingCoherence
 };
 
@@ -1722,10 +1716,7 @@ export function resolveDeterministicDeviceProfile(profileId = 'camoufox-profile-
     const acceptLanguage = buildAcceptLanguageHeader(languages);
     const timeZone = options.timeZone || geo.timeZone;
     const geolocation = resolveGeoCoordinatesWithDeterministicJitter(idStr, geo.country);
-    const gpuPerformance = computeGpuPerformanceScalingWeights(
-        preset.gpuModel || preset.webgl.unmaskedRenderer,
-        { profileId: idStr }
-    );
+    const gpuSpec = lookupGpuPerformanceSpec(preset.gpuModel || preset.webgl.unmaskedRenderer);
     const securityPolicy = {
         portScanProtection: {
             enabled: options.portScanProtection !== undefined ? Boolean(options.portScanProtection) : true,
@@ -1845,8 +1836,8 @@ export function resolveDeterministicDeviceProfile(profileId = 'camoufox-profile-
         requestAdapterNative: true,
         adapterInfo: preset.webgl.GPUAdapterInfo,
         limits: {
-            maxBufferSize: gpuPerformance.targetGpuSpec.webgpuMaxBufferSize,
-            maxComputeWorkgroupSizeX: gpuPerformance.targetGpuSpec.webgpuMaxComputeWorkgroupSizeX
+            maxBufferSize: gpuSpec.webgpuMaxBufferSize,
+            maxComputeWorkgroupSizeX: gpuSpec.webgpuMaxComputeWorkgroupSizeX
         }
     };
 
@@ -2030,7 +2021,6 @@ export function resolveDeterministicDeviceProfile(profileId = 'camoufox-profile-
             }
         },
         hardwareProfile,
-        gpuPerformance,
         storageEstimate
     };
 
@@ -2048,7 +2038,6 @@ export function resolveDeterministicDeviceProfile(profileId = 'camoufox-profile-
         timeZone,
         geolocation,
         securityPolicy,
-        gpuPerformance,
         seeds: {
             audioFp: audioFpSeed,
             clientRectFp: clientRectFpSeed,
@@ -2349,14 +2338,10 @@ export function sanitizeAdsPowerProfileToCoherentPreset(rawAdsPowerProfile = {})
         if (healedProfile.telemetry.stackAndMediaHygiene) {
             healedProfile.telemetry.stackAndMediaHygiene.mediaDevices = refreshedMediaDevices;
         }
-        healedProfile.gpuPerformance = computeGpuPerformanceScalingWeights(sku.gpuRenderer, {
-            profileId
-        });
-        healedProfile.telemetry.gpuPerformance = healedProfile.gpuPerformance;
+        const gpuSpec = lookupGpuPerformanceSpec(sku.gpuRenderer);
         healedProfile.telemetry.webgpu.limits = {
-            maxBufferSize: healedProfile.gpuPerformance.targetGpuSpec.webgpuMaxBufferSize,
-            maxComputeWorkgroupSizeX:
-                healedProfile.gpuPerformance.targetGpuSpec.webgpuMaxComputeWorkgroupSizeX
+            maxBufferSize: gpuSpec.webgpuMaxBufferSize,
+            maxComputeWorkgroupSizeX: gpuSpec.webgpuMaxComputeWorkgroupSizeX
         };
         healedProfile.webgpu = healedProfile.telemetry.webgpu;
 

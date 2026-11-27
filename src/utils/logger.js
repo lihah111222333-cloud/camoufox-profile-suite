@@ -14,7 +14,6 @@ const LOG_LEVELS = {
     DEBUG: 3
 };
 
-const LOG_LEVEL = process.env.LOG_LEVEL?.toUpperCase() || 'INFO';
 const LOG_DIR = path.join(STATE_DIRECTORY, 'logs');
 
 try {
@@ -32,7 +31,12 @@ const REDACTED_FIELDS = new Set([
     'key', 'apikey', 'omocaptchakey', 'token', 'secret', 'credential', 'credentials',
     'authorization', 'cookie', 'setcookie',
     'expected', 'actual', 'entered', 'currentvalue', 'text',
-    'stack', 'errormessage', 'message', 'response'
+    'stack', 'errormessage', 'message', 'response',
+    'name', 'firstname', 'lastname', 'fullname', 'username', 'email', 'accountemail',
+    'profilename', 'foldername', 'title',
+    'id', 'accountid', 'browserid', 'profileid', 'profileids', 'folderid', 'folderids',
+    'cpu', 'cpumodel', 'gpu', 'gpumodel', 'gpuperformance', 'hostbaseline', 'hostchipmodel',
+    'hostcpu', 'hostgpu', 'hostcpumodel', 'hostgpumodel'
 ]);
 const ERROR_NAMES = new Set(['Error', 'TypeError', 'RangeError', 'SyntaxError', 'TimeoutError', 'AbortError']);
 
@@ -47,9 +51,15 @@ function safeStringify(data) {
         return JSON.stringify(data, (key, value) => {
             const field = key.toLowerCase().replace(/[^a-z0-9]/g, '');
             if (field === 'error' || field === 'err') {
-                return value instanceof Error ? { name: getErrorType(value) } : '[Redacted]';
+                return value instanceof Error ? { type: getErrorType(value) } : '[Redacted]';
             }
-            if (REDACTED_FIELDS.has(field) || field.endsWith('apikey')) return '[Redacted]';
+            if (REDACTED_FIELDS.has(field) || /(?:apikey|paths?|dirs?|director(?:y|ies))$/.test(field)) {
+                return '[Redacted]';
+            }
+            if (typeof value === 'string' &&
+                (path.posix.isAbsolute(value) || path.win32.isAbsolute(value) || /^file:/i.test(value))) {
+                return '[Redacted]';
+            }
             if (field.endsWith('url') && typeof value === 'string') {
                 try {
                     const origin = new URL(value).origin;
@@ -62,7 +72,7 @@ function safeStringify(data) {
                 return value.toString();
             }
             if (value instanceof Error) {
-                return { name: getErrorType(value) };
+                return { type: getErrorType(value) };
             }
             if (typeof value === 'object' && value !== null) {
                 if (seen.has(value)) {
@@ -84,7 +94,8 @@ function formatMessage(level, message, data = null) {
 }
 
 function shouldLog(level) {
-    return LOG_LEVELS[level] <= LOG_LEVELS[LOG_LEVEL];
+    const configuredLevel = process.env.LOG_LEVEL?.toUpperCase() || 'INFO';
+    return LOG_LEVELS[level] <= LOG_LEVELS[configuredLevel];
 }
 
 function writeLog(level, message, data = null) {

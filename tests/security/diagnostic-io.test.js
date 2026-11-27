@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {
-    evaluateWireToDomCoherence, readCoherenceCaptureEvents
+    evaluatePlatformCoherence, evaluateWireToDomCoherence, readCoherenceCaptureEvents
 } from '../../src/camoufox/coherence-auditor.js';
 
 const repo = fileURLToPath(new URL('../../', import.meta.url));
@@ -18,6 +18,42 @@ function fixture(t) {
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
     return root;
 }
+
+test('WebRTC and wire coherence require observations', () => {
+    const dom = { navigator: { userAgent: 'fixture user agent', language: 'en-US' } };
+    for (const webrtc of [undefined, { available: true }, { available: false }, {
+        available: true, candidateIps: [], candidatePorts: [], privateIpLeaked: false
+    }, { candidateIps: ['203.0.113.45'] }]) {
+        const result = evaluatePlatformCoherence({ ...dom, webrtc }, 'windows');
+        const check = result.checks.find(({ name }) => name === 'webrtc-network-coherence');
+        assert.equal(check.passed, false);
+        assert.equal(check.status, 'not-tested');
+    }
+
+    for (const events of [[], [{ type: 'egress', headers: {} }], [{ type: 'ingress', headers: { Accept: '*/*' } }]]) {
+        const result = evaluateWireToDomCoherence(dom, events);
+        assert.equal(result.status, 'not-tested');
+        assert.equal(result.passed, false);
+        assert.equal(result.score, null);
+        assert.equal(result.inspectedRequests, 0);
+        assert.ok(result.checks.every(({ status }) => status === 'not-tested'));
+    }
+
+    const event = { type: 'egress', headers: { 'User-Agent': dom.navigator.userAgent } };
+    const partial = evaluateWireToDomCoherence(dom, [event]);
+    assert.equal(partial.status, 'incomplete');
+    assert.equal(partial.passed, false);
+    assert.equal(partial.inspectedRequests, 1);
+    assert.equal(partial.checks.find(({ name }) => name === 'wire-accept-language-matches-dom').status, 'not-tested');
+
+    event.headers['Accept-Language'] = dom.navigator.language;
+    const measured = evaluateWireToDomCoherence(dom, [event]);
+    assert.equal(measured.status, 'passed');
+    assert.equal(measured.score, 100);
+    const missingHeaders = evaluateWireToDomCoherence(dom, [event, { type: 'egress' }]);
+    assert.equal(missingHeaders.passed, false);
+    assert.equal(missingHeaders.inspectedRequests, 1);
+});
 
 test('only explicitly selected local capture roots supply coherence ledger files', { skip: !supportsCaptureReads }, (t) => {
     const root = fixture(t);
@@ -105,8 +141,28 @@ test('standalone native logging opts in, excludes inherited destinations and rej
     };
     assert.equal(disabled.sslKeyLogPath, null);
     assert.equal(disabled.neckoMozLogPath, null);
-    const safeEnv = disabled.getLaunchEnv(inherited);
+    const safeEnv = disabled.getLaunchEnv({
+        ...inherited,
+        PATH: '/synthetic/browser/runtime',
+        GOOGLE_APPLICATION_CREDENTIALS: '/synthetic/private/application.json',
+        SMS_VERIFY_API_KEY: 'synthetic-local-key',
+        HTTP_PROXY: 'http://synthetic-proxy.invalid:8080'
+    });
     for (const key of Object.keys(inherited)) assert.equal(safeEnv[key], '');
+    assert.equal(safeEnv.PATH, '/synthetic/browser/runtime');
+    for (const key of ['GOOGLE_APPLICATION_CREDENTIALS', 'SMS_VERIFY_API_KEY', 'HTTP_PROXY']) {
+        assert.equal(Object.hasOwn(safeEnv, key), false);
+    }
+    const parentKey = 'CAMOUFOX_DIAGNOSTIC_TEST_PRIVATE_TOKEN';
+    const previous = process.env[parentKey];
+    process.env[parentKey] = 'synthetic-parent-token';
+    try {
+        assert.equal(Object.hasOwn(disabled.getLaunchEnv(), parentKey), false);
+        assert.equal(disabled.getLaunchEnv().PATH, process.env.PATH);
+    } finally {
+        if (previous === undefined) delete process.env[parentKey];
+        else process.env[parentKey] = previous;
+    }
     assert.equal(fs.existsSync(disabled.profileNativeDir), false);
     await disabled.stop();
 
@@ -116,6 +172,7 @@ test('standalone native logging opts in, excludes inherited destinations and rej
     assert.equal(path.dirname(enabled.profileNativeDir), root);
     assert.equal(enabled.getLaunchEnv(inherited).MOZ_LOG_FILE, enabled.neckoMozLogPath);
     assert.equal(enabled.getLaunchEnv(inherited).SSLKEYLOGFILE, enabled.sslKeyLogPath);
+    assert.equal(enabled.getLaunchEnv(inherited).MOZ_LOG, inherited.MOZ_LOG);
     if (process.platform !== 'win32') {
         assert.equal(fs.statSync(enabled.profileNativeDir).mode & 0o777, 0o700);
         assert.equal(fs.statSync(enabled.neckoMozLogPath).mode & 0o777, 0o600);
@@ -132,7 +189,7 @@ test('standalone native logging opts in, excludes inherited destinations and rej
     assert.equal(fs.existsSync(capturePath), false);
 });
 
-test('Camoufox diagnostic separates temporary reports and publishes persistent reports privately', (t) => {
+test('Camoufox diagnostic separates live evidence, unavailable data, and synthetic reports', (t) => {
     const root = fixture(t);
     const stateDir = path.join(root, 'state');
     const temporaryDir = path.join(root, 'temporary');
@@ -165,15 +222,12 @@ test('Camoufox diagnostic separates temporary reports and publishes persistent r
         fs.copyFileSync(origin, target);
     }
     fs.writeFileSync(path.join(root, 'package.json'), '{"type":"module"}');
-    const sdk = path.join(root, 'node_modules', 'camoufox');
-    fs.mkdirSync(sdk, { recursive: true });
-    fs.writeFileSync(path.join(sdk, 'package.json'), '{"type":"module","exports":"./index.js"}');
-    fs.writeFileSync(path.join(sdk, 'index.js'), 'throw new Error("Unexpected SDK evaluation");');
     for (const module of ['src/config.js', 'src/camoufox/profile.js']) {
         fs.writeFileSync(path.join(root, module), 'throw new Error("Unexpected live module import");');
     }
 
     const runDiagnostic = (...options) => spawnSync(process.execPath, [path.join(root, script), '--os=windows', ...options], {
+        cwd: root,
         encoding: 'utf8',
         timeout: 5000,
         env: {
@@ -184,13 +238,36 @@ test('Camoufox diagnostic separates temporary reports and publishes persistent r
             GMAIL_CREATOR_STATE_DIR: stateDir
         }
     });
-    const run = runDiagnostic('--dry-run');
+    function runWithTemporaryReport(...options) {
+        const existing = new Set(fs.readdirSync(temporaryDir));
+        const run = runDiagnostic(...options);
+        const [directory, ...other] = fs.readdirSync(temporaryDir).filter((name) => !existing.has(name));
+        assert.match(directory ?? '', /^camoufox-audit-/, run.error?.message || run.stderr + run.stdout);
+        assert.equal(other.length, 0);
+        const reportFile = path.join(temporaryDir, directory, reportName);
+        return { run, reportFile, report: JSON.parse(fs.readFileSync(reportFile, 'utf8')) };
+    }
+
+    const missingSdk = runWithTemporaryReport();
+    assert.equal(missingSdk.run.status, 1);
+    assert.match(missingSdk.run.stdout, /Live browser audit: NOT TESTED/);
+    assert.equal(missingSdk.report.environment.camoufoxSdkInstalled, false);
+    assert.equal(missingSdk.report.overallStatus, 'not-tested');
+    assert.equal(missingSdk.report.overallPassed, false);
+    assert.equal(missingSdk.report.negativeControl, null);
+    assert.deepEqual(missingSdk.report.results[0], {
+        targetOs: 'windows', mode: 'live-browser-unavailable', status: 'not-tested', passed: false,
+        unavailableReason: 'Camoufox SDK is unavailable', auditReport: null
+    });
+
+    const sdk = path.join(root, 'node_modules', 'camoufox');
+    fs.mkdirSync(sdk, { recursive: true });
+    fs.writeFileSync(path.join(sdk, 'package.json'), '{"type":"module","exports":"./index.js"}');
+    fs.writeFileSync(path.join(sdk, 'index.js'), 'throw new Error("Unexpected SDK evaluation");');
+    const { run, reportFile, report } = runWithTemporaryReport('--dry-run');
     assert.equal(run.status, 0, run.error?.message || run.stderr + run.stdout);
-    for (const report of existingReports) assert.equal(fs.readFileSync(report, 'utf8'), 'original diagnostic fixture');
-    const [directory] = fs.readdirSync(temporaryDir);
-    assert.match(directory, /^camoufox-audit-/);
-    const reportFile = path.join(temporaryDir, directory, reportName);
-    const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
+    assert.match(run.stdout, /Synthetic rule verification: PASS/);
+    assert.equal(report.overallStatus, 'passed');
     assert.equal(report.results[0].mode, 'dry-run-synthetic');
     assert.equal(report.environment.camoufoxSdkInstalled, true);
     assert.equal(report.results[0].auditReport.telemetry.gpuPerformance.hostBaseline.hostChipModel, 'Synthetic fixture');
@@ -199,22 +276,51 @@ test('Camoufox diagnostic separates temporary reports and publishes persistent r
         assert.equal(fs.statSync(path.dirname(reportFile)).mode & 0o777, 0o700);
         assert.equal(fs.statSync(reportFile).mode & 0o777, 0o600);
     }
-    const check = runDiagnostic('--check-env');
-    assert.equal(check.status, 0, check.error?.message || check.stderr + check.stdout);
-    assert.equal(fs.readdirSync(temporaryDir).length, 2);
+    const check = runWithTemporaryReport('--check-env');
+    assert.equal(check.run.status, 0, check.run.error?.message || check.run.stderr + check.run.stdout);
+    assert.equal(check.report.results[0].mode, 'dry-run-synthetic');
+
+    fs.writeFileSync(path.join(root, 'src', 'config.js'), 'export {};');
+    const profile = path.join(root, 'src', 'camoufox', 'profile.js');
+    fs.writeFileSync(profile, 'export async function createAndStartProfile() { throw new Error("Startup unavailable"); }');
+    const startupFailure = runWithTemporaryReport();
+    assert.equal(startupFailure.run.status, 1);
+    assert.equal(startupFailure.report.overallStatus, 'not-tested');
+    assert.equal(startupFailure.report.results[0].auditReport, null);
+
+    function useMockPage(evaluate) {
+        fs.writeFileSync(profile, `export async function createAndStartProfile() {
+            return { getPage: () => ({ evaluate: ${evaluate} }), stop: async () => {} };
+        }`);
+    }
+    useMockPage('() => { throw new Error("No evidence collected"); }');
+    const collectionFailure = runWithTemporaryReport();
+    assert.equal(collectionFailure.run.status, 1);
+    assert.equal(collectionFailure.report.overallStatus, 'not-tested');
+    assert.equal(collectionFailure.report.results[0].auditReport, null);
+
+    useMockPage('() => ({})');
+    const noEvidence = runWithTemporaryReport();
+    assert.equal(noEvidence.run.status, 1);
+    assert.equal(noEvidence.report.overallStatus, 'not-tested');
+    assert.equal(noEvidence.report.results[0].auditReport.score, null);
+    assert.equal(noEvidence.report.results[0].auditReport.telemetry, null);
     for (const persistent of existingReports) assert.equal(fs.readFileSync(persistent, 'utf8'), 'original diagnostic fixture');
 
-    // Supply a synthetic browser session to exercise the persistent report path.
-    fs.writeFileSync(path.join(root, 'src', 'config.js'), 'export {};');
-    const telemetry = JSON.stringify(report.results[0].auditReport.telemetry);
-    fs.writeFileSync(path.join(root, 'src', 'camoufox', 'profile.js'),
-        `export async function createAndStartProfile() {
-            return { getPage: () => ({ evaluate: () => (${telemetry}) }), stop: async () => {} };
-        }`);
+    // Mock browser output so no SDK or browser code runs in this test.
+    const telemetry = report.results[0].auditReport.telemetry;
+    const persistentReport = path.join(stateDir, reportName);
+    useMockPage(`() => (${JSON.stringify({ ...telemetry, webrtc: { available: true } })})`);
+    const incomplete = runDiagnostic();
+    assert.equal(incomplete.status, 1);
+    assert.match(incomplete.stdout, /Not tested: webrtc-network-coherence/);
+    const incompleteReport = JSON.parse(fs.readFileSync(persistentReport, 'utf8'));
+    assert.equal(incompleteReport.overallStatus, 'incomplete');
+    assert.equal(incompleteReport.results[0].mode, 'live-browser');
 
+    useMockPage(`() => (${JSON.stringify(telemetry)})`);
     const simulated = runDiagnostic();
     assert.equal(simulated.status, 0, simulated.error?.message || simulated.stderr + simulated.stdout);
-    const persistentReport = path.join(stateDir, reportName);
     const persisted = fs.readFileSync(persistentReport, 'utf8');
     assert.equal(JSON.parse(persisted).results[0].mode, 'live-browser');
     if (process.platform !== 'win32') {

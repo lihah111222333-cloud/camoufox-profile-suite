@@ -27,7 +27,17 @@ const account = Object.freeze({
     username: 'fixture.candidate',
     email: 'fixture.candidate@example.invalid'
 });
-const manual = stage => ({ code: 'MANUAL_SIGNUP_REQUIRED', stage });
+const manual = stage => ({ code: 'MANUAL_SIGNUP_REQUIRED', stage, message: 'Manual signup is required' });
+const handoffStages = [
+    [origin + '/signup/password', 'password'],
+    [origin + '/challenge/sms', 'verification'],
+    [origin + '/v3/signin/collectemailphone', 'verification'],
+    [origin + '/v3/signin/addrecoveryemail', 'recovery-email'],
+    [origin + '/v3/signin/termsofservice', 'completion'],
+    [origin + '/v3/signin/confirmidentifier', 'completion'],
+    [homeUrl, 'completion'],
+    ['https://example.invalid/signup/password', 'untrusted-page']
+];
 
 function formPage(address, { fields, labels = ['Next'], action = address, onInput, onClick } = {}, events) {
     const document = {};
@@ -161,35 +171,41 @@ test('A unique verified Create account control opens signup only from an empty s
     }
 });
 
-test('Verified ordinary controls advance while reaching Account home still requires human identity review', async () => {
-    const events = [];
-    const telemetry = [];
-    const usernamePage = formPage(usernameUrl, {
-        fields: [{ name: 'Username' }],
-        onClick: () => changePage({ address: homeUrl })
-    }, events);
-    const namePage = formPage(nameUrl, {
-        fields: nameFields,
-        onClick: () => changePage({ address: usernameUrl, document: usernamePage })
-    }, events);
-    const { page, changePage } = browserFixture({
-        initial: blank, afterOpen: { address: nameUrl, document: namePage }, events
-    });
+test('Sensitive and optional steps reached after supported forms hand off immediately', async () => {
+    for (const [address, stage] of handoffStages) {
+        const events = [];
+        const telemetry = [];
+        const usernamePage = formPage(usernameUrl, {
+            fields: [{ name: 'Username' }],
+            onClick: () => changePage({ address })
+        }, events);
+        const namePage = formPage(nameUrl, {
+            fields: nameFields,
+            onClick: () => changePage({ address: usernameUrl, document: usernamePage })
+        }, events);
+        const { page, changePage } = browserFixture({
+            initial: blank, afterOpen: { address: nameUrl, document: namePage }, events
+        });
+        page.evaluate = async () => { events.push(['evaluate']); };
+        page.waitForTimeout = async () => {
+            if (page.url() === address) events.push(['wait on handoff page']);
+        };
 
-    await assert.rejects(createGmailAccount(page, account, {
-        profile: { setStep: (step, data) => { telemetry.push([step, data]); } }
-    }), manual('completion'));
-    assert.deepEqual(telemetry, [
-        ['gmail:init', {}],
-        ['gmail:navigate-signup', {}],
-        ['gmail:fill-name-form', {}],
-        ['gmail:fill-username', {}],
-        ['gmail:manual-signup', { stage: 'completion' }]
-    ]);
-    assert.deepEqual(events, [
-        ['open'], ['firstName', account.firstName], ['lastName', account.lastName], ['click', 'Next'],
-        ['Username', account.username], ['click', 'Next']
-    ]);
+        await assert.rejects(createGmailAccount(page, account, {
+            profile: { setStep: (step, data) => { telemetry.push([step, data]); } }
+        }), manual(stage));
+        assert.deepEqual(telemetry, [
+            ['gmail:init', {}],
+            ['gmail:navigate-signup', {}],
+            ['gmail:fill-name-form', {}],
+            ['gmail:fill-username', {}],
+            ['gmail:manual-signup', { stage }]
+        ]);
+        assert.deepEqual(events, [
+            ['open'], ['firstName', account.firstName], ['lastName', account.lastName], ['click', 'Next'],
+            ['Username', account.username], ['click', 'Next']
+        ]);
+    }
 });
 
 test('A lookalike origin, opaque origin, subframe, or changed top-level document is read-only', async () => {
@@ -254,16 +270,32 @@ test('Changed form action after input stops before entering more data or clickin
     assert.deepEqual(events, [['open'], ['firstName', account.firstName]]);
 });
 
+test('Cancellation while navigating or checking a document prevents subsequent page changes', async () => {
+    for (const phase of ['navigation', 'document-check']) {
+        const events = [];
+        const controller = new AbortController();
+        const cancelled = new Error('Fixture cancelled');
+        const document = formPage(nameUrl, { fields: nameFields }, events);
+        const { page } = browserFixture({
+            initial: blank, afterOpen: { address: nameUrl, document }, events,
+            beforeEvaluation: count => {
+                if (phase === 'document-check' && count === 1) controller.abort(cancelled);
+            }
+        });
+        if (phase === 'navigation') {
+            const open = page.goto;
+            page.goto = async (...args) => {
+                await open(...args);
+                controller.abort(cancelled);
+            };
+        }
+        await assert.rejects(createGmailAccount(page, account, { signal: controller.signal }), error => error === cancelled);
+        assert.deepEqual(events, [['open']]);
+    }
+});
+
 test('Existing sensitive signup steps hand off without touching the browser document', async () => {
-    for (const [step, manualStage] of [
-        ['/signup/password', 'password'],
-        ['/challenge/sms', 'verification'],
-        ['/v3/signin/addrecoveryemail', 'recovery-email'],
-        ['/v3/signin/collectemailphone', 'verification'],
-        ['/v3/signin/termsofservice', 'completion'],
-        ['/v3/signin/confirmidentifier', 'completion'],
-        ['/signup/username', 'completion']
-    ]) {
-        await assert.rejects(createGmailAccount({ url: () => origin + step }, account), manual(manualStage));
+    for (const [address, stage] of [...handoffStages, [usernameUrl, 'completion']]) {
+        await assert.rejects(createGmailAccount({ url: () => address }, account), manual(stage));
     }
 });

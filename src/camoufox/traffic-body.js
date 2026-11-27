@@ -24,6 +24,26 @@ export function allowsTrafficBody(url) {
     }
 }
 
+/** Bound the recorder's work on a body already delivered by the browser transport. */
+export function sampleTrafficBody(content, maxBytes) {
+    if (Buffer.isBuffer(content)) {
+        return { buffer: content.subarray(0, maxBytes), byteLength: content.byteLength };
+    }
+    if (typeof content !== 'string') return null;
+
+    // Each UTF-16 code unit contributes at least one UTF-8 byte. A longer string can
+    // exceed the budget without measuring or encoding the rest of it.
+    const sample = content.slice(0, maxBytes + 1);
+    const sampleBytes = Buffer.byteLength(sample, 'utf8');
+    const byteLength = sample.length === content.length ? sampleBytes : null;
+    if (sampleBytes <= maxBytes) return { buffer: Buffer.from(sample, 'utf8'), byteLength };
+
+    // Leave room for the character at the boundary so the result is a byte prefix.
+    const scratch = Buffer.allocUnsafe(Math.min(sampleBytes, maxBytes + 3));
+    const encodedBytes = scratch.write(sample, 0, scratch.length, 'utf8');
+    return { buffer: scratch.subarray(0, Math.min(maxBytes, encodedBytes)), byteLength };
+}
+
 function bodyFormat(mimeType) {
     if (typeof mimeType !== 'string') return null;
     const [type, ...params] = mimeType.toLowerCase().split(';');

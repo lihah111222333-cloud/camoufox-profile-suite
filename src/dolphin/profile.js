@@ -8,8 +8,10 @@ import logger from '../utils/logger.js';
 import dolphinClient from './client.js';
 import ManagedProfile, { rollbackNewManagedProfile } from '../utils/managed-profile.js';
 import {
+    ControllerConnectionError,
     ControllerUrlError,
     connectBrowser,
+    controllerDelay,
     parseControllerUrl,
     toWebSocketUrl,
     validateControllerEndpoint
@@ -17,31 +19,38 @@ import {
 
 class DolphinProfile extends ManagedProfile {
     constructor(profileId, webSocketUrl = null) {
-        super(profileId, dolphinClient, 'webSocketUrl', webSocketUrl, () => this.#startBrowser());
+        super(profileId, dolphinClient, 'webSocketUrl', webSocketUrl,
+            (client, address, signal) => this.#startBrowser(client, address, signal));
+    }
+
+    delete() {
+        return dolphinClient.deleteProfile();
     }
 
     /**
      * Start profile and get browser instance
      * بدء البروفايل والحصول على متصفح
      */
-    async #startBrowser() {
+    async #startBrowser(client, address, signal) {
         try {
             logger.info('Starting Dolphin Anty profile', { profileId: this.profileId });
 
-            if (!this.webSocketUrl) {
-                // Start profile to get WebSocket URL
-                const startData = await dolphinClient.startProfile(this.profileId);
-                this.webSocketUrl = startData.ws || startData.webSocketDebuggerUrl;
+            if (client) {
+                // Let a dispatched launch return before cleanup can stop it by ID.
+                const startData = await client.startProfile(this.profileId);
+                address = startData.ws || startData.webSocketDebuggerUrl;
             }
 
-            if (!this.webSocketUrl) {
+            signal.throwIfAborted();
+            if (!address) {
                 throw new Error('Failed to get WebSocket URL from Dolphin Anty');
             }
 
-            let endpoint = toWebSocketUrl(parseControllerUrl(this.webSocketUrl, 'ws:'));
+            this.webSocketUrl = address;
+            let endpoint = toWebSocketUrl(parseControllerUrl(address, 'ws:'));
 
             // Wait a bit for browser to fully start
-            await new Promise(resolve => setTimeout(resolve, 3000));
+            await controllerDelay(3000, signal);
 
             let browser;
             let lastError;
@@ -54,7 +63,7 @@ class DolphinProfile extends ManagedProfile {
                         profileId: this.profileId,
                         controller: endpoint.origin
                     });
-                    connection = await connectBrowser(puppeteer, endpoint);
+                    connection = await connectBrowser(puppeteer, endpoint, { signal });
                     const pages = await connection.pages();
                     browser = connection;
                     this.webSocketUrl = endpoint.href;
@@ -64,8 +73,9 @@ class DolphinProfile extends ManagedProfile {
                     });
                     break;
                 } catch (error) {
-                    if (error instanceof ControllerUrlError) throw error;
                     if (connection) await connection.disconnect();
+                    signal.throwIfAborted();
+                    if (error instanceof ControllerUrlError || error instanceof ControllerConnectionError) throw error;
                     lastError = error;
                     logger.warn(`Dolphin Anty browser connection attempt ${attempt} failed`, {
                         error: error.message,
@@ -75,16 +85,20 @@ class DolphinProfile extends ManagedProfile {
                     if (attempt < retries) {
                         const waitTime = Math.min(2000 + (attempt * 1000), 8000);
                         logger.info(`Waiting ${waitTime / 1000}s before retry...`);
-                        await new Promise(resolve => setTimeout(resolve, waitTime));
+                        await controllerDelay(waitTime, signal);
 
+                        if (!client) continue;
+                        signal.throwIfAborted();
                         let address;
                         try {
-                            const startData = await dolphinClient.startProfile(this.profileId);
+                            const startData = await client.startProfile(this.profileId);
                             address = startData.ws || startData.webSocketDebuggerUrl;
                         } catch (refreshError) {
+                            signal.throwIfAborted();
                             if (refreshError instanceof ControllerUrlError) throw refreshError;
                             logger.debug('Could not refresh Dolphin Anty browser endpoint', { error: refreshError.message });
                         }
+                        signal.throwIfAborted();
                         if (address) {
                             const refreshed = toWebSocketUrl(parseControllerUrl(address, 'ws:'));
                             endpoint = validateControllerEndpoint(refreshed, endpoint);
@@ -98,15 +112,17 @@ class DolphinProfile extends ManagedProfile {
             }
 
             this.browser = browser;
+            signal.throwIfAborted();
             
             // Always create a new clean page for stability
             // دائماً إنشاء صفحة نظيفة جديدة للاستقرار
-            this.page = await browser.newPage();
+            this.page = await this.createOwnedPage();
+            signal.throwIfAborted();
             logger.info('Created new clean page');
             
             // Wait for page to be fully ready before proceeding
             // انتظار حتى تكون الصفحة جاهزة بالكامل قبل المتابعة
-            await new Promise(resolve => setTimeout(resolve, 3000));
+            await controllerDelay(3000, signal);
             
             // Ensure page is still accessible
             try {
@@ -121,7 +137,7 @@ class DolphinProfile extends ManagedProfile {
         } catch (error) {
             logger.error('Failed to start Dolphin Anty profile', { 
                 profileId: this.profileId, 
-                error: error.message 
+                error: error?.message
             });
             throw error;
         }
@@ -132,11 +148,13 @@ class DolphinProfile extends ManagedProfile {
  * Create and start a new profile
  * إنشاء وبدء بروفايل جديد
  */
-export async function createAndStartProfile(name, proxy = null) {
+export async function createAndStartProfile(name, proxy = null, { signal } = {}) {
     let profileManager;
     try {
+        signal?.throwIfAborted();
         // Check Dolphin connection first
         const isConnected = await dolphinClient.checkDolphinConnection();
+        signal?.throwIfAborted();
         if (!isConnected) {
             throw new Error('Dolphin Anty API is not available. Please make sure Dolphin Anty is running and DOLPHIN_API_KEY is set correctly.');
         }
@@ -151,16 +169,16 @@ export async function createAndStartProfile(name, proxy = null) {
 
         // Wait a bit for profile to be ready
         logger.info('Waiting for profile initialization...');
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        await controllerDelay(2000, signal);
 
-        await profileManager.start();
+        await profileManager.start({ signal });
 
         logger.info('Dolphin Anty profile created and started', { profileId: profile.id });
         
         return profileManager;
     } catch (error) {
-        if (profileManager) throw await rollbackNewManagedProfile(profileManager, error);
-        logger.error('Failed to create and start Dolphin Anty profile', { error: error.message });
+        if (profileManager) throw await rollbackNewManagedProfile(profileManager, error, 'recycle');
+        logger.error('Failed to create and start Dolphin Anty profile', { error: error?.message });
         throw error;
     }
 }

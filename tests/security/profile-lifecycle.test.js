@@ -8,15 +8,17 @@ import {
     closeSharedBrowser,
     getActiveProfileIds,
     setCamoufoxModule,
+    startProfile,
     stopAllActiveProfiles,
     stopProfile,
     unregisterProcessCleanupHooks
 } from '../../src/camoufox/client.js';
-import { CamoufoxProfile } from '../../src/camoufox/profile.js';
+import { CamoufoxProfile, createAndStartProfile } from '../../src/camoufox/profile.js';
 
-function setup(t, configureContext = () => {}) {
+function setup(t, configureContext = () => {}, beforeLaunch = () => {}) {
     const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'profile-lifecycle-')));
     const contexts = [];
+    const browsers = [];
     setCamoufoxModule({
         async Camoufox() {
             const ownContexts = [];
@@ -24,7 +26,11 @@ function setup(t, configureContext = () => {}) {
             const browser = Object.assign(new EventEmitter(), {
                 isConnected: () => connected,
                 async close() {
-                    for (const fixture of ownContexts) await fixture.context.close();
+                    for (const fixture of ownContexts) {
+                        if (fixture.closed) continue;
+                        await fixture.beforeClose?.();
+                        fixture.finishClose();
+                    }
                     connected = false;
                     browser.emit('disconnected');
                 },
@@ -48,7 +54,8 @@ function setup(t, configureContext = () => {}) {
                             const page = Object.assign(new EventEmitter(), {
                                 context: () => fixture.context,
                                 isClosed: () => fixture.closed,
-                                url: () => 'about:blank'
+                                url: () => 'about:blank',
+                                evaluate: () => fixture.evaluate?.()
                             });
                             fixture.pages.push(page);
                             fixture.context.emit('page', page);
@@ -78,6 +85,8 @@ function setup(t, configureContext = () => {}) {
                     return fixture.context;
                 }
             });
+            browsers.push(browser);
+            await beforeLaunch();
             return browser;
         }
     });
@@ -106,7 +115,7 @@ function setup(t, configureContext = () => {}) {
         sslKeyLog: false,
         neckoMozLog: false
     };
-    return { root, contexts, options };
+    return { root, contexts, browsers, options };
 }
 
 test('profile close keeps filters installed through pending save and failed native close', async (t) => {
@@ -171,6 +180,106 @@ test('shared-browser close retains the native process and context through a reje
     assert.equal(fixture.closed, true);
     assert.equal(fixture.routes.size, 0);
     assert.deepEqual(getActiveProfileIds(), []);
+});
+
+test('shared browser close saves both live and still-opening contexts before closing the browser', async (t) => {
+    let openPage;
+    let unblockPage;
+    const pageOpening = new Promise((resolve) => { openPage = resolve; });
+    const pageBlocked = new Promise((resolve) => { unblockPage = resolve; });
+    const { contexts, options } = setup(t, (fixture) => {
+        if (contexts.length === 1) {
+            fixture.beforeNewPage = async () => { openPage(); await pageBlocked; };
+        }
+    });
+    const active = await startProfile('active', options);
+    const starting = startProfile('starting', options);
+    await pageOpening;
+    for (const [index, fixture] of contexts.entries()) {
+        fixture.state.origins = [{ origin: 'https://fixture.invalid', localStorage: [{ name: 'sample', value: String(index) }] }];
+    }
+
+    const closing = closeSharedBrowser();
+    unblockPage();
+    const second = await starting;
+    assert.equal(await closing, true);
+    for (const [index, session] of [active, second].entries()) {
+        assert.deepEqual(JSON.parse(fs.readFileSync(session.storageStatePath, 'utf8')), contexts[index].state);
+        assert.equal(contexts[index].closed, true);
+    }
+    assert.deepEqual(getActiveProfileIds(), []);
+});
+
+test('closing the public context saves the final state before native close', async (t) => {
+    const { contexts, options } = setup(t);
+    const manager = await new CamoufoxProfile('context-close', options).start();
+    const [fixture] = contexts;
+    fixture.state.cookies = [{ name: 'fixture', value: 'final-context-state' }];
+    let snapshots = 0;
+    fixture.beforeSnapshot = () => { snapshots += 1; };
+    const context = await manager.getContext();
+    const [, stopped] = await Promise.all([context.close(), manager.stop()]);
+    assert.equal(stopped, true);
+    assert.equal(snapshots, 1);
+    assert.deepEqual(JSON.parse(fs.readFileSync(manager.storageStatePath, 'utf8')), fixture.state);
+    assert.equal(await manager.stop(), true);
+});
+
+test('shared browser shutdown reports a failed final snapshot after closing the native context', async (t) => {
+    const { contexts, options } = setup(t);
+    await startProfile('shared-save-failed', options);
+    contexts[0].beforeSnapshot = () => { throw new Error('Fixture snapshot unavailable'); };
+    assert.equal(await closeSharedBrowser(), false);
+    assert.equal(contexts[0].closed, true);
+    assert.deepEqual(getActiveProfileIds(), []);
+});
+
+test('public context closure reports a failed final snapshot and shutdown preserves the previous bytes', async (t) => {
+    const { contexts, options } = setup(t);
+    const manager = await new CamoufoxProfile('context-save-failed', options).start();
+    const snapshot = fs.readFileSync(manager.storageStatePath, 'utf8');
+    const [fixture] = contexts;
+    fixture.beforeSnapshot = () => { throw new Error('Fixture snapshot unavailable'); };
+    const context = await manager.getContext();
+    await assert.rejects(context.close(), /Fixture snapshot unavailable/);
+    assert.equal(fixture.closed, true);
+    assert.equal(await manager.stop(), false);
+    assert.equal(fs.readFileSync(manager.storageStatePath, 'utf8'), snapshot);
+});
+
+test('a context that closes unexpectedly reports the unavailable final snapshot', async (t) => {
+    const { contexts, options } = setup(t);
+    const manager = await new CamoufoxProfile('unexpected-close', options).start();
+    await manager.saveStorageState();
+    contexts[0].finishClose();
+    assert.equal(await manager.stop(), false);
+    assert.deepEqual(getActiveProfileIds(), []);
+});
+
+test('a failed HAR scratch removal keeps cleanup retryable after the browser context closes', async (t) => {
+    const { contexts, options } = setup(t);
+    const settings = { ...options, recordHar: true };
+    const session = await startProfile('har-cleanup', settings);
+    const nativeDir = path.join(path.dirname(session.storageStatePath), '.native');
+    const entry = fs.readdirSync(nativeDir).find((name) => fs.existsSync(path.join(nativeDir, name, 'payloads')));
+    assert.ok(entry);
+    const scratch = path.join(nativeDir, entry);
+    const remove = fs.rmSync;
+    const failRemoval = t.mock.method(fs, 'rmSync', (target, rmOptions) => {
+        if (target === scratch) throw Object.assign(new Error('Fixture directory is busy'), { code: 'EBUSY' });
+        return remove(target, rmOptions);
+    });
+    try {
+        assert.equal(await stopProfile('har-cleanup', settings), false);
+        assert.equal(contexts[0].closed, true);
+        assert.equal(fs.existsSync(scratch), true);
+    } finally {
+        failRemoval.mock.restore();
+    }
+    await startProfile('har-cleanup', options);
+    assert.equal(fs.existsSync(scratch), false);
+    assert.equal(await stopProfile('har-cleanup', options), true);
+    assert.deepEqual(fs.readdirSync(nativeDir), []);
 });
 
 test('failed startup keeps a still-live context tracked and filtered until cleanup can close it', async (t) => {
@@ -289,4 +398,137 @@ test('stopped manager attribution is an immutable snapshot of its session', asyn
     oldSummary.integrity.chainHeadHash = 'caller-edit';
     assert.deepEqual(await old.getTrafficAttribution(), original);
     assert.equal(fs.readFileSync(index, 'utf8'), currentBytes);
+});
+
+test('stop during SDK launch waits for closure of the late browser', async (t) => {
+    let enterLaunch;
+    let releaseLaunch;
+    const launchEntered = new Promise((resolve) => { enterLaunch = resolve; });
+    const launchHeld = new Promise((resolve) => { releaseLaunch = resolve; });
+    const { contexts, browsers, options } = setup(t, undefined, () => {
+        enterLaunch();
+        return launchHeld;
+    });
+    const manager = new CamoufoxProfile('starting-stop', { ...options, useSharedBrowser: false });
+    const startupError = manager.start().then(() => null, (error) => error);
+    await launchEntered;
+    const stopping = manager.stop();
+    try {
+        assert.equal(await Promise.race([
+            stopping.then(() => true),
+            new Promise((resolve) => setImmediate(() => resolve(false)))
+        ]), false);
+    } finally {
+        releaseLaunch();
+    }
+    assert.match((await startupError)?.message ?? '', /startup cancelled by stop/);
+    assert.equal(await stopping, true);
+    assert.equal(contexts.length, 0);
+    assert.equal(browsers[0].isConnected(), false);
+    assert.deepEqual(getActiveProfileIds(), []);
+});
+
+test('factory audit failure closes dedicated and idle shared browsers and rolls back the new profile', async (t) => {
+    const { root, contexts, browsers, options } = setup(t, (fixture) => {
+        fixture.evaluate = () => { throw new Error('Fixture diagnostic unavailable'); };
+    });
+    for (const useSharedBrowser of [false, true]) {
+        const profileId = `audit-failure-${useSharedBrowser}`;
+        await assert.rejects(createAndStartProfile('fixture', null, {
+            ...options, useSharedBrowser, profileId, verifyCoherence: true
+        }), (error) => error.profileId === profileId && error.profileCleanup === 'deleted' &&
+            error.cause?.message === 'Fixture diagnostic unavailable');
+        assert.equal(contexts.at(-1).closed, true);
+        assert.equal(browsers.at(-1).isConnected(), false);
+        assert.equal(fs.existsSync(path.join(root, profileId)), false);
+        assert.deepEqual(getActiveProfileIds(), []);
+    }
+});
+
+test('a shared startup rollback leaves another profile on the browser connected', async (t) => {
+    const { root, contexts, browsers, options } = setup(t, (fixture) => {
+        fixture.evaluate = () => { throw new Error('Fixture diagnostic unavailable'); };
+    });
+    const neighbor = await startProfile('running-neighbor', options);
+    await assert.rejects(createAndStartProfile('fixture', null, {
+        ...options, profileId: 'shared-audit-failure', verifyCoherence: true
+    }), { profileId: 'shared-audit-failure', profileCleanup: 'deleted' });
+
+    assert.equal(browsers.length, 1);
+    assert.equal(browsers[0].isConnected(), true);
+    assert.equal(neighbor.browser.isConnected(), true);
+    assert.equal(contexts[1].closed, true);
+    assert.equal(fs.existsSync(path.join(root, 'shared-audit-failure')), false);
+    assert.deepEqual(getActiveProfileIds(), ['running-neighbor']);
+});
+
+test('a failed startup with an unconfirmed close reports the retained profile ID', async (t) => {
+    const { root, contexts, options } = setup(t, (fixture) => {
+        fixture.evaluate = () => { throw new Error('Fixture diagnostic unavailable'); };
+        fixture.beforeClose = () => { throw new Error('Fixture close unavailable'); };
+    });
+    const profileId = 'unconfirmed-start';
+    await assert.rejects(createAndStartProfile('fixture', null, {
+        ...options, useSharedBrowser: false, profileId, verifyCoherence: true
+    }), { profileId, profileCleanup: 'stop-unconfirmed' });
+
+    assert.equal(fs.existsSync(path.join(root, profileId)), true);
+    assert.deepEqual(getActiveProfileIds(), [profileId]);
+    contexts[0].beforeClose = null;
+    assert.equal(await stopProfile(profileId, options), true);
+    assert.deepEqual(getActiveProfileIds(), []);
+});
+
+test('factory abort reports pending cleanup promptly and removes its profile when the SDK settles', async (t) => {
+    let enterLaunch;
+    let releaseLaunch;
+    const launchEntered = new Promise((resolve) => { enterLaunch = resolve; });
+    const launchHeld = new Promise((resolve) => { releaseLaunch = resolve; });
+    const { root, contexts, browsers, options } = setup(t, undefined, () => {
+        enterLaunch();
+        return launchHeld;
+    });
+    const controller = new AbortController();
+    const profileId = 'abort-factory';
+    const attempt = createAndStartProfile('fixture', null, {
+        ...options, useSharedBrowser: false, profileId, signal: controller.signal
+    });
+    await launchEntered;
+    controller.abort(new Error('Fixture startup cancelled'));
+    try {
+        const outcome = await Promise.race([
+            attempt.catch((error) => error),
+            new Promise((resolve) => setImmediate(resolve))
+        ]);
+        assert.ok(outcome instanceof Error);
+        assert.equal(outcome.name, 'AbortError');
+        assert.equal(outcome.profileId, profileId);
+        assert.equal(outcome.profileCleanup, 'stop-unconfirmed');
+    } finally {
+        releaseLaunch();
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(contexts.length, 0);
+    assert.equal(browsers[0].isConnected(), false);
+    assert.equal(fs.existsSync(path.join(root, profileId)), false);
+    assert.deepEqual(getActiveProfileIds(), []);
+});
+
+test('a failed native close preserves the recorder and prevents reattachment', async (t) => {
+    const { contexts, options } = setup(t);
+    const recording = { ...options, recordTraffic: true };
+    const session = await startProfile('recording-close-failure', recording);
+    const [fixture] = contexts;
+    fixture.beforeClose = () => { throw new Error('Fixture close unavailable'); };
+
+    assert.equal(await stopProfile('recording-close-failure', options), false);
+    assert.equal(session.browser.isConnected(), true);
+    assert.equal(session.trafficRecorder.stopped, false);
+    await assert.rejects(startProfile('recording-close-failure', recording), /Finish stopping this Camoufox profile/);
+    session.trafficRecorder.recordTriggerAction('fixture.retained-recorder');
+
+    fixture.beforeClose = null;
+    assert.equal(await stopProfile('recording-close-failure', options), true);
+    assert.equal(session.trafficRecorder.stopped, true);
+    assert.match(fs.readFileSync(session.trafficPaths.trafficNdjsonPath, 'utf8'), /fixture\.retained-recorder/);
 });

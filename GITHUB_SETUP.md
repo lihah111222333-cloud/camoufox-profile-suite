@@ -12,21 +12,18 @@
 
 ### 2. رفع المشروع
 
-بعد إنشاء الـ repository، قم بتنفيذ الأوامر التالية:
+بعد إنشاء المستودع، عيّن `expected_origin` إلى عنوان المستودع المطلوب ونفّذ الكتلة كاملة. استخدم عنوان HTTPS أو SSH. يتوقف التسلسل إذا فشل الفحص أو تعذّر إعداد `origin` أو اختلف عنوان الدفع الفعلي.
+
+يفحص سكريبت الدفع الأول سجل أمثلة OpenAPI في الفرع قبل تجهيز الالتزام. إذا أبلغ عن أمثلة قديمة، نسّق مع مالك المستودع لمعالجة السجل قبل نقله إلى وجهة جديدة.
 
 ```bash
-# فحص الملفات ومراجعة ما تم تجهيزه ثم إنشاء الالتزام
-bash PUSH_TO_GITHUB.sh
-
-# إضافة remote repository (استبدل YOUR_USERNAME و REPO_NAME)
-git remote add origin https://github.com/YOUR_USERNAME/REPO_NAME.git
-
-# أو إذا كنت تستخدم SSH:
-# git remote add origin git@github.com:YOUR_USERNAME/REPO_NAME.git
-
-# رفع المشروع
-git branch -M main
-git push -u origin main
+expected_origin=https://github.com/YOUR_USERNAME/REPO_NAME.git
+bash PUSH_TO_GITHUB.sh &&
+  git remote add origin "$expected_origin" &&
+  push_origin=$(git remote get-url --push --all origin) &&
+  test "$push_origin" = "$expected_origin" &&
+  git branch -M main &&
+  git push -u origin main
 ```
 
 ### 3. التحقق من الملفات الحساسة
@@ -83,6 +80,21 @@ TEST_PROXY=true
   - Personal data
 - احتفظ بـ `.env` وملفات الاعتماد في [مجلد حالة التطبيق](ENV_VARIABLES.md#configuration-and-local-state).
 - احتفظ بقواعد تجاهل الملفات الحساسة في `.gitignore`.
+
+## التحقق من الإصدار قبل نشره
+
+يشير الوسم المحلي `v1.0.0` إلى الالتزام `6392824`. تتضمن نسخة OpenAPI في ذلك الالتزام أمثلة قديمة لقيم ملفات تعريف الارتباط ومفتاح ورمز مميز. يرفض فاحص الإصدار الحالي هذا الوسم. يلزم التنسيق بشأن الوسم والسجل السابقين، والتحقق من حالة النشر وصلاحية بيانات الاعتماد لدى مالك المستودع. أبقِ تفاصيل القيم خارج التقارير والإصدارات.
+
+حضّر التزامًا خضع للمراجعة يتضمن إصدارًا جديدًا في `package.json`. نفّذ الفحوص التالية من نسخة عمل نظيفة لذلك الالتزام، واستبدل `v1.0.1` بالوسم المطابق للإصدار:
+
+```bash
+set -o pipefail
+node scripts/check-distribution.mjs tag v1.0.1 &&
+  node scripts/check-distribution.mjs source HEAD &&
+  npm pack --json | node scripts/check-distribution.mjs archive
+```
+
+نفّذ الفحوص قبل دفع الوسم أو النشر من واجهة GitHub. يُنشئ GitHub أرشيف المصدر من الالتزام الذي يشير إليه الوسم، ويمكن أن يصبح متاحًا عند دفع الوسم قبل انتهاء سير العمل. افحص السجل كذلك إذا كانت الوجهة جديدة. احتفظ بالوسم والسجل الحاليين إلى أن ينسق المالك بشأنهما.
 
 ## إذا رفعت ملفًا حساسًا بالخطأ
 

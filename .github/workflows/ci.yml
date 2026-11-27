@@ -22,6 +22,12 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
 
+      - name: Verify distribution files
+        shell: bash
+        run: |
+          node scripts/check-distribution.mjs source "$GITHUB_SHA"
+          npm pack --json | node scripts/check-distribution.mjs archive
+
       - name: Install dependencies
         run: npm install --package-lock=false --ignore-scripts
 

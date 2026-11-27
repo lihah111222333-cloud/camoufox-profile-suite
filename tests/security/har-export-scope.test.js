@@ -74,6 +74,44 @@ test('HAR CLI filters transactions before assembling pages and rejects unsupport
     assert.equal(log.entries[0].response.status, 409);
     assert.deepEqual(log.pages.map((page) => page.title), ['show (step 0)']);
     assert.doesNotMatch(contents, /unrelated\.example|other-page|other-step|wrong-/);
+
+    const invalidScopes = [
+        [['--domian=selected.example'], /Unknown option --domian/],
+        [['--since', '2024-01-01'], /Unknown option --since/],
+        [['unexpected'], /Unexpected positional argument/]
+    ];
+    for (const [args, expected] of invalidScopes) {
+        const rejected = run(...args);
+        assert.equal(rejected.status, 1);
+        assert.match(rejected.stderr, expected);
+        assert.equal(rejected.stdout, '');
+        assert.equal(fs.readFileSync(outputPath, 'utf8'), contents);
+    }
+});
+
+test('HAR CLI selects a capture automatically only when it is unique', { skip: !supported }, (t) => {
+    const { root, ledgerPath, outputPath } = fixture(t);
+    writeLedger(ledgerPath, transaction('first'));
+    const args = [cliPath, '--profiles-dir=' + root, '--export-har=' + outputPath, '--json'];
+    const run = (...flags) => spawnSync(process.execPath, [...args, ...flags], { encoding: 'utf8' });
+
+    const automatic = run();
+    assert.equal(automatic.status, 0, automatic.stderr);
+    assert.equal(JSON.parse(automatic.stdout).profileId, 'fixture');
+    const original = fs.readFileSync(outputPath);
+
+    const second = path.join(root, 'fixture-other', 'traffic');
+    fs.mkdirSync(second, { recursive: true });
+    writeLedger(path.join(second, 'traffic.ndjson'), transaction('second'));
+    const ambiguous = run();
+    assert.equal(ambiguous.status, 1);
+    assert.match(ambiguous.stderr, /Multiple traffic captures.*--profile/);
+    assert.deepEqual(fs.readFileSync(outputPath), original);
+
+    const explicit = run('--profile=fixture-other');
+    assert.equal(explicit.status, 0, explicit.stderr);
+    const entries = JSON.parse(fs.readFileSync(outputPath, 'utf8')).log.entries;
+    assert.deepEqual(entries.map((entry) => entry._attribution.correlationId), ['second']);
 });
 
 test('missing, malformed and unspecified index policy retain metadata and omit bodies', { skip: !supported }, (t) => {
@@ -130,7 +168,8 @@ test('shared event and wire reports omit private body digests for withheld reque
     writeLedger(ledgerPath, [
         {
             ...request, recordBodies: true, postDataSha256: digests[0], eventHash: digests[3],
-            platformSignatures: [signature]
+            platformSignatures: [signature],
+            payloadStorage: { status: 'stored', sha256: digests[0], bytes: 9 }
         },
         { ...response, recordBodies: true, bodySha256: digests[1], prevEventHash: digests[3] },
         { ...request, type: 'ws-egress', recordBodies: true, payloadSha256: digests[2] }
@@ -143,10 +182,35 @@ test('shared event and wire reports omit private body digests for withheld reque
         queryProfileTraffic({ trafficDir, signatures: true })
     ];
     const serialized = JSON.stringify(reports);
+    assert.deepEqual(reports[0].events[0].payloadStorage, { status: 'stored', bytes: 9 });
+    assert.deepEqual(reports[1].egress.payloadStorage, { status: 'stored', bytes: 9 });
     for (const digest of digests) {
         assert.equal(serialized.includes(digest), false);
         assert.equal(fs.readFileSync(ledgerPath, 'utf8').includes(digest), true);
     }
+});
+
+test('wire reports hide content-derived attachment names when a body is shareable', { skip: !supported }, (t) => {
+    const { trafficDir, ledgerPath, indexPath, payloadsDir } = fixture(t);
+    const [egress, ingress] = transaction('permitted-fixture');
+    const body = '{"count":12,"message":"local fixture detail"}';
+    const sha256 = createHash('sha256').update(body).digest('hex');
+    const name = `req-1-${sha256.slice(0, 12)}.json`;
+    const payloadFile = 'payloads/' + name;
+    fs.writeFileSync(path.join(payloadsDir, name), body);
+    writeLedger(ledgerPath, [{
+        ...egress, recordBodies: true, payloadFile, headers: { 'content-type': 'application/json' },
+        payloadStorage: { status: 'stored', sha256, bytes: Buffer.byteLength(body) }
+    }, ingress]);
+    fs.writeFileSync(indexPath, '{"session":{"recordBodies":true,"traceId":"fixture-trace"}}');
+
+    const report = queryProfileTraffic({ trafficDir, correlationId: 'permitted-fixture' });
+    assert.equal(report.requestPayload, '{"count":12}');
+    assert.equal(report.requestPayloadExistsOnDisk, true);
+    assert.equal(report.requestPayloadFile, null);
+    assert.equal(report.egress.payloadFile, null);
+    assert.equal(JSON.stringify(report).includes(sha256.slice(0, 12)), false);
+    assert.equal(fs.readFileSync(path.join(payloadsDir, name), 'utf8'), body);
 });
 
 test('context HAR cuts off earlier sessions even if the same trace ID is reused', async (t) => {

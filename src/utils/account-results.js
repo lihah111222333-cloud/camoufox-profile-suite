@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { isIP } from 'node:net';
 import path from 'node:path';
+import { TextDecoder } from 'node:util';
 import { withAccountOutputLock } from './account-output-lock.js';
 import { readPrivateFile, writePrivateFile } from './private-storage.js';
 
@@ -16,19 +17,20 @@ const TELEMETRY_FIELDS = [
     'profileId', 'presetId', 'deviceModel', 'os', 'coherenceScore', 'coherencePassed'
 ];
 const TELEMETRY_GROUPS = {
-    gpuPerformance: [
-        'targetGpuModel', 'hostChipModel', 'computeTimeMultiplier', 'throughputSpeedupRatio',
-        'antiPenetrationActive'
-    ],
+    gpuPerformance: ['targetGpuModel', 'antiPenetrationActive'],
     securityGuards: [
         'profileId', 'portScanProtectionEnabled', 'webrtcInitScriptAttached',
         'blockedPortScanCount', 'blockedInternalSchemeCount'
     ],
     fingerprintLedger: ['profileId', 'maxHammingDistance', 'totalEntries', 'driftAlertCount']
 };
-const PROFILE_CLEANUP = new Set(['pending', 'stopped', 'stop-unconfirmed', 'deleted', 'delete-unconfirmed']);
+const PROFILE_CLEANUP = new Set([
+    'pending', 'stopped', 'stop-unconfirmed', 'deleted', 'delete-unconfirmed',
+    'allocation-unconfirmed', 'recycled', 'recycle-unconfirmed'
+]);
 const RESULT_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const MANUAL_STAGES = new Set(['password', 'verification', 'recovery-email', 'untrusted-page', 'completion']);
+const outputDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 function pickScalars(source, fields) {
     const selected = {};
@@ -62,6 +64,9 @@ function failureDetails(record) {
             errorCode: 'MANUAL_SIGNUP_REQUIRED',
             ...(MANUAL_STAGES.has(record.errorStage) ? { errorStage: record.errorStage } : {})
         };
+    }
+    if (record.errorCode === 'PROFILE_ALLOCATION_UNCONFIRMED') {
+        return { error: 'Managed profile allocation is unconfirmed', errorCode: 'PROFILE_ALLOCATION_UNCONFIRMED' };
     }
     return { error: 'Account creation failed' };
 }
@@ -103,9 +108,9 @@ function savedAccountRecord(record) {
 }
 
 function readExistingOutput(filePath, label, { restrict = true } = {}) {
-    let content;
+    let bytes;
     try {
-        content = readPrivateFile(filePath, 'utf8', { requireOwner: true, restrict });
+        bytes = readPrivateFile(filePath, null, { requireOwner: true, restrict });
     } catch (error) {
         if (error.code === 'ENOENT') {
             return undefined;
@@ -113,6 +118,12 @@ function readExistingOutput(filePath, label, { restrict = true } = {}) {
         throw error;
     }
 
+    let content;
+    try {
+        content = outputDecoder.decode(bytes);
+    } catch {
+        throw invalidOutput(`${label} contains invalid UTF-8`);
+    }
     try {
         return { content, data: JSON.parse(content) };
     } catch {
@@ -134,7 +145,7 @@ function projectSummary(summary) {
     return {
         ...pickScalars(summary, ['timestamp']),
         configuration: pickScalars(summary.configuration, ['accountsCount', 'threadsCount', 'profileService', 'smsProvider']),
-        stats: pickScalars(summary.stats, ['total', 'completed', 'failed', 'successRate', 'skipped']),
+        stats: pickScalars(summary.stats, ['total', 'completed', 'failed', 'manual', 'successRate', 'skipped']),
         ...pickScalars(summary, ['duration']),
         results: summary.results.map((entry) => {
             assertAccountRecord(entry, 'summary.json');
@@ -167,7 +178,7 @@ export function migrateExistingAccountOutputs(resultsFile, summaryFile, { legacy
     const errors = [];
     for (const { filePath, label, project } of outputs) {
         try {
-            withAccountOutputLock(filePath, () => {
+            withAccountOutputLock(filePath, (temporaryPath) => {
                 const existing = readExistingOutput(filePath, label);
                 const legacy = !existing && legacyDirectory
                     ? readExistingOutput(path.join(legacyDirectory, path.basename(filePath)), label, { restrict: false })
@@ -177,7 +188,7 @@ export function migrateExistingAccountOutputs(resultsFile, summaryFile, { legacy
 
                 const updated = JSON.stringify(project(source.data), null, 2);
                 if (!existing || existing.content !== updated) {
-                    writePrivateFile(filePath, updated, { requireOwner: true });
+                    writePrivateFile(filePath, updated, { requireOwner: true, temporaryPath });
                 }
             });
         } catch (error) {
@@ -190,11 +201,11 @@ export function migrateExistingAccountOutputs(resultsFile, summaryFile, { legacy
 }
 
 function updateResults(filePath, update) {
-    return withAccountOutputLock(filePath, () => {
+    return withAccountOutputLock(filePath, (temporaryPath) => {
         const existing = readExistingOutput(filePath, 'Account results file');
         const results = existing ? projectResults(existing.data) : [];
         const updated = update(results);
-        writePrivateFile(filePath, JSON.stringify(results, null, 2), { requireOwner: true });
+        writePrivateFile(filePath, JSON.stringify(results, null, 2), { requireOwner: true, temporaryPath });
         return updated;
     });
 }
@@ -223,7 +234,7 @@ export function recordAccountCleanup(filePath, resultId, profileCleanup) {
 }
 
 export function writeRunSummary(filePath, summary) {
-    withAccountOutputLock(filePath, () => {
-        writePrivateFile(filePath, JSON.stringify(projectSummary(summary), null, 2), { requireOwner: true });
+    withAccountOutputLock(filePath, (temporaryPath) => {
+        writePrivateFile(filePath, JSON.stringify(projectSummary(summary), null, 2), { requireOwner: true, temporaryPath });
     });
 }

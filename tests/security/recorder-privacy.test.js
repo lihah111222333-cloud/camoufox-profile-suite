@@ -63,6 +63,28 @@ function assertAbsent(recorder, markers) {
 
 const digest = (value) => createHash('sha256').update(value).digest('hex');
 
+test('initial and updated account emails are omitted from recorded attribution', async (t) => {
+    const initialEmail = 'initial-candidate@example.test';
+    const updatedEmail = 'updated-candidate@example.test';
+    const { recorder, context } = fixture(t, { accountId: 1, accountEmail: initialEmail });
+    context.emit('request', request('https://fixture.invalid/first'));
+    await recorder.flushSummary();
+
+    const snapshot = recorder.updateAttribution({ accountId: 2, accountEmail: updatedEmail });
+    assert.equal(snapshot.accountEmail, null);
+    const second = request('https://fixture.invalid/second');
+    context.emit('request', second);
+    context.emit('response', response(second));
+
+    const summary = await recorder.stop();
+    assert.equal(summary.session.accountEmail, null);
+    assert.equal(summary.session.accountId, 2);
+    assert.deepEqual(events(recorder).map(({ attribution }) => [attribution.accountId, attribution.accountEmail]), [
+        [1, null], [2, null], [2, null]
+    ]);
+    assertAbsent(recorder, [initialEmail, updatedEmail]);
+});
+
 test('credential headers are masked and cookie digests are recoverable from the ledger', async (t) => {
     const { recorder, context, recorderOptions } = fixture(t);
     const cookie = 'lineage-cookie-fixture-1234';
@@ -114,8 +136,14 @@ test('navigation and step metadata use the same URL masking as headers and HTTP 
     const locationToken = 'redirect-navigation-fixture';
     const fragmentToken = 'fragment-navigation-fixture';
     const userInfo = 'userinfo-navigation-fixture';
-    const url = `https://user:${userInfo}@example.test/go?ordinary=retained&access%5Ftoken=${targetToken}#id_token=${fragmentToken}`;
+    const authToken = 'header-authentication-fixture';
+    const signedToken = 'signed-query-fixture';
+    const linkToken = 'link-anchor-fixture';
+    const url = `https://user:${userInfo}@example.test/go?ordinary=retained&access%5Ftoken=${targetToken}` +
+        `&X-Amz-Signature=${signedToken}#id_token=${fragmentToken}`;
     const redirect = `/callback?refresh_token=${locationToken}`;
+    const link = `<${redirect}>; rel="next"; anchor="related?sig=${linkToken}&page=2"`;
+    const maskedLink = `<${redactUrlSecrets(redirect)}>; rel="next"; anchor="related?sig=[REDACTED]&page=2"`;
     const meta = { url, pageUrl: url, nested: { destination: [redirect] } };
     recorder.setStep('navigation', meta);
     const action = recorder.recordTriggerAction('page.goto', url, meta);
@@ -124,26 +152,30 @@ test('navigation and step metadata use the same URL masking as headers and HTTP 
     assert.equal(action.metadata.pageUrl, action.target);
     assert.equal(meta.url, url);
 
-    const req = request(url, { Referer: url, 'X-Original-URL': redirect });
+    const req = request(url, { Referer: url, 'X-Original-URL': redirect, 'X-Auth-Token': authToken });
     context.emit('request', req);
     context.emit('response', response(req, {
         Location: redirect,
-        Link: `<${redirect}>; rel="next"`,
+        Link: link,
         Refresh: `0; url="${url}"`
     }));
     const summary = await recorder.stop();
-    recorder.exportHar();
+    const { log } = recorder.exportHar();
     const [step, trigger, egress, ingress] = events(recorder);
     assert.equal(step.metadata.nested.destination[0], redactUrlSecrets(redirect));
     assert.equal(trigger.target, egress.url);
     assert.equal(egress.headers.Referer, egress.url);
     assert.equal(egress.headers['X-Original-URL'], redactUrlSecrets(redirect));
+    assert.equal(egress.headers['X-Auth-Token'], '[REDACTED]');
     assert.equal(egress.searchParams.ordinary, 'retained');
+    assert.equal(egress.searchParams['X-Amz-Signature'], '[REDACTED]');
     assert.equal(ingress.headers.Location, redactUrlSecrets(redirect));
+    assert.equal(ingress.headers.Link, maskedLink);
     assert.equal(ingress.headers.Refresh, `0; url="${egress.url}"`);
+    assert.equal(log.entries[0].response.headers.find(({ name }) => name === 'Link').value, maskedLink);
     assert.equal(summary.byTriggerAction[action.actionId].target, egress.url);
     assert.equal(summary.byTriggerAction[action.actionId].metadata.url, egress.url);
-    assertAbsent(recorder, [targetToken, locationToken, fragmentToken, userInfo]);
+    assertAbsent(recorder, [targetToken, locationToken, fragmentToken, userInfo, authToken, signedToken, linkToken]);
 });
 
 test('private Necko source keeps its format while the diagnostic index masks credentials and URLs', async (t) => {
@@ -339,13 +371,14 @@ test('opted-in requests project complete JSON and forms while authentication and
 
 test('reopened wire applies current header, URL, trigger and body rules to accepted legacy events', async (t) => {
     const traceId = 'legacy-wire-fixture';
+    const archivedEmail = 'archived-candidate@example.test';
     const { recorder, recorderOptions } = fixture(t, { traceId, recordBodies: true, neckoMozLog: false });
     const common = {
         correlationId: 'legacy-transaction',
         timestamp: '2026-01-01T00:00:00.000Z',
         url: 'https://example.test/items',
         recordBodies: true,
-        attribution: { traceId }
+        attribution: { traceId, accountEmail: archivedEmail }
     };
     const legacy = [
         {
@@ -400,6 +433,10 @@ test('reopened wire applies current header, URL, trigger and body rules to accep
         return JSON.stringify({ ...record, eventHash: head });
     });
     const archived = `${lines.join('\n')}\n`;
+    await recorder.stop();
+    const archivedIndex = JSON.parse(fs.readFileSync(recorder.attributionIndexPath, 'utf8'));
+    archivedIndex.session.accountEmail = archivedEmail;
+    fs.writeFileSync(recorder.attributionIndexPath, JSON.stringify(archivedIndex));
     fs.writeFileSync(recorder.trafficNdjsonPath, archived);
     const reopened = new CamoufoxTrafficRecorder(recorderOptions);
     const summary = await reopened.stop();
@@ -408,7 +445,10 @@ test('reopened wire applies current header, URL, trigger and body rules to accep
     assert.equal(signature.maskedPreview, '[REDACTED]');
     assert.equal(signature.valueSha256, null);
     assert.equal(signature.valueLength, null);
-    assert.doesNotMatch(fs.readFileSync(recorder.attributionIndexPath, 'utf8'), /legacy-signature-marker/);
+    assert.equal(summary.session.accountEmail, null);
+    const rebuiltIndex = fs.readFileSync(recorder.attributionIndexPath, 'utf8');
+    assert.doesNotMatch(rebuiltIndex, /legacy-signature-marker/);
+    assert.equal(rebuiltIndex.includes(archivedEmail), false);
     const wire = reopened.formatTransactionWireDump('legacy-transaction');
     assert.match(wire, /Authorization: Bearer \[REDACTED\]/);
     assert.match(wire, /Cookie: \[REDACTED\]/);
@@ -416,6 +456,7 @@ test('reopened wire applies current header, URL, trigger and body rules to accep
     assert.match(wire, /"ok":true/);
     assert.match(wire, /legacy-action/);
     assert.doesNotMatch(wire, /legacy-(request|cookie|response|target|body|truncation|location)-marker/);
+    assert.equal(wire.includes(archivedEmail), false);
     const socketWire = reopened.formatTransactionWireDump('legacy-socket');
     assert.match(socketWire, /WS-EGRESS.*bytes=42/);
     assert.doesNotMatch(socketWire, /legacy-ws-marker/);

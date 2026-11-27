@@ -10,6 +10,7 @@ import { isDeepStrictEqual } from 'node:util';
 import logger from '../utils/logger.js';
 import { getDefaultProfilesDirectory } from '../utils/state-paths.js';
 import { ensurePrivateDirectory, writePrivateFile } from '../utils/private-storage.js';
+import { listCaptureDirectory } from './capture-io.js';
 import {
     assertManagedProxyLaunchEnvironment,
     assertManagedProxyReuse,
@@ -25,6 +26,7 @@ import {
     assertProfileLease,
     ensureProfileStorageAt,
     initializeProfileStorageAt,
+    inspectProfileDirectory,
     inspectProfileForDeletion,
     locateProfile,
     prepareNativeLogs,
@@ -38,7 +40,10 @@ import {
     stampProfileIdentity,
     validateProfileId
 } from './profile-storage.js';
-import { CamoufoxTrafficRecorder, selectProfileNativeLogPaths } from './traffic-recorder.js';
+import {
+    CamoufoxTrafficRecorder, acquireProfileTrafficDeletionLease, acquireTrafficDirectoryLease, buildBrowserEnvironment, buildNativeLogEnvironment,
+    exportTrafficToHar, inspectHarScratch, selectProfileNativeLogPaths
+} from './traffic-recorder.js';
 import { redactDiagnosticText, redactUrlSecrets } from './traffic-redaction.js';
 import {
     USABLE_DEVICE_PRESET_CATALOG,
@@ -59,11 +64,8 @@ import {
     buildZiniaoWebRtcSecurityInitScript,
     GPU_PERFORMANCE_SPEC_CATALOG,
     lookupGpuPerformanceSpec,
-    collectHostMacPerformanceBaseline,
     computeGpuPerformanceScalingWeights,
     scaleGpuExecutionDurationMs,
-    buildGpuPerformanceInitScript,
-    attachGpuPerformanceScalerToContext,
     validateGpuPerformanceScalingCoherence
 } from './device-presets.js';
 
@@ -86,11 +88,8 @@ export {
     buildZiniaoWebRtcSecurityInitScript,
     GPU_PERFORMANCE_SPEC_CATALOG,
     lookupGpuPerformanceSpec,
-    collectHostMacPerformanceBaseline,
     computeGpuPerformanceScalingWeights,
     scaleGpuExecutionDurationMs,
-    buildGpuPerformanceInitScript,
-    attachGpuPerformanceScalerToContext,
     validateGpuPerformanceScalingCoherence
 };
 
@@ -104,6 +103,7 @@ const FORBIDDEN_UA_PATTERNS =
 let cachedCamoufoxModule = null;
 const sharedBrowsers = new Map();
 const activeProfiles = new Map();
+const createdProfileOwners = new WeakMap();
 const pendingProfileStarts = new Map();
 const pendingProfileSaves = new Map();
 const pendingProfileStops = new Map();
@@ -120,6 +120,20 @@ let processCleanupAttached = false;
 export function setCamoufoxModule(mockModule = null) {
     cachedCamoufoxModule = mockModule || null;
     return cachedCamoufoxModule;
+}
+
+export async function waitForCamoufoxStartup(pending, signal) {
+    if (!signal) return pending;
+    let abort;
+    try {
+        return await Promise.race([pending, new Promise((resolve, reject) => {
+            abort = () => reject(signal.reason);
+            signal.addEventListener('abort', abort, { once: true });
+            if (signal.aborted) abort();
+        })]);
+    } finally {
+        signal.removeEventListener('abort', abort);
+    }
 }
 
 /**
@@ -624,7 +638,7 @@ export async function saveProfileStorageState(profileId, context = null, profile
         throw new Error('Camoufox context does not belong to the active profile in this store');
     }
 
-    if (!session || pendingProfileStarts.has(location.key) ||
+    if (!session || session.closingSnapshot || pendingProfileStarts.has(location.key) ||
         pendingProfileStops.has(location.key) || pendingProfileDeletes.has(location.key)) {
         return null;
     }
@@ -657,40 +671,10 @@ export async function checkCamoufoxConnection() {
     }
 }
 
-const BROWSER_ENV_KEYS = [
-    'PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP', 'TZ', 'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE',
-    'LC_COLLATE', 'LC_MESSAGES', 'LC_MONETARY', 'LC_NUMERIC', 'LC_TIME',
-    'DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'MOZ_ENABLE_WAYLAND', 'GDK_BACKEND',
-    'XDG_SESSION_TYPE', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME',
-    'XDG_DATA_HOME', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS',
-    'SystemRoot', 'SystemDrive', 'WINDIR', 'COMSPEC', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA',
-    'ProgramFiles', 'ProgramFiles(x86)', 'PROGRAMDATA'
-];
-
-function buildBrowserEnvironment(overrides) {
-    return Object.fromEntries(BROWSER_ENV_KEYS.flatMap((name) => {
-        const value = overrides[name] ?? process.env[name];
-        return typeof value === 'string' ? [[name, value]] : [];
-    }));
-}
-
-// The launcher receives explicit empty native log values for disabled diagnostics.
-function buildNativeLogEnvironment(env, { sslKeyLogPath, neckoMozLogPath, neckoMozLogModules } = {}) {
-    return {
-        ...env,
-        SSLKEYLOGFILE: sslKeyLogPath || '',
-        MOZ_LOG: neckoMozLogPath ? neckoMozLogModules : '',
-        MOZ_LOG_FILE: neckoMozLogPath || '',
-        NSPR_LOG_MODULES: '',
-        NSPR_LOG_FILE: ''
-    };
-}
-
 /**
  * Obtain or launch a shared Camoufox browser instance for multi-context profiles.
  */
 async function getOrCreateSharedBrowser(options) {
-    if (closingSharedBrowsers) await closingSharedBrowsers;
     assertFirefoxCoherence(options);
     const targetOs = normalizeTargetOs(options.os);
     const headless = options.headless ?? (process.env.CAMOUFOX_HEADLESS === 'true');
@@ -750,13 +734,20 @@ export function closeSharedBrowser() {
 }
 
 async function closeSharedBrowsers() {
+    const starting = [...pendingProfileStarts.values()].filter(({ networkSettings }) => networkSettings.useSharedBrowser);
+    await Promise.allSettled(starting.map(({ promise }) => promise));
     const entries = [...sharedBrowsers.entries()];
     const launches = await Promise.allSettled(entries.map(([, entry]) => entry.promise));
     const instances = new Set(
         launches.filter((result) => result.status === 'fulfilled').map((result) => result.value)
     );
+    const sessions = [...activeProfiles.values()].filter((session) => !session.ownsBrowser && session.browser);
+    const outcomes = await Promise.allSettled(sessions.map((session) => stopProfileAt(session.location, session)));
+    const incomplete = new Set(sessions.filter((session) => !session.contextClosed && !session.hasClosedContext())
+        .map((session) => session.browser));
     const closed = new Set();
     for (const instance of instances) {
+        if (incomplete.has(instance)) continue;
         if (instance.isConnected?.() !== false) {
             try {
                 await instance.close();
@@ -775,16 +766,8 @@ async function closeSharedBrowsers() {
     for (const [key, entry] of entries) {
         if (closed.has(entry.browser) && sharedBrowsers.get(key) === entry) sharedBrowsers.delete(key);
     }
-
-    const disconnected = [...activeProfiles.values()].filter((session) =>
-        !session.ownsBrowser && closed.has(session.browser)
-    );
-    await Promise.allSettled(disconnected.map((session) => {
-        session.contextClosed = true;
-        return stopProfileAt(session.location);
-    }));
     updateProcessCleanupHooks();
-    return closed.size === instances.size;
+    return closed.size === instances.size && outcomes.every(({ status, value }) => status === 'fulfilled' && value);
 }
 
 /**
@@ -811,7 +794,13 @@ export async function createProfile(profileName, proxy = null, options = {}) {
         }
         const lease = acquireProfileLease(location);
         try {
-            return createProfileAt(location, cleanName, requestedProxy, options, managedProxyBinding);
+            const created = createProfileAt(location, cleanName, requestedProxy, options, managedProxyBinding);
+            createdProfileOwners.set(created, {
+                location,
+                identity: inspectProfileForDeletion(location),
+                stopResult: true
+            });
+            return created;
         } finally {
             releaseProfileLease(lease);
         }
@@ -879,7 +868,6 @@ function createProfileAt(location, cleanName, requestedProxy, options, managedPr
         resolvedTimezoneId: deviceProfile.timeZone,
         resolvedGeolocation: deviceProfile.geolocation,
         securityPolicy: deviceProfile.securityPolicy,
-        gpuPerformance: deviceProfile.gpuPerformance,
         hardwareProfile: deviceProfile.hardwareProfile,
         seeds: deviceProfile.seeds,
         createdAt: new Date().toISOString(),
@@ -996,15 +984,27 @@ function resolveRecordingSettings(options, useSharedBrowser, nativeHarOptions) {
         Boolean(nativeHarOptions ?? options.recordHar ?? (process.env.CAMOUFOX_RECORD_HAR === 'true'));
     const harBodies = recordHar && bodyRecordingEnabled && nativeHarOptions?.content !== 'omit' &&
         nativeHarOptions?.omitContent !== true;
+    const recordBodies = recordTraffic ? bodyRecordingEnabled : harBodies;
+    const configuredBodyLimit = options.maxBodyBytes !== undefined
+        ? options.maxBodyBytes
+        : Number.parseInt(process.env.CAMOUFOX_TRAFFIC_MAX_BODY_BYTES, 10);
+    const neckoMozLog = !useSharedBrowser && (options.neckoMozLog ?? (process.env.CAMOUFOX_NECKO_MOZ_LOG === 'true')) === true;
 
     return {
         recordTraffic,
-        recordBodies: recordTraffic ? bodyRecordingEnabled : harBodies,
+        recordBodies,
+        maxBodyBytes: recordBodies && Number.isFinite(configuredBodyLimit) && configuredBodyLimit > 0
+            ? configuredBodyLimit
+            : undefined,
         recordWireLog: recordTraffic && wireRecordingEnabled,
         recordHar,
         harBodies,
         sslKeyLog: !useSharedBrowser && (options.sslKeyLog ?? (process.env.CAMOUFOX_SSLKEYLOG === 'true')) === true,
-        neckoMozLog: !useSharedBrowser && (options.neckoMozLog ?? (process.env.CAMOUFOX_NECKO_MOZ_LOG === 'true')) === true
+        neckoMozLog,
+        neckoMozLogModules: neckoMozLog
+            ? options.neckoMozLogModules || process.env.CAMOUFOX_NECKO_MOZ_LOG_MODULES ||
+                'timestamp,nsHttp:5,nsSocketTransport:5,nsHostResolver:4'
+            : null
     };
 }
 
@@ -1021,12 +1021,20 @@ const RECORDING_OPTIONS = {
 function checkProfileReuse(existing, requested) {
     assertManagedProxyReuse(existing.managedProxyBinding, requested.managedProxyBinding);
     if (!isDeepStrictEqual(existing.networkSettings, requested.networkSettings)) {
-        throw new Error('Stop this Camoufox profile before changing its network or URL guard settings');
+        throw new Error('Stop this Camoufox profile before changing its network or URL guard settings or context permissions');
     }
     for (const [key, label] of Object.entries(RECORDING_OPTIONS)) {
-        if (existing.recordingSettings[key] && !requested.recordingSettings[key]) {
-            throw new Error(`Stop this Camoufox profile before disabling ${label}`);
+        const previous = existing.recordingSettings[key];
+        const next = requested.recordingSettings[key];
+        if (previous !== next && (previous || !requested.implicitRecordingDefaults[key])) {
+            throw new Error(`Stop this Camoufox profile before ${next ? 'enabling' : 'disabling'} ${label}`);
         }
+    }
+    if (existing.recordingSettings.neckoMozLogModules !== requested.recordingSettings.neckoMozLogModules) {
+        throw new Error('Stop this Camoufox profile before changing Necko logging modules');
+    }
+    if (existing.recordingSettings.maxBodyBytes !== requested.recordingSettings.maxBodyBytes) {
+        throw new Error('Stop this Camoufox profile before changing the body recording limit');
     }
 }
 
@@ -1045,7 +1053,7 @@ function resolveSessionStartSettings(options, savedMetadata, managedProxyBinding
     const { recordHar: _launchHar, env: launchEnv, ...launchOptions } = startOptions.launchOptions || {};
     const { recordHar: nativeHarOptions, storageState: _storageState, ...contextOptions } =
         startOptions.contextOptions || {};
-    const env = buildBrowserEnvironment({ ...launchEnv, ...startOptions.env });
+    const env = buildBrowserEnvironment({ ...launchEnv, ...startOptions.env }, process.env);
 
     if (useSharedBrowser && (Object.keys(launchOptions).length ||
         ['addons', 'fonts', 'screen', 'window', 'config', 'firefox_user_prefs'].some((key) => startOptions[key]))) {
@@ -1058,11 +1066,18 @@ function resolveSessionStartSettings(options, savedMetadata, managedProxyBinding
         'from_options', 'executablePath', 'executable_path', 'persistent_context', 'user_data_dir'
     ]);
     Object.assign(launchOptions, structuredClone(launchRouting));
-    const contextRouting = copyOptionValues(contextOptions, ['proxy', 'proxyOverride', 'ignoreHTTPSErrors']);
+    const contextRouting = copyOptionValues(contextOptions, [
+        'proxy', 'proxyOverride', 'ignoreHTTPSErrors', 'acceptDownloads', 'permissions'
+    ]);
     Object.assign(contextOptions, structuredClone(contextRouting));
     const processRouting = copyOptionValues(startOptions, ['firefox_user_prefs', 'config']);
 
     const recordingSettings = resolveRecordingSettings(startOptions, useSharedBrowser, nativeHarOptions);
+    // Attaching by ID alone should preserve a session's deliberate choice to disable default recording.
+    const implicitRecordingDefaults = {
+        recordTraffic: startOptions.recordTraffic === undefined && process.env.CAMOUFOX_RECORD_TRAFFIC === undefined,
+        recordWireLog: startOptions.recordWireLog === undefined && process.env.CAMOUFOX_RECORD_WIRE_LOG === undefined
+    };
     const reuseSettings = {
         managedProxyBinding,
         networkSettings: {
@@ -1074,7 +1089,8 @@ function resolveSessionStartSettings(options, savedMetadata, managedProxyBinding
             contextRouting,
             processRouting
         },
-        recordingSettings
+        recordingSettings,
+        implicitRecordingDefaults
     };
     return {
         definedOptions, normalizedProxy, useSharedBrowser, launchOptions, nativeHarOptions,
@@ -1082,11 +1098,87 @@ function resolveSessionStartSettings(options, savedMetadata, managedProxyBinding
     };
 }
 
-function removeHarTemporaryDir(directory) {
+function removeHarTemporaryDir(directory, shouldRemove = () => true) {
+    if (inspectProfileDirectory({ profileDir: directory })) {
+        const lease = acquireTrafficDirectoryLease(directory);
+        try {
+            if (shouldRemove(directory)) fs.rmSync(directory, { recursive: true, force: true });
+        } finally {
+            releaseProfileLease(lease);
+        }
+    }
+}
+
+function hasHarScratchIndex(directory) {
+    return Boolean(fs.lstatSync(path.join(directory, 'attribution-index.json'), { throwIfNoEntry: false }));
+}
+
+function pendingHarExportError(directory) {
+    const error = new Error('Camoufox HAR cleanup is pending. Stop this profile to retry the export.');
+    error.code = 'ERR_CAMOUFOX_HAR_EXPORT_PENDING';
+    if (directory) error.recoveryDir = directory;
+    return error;
+}
+
+function cleanAbandonedHarScratch(storage, profileId, harScratch) {
+    removeHarTemporaryDir(harScratch, (directory) => {
+        // HAR-only recording publishes this index just before the export. Keep a
+        // completed capture available even if the process stopped before cleanup.
+        if (hasHarScratchIndex(directory)) throw pendingHarExportError(directory);
+        return true;
+    });
+    if (!inspectProfileDirectory({ profileDir: storage.nativeDir })) return;
+    for (const entry of listCaptureDirectory(storage.nativeDir, { trustedLocal: true })) {
+        if (!entry.isDirectory() || !/^har-[A-Za-z0-9]{6}$/.test(entry.name)) continue;
+        const directory = path.join(storage.nativeDir, entry.name);
+        const stats = inspectProfileDirectory({ profileDir: directory });
+        if (!stats || (typeof process.geteuid === 'function' &&
+            (stats.uid !== BigInt(process.geteuid()) || (stats.mode & 0o7777n) !== 0o700n))) continue;
+        try {
+            removeHarTemporaryDir(directory, () => {
+                const entries = listCaptureDirectory(directory, { trustedLocal: true });
+                return entries.some((entry) => entry.name === 'payloads' && entry.isDirectory()) &&
+                    entries.every((entry) => entry.name === 'payloads' || (entry.isFile() &&
+                        ['traffic.ndjson', 'attribution-index.json'].includes(entry.name))) &&
+                    Boolean(inspectHarScratch(directory, profileId, storage.trafficDir));
+            });
+        } catch (error) {
+            if (error.code !== 'ERR_CAMOUFOX_PROFILE_BUSY') throw error;
+        }
+    }
+}
+
+function recoverPendingHar(location) {
+    const { profileDir, id: profileId } = location;
+    const directory = path.join(profileDir, '.native', '~har-scratch');
+    if (!inspectProfileDirectory({ profileDir: directory }) || !hasHarScratchIndex(directory)) return true;
+
+    let lease;
+    let published = false;
     try {
-        fs.rmSync(directory, { recursive: true, force: true });
+        lease = acquireProfileLease(location);
+        if (!inspectProfileForDeletion(location)) return false;
+        const trafficDir = path.join(profileDir, 'traffic');
+        removeHarTemporaryDir(directory, () => {
+            const pending = inspectHarScratch(directory, profileId, trafficDir);
+            if (!pending?.harPath) throw new Error('Could not validate the pending Camoufox HAR capture');
+            exportTrafficToHar(directory, pending.harPath, { profileId }, {
+                trustedLocal: true,
+                recordBodies: pending.recordBodies
+            });
+            published = true;
+            return true;
+        });
+        return true;
     } catch (error) {
-        logger.warn('Could not remove temporary Camoufox HAR data', { error: error.message });
+        logger.warn(published ? 'Could not remove published Camoufox HAR scratch' :
+            'Camoufox HAR archive was not published. Capture preserved for retry.', {
+            profileId,
+            error: redactDiagnosticText(error.message)
+        });
+        return false;
+    } finally {
+        if (lease) releaseProfileLease(lease);
     }
 }
 
@@ -1106,60 +1198,124 @@ function readStartSettings(location, options, expectedStorageGeneration) {
     };
 }
 
+function canReuseProfile(session) {
+    return !session.stopRequested && !session.recording?.stopped && session.view?.browser.isConnected();
+}
+
+function profileLifecycle(session) {
+    const { location, profileId, context } = session;
+    return {
+        profilesDir: location.profilesDir,
+        canReuse: () => canReuseProfile(session),
+        saveStorageState: () => saveProfileStorageState(profileId, context),
+        closeContext: (close) => closeProfileContext(session, close),
+        stop: async () => ({
+            stopped: await stopProfileAt(location, session),
+            closed: Boolean(session.closed),
+            trafficAttribution: structuredClone(session.finalTrafficAttribution ?? null)
+        }),
+        delete: () => deleteProfileAt(location, session),
+        async getTrafficAttribution() {
+            if (activeProfiles.get(location.key) === session) await pendingProfileStops.get(location.key);
+            if (session.closed || activeProfiles.get(location.key) !== session) {
+                return structuredClone(session.finalTrafficAttribution ?? null);
+            }
+            if (!session.trafficRecorder) return null;
+            assertProfileOwner(session);
+            return session.trafficRecorder.flushSummary({ nativeLogsClosed: false });
+        }
+    };
+}
+
+function takeIdleSharedBrowser(browser, failedKey) {
+    if (!browser || [...activeProfiles.values()].some((session) => session.browser === browser) ||
+        [...pendingProfileStarts].some(([key, start]) => key !== failedKey && start.networkSettings.useSharedBrowser)) {
+        return false;
+    }
+    for (const [key, entry] of sharedBrowsers) {
+        if (entry.browser === browser) {
+            sharedBrowsers.delete(key);
+            return true;
+        }
+    }
+    return false;
+}
+
 /**
  * Start a Camoufox profile by ID.
  * Supports both dedicated per-profile Camoufox browser instances and shared browser contexts,
  * loading and persisting `profiles/<profileId>/storage-state.json`.
  */
-export async function startProfile(requestedProfileId, options = {}, expectedStorageGeneration = undefined) {
+export async function startProfile(requestedProfileId, options = {}, expectedStorageGeneration, attempt = {}) {
+    const { signal } = options;
+    signal?.throwIfAborted();
     resolveConfiguredNetworkPolicyMode(options.portScanProtection, options.securityPolicy?.portScanProtection);
     if (stoppingAllProfiles) {
         throw new Error('Camoufox profile shutdown is in progress');
     }
     const location = locateProfile(requestedProfileId, options.profilesDir || DEFAULT_PROFILES_DIR, true);
     const { id: profileId, profilesDir, key } = location;
+    const creation = createdProfileOwners.get(attempt.createdProfile);
+    if (creation && creation.location.key !== key) {
+        throw new Error('Camoufox startup does not match its newly created profile');
+    }
 
     if (pendingProfileDeletes.has(key)) {
         throw new Error('Camoufox profile is being deleted');
     }
     const stopping = pendingProfileStops.get(key);
     if (stopping) {
-        await stopping;
-        return startProfile(profileId, { ...options, profilesDir }, expectedStorageGeneration);
+        await waitForCamoufoxStartup(stopping, signal);
+        return startProfile(profileId, { ...options, profilesDir }, expectedStorageGeneration, attempt);
     }
     let startSettings = readStartSettings(location, options, expectedStorageGeneration);
+    if (closingSharedBrowsers && startSettings.useSharedBrowser) {
+        await waitForCamoufoxStartup(closingSharedBrowsers, signal);
+        return startProfile(profileId, { ...options, profilesDir }, expectedStorageGeneration, attempt);
+    }
     const existing = activeProfiles.get(key);
     if (existing) {
+        if (existing.harExportPending) throw pendingHarExportError(existing.harTemporaryDir);
         if (existing.view?.browser.isConnected()) {
+            if (!canReuseProfile(existing)) {
+                throw new Error('Finish stopping this Camoufox profile before starting it again');
+            }
             assertProfileOwner(existing);
             checkProfileReuse(existing, startSettings.reuseSettings);
             logger.info('Reusing active Camoufox profile session', { profileId });
             return existing.view;
         }
-        if (!(await stopProfileAt(location))) {
+        if (!(await waitForCamoufoxStartup(stopProfileAt(location), signal))) {
             throw new Error('Previous Camoufox profile session could not be stopped');
         }
-        return startProfile(profileId, { ...options, profilesDir }, expectedStorageGeneration);
+        return startProfile(profileId, { ...options, profilesDir }, expectedStorageGeneration, attempt);
     }
 
     const starting = pendingProfileStarts.get(key);
     if (starting) {
+        if (creation) throw new Error('Camoufox profile is already being started');
         checkProfileReuse(starting, startSettings.reuseSettings);
-        return starting.promise;
+        return waitForCamoufoxStartup(starting.promise, signal);
     }
     const saving = pendingProfileSaves.get(key);
     if (saving) {
-        await saving.promise;
-        return startProfile(profileId, { ...options, profilesDir }, expectedStorageGeneration);
+        await waitForCamoufoxStartup(saving.promise, signal);
+        return startProfile(profileId, { ...options, profilesDir }, expectedStorageGeneration, attempt);
     }
 
     const lease = acquireProfileLease(location);
     try {
         // Another process could have updated the profile before this process acquired it.
+        if (creation) assertProfileIdentity(location, creation.identity);
         startSettings = readStartSettings(location, options, expectedStorageGeneration);
     } catch (error) {
         releaseProfileLease(lease);
         throw error;
+    }
+    if (closingSharedBrowsers && startSettings.useSharedBrowser) {
+        releaseProfileLease(lease);
+        await waitForCamoufoxStartup(closingSharedBrowsers, signal);
+        return startProfile(profileId, { ...options, profilesDir }, expectedStorageGeneration, attempt);
     }
     const {
         savedMetadata, managedProxyBinding, definedOptions, normalizedProxy, useSharedBrowser, launchOptions, nativeHarOptions,
@@ -1173,11 +1329,15 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
         let ownsBrowser = false;
         let securityGuards = null;
         let trafficRecorder = null;
+        let nativeLogsClosed = false;
+        const confirmRecordingClosed = () => { nativeLogsClosed = true; };
         let harTemporaryDir = null;
         let initializedStorage = null;
+        let openedSession = null;
         let hasClosedContext = () => browser?.isConnected?.() === false;
         try {
             const { attachSessionCompatibility, observeContextClosure } = await import('./profile.js');
+            signal?.throwIfAborted();
             let metadata = savedMetadata;
 
             if (!metadata) {
@@ -1206,15 +1366,15 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
             const storageInfo = ensureProfileStorageAt(location);
             const { storageStatePath } = storageInfo;
             const storageState = readStorageState(storageStatePath);
+            const harScratch = path.join(storageInfo.nativeDir, '~har-scratch');
+            cleanAbandonedHarScratch(storageInfo, profileId, harScratch);
             identity = stampProfileIdentity(location, storageInfo.metadataPath, metadata);
+            if (creation) creation.identity = identity;
             initializedStorage = storageInfo;
-            const { recordTraffic, recordBodies, recordWireLog, sslKeyLog, neckoMozLog, recordHar, harBodies } =
-                reuseSettings.recordingSettings;
-            const neckoMozLogModules =
-                options.neckoMozLogModules ||
-                mergedOptions.neckoMozLogModules ||
-                process.env.CAMOUFOX_NECKO_MOZ_LOG_MODULES ||
-                'timestamp,nsHttp:5,nsSocketTransport:5,nsHostResolver:4';
+            const {
+                recordTraffic, recordBodies, recordWireLog, sslKeyLog,
+                neckoMozLog, neckoMozLogModules, recordHar, harBodies, maxBodyBytes
+            } = reuseSettings.recordingSettings;
             if (recordHar && (nativeHarOptions?.urlFilter !== undefined ||
                 (nativeHarOptions?.mode !== undefined && nativeHarOptions.mode !== 'full'))) {
                 throw new Error('Camoufox HAR export does not support native URL filters or minimal mode');
@@ -1230,13 +1390,7 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
             }
 
             restrictLegacySharedKeyLog(profilesDir);
-            archiveLegacyNativeLogs(storageInfo);
-            const maxBodyBytes = mergedOptions.maxBodyBytes !== undefined
-                ? mergedOptions.maxBodyBytes
-                : (process.env.CAMOUFOX_TRAFFIC_MAX_BODY_BYTES
-                    ? parseInt(process.env.CAMOUFOX_TRAFFIC_MAX_BODY_BYTES, 10)
-                    : 5242880);
-
+            if (!recordTraffic) archiveLegacyNativeLogs(storageInfo, acquireTrafficDirectoryLease);
             const trafficPaths = {
                 trafficDir: storageInfo.trafficDir,
                 payloadsDir: storageInfo.payloadsDir,
@@ -1259,13 +1413,15 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
             if (recordTraffic || recordHar) {
                 if (!recordTraffic) {
                     ensurePrivateDirectory(storageInfo.nativeDir);
-                    harTemporaryDir = fs.mkdtempSync(path.join(storageInfo.nativeDir, 'har-'));
+                    fs.mkdirSync(harScratch, { mode: 0o700 });
+                    harTemporaryDir = harScratch;
                 }
                 trafficRecorder = new CamoufoxTrafficRecorder({
                     profileId,
                     trafficDir: harTemporaryDir || storageInfo.trafficDir,
                     profileNativeDir: recordTraffic ? storageInfo.nativeDir : null,
                     trustedLocal: true,
+                    nativeLogsAreClosed: () => nativeLogsClosed,
                     sslKeyLog: recordTraffic && sslKeyLog,
                     sslKeyLogPath: trafficPaths.sslKeyLogPath,
                     preTlsWireLogPath: recordTraffic ? storageInfo.preTlsWireLogPath : null,
@@ -1278,7 +1434,7 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
                     accountEmail: options.accountEmail ?? mergedOptions.accountEmail ?? null,
                     recordBodies: recordTraffic ? recordBodies : harBodies,
                     recordWireLog: recordTraffic && recordWireLog,
-                    maxBodyBytes: options.maxBodyBytes ?? maxBodyBytes
+                    maxBodyBytes
                 });
                 if (recordTraffic) {
                     trafficPaths.sslKeyLogPath = trafficRecorder.sslKeyLogPath;
@@ -1295,6 +1451,7 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
             }
 
             const camoufoxMod = await resolveCamoufoxModule();
+            signal?.throwIfAborted();
             const launchFn = camoufoxMod.AsyncCamoufox || camoufoxMod.Camoufox;
             const newContextFn = camoufoxMod.AsyncNewContext || camoufoxMod.NewContext;
 
@@ -1354,6 +1511,7 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
                     env
                 });
                 ownsBrowser = false;
+                signal?.throwIfAborted();
 
                 const contextOpts = {
                     os: targetOs,
@@ -1412,6 +1570,7 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
 
                 browser = await launchFn(launchOpts);
                 ownsBrowser = true;
+                signal?.throwIfAborted();
 
                 const contextOpts = {
                     ...(effectiveTimezoneId ? { timezoneId: effectiveTimezoneId } : {}),
@@ -1426,6 +1585,7 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
             }
 
             hasClosedContext = observeContextClosure(context, browser);
+            signal?.throwIfAborted();
 
             const fingerprintLedger = new CanvasWebglConsistencyLedger({
                 profileId,
@@ -1475,23 +1635,10 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
                 });
             }
 
-            let gpuPerformanceScaler = null;
-            if (
-                options.enableGpuPerformanceScaling !== false &&
-                mergedOptions.enableGpuPerformanceScaling !== false
-            ) {
-                gpuPerformanceScaler = await attachGpuPerformanceScalerToContext(
-                    context,
-                    mergedOptions.gpuPerformance ||
-                        mergedOptions.hardwareProfile?.gpuModel ||
-                        mergedOptions.deviceModel ||
-                        targetOs,
-                    { profileId }
-                );
-            }
-
+            signal?.throwIfAborted();
             const existingPages = context.pages();
             const page = existingPages.length > 0 ? existingPages[0] : await context.newPage();
+            signal?.throwIfAborted();
 
             if (trafficRecorder) {
                 await trafficRecorder.attachContext(context);
@@ -1510,7 +1657,6 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
                 trafficPaths,
                 fingerprintLedger,
                 securityGuards,
-                gpuPerformanceScaler,
                 metadata: {
                     ...metadata,
                     os: targetOs,
@@ -1521,7 +1667,7 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
                 }
             };
 
-            const active = {
+            const active = openedSession = {
                 ...session,
                 location,
                 lease,
@@ -1529,32 +1675,17 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
                 hasClosedContext,
                 ...reuseSettings,
                 recording: trafficRecorder,
+                confirmRecordingClosed,
                 harPath,
                 harTemporaryDir,
                 harBodies,
                 storageInfo
             };
-            active.view = attachSessionCompatibility(session, {
-                profilesDir,
-                saveStorageState: () => saveProfileStorageState(profileId, context),
-                stop: async () => ({
-                    stopped: await stopProfileAt(location, active),
-                    closed: Boolean(active.closed),
-                    trafficAttribution: structuredClone(active.finalTrafficAttribution ?? null)
-                }),
-                delete: () => deleteProfileAt(location, active),
-                async getTrafficAttribution() {
-                    if (activeProfiles.get(key) === active) await pendingProfileStops.get(key);
-                    if (active.closed || activeProfiles.get(key) !== active) {
-                        return structuredClone(active.finalTrafficAttribution ?? null);
-                    }
-                    if (!active.trafficRecorder) return null;
-                    assertProfileOwner(active);
-                    return active.trafficRecorder.flushSummary({ nativeLogsClosed: false });
-                }
-            });
-            profileContexts.set(context, location);
-            activeProfiles.set(key, active);
+            const lifecycle = profileLifecycle(active);
+            active.view = attachSessionCompatibility(session, lifecycle);
+            signal?.throwIfAborted();
+            if (attempt.beforeReady) await attempt.beforeReady(active.view);
+            signal?.throwIfAborted();
 
             logger.info('Camoufox profile started', {
                 profileId,
@@ -1563,9 +1694,13 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
                 useSharedBrowser
             });
 
+            profileContexts.set(context, location);
+            activeProfiles.set(key, active);
+            attempt.lifecycle = lifecycle;
+            if (creation) creation.session = active;
             return active.view;
         } catch (error) {
-            const failed = {
+            const failed = openedSession ?? {
                 profileId,
                 location,
                 browser,
@@ -1574,25 +1709,34 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
                 hasClosedContext,
                 securityGuards,
                 recording: trafficRecorder,
+                confirmRecordingClosed,
                 harTemporaryDir,
                 storageInfo: initializedStorage,
                 lease,
-                identity,
-                startFailed: true
+                identity
             };
-            if (await closeNativeProfile(failed)) {
-                try {
-                    await cleanClosedProfile(failed);
-                    releaseProfileLease(lease);
-                } catch (cleanupError) {
-                    activeProfiles.set(key, failed);
-                    logger.warn('Could not finish failed Camoufox profile startup cleanup', {
-                        profileId,
-                        error: redactDiagnosticText(cleanupError.message)
-                    });
+            failed.startFailed = true;
+            failed.stopRequested = true;
+            failed.ownsBrowser ||= takeIdleSharedBrowser(browser, key);
+            let released = false;
+            try {
+                if (await closeNativeProfile(failed)) {
+                    const finalized = await cleanClosedProfile(failed);
+                    if (finalized || failed.cleanupAbandoned) {
+                        releaseProfileLease(lease);
+                        released = true;
+                    }
                 }
-            } else {
+            } catch (cleanupError) {
+                logger.warn('Could not finish failed Camoufox profile startup cleanup', {
+                    profileId,
+                    error: redactDiagnosticText(cleanupError.message)
+                });
+            }
+            if (!released) {
                 activeProfiles.set(key, failed);
+                attempt.lifecycle = profileLifecycle(failed);
+                if (creation) creation.session = failed;
             }
             logger.error('Error starting Camoufox profile', {
                 profileId,
@@ -1617,20 +1761,53 @@ export async function stopProfile(profileId, options = {}) {
     return stopProfileAt(locateProfile(profileId, options.profilesDir || DEFAULT_PROFILES_DIR));
 }
 
-function hasNativeRecording(session) {
-    return Boolean(session.recording?.sslKeyLogPath || session.recording?.neckoMozLogPath);
-}
-
-async function finalizeProfileRecording(session, nativeLogsClosed) {
+async function finalizeProfileRecording(session) {
+    if (!session.closed) throw new Error('Camoufox has not confirmed browser closure');
     if (session.identity) assertProfileOwner(session);
-    const summary = session.recordingFinalized
-        ? await session.recording.flushSummary({ nativeLogsClosed })
-        : await session.recording.stop({ nativeLogsClosed });
-    if (!session.recordingFinalized && session.harPath) {
-        session.recording.exportHar(session.harPath, { recordBodies: session.harBodies });
+    const summary = await session.recording.stop({ nativeLogsClosed: true });
+    if (session.harPath) {
+        try {
+            session.recording.exportHar(session.harPath, { recordBodies: session.harBodies });
+        } catch (cause) {
+            throw Object.assign(new Error('Camoufox HAR archive was not published. Capture preserved for retry.', {
+                cause
+            }), { code: 'ERR_CAMOUFOX_HAR_EXPORT_PENDING' });
+        }
     }
     session.recordingFinalized = true;
-    if (nativeLogsClosed) session.finalTrafficAttribution = structuredClone(summary);
+    session.harExportPending = false;
+    session.finalTrafficAttribution = structuredClone(summary);
+}
+
+function saveFinalProfileSnapshot(session) {
+    if (session.startFailed) return;
+    session.closingSnapshot ??= (async () => {
+        await pendingProfileSaves.get(session.location.key)?.promise.catch(() => {});
+        try {
+            if (session.contextClosed || session.hasClosedContext()) {
+                throw new Error('Camoufox context closed before the final storage snapshot');
+            }
+            await persistProfileStorageState(session);
+        } catch (error) {
+            logger.warn('Could not save storage state before closing profile', {
+                profileId: session.profileId,
+                error: redactDiagnosticText(error?.message ?? String(error))
+            });
+            return { error };
+        }
+    })();
+    return session.closingSnapshot;
+}
+
+async function closeProfileContext(session, close) {
+    const snapshot = await saveFinalProfileSnapshot(session);
+    try {
+        await close();
+    } catch (error) {
+        if (!session.hasClosedContext()) session.closingSnapshot = null;
+        throw error;
+    }
+    if (snapshot) throw snapshot.error;
 }
 
 async function closeNativeProfile(session) {
@@ -1653,6 +1830,7 @@ async function closeNativeProfile(session) {
 
     session.browserClosed ||= !session.ownsBrowser || !browser || browser.isConnected?.() === false;
     if (!session.browserClosed) {
+        if (!session.contextClosed) await saveFinalProfileSnapshot(session);
         try {
             await browser.close();
             session.browserClosed = true;
@@ -1667,11 +1845,14 @@ async function closeNativeProfile(session) {
         }
         session.contextClosed ||= session.browserClosed;
     }
+    if (!session.contextClosed) session.closingSnapshot = null;
     return session.contextClosed && session.browserClosed;
 }
 
 async function cleanClosedProfile(session) {
     session.closed = true;
+    session.harExportPending = Boolean(session.harPath && !session.recordingFinalized);
+    session.confirmRecordingClosed?.();
     const { profileId } = session;
     if (session.securityGuards) {
         try {
@@ -1685,21 +1866,27 @@ async function cleanClosedProfile(session) {
         session.securityGuards = null;
     }
 
-    let finalized = true;
     try {
         if (session.storageInfo) {
             assertProfileOwner(session);
             restrictNativeLogs(session.storageInfo);
         }
-        if (session.recording && (!session.recordingFinalized || hasNativeRecording(session))) {
-            await finalizeProfileRecording(session, true);
+        if (session.recording && !session.recordingFinalized) {
+            await finalizeProfileRecording(session);
         }
     } catch (error) {
-        finalized = false;
-        logger.warn('Could not finalize Camoufox profile files', {
+        if (error.code === 'ERR_CAMOUFOX_PROFILE_STALE' ||
+            session.recording?.ledgerWriteError || session.recording?.wireWriteError) {
+            await session.recording?.abandon();
+            session.cleanupAbandoned = true;
+        }
+        const message = error.code === 'ERR_CAMOUFOX_HAR_EXPORT_PENDING' ? error.message :
+            'Could not finalize Camoufox profile files';
+        logger.warn(message, {
             profileId,
             error: redactDiagnosticText(error.message)
         });
+        return false;
     }
     if (session.harTemporaryDir) {
         try {
@@ -1707,14 +1894,14 @@ async function cleanClosedProfile(session) {
             removeHarTemporaryDir(session.harTemporaryDir);
             session.harTemporaryDir = null;
         } catch (error) {
-            finalized = false;
-            logger.warn('Could not verify temporary Camoufox HAR data ownership', {
+            logger.warn('Could not remove temporary Camoufox HAR data', {
                 profileId,
                 error: redactDiagnosticText(error.message)
             });
+            return false;
         }
     }
-    return finalized;
+    return true;
 }
 
 function matchesProfileSession(session) {
@@ -1752,21 +1939,11 @@ function stopProfileAt(location, expected = null) {
     const stopPromise = (async () => {
         await Promise.allSettled([pendingProfileStarts.get(key)?.promise, pendingProfileSaves.get(key)?.promise]);
         const session = activeProfiles.get(key);
-        if (!session) return !expected;
+        if (!session) return expected ? false : recoverPendingHar(location);
         if (expected && (session !== expected || !matchesProfileSession(session))) return false;
 
-        if (!session.startFailed && !session.contextClosed && !session.hasClosedContext()) {
-            try {
-                await persistProfileStorageState(session);
-                session.storageSaved = true;
-            } catch (error) {
-                session.storageSaved = false;
-                logger.warn('Could not save storage state before stopping profile', {
-                    profileId,
-                    error: redactDiagnosticText(error.message)
-                });
-            }
-        }
+        session.stopRequested = true;
+        await saveFinalProfileSnapshot(session);
         if (session.fingerprintLedger && !session.contextClosed) {
             try {
                 assertProfileOwner(session);
@@ -1778,22 +1955,13 @@ function stopProfileAt(location, expected = null) {
                 });
             }
         }
-        if (session.recording && !session.recordingFinalized) {
-            try {
-                await finalizeProfileRecording(session, !hasNativeRecording(session));
-            } catch (error) {
-                logger.warn('Could not finalize Camoufox traffic recording', {
-                    profileId,
-                    error: redactDiagnosticText(error.message)
-                });
-            }
-        }
-
         if (!(await closeNativeProfile(session))) return false;
         const finalized = await cleanClosedProfile(session);
+        if (!finalized && !session.cleanupAbandoned) return false;
+        const snapshotError = await session.closingSnapshot;
         releaseProfileLease(session.lease);
         activeProfiles.delete(key);
-        session.stopResult = session.storageSaved !== false && finalized;
+        session.stopResult = !snapshotError && finalized;
         if (session.stopResult) logger.info('Camoufox profile stopped', { profileId });
         return session.stopResult;
     })().catch((error) => {
@@ -1812,6 +1980,17 @@ function stopProfileAt(location, expected = null) {
  */
 export async function deleteProfile(profileId, options = {}) {
     return deleteProfileAt(locateProfile(profileId, options.profilesDir || DEFAULT_PROFILES_DIR));
+}
+
+export async function rollbackCreatedProfile(created) {
+    const owner = createdProfileOwners.get(created);
+    if (!owner) return 'delete-unconfirmed';
+    try {
+        await deleteProfileAt(owner.location, owner.session ?? owner);
+        return 'deleted';
+    } catch {
+        return owner.session && !owner.session.closed ? 'stop-unconfirmed' : 'delete-unconfirmed';
+    }
 }
 
 function deleteProfileAt(location, expected = null) {
@@ -1853,8 +2032,13 @@ function deleteProfileAt(location, expected = null) {
                 }
                 return true;
             }
-            assertProfileIdentity(location, expected?.identity ?? checked);
-            fs.rmSync(profileDir, { recursive: true });
+            const deletion = acquireProfileTrafficDeletionLease(profileDir);
+            try {
+                assertProfileIdentity(location, expected?.identity ?? checked);
+                fs.rmSync(profileDir, { recursive: true });
+            } finally {
+                releaseProfileLease(deletion);
+            }
             if (expected) expected.deleted = true;
             logger.info('Camoufox profile deleted', { profileId: location.id, profileDir });
             return true;
@@ -2050,10 +2234,7 @@ export default {
     buildZiniaoWebRtcSecurityInitScript,
     GPU_PERFORMANCE_SPEC_CATALOG,
     lookupGpuPerformanceSpec,
-    collectHostMacPerformanceBaseline,
     computeGpuPerformanceScalingWeights,
     scaleGpuExecutionDurationMs,
-    buildGpuPerformanceInitScript,
-    attachGpuPerformanceScalerToContext,
     validateGpuPerformanceScalingCoherence
 };

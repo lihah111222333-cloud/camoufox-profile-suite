@@ -16,18 +16,33 @@ function parseCount(value, source) {
     throw error;
 }
 
-export function parseRunCounts(args, env = process.env) {
+export function parseRunCountOptions(args) {
     let accountsCount;
     let threadsCount;
     for (const arg of args) {
         const separator = arg.indexOf('=');
         const name = separator === -1 ? arg : arg.slice(0, separator);
         const value = separator === -1 ? undefined : arg.slice(separator + 1);
-        if (name === '--accounts' || name === '-a') accountsCount = parseAccountCount(value, name);
-        if (name === '--threads' || name === '-t') threadsCount = parseThreadCount(value, name);
+        if (name === '--accounts' || name === '-a') {
+            accountsCount = parseAccountCount(value, name);
+        } else if (name === '--threads' || name === '-t') {
+            threadsCount = parseThreadCount(value, name);
+        } else {
+            const error = new Error('Unknown command-line argument. See --help for usage.');
+            error.code = 'INVALID_CLI_ARGUMENT';
+            throw error;
+        }
     }
+    return { accountsCount, threadsCount };
+}
+
+export function resolveRunCounts({ accountsCount, threadsCount }, env = process.env) {
     return {
         accountsCount: accountsCount ?? parseAccountCount(env.ACCOUNTS_COUNT ?? '1'),
         threadsCount: threadsCount ?? parseThreadCount(env.THREADS_COUNT ?? '1')
     };
+}
+
+export function parseRunCounts(args, env = process.env) {
+    return resolveRunCounts(parseRunCountOptions(args), env);
 }

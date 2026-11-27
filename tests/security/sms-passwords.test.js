@@ -128,7 +128,7 @@ test('SMS Verify drops provider bodies and transport details from errors', async
         [smsVerify.getSmsVerifyBalance, /HTTP 503/],
         [smsVerify.buySmsVerifyNumber, /Price too low/],
         [smsVerify.buySmsVerifyNumberV2, /Price too low/],
-        [smsVerify.buySmsVerifyNumber, /Unexpected response/],
+        [smsVerify.buySmsVerifyNumber, /purchase is unconfirmed/],
         [smsVerify.getSmsVerifyBalance, /request failed/]
     ]) {
         await assert.rejects(operation(), error => {

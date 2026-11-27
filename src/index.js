@@ -9,15 +9,19 @@
 import {
     appendAccountResult, migrateExistingAccountOutputs, recordAccountCleanup, writeRunSummary
 } from './utils/account-results.js';
-import { parseRunCounts } from './utils/cli-counts.js';
-import { ensureStateDirectory, LEGACY_DIRECTORY, STATE_DIRECTORY } from './utils/state-paths.js';
+import { parseRunCountOptions, resolveRunCounts } from './utils/cli-counts.js';
+import { requireControllerProfileId } from './utils/controller-id.js';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { setImmediate } from 'node:timers/promises';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 
-const RESULTS_FILE = path.join(STATE_DIRECTORY, 'results.json');
-const SUMMARY_FILE = path.join(STATE_DIRECTORY, 'summary.json');
+const PROFILE_TYPES = new Set(['Camoufox', 'Dolphin Anty', 'GPM Login']);
+const UNCONFIRMED_CLEANUP = new Set([
+    'allocation-unconfirmed', 'stop-unconfirmed', 'delete-unconfirmed', 'recycle-unconfirmed'
+]);
+const MANUAL_SIGNUP_REQUIRED = 'MANUAL_SIGNUP_REQUIRED';
 
 function accountOutputDiagnostic(error) {
     if (error?.code === 'ACCOUNT_OUTPUT_INVALID_DATA' || error?.code === 'ACCOUNT_OUTPUT_LOCK_FAILED') {
@@ -26,10 +30,14 @@ function accountOutputDiagnostic(error) {
     return '';
 }
 
-function prepareAccountOutputs() {
+async function prepareAccountOutputs(signal) {
+    const { ensureStateDirectory, LEGACY_DIRECTORY, STATE_DIRECTORY } = await import('./utils/state-paths.js');
+    signal?.throwIfAborted();
+    const resultsFile = path.join(STATE_DIRECTORY, 'results.json');
+    const summaryFile = path.join(STATE_DIRECTORY, 'summary.json');
     try {
         ensureStateDirectory();
-        migrateExistingAccountOutputs(RESULTS_FILE, SUMMARY_FILE, { legacyDirectory: LEGACY_DIRECTORY });
+        migrateExistingAccountOutputs(resultsFile, summaryFile, { legacyDirectory: LEGACY_DIRECTORY });
     } catch (error) {
         const details = error instanceof AggregateError
             ? error.errors.map(accountOutputDiagnostic).join('')
@@ -38,18 +46,53 @@ function prepareAccountOutputs() {
             'Could not prepare results.json or summary.json in the application state directory.' + details, error
         );
     }
+    return { resultsFile, summaryFile };
 }
 
 class AccountOutputWriteError extends Error {
+    #outputMessage;
+
     constructor(message, cause) {
         super(message, { cause });
+        this.#outputMessage = message;
         this.code = 'ACCOUNT_OUTPUT_WRITE_FAILED';
+        this.unconfirmedProfiles = [];
+    }
+
+    addUnconfirmedProfiles(outcomes) {
+        for (const { profileId, profileType, profileCleanup } of outcomes) {
+            if (!UNCONFIRMED_CLEANUP.has(profileCleanup)) continue;
+            const report = {
+                profileType: PROFILE_TYPES.has(profileType) ? profileType : 'Profile',
+                profileCleanup
+            };
+            try {
+                report.profileId = requireControllerProfileId(profileId);
+            } catch {
+                // Preserve the cleanup status when no printable profile ID is available.
+            }
+            this.unconfirmedProfiles.push(report);
+        }
+        if (this.unconfirmedProfiles.length) {
+            const details = new Set(this.unconfirmedProfiles.map(({ profileId, profileType, profileCleanup }) =>
+                `${profileType} ${profileId ?? '(profile ID unavailable)'} (${profileCleanup})`));
+            this.message = `${this.#outputMessage} Managed profile cleanup is unconfirmed. ${[...details].join(', ')}.`;
+        }
     }
 }
 
-async function loadRuntime(config) {
+async function loadRuntime(config, resultsFile) {
     const { default: proxyManager } = await import('./utils/proxy-manager.js');
-    if (config.profileService === 'camoufox' && config.app?.testProxy === false && !proxyManager.proxies.length) {
+    const directConnection = proxyManager.proxies.length === 0;
+    if (directConnection) {
+        const supportsDirectConnection = config.profileService === 'camoufox' &&
+            config.camoufox.portScanProtectionMode === 'url-only';
+        if (!supportsDirectConnection || config.app.allowDirectConnection !== true) {
+            const hint = supportsDirectConnection ? ' To allow direct Camoufox use, set CAMOUFOX_ALLOW_DIRECT=true.' : '';
+            throw Object.assign(new Error('No proxies available. Add a proxy to config/proxies.txt.' + hint), {
+                code: 'PROXY_CONFIGURATION_ERROR'
+            });
+        }
         proxyManager.rejectUnselectedLegacyInventory();
     }
     const [
@@ -61,24 +104,24 @@ async function loadRuntime(config) {
         import('./utils/name-generator.js'),
         import('./gmail/creator.js')
     ]);
-    return { config, logger, proxyManager, nameGenerator, createGmailAccount };
+    return { config, resultsFile, logger, proxyManager, nameGenerator, createGmailAccount, directConnection };
 }
 
 /**
  * Save account result
  * حفظ نتيجة الحساب
  */
-function saveResult(result, logger) {
+function saveResult(resultsFile, result, logger) {
     let saved;
     try {
-        saved = appendAccountResult(RESULTS_FILE, result);
+        saved = appendAccountResult(resultsFile, result);
     } catch (error) {
         const message = result.success
             ? 'An account was created and its result could not be saved safely in results.json.'
-            : 'A failed account attempt could not be saved safely in results.json.';
+            : 'The account attempt outcome could not be saved safely in results.json.';
         throw new AccountOutputWriteError(message + accountOutputDiagnostic(error), error);
     }
-    logger.info('Result saved', { email: saved.email });
+    logger.info('Result saved');
     return saved;
 }
 
@@ -88,14 +131,14 @@ function saveResult(result, logger) {
  */
 async function createAccount(accountNumber = null) {
     const { default: config } = await import('./config.js');
-    prepareAccountOutputs();
-    const { result, failure } = await createAccountWithRuntime(await loadRuntime(config), accountNumber);
+    const { resultsFile } = await prepareAccountOutputs();
+    const { result, failure } = await createAccountWithRuntime(await loadRuntime(config, resultsFile), accountNumber);
     if (!result.success) throw failure;
     return result;
 }
 
 async function createAccountWithRuntime(runtime, accountNumber, { signal, activeStops } = {}) {
-    const { config, logger, proxyManager, nameGenerator, createGmailAccount } = runtime;
+    const { config, resultsFile, logger, proxyManager, nameGenerator, createGmailAccount, directConnection } = runtime;
     const profileService = config.profileService || 'gpm';
     const serviceName = profileService === 'camoufox'
         ? 'Camoufox'
@@ -107,18 +150,29 @@ async function createAccountWithRuntime(runtime, accountNumber, { signal, active
     let failure;
     let profileCleanup;
     let stopping;
+    let outputWriteError;
+    const saveOutcome = outcome => {
+        try {
+            return saveResult(resultsFile, outcome, logger);
+        } catch (error) {
+            if (error instanceof AccountOutputWriteError) outputWriteError = error;
+            throw error;
+        }
+    };
     const stop = () => {
         stopping ??= (async () => {
-            const details = { profileId: profile.profileId, profileType: serviceName };
             try {
                 if (await profile.stop() === true) {
-                    logger.info(`${accountLabel} Profile stopped`, details);
+                    logger.info(`${accountLabel} Profile stopped`, { profileType: serviceName });
                     return 'stopped';
                 }
             } catch {
                 // A thrown stop failure is also unconfirmed.
             }
-            logger.warn(`${accountLabel} Profile shutdown unconfirmed`, details);
+            logger.warn(`${accountLabel} Profile shutdown unconfirmed`, {
+                profileId: profile.profileId,
+                profileType: serviceName
+            });
             return 'stop-unconfirmed';
         })();
         return stopping;
@@ -130,29 +184,21 @@ async function createAccountWithRuntime(runtime, accountNumber, { signal, active
 
         // Step 1: Get proxy
         proxy = proxyManager.getNextProxy();
-        if (!proxy) {
-            if (profileService === 'camoufox' && config.app?.testProxy === false) {
-                logger.warn(`${accountLabel} No proxies configured; proceeding with direct connection (TEST_PROXY=false)`);
-            } else {
-                throw new Error('No proxies available');
-            }
-        } else {
+        if (proxy) {
             logger.info(`${accountLabel} Proxy selected`);
+        } else if (directConnection) {
+            logger.warn(`${accountLabel} No proxies configured. Proceeding with the explicitly allowed direct connection.`);
+        } else {
+            throw new Error('No proxies available');
         }
 
         // Step 2: Generate account data
         const accountData = nameGenerator.generateAccountData();
-        logger.info(`${accountLabel} Account data generated`, { 
-            name: accountData.fullName,
-            email: accountData.email
-        });
 
         // Step 3: Create profile based on selected service
-        const profileName = profileService === 'camoufox'
-            ? `Gmail_${randomUUID()}`
-            : `Gmail_${accountData.username}_${Date.now()}`;
+        const profileName = `Gmail_${randomUUID()}`;
         
-        logger.info(`${accountLabel} Creating ${profileService.toUpperCase()} profile`, { name: profileName });
+        logger.info(`${accountLabel} Creating ${serviceName} profile`);
         
         // Format proxy according to service
         signal?.throwIfAborted();
@@ -161,6 +207,7 @@ async function createAccountWithRuntime(runtime, accountNumber, { signal, active
             signal?.throwIfAborted();
             const camoufoxProxy = proxy ? proxyManager.getCamoufoxFormat(proxy) : null;
             profile = await createAndStartCamoufoxProfile(profileName, camoufoxProxy, {
+                signal,
                 os: config.camoufox?.os,
                 presetId: config.camoufox?.presetId,
                 country: config.camoufox?.country,
@@ -174,12 +221,10 @@ async function createAccountWithRuntime(runtime, accountNumber, { signal, active
                     enabled: config.camoufox?.enablePortScanProtection
                 },
                 allowedLocalPorts: config.camoufox?.allowedLocalPorts,
-                enableGpuPerformanceScaling: config.camoufox?.enableGpuPerformanceScaling,
                 canvasSkipHosts: config.camoufox?.canvasSkipHosts,
                 maxHammingDistance: config.camoufox?.maxHammingDistance,
                 profilesDir: config.camoufox?.storageDir,
                 accountId: accountNumber,
-                accountEmail: accountData.email,
                 recordTraffic: config.camoufox?.recordTraffic,
                 recordBodies: config.camoufox?.recordBodies,
                 recordWireLog: config.camoufox?.recordWireLog,
@@ -200,7 +245,7 @@ async function createAccountWithRuntime(runtime, accountNumber, { signal, active
                 password: proxy.password || '',
                 type: proxy.type || 'http'
             } : null;
-            profile = await createAndStartDolphinProfile(profileName, dolphinProxy);
+            profile = await createAndStartDolphinProfile(profileName, dolphinProxy, { signal });
         } else {
             // Lazy-load GPM Login profile module only when selected
             const { createAndStartProfile: createAndStartGPMProfile } = await import('./gpmlogin/profile.js');
@@ -212,25 +257,13 @@ async function createAccountWithRuntime(runtime, accountNumber, { signal, active
                 password: proxy.password || '',
                 type: proxy.type || 'http'
             } : null;
-            profile = await createAndStartGPMProfile(profileName, gpmProxy);
+            profile = await createAndStartGPMProfile(profileName, gpmProxy, { signal });
         }
 
         activeStops?.add(stop);
         signal?.throwIfAborted();
 
-        const camoufoxTelemetry =
-            typeof profile?.getTelemetrySummary === 'function' ? profile.getTelemetrySummary() : null;
-        logger.info(`${accountLabel} Profile created and started`, {
-            profileId: profile.profileId,
-            ...(camoufoxTelemetry
-                ? {
-                      presetId: camoufoxTelemetry.presetId,
-                      deviceModel: camoufoxTelemetry.deviceModel,
-                      os: camoufoxTelemetry.os,
-                      gpuPerformance: camoufoxTelemetry.gpuPerformance
-                  }
-                : {})
-        });
+        logger.info(`${accountLabel} Profile created and started`, { profileType: serviceName });
 
         // Step 4: Get browser and page
         const browser = await profile.getBrowser();
@@ -247,83 +280,64 @@ async function createAccountWithRuntime(runtime, accountNumber, { signal, active
         if (typeof profile.setTrafficStep === 'function') {
             profile.setTrafficStep('signup-flow');
         }
-        const result = await createGmailAccount(page, accountData, { profile });
-        if (result?.email && typeof profile.updateTrafficAttribution === 'function') {
-            profile.updateTrafficAttribution({ accountEmail: result.email });
-        }
-
-        // Step 6: Get profile IP (if available)
-        let profileIP = null;
-        try {
-            if (!signal?.aborted) {
-                if (typeof profile.setTrafficStep === 'function') {
-                    profile.setTrafficStep('ip-check');
-                }
-                profileIP = await page.evaluate(() => {
-                    return new Promise((resolve) => {
-                        fetch('https://api.ipify.org?format=json')
-                            .then(r => r.json())
-                            .then(data => resolve(data.ip))
-                            .catch(() => resolve(null));
-                    });
-                });
-            }
-        } catch (ipError) {
-            logger.debug('Could not get profile IP', { error: ipError.message });
-        }
+        signal?.throwIfAborted();
+        const result = await createGmailAccount(page, accountData, { profile, signal });
 
         const finalCamoufoxTelemetry =
             typeof profile?.getTelemetrySummary === 'function' ? profile.getTelemetrySummary() : null;
 
-        // Step 7: Save account outcome
-        savedResult = saveResult({
+        // Save account outcome before attempting cleanup.
+        savedResult = saveOutcome({
             ...result,
             success: true,
             profileId: profile.profileId,
             profileType: serviceName,
             profileCleanup: 'pending',
             proxyIP: proxy ? proxy.ip : null,
-            profileIP: profileIP,
             trafficAttribution: profile.trafficPaths || null,
             ...(finalCamoufoxTelemetry ? { camoufoxTelemetry: finalCamoufoxTelemetry } : {}),
             timestamp: new Date().toISOString()
-        }, logger);
+        });
     } catch (error) {
         if (error instanceof AccountOutputWriteError) throw error;
         failure = error;
-        logger.error(`${accountLabel} === Account Creation Failed ===`, {
-            error: error?.message,
-            stack: error?.stack
-        });
 
         const profileId = profile?.profileId ?? error?.profileId ?? null;
-        savedResult = saveResult({
+        profileCleanup = profile ? 'pending' : error?.profileCleanup;
+        savedResult = saveOutcome({
             success: false,
             errorCode: error?.code,
             errorStage: error?.stage,
             profileId,
-            ...(profileId !== null ? { profileType: serviceName } : {}),
+            ...(profileId !== null || UNCONFIRMED_CLEANUP.has(profileCleanup) ? { profileType: serviceName } : {}),
             trafficAttribution: profile?.trafficPaths || null,
-            profileCleanup: profile ? 'pending' : error?.profileCleanup,
+            profileCleanup,
             timestamp: new Date().toISOString()
-        }, logger);
+        });
     } finally {
         activeStops?.delete(stop);
         if (profile) profileCleanup = await stop();
+        outputWriteError?.addUnconfirmedProfiles([{
+            profileId: profile?.profileId ?? failure?.profileId,
+            profileType: serviceName,
+            profileCleanup
+        }]);
     }
 
     let result = savedResult;
     if (profile) {
         try {
-            result = recordAccountCleanup(RESULTS_FILE, savedResult.resultId, profileCleanup);
+            result = recordAccountCleanup(resultsFile, savedResult.resultId, profileCleanup);
         } catch (error) {
-            throw new AccountOutputWriteError(
+            const writeError = new AccountOutputWriteError(
                 'Could not save profile cleanup in results.json.' + accountOutputDiagnostic(error), error
             );
+            writeError.addUnconfirmedProfiles([{ profileId: profile.profileId, profileType: serviceName, profileCleanup }]);
+            throw writeError;
         }
     }
     if (result.success) {
-        logger.info(`${accountLabel} === Account Creation Completed Successfully ===`, { email: result.email });
+        logger.info(`${accountLabel} === Account Creation Completed Successfully ===`);
     }
     return { result, failure };
 }
@@ -337,35 +351,43 @@ async function processQueue(total, concurrency, createTask, logger, signal) {
     const executing = [];
     let completed = 0;
     let failed = 0;
+    let manual = 0;
     let outputWriteError;
+    const additionalUnconfirmedProfiles = [];
 
     const executeTask = async (index) => {
         try {
-            logger.info(`[Thread ${index + 1}] Starting account creation ${completed + failed + 1}/${total}`);
+            logger.info(`[Thread ${index + 1}] Starting account attempt ${index + 1}/${total}`);
             const { result, failure } = await createTask(index + 1);
             results.push(result);
             if (result.success) {
                 completed++;
                 logger.info(`[Thread ${index + 1}] Account created successfully (${completed} success, ${failed} failed)`);
+            } else if (result.errorCode === MANUAL_SIGNUP_REQUIRED) {
+                manual++;
             } else {
                 failed++;
                 logger.error(`[Thread ${index + 1}] Account creation failed (${completed} success, ${failed} failed)`, {
-                    error: failure?.message
+                    error: failure
                 });
             }
         } catch (error) {
             if (error instanceof AccountOutputWriteError) {
-                outputWriteError ??= error;
+                if (outputWriteError) {
+                    additionalUnconfirmedProfiles.push(...error.unconfirmedProfiles);
+                } else {
+                    outputWriteError = error;
+                }
                 return;
             }
             failed++;
             results.push({
                 success: false,
-                errorCode: error.code,
-                errorStage: error.stage
+                errorCode: error?.code,
+                errorStage: error?.stage
             });
             logger.error(`[Thread ${index + 1}] Account creation failed (${completed} success, ${failed} failed)`, {
-                error: error.message
+                error
             });
         }
     };
@@ -393,6 +415,7 @@ async function processQueue(total, concurrency, createTask, logger, signal) {
     // Wait for all remaining tasks
     await Promise.all(executing);
     if (outputWriteError) {
+        outputWriteError.addUnconfirmedProfiles(results.concat(additionalUnconfirmedProfiles));
         throw outputWriteError;
     }
 
@@ -402,7 +425,8 @@ async function processQueue(total, concurrency, createTask, logger, signal) {
             total,
             completed,
             failed,
-            ...(signal?.aborted ? { skipped: total - completed - failed } : {}),
+            manual,
+            ...(signal?.aborted ? { skipped: total - completed - failed - manual } : {}),
             successRate: ((completed / total) * 100).toFixed(2) + '%'
         }
     };
@@ -412,14 +436,30 @@ async function processQueue(total, concurrency, createTask, logger, signal) {
  * Main function
  * الدالة الرئيسية
  */
-async function main({ signal } = {}) {
+async function main({ signal, failIfAllAttemptsFail = false } = {}) {
     signal?.throwIfAborted();
+    const args = process.argv.slice(2);
+    if (args.length === 1 && (args[0] === '--help' || args[0] === '-h')) {
+        console.log([
+            'Usage: gmail-account-creator [--accounts=N] [--threads=N]',
+            '       gmail-account-creator --help',
+            '       gmail-account-creator --version',
+            '',
+            'Counts can also be set with -a=N and -t=N.'
+        ].join('\n'));
+        return;
+    }
+    if (args.length === 1 && (args[0] === '--version' || args[0] === '-v')) {
+        console.log(JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version);
+        return;
+    }
+    const countOptions = parseRunCountOptions(args);
     const { default: config } = await import('./config.js');
-    const { accountsCount, threadsCount: requestedThreads } = parseRunCounts(process.argv.slice(2));
+    const { accountsCount, threadsCount: requestedThreads } = resolveRunCounts(countOptions);
     const threadsCount = Math.min(requestedThreads, accountsCount);
     signal?.throwIfAborted();
-    prepareAccountOutputs();
-    const runtime = await loadRuntime(config);
+    const { resultsFile, summaryFile } = await prepareAccountOutputs(signal);
+    const runtime = await loadRuntime(config, resultsFile);
     const { logger, proxyManager } = runtime;
     const activeStops = new Set();
     const stopActiveProfiles = () => {
@@ -433,9 +473,7 @@ async function main({ signal } = {}) {
         logger.info('Configuration:', {
             accountsCount,
             threadsCount,
-            hasGpmConnection: true, // GPM runs locally, no API key needed
-            hasOmocaptchaKey: !!process.env.OMOCAPTCHA_KEY,
-            hasSmsVerifyKey: !!process.env.SMS_VERIFY_API_KEY,
+            profileService: config.profileService || 'gpm',
             proxyCount: proxyManager.proxies.length,
             availableProxies: proxyManager.getAvailableCount()
         });
@@ -487,20 +525,29 @@ async function main({ signal } = {}) {
         };
 
         try {
-            writeRunSummary(SUMMARY_FILE, summary);
+            writeRunSummary(summaryFile, summary);
         } catch (error) {
-            throw new AccountOutputWriteError(
+            const writeError = new AccountOutputWriteError(
                 'Run summary could not be saved safely in summary.json.' + accountOutputDiagnostic(error), error
             );
+            writeError.addUnconfirmedProfiles(results);
+            throw writeError;
         }
         logger.info('Summary saved to summary.json');
 
-        if (results.some(({ profileCleanup }) =>
-            profileCleanup === 'stop-unconfirmed' || profileCleanup === 'delete-unconfirmed'
-        )) {
-            const error = new Error('Managed profile cleanup is unconfirmed. See summary.json for profile IDs.');
+        if (results.some(({ profileCleanup }) => UNCONFIRMED_CLEANUP.has(profileCleanup))) {
+            const error = new Error('Managed profile cleanup is unconfirmed. Review summary.json and resolve the reported cleanup before continuing.');
             error.code = 'PROFILE_CLEANUP_UNCONFIRMED';
             throw error;
+        }
+        if (failIfAllAttemptsFail && !signal?.aborted && stats.failed === stats.total) {
+            const error = new Error('All account attempts failed. See summary.json for details.');
+            error.code = 'ACCOUNT_ATTEMPTS_FAILED';
+            throw error;
+        }
+        if (!signal?.aborted && results.some(({ errorCode, profileCleanup }) =>
+            errorCode === MANUAL_SIGNUP_REQUIRED && profileCleanup === 'stopped')) {
+            logger.warn('Continue signup manually in a trusted browser you control.');
         }
         logger.info(signal?.aborted ? '=== Bot execution interrupted ===' : '=== Bot execution completed ===');
     } catch (error) {
@@ -524,11 +571,12 @@ export async function runCli() {
     process.on('SIGTERM', onSigterm);
 
     try {
-        await main({ signal: controller.signal });
+        await main({ signal: controller.signal, failIfAllAttemptsFail: true });
     } catch (error) {
         if (error !== controller.signal.reason) {
             const safeMessage = error instanceof AccountOutputWriteError ||
-                error?.code === 'INVALID_CLI_COUNT' || error?.code === 'PROFILE_CLEANUP_UNCONFIRMED' ||
+                error?.code === 'INVALID_CLI_COUNT' || error?.code === 'INVALID_CLI_ARGUMENT' ||
+                error?.code === 'PROFILE_CLEANUP_UNCONFIRMED' || error?.code === 'ACCOUNT_ATTEMPTS_FAILED' ||
                 error?.code === 'PROXY_CONFIGURATION_ERROR' || error?.code === 'PRIVATE_ENV_CONFIGURATION_ERROR';
             console.error(safeMessage ? error.message : 'The run could not be completed.');
         }

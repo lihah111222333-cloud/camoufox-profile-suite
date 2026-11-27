@@ -1,27 +1,40 @@
-# Create a GitHub Release and attach the npm pack tarball when you push a version tag.
-# Usage: update version in package.json, then:
-#   git tag v1.0.1 && git push origin v1.0.1
+# Publish the same verified npm tarball as a Release asset and to GitHub Packages.
+# Follow the pre-publication checks in GITHUB_SETUP.md before pushing a tag.
 name: Release
 
 on:
   push:
     tags:
       - 'v*'
+  release:
+    types: [published]
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   release:
+    if: github.event_name != 'push' || !github.event.deleted
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@code-root'
+
+      - name: Verify the release tag and source files
+        run: |
+          node scripts/check-distribution.mjs tag "$GITHUB_REF_NAME"
+          node scripts/check-distribution.mjs source "$GITHUB_SHA"
 
       - name: Install dependencies
         run: npm install --package-lock=false --ignore-scripts
@@ -29,17 +42,25 @@ jobs:
       - name: Security tests
         run: npm run test:security
 
-      - name: Create tarball
+      - name: Pack and verify the archive
         id: pack
+        shell: bash
         run: |
-          TGZ=$(npm pack --json | node -p 'JSON.parse(require("node:fs").readFileSync(0, "utf8"))[0].filename')
-          echo "package=$TGZ" >> "$GITHUB_OUTPUT"
-          echo "Created $TGZ"
+          TGZ=$(npm pack --json | node scripts/check-distribution.mjs archive)
+          printf 'package=%s\n' "$TGZ" >> "$GITHUB_OUTPUT"
 
       - name: Publish GitHub Release
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}
           files: ${{ steps.pack.outputs.package }}
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to GitHub Packages
+        run: npm publish "./$PACKAGE_ARCHIVE"
+        env:
+          PACKAGE_ARCHIVE: ${{ steps.pack.outputs.package }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

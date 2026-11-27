@@ -16,7 +16,15 @@ import {
     validateControllerEndpoint
 } from '../utils/controller-url.js';
 import { requireControllerProfileId } from '../utils/controller-id.js';
-import { controllerErrorDetails, controllerRejected, sendControllerRequest } from '../utils/controller-request.js';
+import {
+    controllerAcknowledged,
+    controllerErrorDetails,
+    controllerRejected,
+    parseControllerPayload,
+    requireCreatedProfileId,
+    sendControllerProfileCreate,
+    sendControllerRequest
+} from '../utils/controller-request.js';
 import { requireProxyProtocol } from '../utils/proxy-protocol.js';
 
 const DOLPHIN_API_URL = config.dolphin.apiUrl;
@@ -44,10 +52,11 @@ function dolphinErrorCode(data) {
     if (code === 50200 || code === '50200') return '50200';
 }
 
-function dolphinPost(operation, path, body, timeout, authorization) {
+function dolphinPost(operation, path, body, timeout, { authorization, allocatesProfile = false } = {}) {
     const url = controllerApiUrl(DOLPHIN_API_URL, path, 'DOLPHIN_TRUSTED_HTTP_API_URL');
     const auth = authorization ?? getAuthHeader();
-    return sendControllerRequest(operation, () => controllerClient.post(url, body, {
+    const send = allocatesProfile ? sendControllerProfileCreate : sendControllerRequest;
+    return send(operation, () => controllerClient.post(url, body, {
         headers: { Authorization: auth, 'Content-Type': 'application/json' },
         timeout
     }), dolphinErrorCode);
@@ -68,7 +77,13 @@ function readJsonResponse(data, operation) {
  */
 export async function checkDolphinConnection() {
     try {
-        await dolphinPost('Dolphin Anty API connection check', '/api/profile/getProfiles', { page: 1, pageSize: 1 }, 5000);
+        const response = await dolphinPost('Dolphin Anty API connection check', '/api/profile/getProfiles',
+            { page: 1, pageSize: 1 }, 5000);
+        const data = parseControllerPayload(response.data);
+        if (response.status !== 200 || data?.success === false || !Array.isArray(data?.list)) {
+            logger.error('Dolphin Anty API connection check did not return a profile list');
+            return false;
+        }
         logger.info('Dolphin Anty API is connected and responding');
         return true;
     } catch (error) {
@@ -291,11 +306,12 @@ export async function createProfile(profileName, proxy = null) {
 
         const operation = 'Dolphin Anty API create profile';
         logger.info('Creating Dolphin Anty profile', { name: finalName, hasProxy: !!proxyObj });
-        const response = await dolphinPost(operation, '/api/profile/advancedCreateProfile', requestBody, 30000);
-        const data = readJsonResponse(response.data, operation);
-        if (data?.success === false) throw new Error('Dolphin Anty API rejected profile creation');
+        const response = await dolphinPost(operation, '/api/profile/advancedCreateProfile', requestBody, 30000,
+            { allocatesProfile: true });
+        const data = parseControllerPayload(response.data);
+        if (data === false || data?.success === false) throw new Error('Dolphin Anty API rejected profile creation');
 
-        const id = requireControllerProfileId(data?.id);
+        const id = requireCreatedProfileId(data?.id);
         logger.info('Dolphin Anty profile created successfully', { name: finalName });
         return { id, profileId: id, title: data.title || finalName, userAgent };
     } catch (error) {
@@ -337,7 +353,7 @@ export async function stopProfile(profileId) {
     try {
         const response = await dolphinPost('Dolphin Anty API stop profile', '/api/browser/closeProfiles',
             { profileIds: [requireControllerProfileId(profileId)] }, 10000);
-        if ((response.status !== 200 && response.status !== 204) || controllerRejected(response.data)) {
+        if (!controllerAcknowledged(response)) {
             logger.warn('Dolphin Anty API did not confirm profile closure');
             return false;
         }
@@ -350,22 +366,26 @@ export async function stopProfile(profileId) {
 }
 
 /**
- * Delete a profile by ID
- * حذف بروفايل بالمعرف
+ * Move a profile to the recycle bin.
  */
-export async function deleteProfile(profileId) {
+export async function recycleProfile(profileId) {
     try {
-        const response = await dolphinPost('Dolphin Anty API delete profile', '/api/profile/delete',
-            { profileIds: [requireControllerProfileId(profileId)] }, 10000);
-        if ((response.status !== 200 && response.status !== 204) || controllerRejected(response.data)) {
-            throw new Error('Dolphin Anty API did not confirm profile deletion');
+        const id = String(requireControllerProfileId(profileId));
+        const response = await dolphinPost('Dolphin Anty API recycle profile', '/api/profile/moveProfiletoRecycle',
+            { ids: [id] }, 10000);
+        if (response.status !== 200 || !controllerAcknowledged(response)) {
+            throw new Error('Dolphin Anty API did not confirm profile recycling');
         }
-        logger.info('Dolphin Anty profile deleted successfully');
+        logger.info('Dolphin Anty profile moved to the recycle bin');
         return true;
     } catch (error) {
-        logger.error('Dolphin Anty API delete profile failed', controllerErrorDetails(error));
+        logger.error('Dolphin Anty API recycle profile failed', controllerErrorDetails(error));
         throw error;
     }
+}
+
+export async function deleteProfile() {
+    throw new Error('Permanent Dolphin Anty profile deletion is unavailable through the documented controller API');
 }
 
 /**
@@ -427,7 +447,7 @@ export async function updateProfileProxy(profileIds, proxy) {
 export async function getFolderList(page = 1, pageSize = 100) {
     const operation = 'Dolphin Anty API list folders';
     const auth = getAuthHeader();
-    const request = authorization => dolphinPost(operation, '/api/folder/list', { page, pageSize }, 10000, authorization);
+    const request = authorization => dolphinPost(operation, '/api/folder/list', { page, pageSize }, 10000, { authorization });
     let response;
     try {
         response = await request(auth);
@@ -536,6 +556,7 @@ export default {
     createProfile,
     startProfile,
     stopProfile,
+    recycleProfile,
     deleteProfile,
     getProfile,
     updateProfileProxy,

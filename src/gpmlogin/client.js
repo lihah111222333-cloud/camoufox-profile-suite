@@ -12,8 +12,17 @@ import {
     parseControllerUrl,
     validateControllerEndpoint
 } from '../utils/controller-url.js';
-import { profileIdPathComponent, requireControllerProfileId } from '../utils/controller-id.js';
-import { controllerErrorDetails, controllerRejected, sendControllerRequest } from '../utils/controller-request.js';
+import { profileIdPathComponent } from '../utils/controller-id.js';
+import {
+    controllerAcknowledged,
+    controllerErrorDetails,
+    controllerRejected,
+    parseControllerPayload,
+    profileAllocationUnconfirmed,
+    requireCreatedProfileId,
+    sendControllerProfileCreate,
+    sendControllerRequest
+} from '../utils/controller-request.js';
 import { requireProxyProtocol } from '../utils/proxy-protocol.js';
 
 const GPM_API_URL = config.gpmlogin.apiUrl;
@@ -23,9 +32,22 @@ function gpmApiUrl(path) {
     return controllerApiUrl(GPM_API_URL, path, 'GPM_TRUSTED_HTTP_API_URL');
 }
 
+function gpmMissingProfileCode(data) {
+    const payload = parseControllerPayload(data);
+    const message = payload?.message;
+    if (payload?.success === false && typeof message === 'string' &&
+        /^profile (?:is )?not found\.?$/i.test(message.trim())) {
+        return 'PROFILE_NOT_FOUND';
+    }
+}
+
 function gpmStopCode(data) {
-    const message = data?.message;
-    if (typeof message === 'string' && /^(?:profile (?:is )?)?(?:not found|already stopped|not running)\.?$/i.test(message.trim())) {
+    const payload = parseControllerPayload(data);
+    const missing = gpmMissingProfileCode(payload);
+    if (missing) return missing;
+    const message = payload?.message;
+    if (payload?.success !== true && typeof message === 'string' &&
+        /^(?:(?:profile (?:is )?)?already stopped|profile (?:is )?not running)\.?$/i.test(message.trim())) {
         return 'PROFILE_ALREADY_STOPPED';
     }
 }
@@ -241,7 +263,13 @@ export function generateAndroidFingerprint() {
 export async function checkGPMConnection() {
     try {
         const url = gpmApiUrl('/api/v3/profiles');
-        await sendControllerRequest('GPM API connection check', () => controllerClient.get(url, { timeout: 5000 }));
+        const response = await sendControllerRequest('GPM API connection check', () =>
+            controllerClient.get(url, { timeout: 5000 })
+        );
+        const payload = parseControllerPayload(response.data);
+        if (payload?.success !== true || !Array.isArray(payload.data)) {
+            throw new Error('GPM API did not return a successful profile list');
+        }
         logger.info('GPM API is connected and responding');
         return true;
     } catch (error) {
@@ -317,9 +345,9 @@ export async function createProfile(profileName, proxy = null) {
             }
         });
         
-        // Add OMO Captcha extension
-        const OMOCAPTCHA_EXTENSION_ID = 'dfjghhjachoacpgpkmbpdlpppeagojhe';
-        requestBody.extension_ids = [OMOCAPTCHA_EXTENSION_ID];
+        if (config.omocaptcha.enabled) {
+            requestBody.extension_ids = [config.omocaptcha.extensionId];
+        }
         
         // GPM's raw proxy format here only represents HTTP and SOCKS5.
         if (proxy) {
@@ -350,7 +378,7 @@ export async function createProfile(profileName, proxy = null) {
         logger.info('Creating GPM profile', { name: finalName, userAgent: userAgent.substring(0, 50) + '...' });
         
         const url = gpmApiUrl('/api/v3/profiles/create');
-        const response = await sendControllerRequest('GPM API create profile', () =>
+        const response = await sendControllerProfileCreate('GPM API create profile', () =>
             controllerClient.post(url, requestBody, {
                 headers: {
                     'Content-Type': 'application/json',
@@ -360,21 +388,17 @@ export async function createProfile(profileName, proxy = null) {
             })
         );
 
-        let responseData = response.data;
-        if (typeof responseData === 'string') {
-            try {
-                responseData = JSON.parse(responseData);
-            } catch {
-                throw new Error('GPM API returned invalid JSON while creating a profile');
-            }
+        const responseData = parseControllerPayload(response.data);
+        if (typeof response.data === 'string' && responseData === undefined) {
+            throw profileAllocationUnconfirmed(new Error('GPM API returned invalid JSON while creating a profile'));
         }
 
-        if (responseData?.success === false) {
+        if (controllerRejected(responseData)) {
             throw new Error('GPM API rejected profile creation');
         }
 
-        const profile = responseData?.data || responseData;
-        const id = requireControllerProfileId(profile?.id);
+        const profile = responseData?.data ?? responseData;
+        const id = requireCreatedProfileId(profile?.id);
         return { ...profile, id, userAgent };
     } catch (error) {
         logger.error('GPM API create profile failed', controllerErrorDetails(error));
@@ -415,17 +439,18 @@ export async function startProfile(profileId, options = {}) {
             controllerClient.get(url, { timeout: 30000 })
         );
         
-        if (response.data) {
-            const data = response.data.data || response.data;
-            
-            if (data.remote_debugging_address) {
-                const endpoint = parseControllerUrl(data.remote_debugging_address, 'http:');
-                validateControllerEndpoint(endpoint, parseControllerUrl(GPM_API_URL));
-                return {
-                    driver_path: data.driver_path || '',
-                    remote_debugging_address: endpoint.href
-                };
-            }
+        const payload = parseControllerPayload(response.data);
+        const data = payload?.data ?? payload;
+        if (controllerRejected(payload) || data?.success === false) {
+            throw new Error('GPM API rejected profile startup');
+        }
+        if (data?.remote_debugging_address) {
+            const endpoint = parseControllerUrl(data.remote_debugging_address, 'http:');
+            validateControllerEndpoint(endpoint, parseControllerUrl(GPM_API_URL));
+            return {
+                driver_path: data.driver_path || '',
+                remote_debugging_address: endpoint.href
+            };
         }
         
         throw new Error('GPM API returned an invalid profile startup response');
@@ -454,10 +479,10 @@ export async function stopProfile(profileId, maxRetries = 3) {
             const response = await sendControllerRequest('GPM API stop profile', () =>
                 controllerClient.get(url, { timeout: 10000 }), gpmStopCode
             );
-            if ((response.status === 200 || response.status === 204) && !controllerRejected(response.data)) return true;
+            if (controllerAcknowledged(response)) return true;
             break;
         } catch (error) {
-            if (error.status === 404) return true;
+            if (error.status === 404 && error.providerCode === 'PROFILE_NOT_FOUND') return true;
             if ((error.status === 400 || error.status === 409) && error.providerCode === 'PROFILE_ALREADY_STOPPED') return true;
             lastError = error;
 
@@ -488,16 +513,16 @@ export async function deleteProfile(profileId, mode = 2) {
             controllerClient.delete(url, {
                 headers: { 'Accept': 'application/json' },
                 timeout: 15000
-            })
+            }), gpmMissingProfileCode
         );
 
-        if ((response.status === 200 || response.status === 204) && !controllerRejected(response.data)) {
+        if (controllerAcknowledged(response)) {
             logger.info('GPM API profile deleted successfully', { profileId: id });
             return true;
         }
         throw new Error('GPM API did not confirm profile deletion');
     } catch (error) {
-        if (error.status === 404) return true;
+        if (error.status === 404 && error.providerCode === 'PROFILE_NOT_FOUND') return true;
         logger.error('GPM API delete profile failed', controllerErrorDetails(error));
         throw error;
     }

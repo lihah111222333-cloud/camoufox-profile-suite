@@ -11,8 +11,10 @@ import {
 
 const API_KEY = 'fixture-api-key';
 const PRIVATE_DATA = 'fixture-private-provider-data';
+const PHONE_NUMBER = '+12025550123';
+const SMS_CODE = '042691';
 const ORDER_ID = 71234;
-const ORDER_REPLY = `ACCESS_NUMBER:${ORDER_ID}:${PRIVATE_DATA}`;
+const ORDER_REPLY = `ACCESS_NUMBER:${ORDER_ID}:${PHONE_NUMBER}`;
 
 function setEnv(t, name, value) {
     const original = process.env[name];
@@ -45,18 +47,21 @@ function mockTransport(t, ...responses) {
         const response = responses.shift();
         if (response instanceof Error) throw response;
         if (response === undefined) throw new Error('Unexpected fixture request');
-        return new Response(response);
+        return response instanceof Response ? response : new Response(response);
     });
     return requests;
 }
 
-function expectOrderError(status) {
+function expectOrderError(status, orderId = ORDER_ID) {
     return error => {
-        assert.equal(error.orderId, ORDER_ID);
+        assert.equal(error.name, 'SmsVerifyOrderError');
+        assert.equal(error.orderId, orderId);
         assert.equal(error.status, status);
+        if (status === 'RECONCILIATION_REQUIRED') assert.equal(error.retryable, false);
         const details = inspect(error, { showHidden: true });
-        assert.equal(details.includes(PRIVATE_DATA), false);
-        assert.equal(details.includes(API_KEY), false);
+        for (const privateValue of [PRIVATE_DATA, API_KEY, PHONE_NUMBER, SMS_CODE]) {
+            assert.equal(details.includes(privateValue), false);
+        }
         return true;
     };
 }
@@ -80,6 +85,91 @@ test('SMS order requests retain positive caps and preserve omitted caps', async 
     assert.deepEqual(requests.map(({ action, maxPrice }) => [action, maxPrice]), [
         ['getNumber', '0.25'], ['getNumber', null], ['getNumberV2', '0.25'], ['getNumberV2', null]
     ]);
+});
+
+test('SMS purchase uncertainty requires reconciliation without another request', async t => {
+    const privateError = new Error(`${API_KEY} ${PHONE_NUMBER} ${SMS_CODE}`, { cause: PRIVATE_DATA });
+    const interruptedBody = new Response(new ReadableStream({
+        start(controller) { controller.error(privateError); }
+    }));
+    const requests = mockTransport(t, privateError, interruptedBody,
+        new Response(PRIVATE_DATA, { status: 504 }), new Response('NO_BALANCE', { status: 503 }),
+        new Response(PRIVATE_DATA, { status: 409 }));
+    const wrapper = await importWrapper(t, 'sms-verification', 'uncertain-purchase');
+    const uncertain = expectOrderError('RECONCILIATION_REQUIRED', null);
+    await assert.rejects(buySmsVerifyNumber(), uncertain);
+    await assert.rejects(buySmsVerifyNumberV2(), uncertain);
+    await assert.rejects(buyNumberAndGetSMS({ maxWaitTime: 0 }), uncertain);
+    await assert.rejects(wrapper.buyNumber(), uncertain);
+    await assert.rejects(wrapper.buyNumberAndGetSMS({ maxWaitTime: 0 }), uncertain);
+    assert.deepEqual(requests.map(({ action }) => action), [
+        'getNumber', 'getNumberV2', 'getNumber', 'getNumber', 'getNumber'
+    ]);
+});
+
+test('SMS purchase preserves explicit refusals and errors before dispatch', async t => {
+    const requests = mockTransport(t, new Response('NO_BALANCE', { status: 400 }),
+        new Response('BAD_KEY', { status: 403 }));
+    const invalidService = { toString() { throw new Error(API_KEY); } };
+    await assert.rejects(buySmsVerifyNumber(invalidService), error => {
+        assert.match(error.message, /could not be prepared/);
+        assert.equal(error.status, undefined);
+        assert.equal(inspect(error, { showHidden: true }).includes(API_KEY), false);
+        return true;
+    });
+    assert.deepEqual(requests, []);
+    await assert.rejects(buySmsVerifyNumber(), /HTTP 400 \(NO_BALANCE\)/);
+    await assert.rejects(buySmsVerifyNumberV2(), /BAD_KEY/);
+    assert.equal(requests.length, 2);
+});
+
+test('SMS purchases require a valid order ID and phone in each receipt format', async t => {
+    const invalidV1 = [
+        [PRIVATE_DATA, null],
+        [`ACCESS_NUMBER:0:${PHONE_NUMBER}`, null],
+        [`ACCESS_NUMBER:${ORDER_ID}x:${PHONE_NUMBER}`, null],
+        [`ACCESS_NUMBER:9007199254740992:${PHONE_NUMBER}`, null],
+        [`ACCESS_NUMBER:${ORDER_ID}:`, ORDER_ID],
+        [`${ORDER_REPLY}:${SMS_CODE}`, ORDER_ID]
+    ];
+    const invalidV2 = [
+        [null, null],
+        [[], null],
+        [PRIVATE_DATA, null],
+        [{ error: PRIVATE_DATA }, null],
+        [{ activationId: -1, phoneNumber: PHONE_NUMBER }, null],
+        [{ activationId: 12.5, phoneNumber: PHONE_NUMBER }, null],
+        [{ activationId: '9007199254740992', phoneNumber: PHONE_NUMBER }, null],
+        [{ activationId: ORDER_ID }, ORDER_ID],
+        [{ activationId: ORDER_ID, phoneNumber: { key: API_KEY, code: SMS_CODE } }, ORDER_ID]
+    ];
+    const requests = mockTransport(t, ...invalidV1.map(([body]) => body),
+        ...invalidV2.map(([body]) => JSON.stringify(body)), `ACCESS_NUMBER:${ORDER_ID}:${PRIVATE_DATA}`);
+
+    for (const [, orderId] of invalidV1) {
+        await assert.rejects(buySmsVerifyNumber(), expectOrderError('RECONCILIATION_REQUIRED', orderId));
+    }
+    for (const [, orderId] of invalidV2) {
+        await assert.rejects(buySmsVerifyNumberV2(), expectOrderError('RECONCILIATION_REQUIRED', orderId));
+    }
+    await assert.rejects(buyNumberAndGetSMS({ maxWaitTime: 0 }), expectOrderError('RECONCILIATION_REQUIRED'));
+    assert.equal(requests.length, invalidV1.length + invalidV2.length + 1);
+    assert.ok(requests.every(({ action, id }) => ['getNumber', 'getNumberV2'].includes(action) && id === null));
+});
+
+test('SMS purchases preserve valid V1 and V2 receipt fields', async t => {
+    const v2Receipt = {
+        activationId: String(ORDER_ID),
+        phoneNumber: PHONE_NUMBER,
+        activationCost: 0.25
+    };
+    const requests = mockTransport(t, ORDER_REPLY, JSON.stringify(v2Receipt));
+    assert.deepEqual(await buySmsVerifyNumber(), { id: ORDER_ID, phone: PHONE_NUMBER });
+    const receipt = await buySmsVerifyNumberV2();
+    assert.equal(receipt.id, v2Receipt.activationId);
+    assert.equal(receipt.phone, PHONE_NUMBER);
+    assert.equal(receipt.price, v2Receipt.activationCost);
+    assert.deepEqual(requests.map(({ action }) => action), ['getNumber', 'getNumberV2']);
 });
 
 test('SMS order wrapper rejects an unknown provider before requesting anything', async t => {

@@ -183,6 +183,22 @@ export function deriveCookieObservations({ headers = {}, headersArray = [] }, na
 
 const RETAINED_OBSERVATIONS_PER_SCOPE = 256;
 
+function observationClock(event) {
+    return Number.isFinite(event.epochMs) ? event.epochMs : Date.parse(event.timestamp);
+}
+
+function observationOrder(event, clock = observationClock(event)) {
+    return {
+        clock: Number.isFinite(clock) ? clock : -Infinity,
+        sequence: Number.isSafeInteger(event.observationSequence) ? event.observationSequence : 0
+    };
+}
+
+function compareObservationOrder(first, second) {
+    if (first.clock !== second.clock) return first.clock < second.clock ? -1 : 1;
+    return first.sequence - second.sequence;
+}
+
 function matchingDomain(host, domain) {
     return Boolean(host && domain && (
         host === domain || (!isIP(host) && host.endsWith(`.${domain}`))
@@ -259,20 +275,40 @@ function entryFor(entries, observation, scope, key) {
 
 /** One projection for live capture, ledger replay, and offline queries. */
 export class CookieLineage {
+    #lastObservation = null;
+
     constructor({ limit = RETAINED_OBSERVATIONS_PER_SCOPE } = {}) {
         this.limit = limit;
         this.byName = new Map();
+        this.needsReplay = false;
+    }
+
+    observeAll(events) {
+        const observations = events.flatMap((event) => {
+            if ((event?.type !== 'ingress' && event?.type !== 'egress') ||
+                (Array.isArray(event.cookieObservations) && event.cookieObservations.length === 0)) return [];
+            return [{ event, order: observationOrder(event) }];
+        });
+        // Stable sorting preserves ledger order for legacy events with the same observation time.
+        observations.sort((first, second) => compareObservationOrder(first.order, second.order));
+        for (const { event } of observations) this.observe(event);
     }
 
     observe(event) {
         const incoming = event?.type === 'ingress';
-        if (!incoming && event?.type !== 'egress') return;
+        if (this.needsReplay || (!incoming && event?.type !== 'egress')) return;
         const timestamp = event.timestamp || null;
-        const clock = typeof event.epochMs === 'number' ? event.epochMs : Date.parse(timestamp);
+        const clock = observationClock(event);
         const observations = Array.isArray(event.cookieObservations)
             ? event.cookieObservations
             : deriveCookieObservations(event, incoming ? 'set-cookie' : 'cookie', clock);
         if (!observations.length) return;
+        const order = observationOrder(event, clock);
+        if (this.#lastObservation && compareObservationOrder(order, this.#lastObservation) < 0) {
+            this.needsReplay = true;
+            return;
+        }
+        this.#lastObservation = order;
         const actionStep = redactDiagnosticText(event.attribution?.actionStep || event.actionStep || 'init');
         const correlationId = event.correlationId || null;
         const triggerActionId = event.triggerAction?.actionId || event.attribution?.triggerAction?.actionId || null;

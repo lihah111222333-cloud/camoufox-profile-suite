@@ -21,6 +21,8 @@ fi
 repository_root=$(git rev-parse --show-toplevel) || exit 1
 cd "$repository_root" || exit 1
 
+node scripts/check-distribution.mjs history || exit 1
+
 # إضافة جميع الملفات
 echo "📦 إضافة الملفات..."
 echo "📦 Adding files..."
@@ -73,15 +75,15 @@ echo ""
 echo "3. بعد إنشاء الـ repository، قم بتنفيذ:"
 echo "   After creating the repository, run:"
 echo ""
-echo "   git remote add origin https://github.com/YOUR_USERNAME/REPO_NAME.git"
-echo "   git branch -M main"
-echo "   git push -u origin main"
-echo ""
-echo "   أو إذا كنت تستخدم SSH:"
-echo "   Or if using SSH:"
-echo ""
-echo "   git remote add origin git@github.com:YOUR_USERNAME/REPO_NAME.git"
-echo "   git branch -M main"
-echo "   git push -u origin main"
-echo ""
+cat <<'EOF'
+   expected_origin=https://github.com/YOUR_USERNAME/REPO_NAME.git
+   git remote add origin "$expected_origin" &&
+     push_origin=$(git remote get-url --push --all origin) &&
+     test "$push_origin" = "$expected_origin" &&
+     git branch -M main &&
+     git push -u origin main
+
+   استخدم git@github.com:YOUR_USERNAME/REPO_NAME.git لعنوان SSH.
+   For SSH, set expected_origin to git@github.com:YOUR_USERNAME/REPO_NAME.git.
+EOF
 

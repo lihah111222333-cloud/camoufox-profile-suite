@@ -58,11 +58,8 @@ import {
     attachZiniaoSecurityGuardsToContext,
     GPU_PERFORMANCE_SPEC_CATALOG,
     lookupGpuPerformanceSpec,
-    collectHostMacPerformanceBaseline,
     computeGpuPerformanceScalingWeights,
     scaleGpuExecutionDurationMs,
-    buildGpuPerformanceInitScript,
-    attachGpuPerformanceScalerToContext,
     validateGpuPerformanceScalingCoherence,
     normalizeTargetOs,
     gpuFitsOs,
@@ -71,6 +68,13 @@ import {
     auditProfileCoherence
 } from '../src/camoufox/coherence-auditor.js';
 import { CamoufoxProfile } from '../src/camoufox/profile.js';
+
+const SYNTHETIC_GPU_BASELINE = Object.freeze({
+    hostChipModel: 'Synthetic fixture',
+    hostFp32Tflops: 11.5,
+    hostMemoryBandwidthGBps: 300,
+    hostPixelFillRateGPixels: 120
+});
 
 function float64ToHex(val) {
     const buf = new ArrayBuffer(8);
@@ -791,7 +795,7 @@ const tests = [
                 assert.equal(res.checks.length, 17, `Expected 17 checks for ${os}`);
                 assert.ok(res.checks.every((c) => c.passed));
 
-                // Also verify backward compatibility when older synthetic fixtures omit the optional fields
+                // Legacy telemetry still runs, with absent WebRTC evidence marked as untested.
                 const legacyTelemetry = buildCoherentTelemetry(os);
                 delete legacyTelemetry.automationGlobals;
                 delete legacyTelemetry.webrtc;
@@ -804,8 +808,9 @@ const tests = [
                 delete legacyTelemetry.hardwareProfile;
                 delete legacyTelemetry.storageEstimate;
                 const legacyRes = evaluatePlatformCoherence(legacyTelemetry, os);
-                assert.equal(legacyRes.passed, true);
-                assert.equal(legacyRes.score, 100);
+                assert.equal(legacyRes.passed, false);
+                assert.equal(legacyRes.status, 'incomplete');
+                assert.equal(findCheck(legacyRes, 'webrtc-network-coherence').status, 'not-tested');
                 assert.equal(legacyRes.checks.length, 17);
             }
         }
@@ -1168,12 +1173,7 @@ const tests = [
             const telemetry = buildCoherentTelemetry('windows');
             const profile = new CamoufoxProfile('unit-test-profile-win', { os: 'windows' });
             profile.metadata = { os: 'windows' };
-            profile.page = {
-                isClosed: () => false,
-                async evaluate() {
-                    return telemetry;
-                }
-            };
+            profile.getPage = async () => ({ evaluate: async () => telemetry });
             profile.trafficRecorder = {
                 transactions: new Map([
                     [
@@ -1200,6 +1200,21 @@ const tests = [
             assert.equal(report.wireToDomCoherence.score, 100);
             assert.equal(report.wireToDomCoherence.inspectedRequests, 1);
             assert.equal(report.wireToDomCoherence.checks.length, 4);
+
+            profile.trafficRecorder.transactions.clear();
+            const incomplete = await profile.auditCoherence();
+            assert.equal(incomplete.wireToDomCoherence.status, 'not-tested');
+            assert.equal(incomplete.passed, false);
+            assert.equal(incomplete.status, 'incomplete');
+            assert.ok(incomplete.score < 100);
+
+            profile.trafficRecorder.transactions.set('tx-2', {
+                headers: { 'User-Agent': 'different user agent', 'Accept-Language': 'en-US' }
+            });
+            const failed = await profile.auditCoherence();
+            assert.equal(failed.wireToDomCoherence.status, 'failed');
+            assert.equal(failed.status, 'failed');
+            assert.equal(failed.passed, false);
         }
     },
     {
@@ -2798,19 +2813,14 @@ const tests = [
         }
     },
     {
-        name: '81. Host Mac GPU Performance Baseline Collector (collectHostMacPerformanceBaseline) & 45+ GPU Physical Performance Catalog (GPU_PERFORMANCE_SPEC_CATALOG)',
+        name: '81. GPU diagnostics require an explicit baseline and use catalog specifications',
         fn: () => {
-            const hostBase = collectHostMacPerformanceBaseline({ forceRefresh: true });
-            assert.ok(hostBase.hostChipModel && hostBase.hostChipModel.length > 0);
-            assert.ok(hostBase.hostCpuCores >= 4);
-            assert.ok(hostBase.hostGpuCores >= 8);
-            assert.ok(hostBase.hostRamGb >= 8);
-            assert.ok(hostBase.hostFp32Tflops > 0);
-            assert.ok(hostBase.hostMemoryBandwidthGBps > 0);
-            assert.ok(hostBase.hostPixelFillRateGPixels > 0);
-            assert.ok(hostBase.hostMeasuredMatrixOpsPerMs > 10000);
+            assert.throws(() => computeGpuPerformanceScalingWeights('NVIDIA GeForce RTX 4090'), /explicit baseline/);
+            const missingBaseline = validateGpuPerformanceScalingCoherence({ gpuPerformance: { computeTimeMultiplier: 1 } });
+            assert.equal(missingBaseline.passed, false);
+            assert.match(missingBaseline.issues[0], /explicit baseline/);
 
-            // Verify key GPUs in GPU_PERFORMANCE_SPEC_CATALOG
+            assert.ok(Object.keys(GPU_PERFORMANCE_SPEC_CATALOG).length >= 45);
             const rtx4090 = lookupGpuPerformanceSpec(
                 'ANGLE (NVIDIA, NVIDIA GeForce RTX 4090 Direct3D11 vs_5_0 ps_5_0, D3D11)'
             );
@@ -2834,22 +2844,17 @@ const tests = [
         }
     },
     {
-        name: '82. Host-to-Target GPU Performance Weighting (computeGpuPerformanceScalingWeights & scaleGpuExecutionDurationMs): Weights RTX 4090 ~7.18x faster and Intel UHD 620 ~26.1x slower than Host Apple M5 Pro without leaking host timing',
+        name: '82. Reference GPU model calculations use explicitly supplied synthetic samples',
         fn: () => {
-            const hostBase = collectHostMacPerformanceBaseline();
-
-            // 1. Target = NVIDIA GeForce RTX 4090 (82.58 TFLOPS vs Host Apple M5 Pro 11.5 TFLOPS)
             const rtx4090Weights = computeGpuPerformanceScalingWeights(
                 'ANGLE (NVIDIA, NVIDIA GeForce RTX 4090 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-                { profileId: 'perf_rtx4090_01', hostBaseline: hostBase }
+                { profileId: 'perf_rtx4090_01', hostBaseline: SYNTHETIC_GPU_BASELINE }
             );
             assert.equal(rtx4090Weights.targetGpuSpec.model, 'NVIDIA GeForce RTX 4090');
-            // computeTimeMultiplier = 11.5 / 82.58 ≈ 0.139259 (< 1.0, i.e., 7.18x faster than host Mac!)
             assert.ok(rtx4090Weights.computeTimeMultiplier < 0.25);
             assert.ok(rtx4090Weights.throughputSpeedupRatio > 4.0);
             assert.ok(rtx4090Weights.memoryTransferMultiplier < 0.45);
 
-            // A 10.0ms shader benchmark on the host Mac is weighted down to ~1.5-2.5ms for RTX 4090
             const rtxSample1 = scaleGpuExecutionDurationMs(10.0, rtx4090Weights, {
                 operationType: 'compute',
                 sampleIndex: 1
@@ -2859,13 +2864,11 @@ const tests = [
                 sampleIndex: 2
             });
             assert.ok(rtxSample1.weightedTargetElapsedMs < 2.5);
-            assert.notEqual(rtxSample1.weightedTargetElapsedMs, 10.0); // Never leaks raw 10.0ms host Mac timing!
-            assert.notEqual(rtxSample1.weightedTargetElapsedMs, rtxSample2.weightedTargetElapsedMs); // Has realistic thermal micro-jitter
+            assert.notEqual(rtxSample1.weightedTargetElapsedMs, rtxSample2.weightedTargetElapsedMs);
 
-            // 2. Target = Intel(R) UHD Graphics 620 (0.44 TFLOPS vs Host Apple M5 Pro 11.5 TFLOPS)
             const uhd620Weights = computeGpuPerformanceScalingWeights(
                 'Mesa Intel(R) UHD Graphics 620 (KBL GT2)',
-                { profileId: 'perf_uhd620_01', hostBaseline: hostBase }
+                { profileId: 'perf_uhd620_01', hostBaseline: SYNTHETIC_GPU_BASELINE }
             );
             assert.equal(uhd620Weights.targetGpuSpec.model, 'Intel(R) UHD Graphics 620');
             assert.ok(uhd620Weights.computeTimeMultiplier > 15.0);
@@ -2877,132 +2880,18 @@ const tests = [
         }
     },
     {
-        name: '83. In-Browser Anti-Penetration GPU Performance Init Script (buildGpuPerformanceInitScript): Compresses RTX 4090 & Dilates UHD 620 WebGL/Timer-Query/WebGPU Benchmarks while Preserving Monotonic performance.now() and [native code]',
-        fn: async () => {
-            const vm = await import('node:vm');
-
-            const runSimulatedBrowserBenchmark = (targetGpuRenderer, realHostElapsedMs = 20.0) => {
-                const weights = computeGpuPerformanceScalingWeights(targetGpuRenderer, {
-                    profileId: 'vm_test_profile'
-                });
-                const scriptCode = buildGpuPerformanceInitScript(weights);
-
-                let simulatedRealClockMs = 1000.0;
-                function now() {
-                    return simulatedRealClockMs;
-                }
-                function Performance() {}
-                Performance.prototype.now = now;
-                const perfInstance = new Performance();
-
-                function WebGL2RenderingContext() {}
-                WebGL2RenderingContext.prototype.drawArrays = function drawArrays() {};
-                WebGL2RenderingContext.prototype.finish = function finish() {};
-                WebGL2RenderingContext.prototype.readPixels = function readPixels() {};
-                WebGL2RenderingContext.prototype.getQueryParameter = function getQueryParameter(_q, pname) {
-                    // Simulate raw host Mac returning 20,000,000 ns (20ms) for QUERY_RESULT (0x8866)
-                    return pname === 0x8866 ? realHostElapsedMs * 1e6 : 1;
-                };
-
-                const sandbox = {
-                    Performance,
-                    performance: perfInstance,
-                    Date: {
-                        now: function now() {
-                            return Math.round(1700000000000 + simulatedRealClockMs);
-                        }
-                    },
-                    WebGLRenderingContext: WebGL2RenderingContext,
-                    WebGL2RenderingContext
-                };
-
-                vm.createContext(sandbox);
-                vm.runInContext(scriptCode, sandbox);
-
-                const gl = new sandbox.WebGL2RenderingContext();
-
-                // Check [native code] preservation
-                const perfNowStr = vm.runInContext(
-                    'Function.prototype.toString.call(Performance.prototype.now)',
-                    sandbox
-                );
-                const readPixelsStr = vm.runInContext(
-                    'Function.prototype.toString.call(WebGL2RenderingContext.prototype.readPixels)',
-                    sandbox
-                );
-
-                // Simulate WebGL drawArrays -> 20ms host GPU work -> gl.finish() benchmark
-                const t0 = sandbox.Performance.prototype.now.call(sandbox.performance);
-                gl.drawArrays(4, 0, 10000);
-                simulatedRealClockMs += realHostElapsedMs;
-                gl.finish();
-                const t1 = sandbox.Performance.prototype.now.call(sandbox.performance);
-
-                // Check strict monotonicity across 10 consecutive calls
-                let prev = t1;
-                let monotonic = true;
-                for (let i = 0; i < 10; i++) {
-                    simulatedRealClockMs += 0.5;
-                    const curr = sandbox.Performance.prototype.now.call(sandbox.performance);
-                    if (curr < prev) monotonic = false;
-                    prev = curr;
-                }
-
-                // Hardware timer query (TIME_ELAPSED_EXT / QUERY_RESULT = 0x8866)
-                const queryNs = gl.getQueryParameter({}, 0x8866);
-
-                return {
-                    perceivedElapsedMs: Number((t1 - t0).toFixed(4)),
-                    queryNs,
-                    monotonic,
-                    perfNowStr,
-                    readPixelsStr
-                };
-            };
-
-            const rtx4090Run = runSimulatedBrowserBenchmark('NVIDIA GeForce RTX 4090', 20.0);
-            const m5ProHostRun = runSimulatedBrowserBenchmark('Apple M5 Pro', 20.0);
-            const uhd620Run = runSimulatedBrowserBenchmark('Intel(R) UHD Graphics 620', 20.0);
-
-            // RTX 4090 must perceive much faster execution than the 20ms host Mac baseline (~3.5-4.5ms)
-            assert.ok(
-                rtx4090Run.perceivedElapsedMs < 6.0,
-                `Expected RTX 4090 perceived time < 6ms, got ${rtx4090Run.perceivedElapsedMs}ms`
-            );
-            // Host Apple M5 Pro should perceive ~20ms
-            assert.ok(
-                m5ProHostRun.perceivedElapsedMs > 18.0 && m5ProHostRun.perceivedElapsedMs < 22.0,
-                `Expected M5 Pro perceived time ~20ms, got ${m5ProHostRun.perceivedElapsedMs}ms`
-            );
-            // Intel UHD 620 must perceive much slower execution than the 20ms host Mac baseline (> 350ms)
-            assert.ok(
-                uhd620Run.perceivedElapsedMs > 350.0,
-                `Expected UHD 620 perceived time > 350ms, got ${uhd620Run.perceivedElapsedMs}ms`
-            );
-
-            // Hardware timer query (0x8866) in nanoseconds must also be weighted per GPU SKU
-            assert.ok(rtx4090Run.queryNs < 5_000_000); // ~2.78ms in ns
-            assert.ok(uhd620Run.queryNs > 350_000_000); // ~522ms in ns
-
-            // Strict monotonicity & Function.prototype.toString cloaking
-            assert.equal(rtx4090Run.monotonic, true);
-            assert.equal(uhd620Run.monotonic, true);
-            assert.match(rtx4090Run.perfNowStr, /function now\(\)/);
-            assert.match(rtx4090Run.readPixelsStr, /function readPixels\(\)/);
-        }
-    },
-    {
-        name: '84. Check 16 GPU Performance Anti-Penetration Audit (validateGpuPerformanceScalingCoherence): Rejects RTX 4090 or UHD 620 profile leaking unscaled Host Mac GPU timing',
+        name: '84. Rejects contradictory timings and weights in a supplied GPU fixture',
         fn: () => {
-            // 1. Valid weighted RTX 4090 preset passes 17/17 checks (100/100)
             const rtxProfile = resolveDeterministicDeviceProfile('rtx4090_audit_ok', {
                 presetId: 'win-desktop-i9-14900k-rtx4090'
+            });
+            rtxProfile.telemetry.gpuPerformance = computeGpuPerformanceScalingWeights(rtxProfile, {
+                hostBaseline: SYNTHETIC_GPU_BASELINE
             });
             const resOk = evaluatePlatformCoherence(rtxProfile.telemetry, 'windows');
             assert.equal(resOk.passed, true);
             assert.equal(resOk.score, 100);
 
-            // 2. Tamper gpuPerformance to leak raw unscaled host Mac timing (computeTimeMultiplier = 1.0, measured10msHostShaderMs = 10.0)
             const leakedRtxTelemetry = structuredClone(rtxProfile.telemetry);
             leakedRtxTelemetry.gpuPerformance = {
                 ...leakedRtxTelemetry.gpuPerformance,
@@ -3013,8 +2902,8 @@ const tests = [
             assert.equal(resLeaked.passed, false);
             const skuCheck = findCheck(resLeaked, 'exact-hardware-sku-model-coherence');
             assert.equal(skuCheck.passed, false);
-            assert.match(skuCheck.details, /Host Mac GPU performance penetration detected/);
-            assert.match(skuCheck.details, /Host Mac GPU timing leak detected/);
+            assert.match(skuCheck.details, /unweighted computeTimeMultiplier/);
+            assert.match(skuCheck.details, /unweighted timing sample/);
         }
     },
     {
@@ -3215,215 +3104,8 @@ const tests = [
         }
     },
     {
-        name: '88. Subagent 1 & 2 GPU Performance Init Script Hardening: Bounded Virtual-Clock Burst Window, Flush+Finish Preservation, Idempotent Timer Query Cache, GPUBuffer.mapAsync & __camoufoxGpuPerformanceState',
-        fn: async () => {
-            const vm = await import('node:vm');
-            const weights = computeGpuPerformanceScalingWeights('Intel(R) UHD Graphics 620', {
-                profileId: 'gpu_hardening_test'
-            });
-            const scriptSource = buildGpuPerformanceInitScript(weights);
-
-            let mockRealNow = 1000.0;
-            function MockPerformance() {}
-            MockPerformance.prototype.now = function now() {
-                return mockRealNow;
-            };
-            const perfInstance = new MockPerformance();
-            const MockDate = {
-                now: function now() {
-                    return Math.round(1700000000000 + mockRealNow);
-                }
-            };
-            function MockWebGL2() {}
-            MockWebGL2.prototype.drawArrays = function drawArrays() {};
-            MockWebGL2.prototype.flush = function flush() {
-                mockRealNow += 2.0;
-            };
-            MockWebGL2.prototype.finish = function finish() {
-                mockRealNow += 8.0;
-            };
-            MockWebGL2.prototype.clientWaitSync = function clientWaitSync() {
-                mockRealNow += 5.0;
-                return 0x911a;
-            };
-            MockWebGL2.prototype.beginQuery = function beginQuery() {};
-            MockWebGL2.prototype.getQueryParameter = function getQueryParameter() {
-                return 10_000_000;
-            };
-            function MockGPUBuffer() {}
-            MockGPUBuffer.prototype.mapAsync = function mapAsync() {
-                mockRealNow += 4.0;
-                return Promise.resolve();
-            };
-
-            const sandbox = {
-                Function,
-                Object,
-                Math,
-                WeakMap,
-                WeakSet,
-                Promise,
-                Performance: MockPerformance,
-                performance: perfInstance,
-                Date: MockDate,
-                WebGL2RenderingContext: MockWebGL2,
-                GPUBuffer: MockGPUBuffer
-            };
-            sandbox.globalThis = sandbox;
-            vm.createContext(sandbox);
-            vm.runInContext(scriptSource, sandbox);
-
-            // 1. __camoufoxGpuPerformanceState is exposed and non-enumerable
-            assert.ok(sandbox.__camoufoxGpuPerformanceState);
-            assert.equal(sandbox.__camoufoxGpuPerformanceState.targetGpuModel, 'Intel(R) UHD Graphics 620');
-            assert.equal(
-                Object.prototype.propertyIsEnumerable.call(sandbox, '__camoufoxGpuPerformanceState'),
-                false
-            );
-
-            // 2. gl.drawArrays -> gl.flush -> gl.finish preserves burst scaling across flush+finish
-            const gl = new MockWebGL2();
-            const t0 = perfInstance.now();
-            gl.drawArrays(4, 0, 3000);
-            gl.flush();
-            gl.finish();
-            const t1 = perfInstance.now();
-            // 10ms real elapsed on UHD 620 (~26x slower) must scale to > 150ms
-            assert.ok(t1 - t0 > 150, `Expected flush+finish scaled duration > 150ms, got ${t1 - t0}ms`);
-
-            // 3. Unsynchronized drawArrays followed by 5000ms idle time is capped by MAX_GPU_BURST_WINDOW_MS (100ms)
-            const tBeforeIdle = perfInstance.now();
-            gl.drawArrays(4, 0, 3000); // No finish() or readPixels() called!
-            mockRealNow += 5000.0; // 5 seconds of idle page time
-            const tAfterIdle = perfInstance.now();
-            const idleDelta = tAfterIdle - tBeforeIdle;
-            // Only the 100ms burst window is scaled (~2600ms) + 4900ms idle = ~7500ms, NOT 5000 * 26 = 130,000ms!
-            assert.ok(
-                idleDelta < 10000,
-                `Expected bounded burst window delta < 10000ms, got ${idleDelta}ms`
-            );
-
-            // 4. Repeated getQueryParameter(query, 0x8866) on the same query object returns identical cached value
-            const queryObj = {};
-            gl.beginQuery(0x88bf, queryObj);
-            const q1 = gl.getQueryParameter(queryObj, 0x8866);
-            const q2 = gl.getQueryParameter(queryObj, 0x8866);
-            assert.equal(q1, q2);
-
-            // 5. GPUBuffer.prototype.mapAsync is hooked and cloaked
-            const buf = new MockGPUBuffer();
-            const tBeforeMap = perfInstance.now();
-            await buf.mapAsync(1);
-            const tAfterMap = perfInstance.now();
-            assert.ok(tAfterMap - tBeforeMap > 20);
-            assert.match(Function.prototype.toString.call(MockGPUBuffer.prototype.mapAsync), /function mapAsync\(\)/);
-        }
-    },
-    {
-        name: '89. 3-Subagent Deep Audit Hardening (Part 1): Function .name & .length Descriptor Preservation, Zero Extension Property Leak, Non-Timer Query Bypass, HTMLCanvasElement.toBlob & Check 1 GPU Hook Integrity',
-        fn: async () => {
-            const vm = await import('node:vm');
-            const weights = computeGpuPerformanceScalingWeights('Intel(R) UHD Graphics 620', {
-                profileId: 'deep_audit_gpu_descriptors'
-            });
-            const scriptSource = buildGpuPerformanceInitScript(weights);
-
-            let mockRealNow = 5000.0;
-            function MockPerformance() {}
-            MockPerformance.prototype.now = function now() {
-                return mockRealNow;
-            };
-            const perfInstance = new MockPerformance();
-            const MockDate = {
-                now: function now() {
-                    return Math.round(1700000000000 + mockRealNow);
-                }
-            };
-            const extObj = {
-                beginQueryEXT: function beginQueryEXT(target, query) {},
-                getQueryObjectEXT: function getQueryObjectEXT(query, pname) {
-                    return 10_000_000;
-                }
-            };
-            function MockWebGL2() {}
-            MockWebGL2.prototype.drawArrays = function drawArrays(mode, first, count) {};
-            MockWebGL2.prototype.readPixels = function readPixels(x, y, width, height, format, type, pixels) {};
-            MockWebGL2.prototype.beginQuery = function beginQuery(target, query) {};
-            MockWebGL2.prototype.getQueryParameter = function getQueryParameter(query, pname) {
-                return query && query._rawResult !== undefined ? query._rawResult : 10_000_000;
-            };
-            MockWebGL2.prototype.getExtension = function getExtension(name) {
-                return extObj;
-            };
-            function MockHTMLCanvasElement() {}
-            MockHTMLCanvasElement.prototype.toDataURL = function toDataURL(type, quality) {
-                mockRealNow += 3.0;
-                return 'data:image/png;base64,AA==';
-            };
-            MockHTMLCanvasElement.prototype.toBlob = function toBlob(callback, type, quality) {
-                mockRealNow += 3.0;
-                callback({ size: 128 });
-            };
-
-            const sandbox = {
-                Function,
-                Object,
-                Math,
-                WeakMap,
-                WeakSet,
-                Promise,
-                Performance: MockPerformance,
-                performance: perfInstance,
-                Date: MockDate,
-                WebGL2RenderingContext: MockWebGL2,
-                HTMLCanvasElement: MockHTMLCanvasElement
-            };
-            sandbox.globalThis = sandbox;
-            vm.createContext(sandbox);
-            vm.runInContext(scriptSource, sandbox);
-
-            // 1. Exact .name and .length preservation on hooked prototype methods
-            assert.equal(MockPerformance.prototype.now.name, 'now');
-            assert.equal(MockPerformance.prototype.now.length, 0);
-            assert.equal(MockWebGL2.prototype.drawArrays.name, 'drawArrays');
-            assert.equal(MockWebGL2.prototype.drawArrays.length, 3);
-            assert.equal(MockWebGL2.prototype.readPixels.name, 'readPixels');
-            assert.equal(MockWebGL2.prototype.readPixels.length, 7);
-            assert.equal(MockWebGL2.prototype.getQueryParameter.name, 'getQueryParameter');
-            assert.equal(MockWebGL2.prototype.getQueryParameter.length, 2);
-            assert.equal(MockHTMLCanvasElement.prototype.toBlob.name, 'toBlob');
-            assert.equal(MockHTMLCanvasElement.prototype.toBlob.length, 3);
-
-            // 2. Zero leaked internal properties (_camoufoxScaled / _camoufoxBeginScaled) on EXT_disjoint_timer_query object
-            const gl = new MockWebGL2();
-            const ext = gl.getExtension('EXT_disjoint_timer_query');
-            assert.deepEqual(Object.getOwnPropertyNames(ext).sort(), ['beginQueryEXT', 'getQueryObjectEXT']);
-            assert.equal(ext.getQueryObjectEXT.name, 'getQueryObjectEXT');
-            assert.equal(ext.getQueryObjectEXT.length, 2);
-
-            // 3. Non-timer WebGL2 occlusion query (ANY_SAMPLES_PASSED = 0x8C2F) is NOT scaled by getQueryParameter
-            const occlusionQuery = { _rawResult: 1 };
-            gl.beginQuery(0x8c2f, occlusionQuery);
-            assert.equal(gl.getQueryParameter(occlusionQuery, 0x8866), 1);
-
-            // Whereas TIME_ELAPSED_EXT (0x88BF) query IS scaled
-            const timerQuery = { _rawResult: 10_000_000 };
-            gl.beginQuery(0x88bf, timerQuery);
-            assert.ok(gl.getQueryParameter(timerQuery, 0x8866) > 150_000_000);
-
-            // 4. HTMLCanvasElement.prototype.toBlob scales pending draw burst
-            const canvas = new MockHTMLCanvasElement();
-            const t0 = perfInstance.now();
-            gl.drawArrays(4, 0, 1000);
-            let blobSize = 0;
-            canvas.toBlob((b) => {
-                blobSize = b.size;
-            });
-            const t1 = perfInstance.now();
-            assert.equal(blobSize, 128);
-            assert.ok(t1 - t0 > 30);
-
-            // 5. Check 1 (navigator-prototype-integrity) catches tampered performanceNow or webglReadPixels
+        name: '89. Reports an invalid performance.now descriptor in a supplied diagnostic fixture',
+        fn: () => {
             const tamperedProto = buildCoherentTelemetry('windows');
             tamperedProto.prototypeIntegrity.performanceNow = {
                 exists: true,
@@ -3540,96 +3222,8 @@ const tests = [
         }
     },
     {
-        name: '91. Round-2 Adversarial Audit (Part 1): Non-Constructor GPU Wrapper Stealth ("prototype" in fn === false, WebIDL Receiver Brand Check, requestAnimationFrame Synchronization, ANGLE_instanced_arrays & 100% PC_GPU_SKU_CATALOG Coverage)',
-        fn: async () => {
-            const vm = await import('node:vm');
-            const baseline = collectHostMacPerformanceBaseline();
-            const rtx4090Weights = computeGpuPerformanceScalingWeights('NVIDIA GeForce RTX 4090', {
-                profileId: 'round2-rtx4090',
-                hostBaseline: baseline
-            });
-
-            let realClock = 1000;
-            const sandbox = {
-                performance: {
-                    now() {
-                        return realClock;
-                    }
-                },
-                Performance: function Performance() {},
-                Date: {
-                    now() {
-                        return 1700000000000 + Math.round(realClock);
-                    }
-                },
-                requestAnimationFrame(cb) {
-                    return cb(realClock);
-                },
-                WebGLRenderingContext: function WebGLRenderingContext() {},
-                WebGL2RenderingContext: function WebGL2RenderingContext() {}
-            };
-            // Ensure native-like non-constructor methods on mock prototypes
-            sandbox.Performance.prototype = {
-                now() {
-                    if (this !== sandbox.performance) {
-                        throw new TypeError("'now' called on an object that does not implement interface Performance.");
-                    }
-                    return realClock;
-                }
-            };
-            const extObj = {
-                drawArraysInstancedANGLE() {}
-            };
-            sandbox.WebGLRenderingContext.prototype = {
-                drawArrays() {},
-                finish() {},
-                readPixels() {},
-                getExtension(name) {
-                    return /ANGLE_instanced_arrays/i.test(name) ? extObj : null;
-                }
-            };
-            sandbox.WebGL2RenderingContext.prototype = {
-                drawRangeElements() {}
-            };
-            sandbox.globalThis = sandbox;
-
-            const script = buildGpuPerformanceInitScript(rtx4090Weights);
-            vm.runInNewContext(script, sandbox);
-
-            // 1. Every hooked method must have 'prototype' in fn === false and throw on `new fn()`
-            for (const fn of [
-                sandbox.Performance.prototype.now,
-                sandbox.Date.now,
-                sandbox.requestAnimationFrame,
-                sandbox.WebGLRenderingContext.prototype.drawArrays,
-                sandbox.WebGLRenderingContext.prototype.finish,
-                sandbox.WebGL2RenderingContext.prototype.drawRangeElements
-            ]) {
-                assert.equal('prototype' in fn, false, `Expected no .prototype on ${fn.name}`);
-                assert.equal(Object.getOwnPropertyDescriptor(fn, 'prototype'), undefined);
-                assert.throws(() => new fn());
-            }
-
-            // 2. WebIDL receiver brand check on Performance.prototype.now.call({})
-            assert.throws(() => sandbox.Performance.prototype.now.call({}));
-
-            // 3. requestAnimationFrame callback timestamp stays synchronized <= performance.now() after RTX 4090 burst
-            const gl = Object.create(sandbox.WebGLRenderingContext.prototype);
-            const angleExt = gl.getExtension('ANGLE_instanced_arrays');
-            angleExt.drawArraysInstancedANGLE(4, 0, 6, 100);
-            realClock += 50; // 50ms real host Mac burst compressed to ~7ms virtual RTX 4090 time
-            gl.finish();
-            let rafTs = 0;
-            sandbox.requestAnimationFrame((ts) => {
-                rafTs = ts;
-            });
-            const currentVirtualNow = sandbox.Performance.prototype.now.call(sandbox.performance);
-            assert.ok(
-                rafTs <= currentVirtualNow,
-                `Expected requestAnimationFrame ts (${rafTs}) <= virtual performance.now() (${currentVirtualNow})`
-            );
-
-            // 4. Every PC_GPU_SKU_CATALOG entry resolves to its own vendor (never falls through to Apple M5 Pro)
+        name: '91. GPU catalog coverage and desktop/laptop model distinction',
+        fn: () => {
             for (const gpuSku of Object.values(PC_GPU_SKU_CATALOG)) {
                 const gpuId = gpuSku.id || gpuSku.model;
                 const perfSpec = lookupGpuPerformanceSpec(gpuId);
@@ -3664,7 +3258,7 @@ const tests = [
         }
     },
     {
-        name: '92. Round-2 Adversarial Audit (Part 2): IPv4-Compatible IPv6 (::127.0.0.1), NAT64 (64:ff9b::), Gecko jar:http:// Unwrapping, Check 16 In-Browser GPU State Cross-Verification & Resumed Security-Block Anomaly Recovery',
+        name: '92. Checks address and scheme guards, supplied GPU state, and recorder recovery',
         fn: async () => {
             const fs = await import('node:fs');
             const os = await import('node:os');
@@ -3683,12 +3277,15 @@ const tests = [
             assert.equal(jarProbe.shouldBlock, true);
             assert.equal(jarProbe.port, 9222);
 
-            // 2. Check 1 detects tampered functionToString & Check 16 detects in-browser gpuPerformanceState divergence
+            // Check 16 cross-checks a supplied GPU state against the fixture weights.
             const baseProfile = resolveDeterministicDeviceProfile('round2-check16', {
                 os: 'windows',
                 presetId: 'win-desktop-i9-14900k-rtx4090-64g'
             });
             const tamperedStateTelemetry = structuredClone(baseProfile.telemetry);
+            tamperedStateTelemetry.gpuPerformance = computeGpuPerformanceScalingWeights(baseProfile, {
+                hostBaseline: SYNTHETIC_GPU_BASELINE
+            });
             tamperedStateTelemetry.gpuPerformanceState = {
                 targetGpuModel: 'Apple M5 Pro',
                 computeTimeMultiplier: 1.0,
@@ -3698,34 +3295,39 @@ const tests = [
             assert.equal(evalRes.passed, false);
             const check16 = findCheck(evalRes, 'exact-hardware-sku-model-coherence');
             assert.equal(check16.passed, false);
-            assert.match(check16.details, /In-browser GPU/);
+            assert.match(check16.details, /Reported GPU/);
 
             // 3. Resuming CamoufoxTrafficRecorder from unflushed traffic.ndjson preserves stepIndex & security-block anomaly
             const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'camoufox-resume-sec-'));
             try {
-                const rec1 = new CamoufoxTrafficRecorder({
-                    profileId: 'resume-sec-profile',
-                    trafficDir: tmpDir
+                const { execFileSync } = await import('node:child_process');
+                const trafficDir = path.join(tmpDir, 'traffic');
+                const recorderModule = new URL('../src/camoufox/traffic-recorder.js', import.meta.url).href;
+                const child = `
+                    import { CamoufoxTrafficRecorder } from ${JSON.stringify(recorderModule)};
+                    const recorder = new CamoufoxTrafficRecorder({
+                        profileId: 'resume-sec-profile', trafficDir: process.argv[1]
+                    });
+                    recorder.setStep('step-1');
+                    recorder.setStep('step-2');
+                    const block = recorder.recordSecurityBlock({
+                        type: 'fixture', targetUrl: 'https://capture-fixture.invalid/', reason: 'Synthetic block'
+                    });
+                    process.stdout.write(block.correlationId);
+                `;
+                const correlationId = execFileSync(process.execPath, ['--input-type=module', '-e', child, trafficDir], {
+                    encoding: 'utf8', timeout: 5000
                 });
-                rec1.setStep('step-1-login');
-                rec1.setStep('step-2-probe');
-                const secEv = rec1.recordSecurityBlock({
-                    type: 'local-port-scan-probe',
-                    targetUrl: 'http://127.0.0.1:3389/',
-                    host: '127.0.0.1',
-                    port: 3389,
-                    reason: 'Blocked RDP probe'
-                });
-                // Simulate process crash before flushSummary() by opening rec2 directly on traffic.ndjson
+                assert.equal(fs.existsSync(path.join(trafficDir, 'attribution-index.json')), false);
                 const rec2 = new CamoufoxTrafficRecorder({
                     profileId: 'resume-sec-profile',
-                    trafficDir: tmpDir
+                    trafficDir
                 });
                 assert.equal(rec2.attribution.stepIndex, 2);
                 assert.equal(rec2.anomaliesAndRiskSignals.length, 1);
-                assert.equal(rec2.anomaliesAndRiskSignals[0].correlationId, secEv.correlationId);
+                assert.equal(rec2.anomaliesAndRiskSignals[0].correlationId, correlationId);
                 assert.match(
-                    rec2.formatTransactionWireDump(secEv.correlationId),
+                    rec2.formatTransactionWireDump(correlationId),
                     /SECURITY-BLOCK \[ZINIAO ACTIVE GUARD\]/
                 );
                 await rec2.stop();
@@ -3735,115 +3337,8 @@ const tests = [
         }
     },
     {
-        name: '93. Round-3 Deep Adversarial Audit (Part 1): WebGPU GPUSupportedLimits Hook, Date.now() vs new Date().getTime() Zero Drift & Idle Relaxation, Same-Origin Iframe Cross-Realm Cloaking & PCI Device ID Hardening',
-        fn: async () => {
-            const vm = await import('node:vm');
-            const baseline = collectHostMacPerformanceBaseline();
-            const uhd620Weights = computeGpuPerformanceScalingWeights('Intel(R) UHD Graphics 620', {
-                profileId: 'round3-uhd620',
-                hostBaseline: baseline
-            });
-
-            let realClock = 1000;
-            function MockGPUSupportedLimits() {}
-            Object.defineProperty(MockGPUSupportedLimits.prototype, 'maxBufferSize', {
-                get() {
-                    return 4294967296; // Host Apple M5 Pro limit (4GB)
-                },
-                enumerable: true,
-                configurable: true
-            });
-            Object.defineProperty(MockGPUSupportedLimits.prototype, 'maxComputeWorkgroupSizeX', {
-                get() {
-                    return 1024; // Host Apple M5 Pro limit (1024)
-                },
-                enumerable: true,
-                configurable: true
-            });
-
-            const iframeWindow = {
-                Function: {
-                    prototype: {
-                        toString: Function.prototype.toString
-                    }
-                },
-                Performance: function IframePerformance() {},
-                performance: {}
-            };
-            iframeWindow.Performance.prototype = {
-                now() {
-                    return realClock;
-                }
-            };
-            Object.setPrototypeOf(iframeWindow.performance, iframeWindow.Performance.prototype);
-
-            function MockHTMLIFrameElement() {}
-            Object.defineProperty(MockHTMLIFrameElement.prototype, 'contentWindow', {
-                get() {
-                    return iframeWindow;
-                },
-                enumerable: true,
-                configurable: true
-            });
-
-            const sandbox = {
-                performance: {},
-                Performance: function Performance() {},
-                Date,
-                Proxy,
-                Reflect,
-                WebGLRenderingContext: function WebGLRenderingContext() {},
-                GPUSupportedLimits: MockGPUSupportedLimits,
-                HTMLIFrameElement: MockHTMLIFrameElement
-            };
-            sandbox.Performance.prototype = {
-                now() {
-                    return realClock;
-                }
-            };
-            Object.setPrototypeOf(sandbox.performance, sandbox.Performance.prototype);
-            sandbox.WebGLRenderingContext.prototype = {
-                drawArrays() {},
-                finish() {}
-            };
-            sandbox.globalThis = sandbox;
-
-            const script = buildGpuPerformanceInitScript(uhd620Weights);
-            vm.runInNewContext(script, sandbox);
-
-            // 1. GPUSupportedLimits.prototype getters return UHD 620 limits (1GB / 512) instead of host M5 Pro (4GB / 1024)
-            const limitsInstance = Object.create(MockGPUSupportedLimits.prototype);
-            assert.equal(limitsInstance.maxBufferSize, 1073741824);
-            assert.equal(limitsInstance.maxComputeWorkgroupSizeX, 512);
-            const maxBufGetter = Object.getOwnPropertyDescriptor(
-                MockGPUSupportedLimits.prototype,
-                'maxBufferSize'
-            ).get;
-            assert.equal('prototype' in maxBufGetter, false);
-
-            // 2. Date.now() vs new Date().getTime() stays 0ms apart even after 10 heavy GPU bursts
-            const gl = Object.create(sandbox.WebGLRenderingContext.prototype);
-            for (let i = 0; i < 10; i++) {
-                gl.drawArrays(4, 0, 100);
-                realClock += 20;
-                gl.finish();
-            }
-            const dateNowVal = sandbox.Date.now();
-            const newDateGetTimeVal = new sandbox.Date().getTime();
-            assert.equal(Math.abs(dateNowVal - newDateGetTimeVal), 0);
-
-            // 3. Same-origin iframe contentWindow has cloaked Function.prototype.toString and synchronized performance.now()
-            const ifr = Object.create(MockHTMLIFrameElement.prototype);
-            const cw = ifr.contentWindow;
-            const crossRealmStr = cw.Function.prototype.toString.call(sandbox.Performance.prototype.now);
-            assert.equal(crossRealmStr.includes('impl.apply'), false);
-            assert.equal(crossRealmStr.includes('return realClock'), true);
-            assert.equal(
-                Math.abs(cw.performance.now() - sandbox.performance.now()) < 1,
-                true
-            );
-
-            // 4. PCI Device ID 0x4680 (UHD Graphics 770) rejects UHD Graphics 620, and Apple Silicon rejects NVIDIA PCI Vendor ID
+        name: '93. Rejects mismatched GPU PCI device and vendor identifiers in a supplied fixture',
+        fn: () => {
             const uhd620Spoofing770 = buildCoherentTelemetry('windows');
             uhd620Spoofing770.webgl.unmaskedRenderer =
                 'ANGLE (Intel, Intel(R) UHD Graphics 620 (0x00004680) Direct3D11 vs_5_0 ps_5_0, D3D11)';
@@ -3944,71 +3439,8 @@ const tests = [
         }
     },
     {
-        name: '95. Round-4 Ultra-Deep Audit (Part 1): Error Stack-Trace Hygiene on Thrown WebIDL Exceptions, Synchronous Receiver Throw Burst-State Rollback, Cross-Realm Iframe Function.prototype Inheritance, WebGPU Limits Check 16 & Rule F Ultrabook + Gaming GPU Rejection',
-        fn: async () => {
-            const vm = await import('node:vm');
-            const baseline = collectHostMacPerformanceBaseline();
-            const uhd620Weights = computeGpuPerformanceScalingWeights('Intel(R) UHD Graphics 620', {
-                profileId: 'round4-uhd620',
-                hostBaseline: baseline
-            });
-
-            let realClock = 1000;
-            const sandbox = {
-                performance: {},
-                Performance: function Performance() {},
-                Date,
-                Proxy,
-                Reflect,
-                WebGLRenderingContext: function WebGLRenderingContext() {}
-            };
-            sandbox.Performance.prototype = {
-                now() {
-                    if (this !== sandbox.performance) {
-                        throw new TypeError("'now' called on an object that does not implement interface Performance.");
-                    }
-                    return realClock;
-                }
-            };
-            Object.setPrototypeOf(sandbox.performance, sandbox.Performance.prototype);
-            sandbox.WebGLRenderingContext.prototype = {
-                finish() {
-                    if (!(this instanceof sandbox.WebGLRenderingContext)) {
-                        throw new TypeError("'finish' called on an object that does not implement interface WebGLRenderingContext.");
-                    }
-                }
-            };
-            sandbox.globalThis = sandbox;
-
-            const script = buildGpuPerformanceInitScript(uhd620Weights);
-            vm.runInNewContext(script, sandbox);
-
-            // 1. Error stack trace hygiene when Performance.prototype.now.call({}) throws
-            let caughtStack = '';
-            try {
-                sandbox.Performance.prototype.now.call({});
-            } catch (err) {
-                caughtStack = String(err.stack || '');
-            }
-            assert.ok(caughtStack.length > 0);
-            assert.equal(
-                /createNativeMethodWrapper|patchedPerfNow|sanitizeThrownError/.test(caughtStack),
-                false,
-                `Leaked internal wrapper frame in stack: ${caughtStack}`
-            );
-
-            // 2. Synchronous WebIDL receiver throw on gl.finish.call({}) does NOT leave activeGpuBurstMode stuck
-            assert.throws(() => sandbox.WebGLRenderingContext.prototype.finish.call({}));
-            const tBefore = sandbox.performance.now();
-            realClock += 10;
-            const tAfter = sandbox.performance.now();
-            // Since finish.call({}) threw before any GPU work, elapsed time must be ~10ms (not dilated 26x to 260ms!)
-            assert.ok(
-                tAfter - tBefore < 20,
-                `Expected un-dilated 10ms after failed finish.call({}), got ${tAfter - tBefore}ms`
-            );
-
-            // 3. Check 16 catches WebGPU limits mismatch (e.g. UHD 620 claiming 4GB maxBufferSize instead of 1GB)
+        name: '95. Validates declared WebGPU limits and rejects incompatible desktop and laptop hardware',
+        fn: () => {
             const uhdPreset = resolveDeterministicDeviceProfile('round4-webgpu-lim', {
                 os: 'linux',
                 presetId: 'lin-laptop-i5-8250u-uhd620-16g'
@@ -4161,27 +3593,12 @@ const tests = [
         }
     },
     {
-        name: '97. Round-5 Deep Audit (Part 1): Dual Init-Script Cross-Realm Composition (buildZiniaoWebRtcSecurityInitScript + buildGpuPerformanceInitScript), Iframe Date Constructor Sync & Alias-Safe RTCPeerConnection Hooking',
+        name: '97. WebRTC URL protection in same-origin frames and vendor aliases',
         fn: async () => {
             const vm = await import('node:vm');
-            const { computeGpuPerformanceScalingWeights, buildGpuPerformanceInitScript } =
-                await import('../src/camoufox/gpu-performance-scaler.js');
             const { buildZiniaoWebRtcSecurityInitScript } =
                 await import('../src/camoufox/ziniao-security.js');
 
-            let realClock = 1000;
-            function MockPerformance() {}
-            MockPerformance.prototype.now = function now() {
-                if (!(this instanceof MockPerformance)) {
-                    throw new TypeError("'now' called on an object that does not implement interface Performance.");
-                }
-                return realClock;
-            };
-            function MockWebGLRenderingContext() {}
-            MockWebGLRenderingContext.prototype.drawArrays = function drawArrays() {};
-            MockWebGLRenderingContext.prototype.finish = function finish() {
-                realClock += 10;
-            };
             let capturedTopRtcCfg = null;
             function MockRTCPeerConnection(cfg) {
                 if (!new.target) {
@@ -4196,18 +3613,11 @@ const tests = [
                 capturedTopRtcCfg = cfg;
             };
 
-            // Child iframe realm with its own Function, Performance, Date, and RTCPeerConnection
-            const iframeCtx = vm.createContext({
-                URL,
-                realClockRef: () => realClock
-            });
+            // Give the child frame its own Function and RTCPeerConnection.
+            const iframeCtx = vm.createContext({ URL });
             vm.runInContext(
                 `
                 globalThis.Function = Function;
-                globalThis.Date = Date;
-                globalThis.Performance = function Performance() {};
-                globalThis.Performance.prototype.now = function now() { return realClockRef(); };
-                globalThis.performance = Object.create(globalThis.Performance.prototype);
                 globalThis.capturedIframeRtcCfg = null;
                 globalThis.RTCPeerConnection = function RTCPeerConnection(cfg) {
                     if (!new.target) throw new TypeError("Constructor RTCPeerConnection requires 'new'");
@@ -4232,57 +3642,38 @@ const tests = [
 
             const topSandbox = {
                 URL,
-                Performance: MockPerformance,
-                WebGLRenderingContext: MockWebGLRenderingContext,
                 RTCPeerConnection: MockRTCPeerConnection,
                 mozRTCPeerConnection: MockRTCPeerConnection,
                 HTMLIFrameElement: MockHTMLIFrameElement
             };
-            topSandbox.performance = Object.create(MockPerformance.prototype);
             topSandbox.globalThis = topSandbox;
             const topCtx = vm.createContext(topSandbox);
-            vm.runInContext('globalThis.Function = Function; globalThis.Date = Date;', topCtx);
+            vm.runInContext('globalThis.Function = Function;', topCtx);
 
-            // Inject BOTH init scripts in the exact production order used by client.js
             const webrtcScript = buildZiniaoWebRtcSecurityInitScript({
-                profileId: 'round5-dual-test'
+                profileId: 'rtc-frame-fixture'
             });
-            const gpuWeights = computeGpuPerformanceScalingWeights('Intel(R) UHD Graphics 620', {
-                profileId: 'round5-dual-test'
-            });
-            const gpuScript = buildGpuPerformanceInitScript(gpuWeights);
-
             vm.runInContext(webrtcScript, topCtx);
-            vm.runInContext(gpuScript, topCtx);
 
             // 1. Vendor alias deduplication: RTCPeerConnection === mozRTCPeerConnection and prototype.constructor === RTCPeerConnection
             assert.equal(topCtx.RTCPeerConnection, topCtx.mozRTCPeerConnection);
             assert.equal(topCtx.RTCPeerConnection.prototype.constructor, topCtx.RTCPeerConnection);
 
-            // 2. Access iframe.contentWindow so both chained contentWindow getters run hookSameOriginIframeRealm
             const ifr = Object.create(MockHTMLIFrameElement.prototype);
             const cw = ifr.contentWindow;
 
-            // 3. Cross-realm Function.prototype.toString from iframe works for BOTH scripts' hooked functions
             const ifrToString = cw.Function.prototype.toString;
             for (const targetFn of [
                 topCtx.Function.prototype.toString,
-                topCtx.Performance.prototype.now,
-                topCtx.Date.now,
-                topCtx.Date,
                 topCtx.RTCPeerConnection,
                 topCtx.RTCPeerConnection.prototype.setConfiguration,
-                cw.Performance.prototype.now,
-                cw.Date.now,
-                cw.Date,
                 cw.RTCPeerConnection,
                 cw.RTCPeerConnection.prototype.setConfiguration
             ]) {
                 const str = ifrToString.call(targetFn);
                 assert.equal(
-                    /\[native code\]|function (?:now|toString|Date|MockRTCPeerConnection|RTCPeerConnection|setConfiguration)/.test(str) &&
-                        !str.includes('sanitizeRtcConfig') &&
-                        !str.includes('advanceVirtualClock'),
+                    /\[native code\]|function (?:toString|MockRTCPeerConnection|RTCPeerConnection|setConfiguration)/.test(str) &&
+                        !str.includes('sanitizeRtcConfig'),
                     true,
                     `Cross-realm toString leaked wrapper source: ${str}`
                 );
@@ -4307,18 +3698,6 @@ const tests = [
             assert.deepEqual(Array.from(cw.capturedIframeRtcCfg.iceServers[0].urls), [
                 'stun:stun.l.google.com:19302'
             ]);
-
-            // 5. After a GPU burst, iframe cw.Date.now() and new cw.Date().getTime() remain 100% synchronized (0ms drift)
-            const gl = Object.create(MockWebGLRenderingContext.prototype);
-            gl.drawArrays(4, 0, 3000);
-            gl.finish();
-            const ifrDateNow = cw.Date.now();
-            const ifrNewDateMs = new cw.Date().getTime();
-            assert.equal(
-                Math.abs(ifrDateNow - ifrNewDateMs),
-                0,
-                `Expected cw.Date.now() (${ifrDateNow}) === new cw.Date().getTime() (${ifrNewDateMs})`
-            );
 
             // 6. Error stack hygiene on RTCPeerConnection.prototype.setConfiguration.call({})
             let thrownRtcErr = null;

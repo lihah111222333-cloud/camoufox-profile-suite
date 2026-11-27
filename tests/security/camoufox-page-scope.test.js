@@ -5,7 +5,6 @@ import path from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
 import { attachPageCompatibility } from '../../src/camoufox/profile.js';
-import { attachGpuPerformanceScalerToContext } from '../../src/camoufox/gpu-performance-scaler.js';
 import { CamoufoxTrafficRecorder } from '../../src/camoufox/traffic-recorder.js';
 import { buildZiniaoWebRtcSecurityInitScript, sanitizeRtcConfigurationIceServers } from '../../src/camoufox/ziniao-security.js';
 import { queryProfileTraffic } from '../../scripts/query-traffic-attribution.js';
@@ -165,22 +164,6 @@ test('diagnostic exports also omit printable keys from existing ledgers and inde
     }
     assert.equal(queryProfileTraffic({ trafficDir, trigger: 'fixture-legacy-top-key' }).events.length, 0);
     assert.equal(fs.readFileSync(ledgerPath, 'utf8'), `${ledger}\n`);
-});
-
-test('GPU diagnostic init scripts keep profile identifiers in controller telemetry', async () => {
-    const profileId = 'operator-side-fixture-profile';
-    const weights = { profileId, targetGpuSpec: { model: 'fixture-model' }, computeTimeMultiplier: 1.0 };
-    let script;
-    const result = await attachGpuPerformanceScalerToContext({
-        async addInitScript(source) { script = source; }
-    }, weights);
-    assert.equal(result.scalingWeights.profileId, profileId);
-    assert.equal(script.includes(profileId), false);
-    class Performance { now() { return 0; } }
-    const sandbox = { Performance, performance: new Performance() };
-    vm.runInNewContext(script, sandbox);
-    assert.equal(sandbox.__camoufoxGpuPerformanceState.targetGpuModel, 'fixture-model');
-    assert.equal(Object.hasOwn(sandbox.__camoufoxGpuPerformanceState, 'profileId'), false);
 });
 
 test('both RTC guards read the supplied configuration once and use captured URL primitives', () => {

@@ -47,7 +47,7 @@
 
 ## About
 
-**Gmail Account Creator** opens a Google signup flow in a browser profile and records the outcome in JSON. The CLI handles recognized initial fields and hands off password entry, verification, consent and account confirmation to the account holder. On handoff it records `MANUAL_SIGNUP_REQUIRED` and requests managed profile shutdown. Complete the remaining steps in a trusted browser and confirm the account identity there.
+**Gmail Account Creator** opens a Google signup flow in a browser profile and records the outcome in JSON. The CLI handles recognized initial fields and records `MANUAL_SIGNUP_REQUIRED` when the account holder needs to take over. Wait for confirmation that the managed profile has stopped before continuing in a trusted browser you control.
 
 | | |
 |--|--|
@@ -82,7 +82,7 @@ These values are configured on the GitHub **About** sidebar (description, websit
   - **17-Check In-Browser Fingerprint & Hardware SKU Coherence Auditor (`src/camoufox/coherence-auditor.js`, `src/camoufox/hardware-models.js`)**: Enforces Rules A–P across Apple Silicon (`M1`–`M5` Base/Pro/Max/Ultra), Intel Macs (`2017–2020`), Windows 11 ARM64 (`Snapdragon X Elite/Plus`), 20+ OEM Laptops/Tablets (`ThinkPad`, `Dell XPS`, `Surface`, `ASUS ROG/Zenbook`, `Razer Blade`, `HP Spectre`, `Framework`, `System76`), 65+ Intel/AMD CPUs, and 35+ GPUs with PCI Vendor/Device IDs.
   - **32 SKU-Verified Device Presets & AdsPower / Ziniao Auto-Healers (`src/camoufox/device-presets.js`, `scripts/audit-adspower-profiles.js`)**: Absorbs AdsPower's OS font, 50+ locale fallback, RFC-9110 `Accept-Language`, SpeechSynthesis voice, and MediaDevices catalogs while repairing broken AdsPower/Ziniao profiles to 100/100 SKU coherence (`--list-presets`, `--heal`).
   - **Ziniao V6 Absorbed Active Security & Consistency Engine (`src/camoufox/ziniao-security.js`)**: URL-based localhost/RFC1918 filtering (`SENSITIVE_LOCAL_PORT_CATALOG`), per-domain 64-bit Hamming distance Canvas/WebGL consistency ledger (`CanvasWebglConsistencyLedger`), internal browser scheme guard (`BLOCKED_INTERNAL_URL_PATTERNS`), OS/silicon vs browser engine version floor guard, and 40+ country metropolitan geolocation micro-jitter.
-  - **Host-Mac-Calibrated GPU Performance Weighting & Anti-Penetration Engine (`src/camoufox/gpu-performance-scaler.js`)**: Calibrates against the local host Mac baseline (`Apple M5 Pro`, 18C CPU / 20C GPU / 64GB RAM / 11.5 TFLOPS) and weights WebGL/WebGL2 (`drawArrays`, `drawElements`, `finish`, `flush`, `readPixels`, `clientWaitSync`, `EXT_disjoint_timer_query`), Canvas (`toDataURL`, `toBlob`, `OffscreenCanvas.convertToBlob`), and WebGPU (`onSubmittedWorkDone`, `GPUBuffer.mapAsync`) execution timing to match the target GPU SKU (e.g., `RTX 4090` 7.18x faster, `Intel UHD 620` 26.14x slower) with full `.name`, `.length`, and `[native code]` prototype stealth.
+  - Managed sessions use the browser's native graphics timing. The offline GPU calculator accepts an explicitly supplied synthetic baseline.
   - **Pre-TLS Egress/Ingress Traffic Recorder & Attribution CLI (`src/camoufox/traffic-recorder.js`, `scripts/query-traffic-attribution.js`)** collects metadata by default. `CAMOUFOX_RECORD_BODIES=true` retains eligible raw request and WebSocket attachments under the profile's private `traffic/payloads/` directory. Redacted wire and HAR views can include selected fields from eligible complete structured bodies. Reconstruct older wire output through the CLI and review the export before sharing. Keep raw attachments and optional native TLS and Necko diagnostics in private storage.
 - **Antidetect profiles** — Create/start/stop browser profiles via Camoufox (`PROFILE_SERVICE=camoufox`), GPM Login (default), or Dolphin Anty API.
 - **Puppeteer control** — Attaches to the profile’s Chrome over remote debugging (no bundled Chromium in `puppeteer-core`).
@@ -90,7 +90,7 @@ These values are configured on the GitHub **About** sidebar (description, websit
 - **Proxies** — Rotating proxies from the state directory's `config/proxies.txt` (`ip:port` or `ip:port:user:pass`).
 - **Human-like behavior** — Delays, scrolling, and typing patterns to reduce rigid automation signals.
 - **Concurrency** — `--accounts` / `--threads` (or env vars) with a bounded worker pool.
-- **Outputs** — Per-attempt status in `results.json`, run totals in `summary.json`, and private diagnostic logs under `logs/` in the [app state directory](ENV_VARIABLES.md#configuration-and-local-state). Passwords, codes and proxy credentials are omitted from routine results.
+- **Outputs** — Per-attempt status in `results.json`, run totals in `summary.json`, and private diagnostic logs under `logs/` in the [app state directory](ENV_VARIABLES.md#configuration-and-local-state). `stats.manual` counts manual handoffs. The CLI exits with status 1 if every attempt fails operationally or if profile cleanup remains unconfirmed.
 
 ---
 
@@ -113,9 +113,9 @@ These values are configured on the GitHub **About** sidebar (description, websit
 3. **Generate identity** (names/usernames from `config/names.json` via `src/utils/name-generator.js`).
 4. **Create & start** an antidetect profile (GPM or Dolphin) with that proxy.
 5. **Connect Puppeteer** to the profile’s debugging endpoint and open the signup flow (`src/gmail/creator.js`).
-6. Fill only supported initial forms that the CLI can verify as part of the current attempt. An optional enrollment prompt may be skipped when the action and empty fields are verified.
-7. Hand off password entry, verification, uncertain pages, consent and final account confirmation for manual action.
-8. **Persist results** to `results.json` and run totals to `summary.json`, and stop the profile. Check `summary.json` for any unconfirmed cleanup.
+6. Fill supported initial forms that the CLI can verify as part of the current attempt.
+7. On reaching a password, verification, optional enrollment, consent, final confirmation or unrecognized page, record the handoff and stop the profile. The account holder makes those choices after shutdown is confirmed.
+8. **Persist results** to `results.json` and run totals to `summary.json`. The summary identifies any cleanup that still needs confirmation.
 
 The signup boundary lives in `src/gmail/creator.js` and `src/gmail/credential-handoff.js`.
 
@@ -300,11 +300,12 @@ Public entry points and selected helper methods used across the app.
 
 | Function | Description |
 |----------|-------------|
-| `checkDolphinConnection()` | Validates API key and reachability. |
+| `checkDolphinConnection()` | Checks that the configured API returns a profile list. |
 | `createProfile(profileName, proxy)` | Creates Dolphin browser profile. |
 | `startProfile(profileId)` | Launches profile. |
 | `stopProfile(profileId)` | Stops profile. |
-| `deleteProfile(profileId)` | Deletes profile. |
+| `recycleProfile(profileId)` | Moves the profile to the controller's recycle bin and checks its acknowledgement. |
+| `deleteProfile(profileId)` | Reports that permanent deletion is unsupported. |
 | `getProfile(profileId)` | Metadata fetch. |
 | `updateProfileProxy(profileIds, proxy)` | Applies proxy settings. |
 | `getFolderList` / `getAllFolders` / `findFolderByName` / `createFolder` / `getFirstAvailableFolder` / `getOrCreateFolder` | Folder management for organizing profiles. |
@@ -314,7 +315,8 @@ Public entry points and selected helper methods used across the app.
 
 | Method | Description |
 |--------|-------------|
-| `start` / `getBrowser` / `getPage` / `stop` / `delete` | Same role as GPM profile class. |
+| `start` / `getBrowser` / `getPage` / `stop` | Starts, attaches to and stops the managed profile. |
+| `recycle` / `delete` | `recycle` moves the profile to the recycle bin. `delete` reports that permanent deletion is unsupported. |
 | `createAndStartProfile(name, proxy)` | **Exported factory** for Dolphin. |
 
 ### `src/gologin/profile.js` — class `GoLoginProfile`
@@ -547,26 +549,28 @@ On the repository home page, GitHub shows **Releases** (right sidebar / [`…/re
 
 1. Bump `version` in `package.json` (commit and push to `main`).
 2. Create and push a tag: `git tag v1.0.1 && git push origin v1.0.1`
-3. Action **Release** (`.github/workflows/release.yml`) runs `npm pack` and creates a GitHub Release with the tarball and generated notes.
-4. When that release is **published**, **Publish to GitHub Packages** publishes the same version to npm on GitHub Packages.
+3. **Release** (`.github/workflows/release.yml`) checks that the tag matches `package.json`, runs the security tests, and verifies the exact contents of the npm tarball.
+4. The same workflow attaches that tarball to the GitHub Release and publishes it to GitHub Packages.
 
 ### Option B — “Create a new release” in the GitHub UI
 
 1. Open [**Releases**](https://github.com/code-root/gmail-account-creator/releases) → **“Create a new release”** (or **Draft a new release**).
-2. Choose a tag (create new tag `v1.0.x` on `main` if needed), set title, add release notes.
-3. Publish the release.  
-   - **Note:** The attached `.tgz` is only added automatically when the tag is **pushed** (Option A). For a purely UI-created release without a matching tag push, run `npm pack` locally and attach the file manually, or push the tag afterward to let the workflow run.
+2. Choose a tag that matches `package.json` at the tagged commit, set a title, and add release notes.
+3. Publish the release. The workflow verifies and publishes the npm tarball to GitHub Packages. Use Option A to attach the tarball to the release automatically.
 
 This repository is published as **`@code-root/gmail-account-creator`** on [GitHub Packages](https://github.com/features/packages) (npm registry).
 
 #### If GitHub Actions are blocked (e.g. billing)
 
-Workflows that attach `.tgz` or run `npm publish` need **Actions** enabled on the repository. You can still:
+To build locally, use a clean checkout of the matching tag. These commands print the verified archive filename.
 
-1. **Release + asset:** from a clean checkout, run `npm pack`, then use the GitHub UI **Create a new release** and upload the generated `.tgz`, or run:  
-   `gh release create v1.2.3 code-root-gmail-account-creator-1.2.3.tgz --title "v1.2.3" --generate-notes`
-2. **Publish to Packages locally:**  
-   `npm publish` with a [PAT](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-npm-registry#authenticating-with-a-personal-access-token) that has `write:packages`, after `npm login --scope=@code-root --registry=https://npm.pkg.github.com`.
+```bash
+node scripts/check-distribution.mjs tag v1.2.3 &&
+  npm pack --json | node scripts/check-distribution.mjs archive
+```
+
+1. Attach the verified `.tgz` in the GitHub UI or run `gh release create v1.2.3 code-root-gmail-account-creator-1.2.3.tgz --title "v1.2.3" --generate-notes`.
+2. After authenticating to GitHub Packages, run `npm publish ./code-root-gmail-account-creator-1.2.3.tgz` using a token with `write:packages`. [GitHub Packages authentication](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-npm-registry#authenticating-with-a-personal-access-token)
 
 ### Install from GitHub Packages
 
@@ -593,7 +597,7 @@ gmail-account-creator
 
 ### Publish workflow
 
-When a **GitHub Release is published**, **Publish to GitHub Packages** (`.github/workflows/publish-github-packages.yml`) runs `npm publish` using `GITHUB_TOKEN`. Ensure the package `name` scope (`@code-root`) matches the repository owner on GitHub.
+**Release** publishes the verified `.tgz` to GitHub Packages using `GITHUB_TOKEN`. It runs on a version tag push or when you publish a release in GitHub. The package scope (`@code-root`) must match the repository owner.
 
 ---
 
@@ -602,8 +606,7 @@ When a **GitHub Release is published**, **Publish to GitHub Packages** (`.github
 | Workflow | Purpose |
 |----------|---------|
 | **CI** (`.github/workflows/ci.yml`) | On push or PR, install dependencies, check syntax and run security tests |
-| **Release** (`.github/workflows/release.yml`) | On tag `v*`, run security tests and attach the npm tarball to the GitHub Release |
-| **Publish to GitHub Packages** (`.github/workflows/publish-github-packages.yml`) | On `release: published`, run security tests before `npm publish` |
+| **Release** (`.github/workflows/release.yml`) | Validate the tag, run security tests, verify the npm tarball, and publish it to GitHub Packages. A tag push also attaches it to the GitHub Release. |
 | **Dependabot** (optional) | Weekly `npm` dependency updates — add `.github/dependabot.yml` if you want automated PRs |
 
 Run `npm run test:security` from a source checkout with dependencies installed. The npm tarball ships the CLI, library and public assets. Run the security tests from the matching release tag when validating an installed version.

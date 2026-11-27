@@ -5,8 +5,12 @@
 
 import path from 'node:path';
 import logger from '../utils/logger.js';
-import camoufoxClient, { validateCamoufoxNetworkPolicy } from './client.js';
-import { auditProfileCoherence, evaluateWireToDomCoherence, readCoherenceCaptureEvents } from './coherence-auditor.js';
+import camoufoxClient, {
+    rollbackCreatedProfile, validateCamoufoxNetworkPolicy, waitForCamoufoxStartup
+} from './client.js';
+import {
+    auditProfileCoherence, evaluateWireToDomCoherence, readCoherenceCaptureEvents, summarizeCoherenceChecks
+} from './coherence-auditor.js';
 import { recordedControlKey } from './traffic-redaction.js';
 
 const WAIT_UNTIL_MAP = {
@@ -158,7 +162,7 @@ function isContextUsable(context) {
 
 export function observeContextClosure(context, browser) {
     const binding = bindContext(context);
-    return () => binding.closed || browser.isConnected?.() === false;
+    return () => binding.closed || context.isClosed?.() === true || browser.isConnected?.() === false;
 }
 
 function resolvePageContext(page) {
@@ -837,10 +841,13 @@ export function attachBrowserCompatibility(browser, profile = null) {
         if (closeContext) {
             context.close = (...args) => {
                 if (!binding.closing) {
-                    binding.closing = (async () => {
+                    const close = async () => {
                         await closeContext(...args);
                         binding.closed = true;
-                    })().finally(() => {
+                    };
+                    binding.closing = Promise.resolve().then(() => (
+                        profile.closeContext ? profile.closeContext(close) : close()
+                    )).finally(() => {
                         binding.closing = null;
                     });
                 }
@@ -863,7 +870,8 @@ export function attachSessionCompatibility(session, lifecycle) {
             context,
             metadata,
             trafficRecorder: trafficRecorder ?? null,
-            saveStorageState: lifecycle.saveStorageState
+            saveStorageState: lifecycle.saveStorageState,
+            closeContext: lifecycle.closeContext
         }),
         page: attachPageCompatibility(page, context)
     };
@@ -874,6 +882,9 @@ export function attachSessionCompatibility(session, lifecycle) {
 export class CamoufoxProfile {
     #lifecycle = null;
     #profilesDir;
+    #starting = null;
+    #startCancellation = null;
+    #stopping = null;
 
     constructor(profileId, options = {}) {
         this.profileId = profileId;
@@ -889,7 +900,6 @@ export class CamoufoxProfile {
         this.lastTrafficAttribution = null;
         this.fingerprintLedger = null;
         this.securityGuards = null;
-        this.gpuPerformanceScaler = null;
     }
 
     /**
@@ -913,11 +923,9 @@ export class CamoufoxProfile {
         return this.securityGuards;
     }
 
-    /**
-     * Get the Host-Mac-Calibrated GPU Performance Scaler attached to this profile
-     */
+    /** Legacy accessor for callers checking for a scaler. */
     getGpuPerformanceScaler() {
-        return this.gpuPerformanceScaler;
+        return null;
     }
 
     /**
@@ -935,29 +943,14 @@ export class CamoufoxProfile {
     }
 
     /**
-     * Return a consolidated summary of Camoufox hardware preset, GPU performance scaling,
-     * active security guard statistics, fingerprint consistency ledger, and coherence report.
+     * Return a summary of the preset, security guards, consistency ledger, and coherence report.
      */
     getTelemetrySummary() {
-        const gpuWeights =
-            this.gpuPerformanceScaler?.scalingWeights ||
-            this.lastGpuPerformanceSummary ||
-            this.metadata?.gpuPerformance ||
-            null;
         return {
             profileId: this.profileId,
             presetId: this.metadata?.presetId || null,
             deviceModel: this.metadata?.deviceModel || this.metadata?.hardwareProfile?.deviceModel || null,
             os: this.metadata?.os || null,
-            gpuPerformance: gpuWeights
-                ? {
-                      targetGpuModel: gpuWeights.targetGpuSpec?.model || gpuWeights.targetGpuModel || null,
-                      hostChipModel: gpuWeights.hostBaseline?.hostChipModel || null,
-                      computeTimeMultiplier: gpuWeights.computeTimeMultiplier ?? null,
-                      throughputSpeedupRatio: gpuWeights.throughputSpeedupRatio ?? null,
-                      antiPenetrationActive: gpuWeights.antiPenetrationActive ?? true
-                  }
-                : null,
             securityGuards:
                 this.securityGuards?.getStats?.() || this.lastSecurityGuardStats || null,
             fingerprintLedger:
@@ -989,35 +982,36 @@ export class CamoufoxProfile {
     }
 
     /**
-     * Audit in-browser C++ fingerprint coherence on the active profile page
+     * Audit the active page. The overall verdict and score include its wire checks when recording is enabled.
      */
     async auditCoherence(expectedOs = null, options = {}) {
         const page = await this.getPage();
-        const targetOs = expectedOs || this.metadata?.os || this.options?.os || 'windows';
-        this.coherenceReport = await auditProfileCoherence(page, targetOs, {
+        this.coherenceReport = await this.#auditSession({ ...this, page }, expectedOs, options);
+        return this.coherenceReport;
+    }
+
+    async #auditSession(session, expectedOs = null, options = {}, signal) {
+        const { page, browser, metadata, fingerprintLedger, trafficRecorder, trafficPaths } = session;
+        const targetOs = expectedOs || metadata?.os || this.options?.os || 'windows';
+        const report = await waitForCamoufoxStartup(auditProfileCoherence(page, targetOs, {
             profileId: this.profileId,
-            hardwareProfile: this.metadata?.hardwareProfile || undefined,
-            gpuPerformance:
-                this.gpuPerformanceScaler?.scalingWeights ||
-                this.metadata?.gpuPerformance ||
-                undefined,
+            hardwareProfile: metadata?.hardwareProfile || undefined,
             ...options
-        });
-        if (
-            this.fingerprintLedger &&
-            typeof this.fingerprintLedger.recordOrVerify === 'function'
-        ) {
+        }), signal);
+        signal?.throwIfAborted();
+        if (browser?.isConnected() === false) throw new Error('Camoufox profile closed during its audit');
+        if (typeof fingerprintLedger?.recordOrVerify === 'function') {
             const pageUrl =
                 typeof page?.url === 'function' ? page.url() : 'about:blank';
-            if (this.coherenceReport?.telemetry?.canvas2d?.fnv1aHash) {
+            if (report?.telemetry?.canvas2d?.fnv1aHash) {
                 try {
-                    this.coherenceReport.canvasConsistency = this.fingerprintLedger.recordOrVerify({
+                    report.canvasConsistency = fingerprintLedger.recordOrVerify({
                         kind: 'canvas',
                         url: pageUrl || 'about:blank',
                         width: 240,
                         height: 60,
                         drewText: 'Camoufox Coherence 🦊 123.45',
-                        hash: this.coherenceReport.telemetry.canvas2d.fnv1aHash
+                        hash: report.telemetry.canvas2d.fnv1aHash
                     });
                 } catch (ledgerErr) {
                     logger.debug('Could not record canvas2d hash in fingerprintLedger during auditCoherence', {
@@ -1026,7 +1020,7 @@ export class CamoufoxProfile {
                     });
                 }
             }
-            const webglInfo = this.coherenceReport?.telemetry?.webgl;
+            const webglInfo = report?.telemetry?.webgl;
             if (webglInfo && (webglInfo.fnv1aHash || webglInfo.unmaskedRenderer || webglInfo.renderer)) {
                 try {
                     let webglHash = webglInfo.fnv1aHash;
@@ -1054,7 +1048,7 @@ export class CamoufoxProfile {
                             hHigh.toString(16).padStart(8, '0') +
                             hLow.toString(16).padStart(8, '0');
                     }
-                    this.coherenceReport.webglConsistency = this.fingerprintLedger.recordOrVerify({
+                    report.webglConsistency = fingerprintLedger.recordOrVerify({
                         kind: 'webgl',
                         url: pageUrl || 'about:blank',
                         width: 64,
@@ -1070,33 +1064,67 @@ export class CamoufoxProfile {
                 }
             }
         }
-        if (this.trafficRecorder && this.coherenceReport?.telemetry) {
-            const events = this.trafficPaths?.trafficDir
-                ? readCoherenceCaptureEvents(this.trafficPaths.trafficDir, { trustedLocal: true })
+        if (trafficRecorder && report?.telemetry) {
+            const events = trafficPaths?.trafficDir
+                ? readCoherenceCaptureEvents(trafficPaths.trafficDir, { trustedLocal: true })
                 : [];
-            this.coherenceReport.wireToDomCoherence = evaluateWireToDomCoherence(
-                this.coherenceReport.telemetry,
-                events.length > 0 ? events : this.trafficRecorder,
+            const wireToDomCoherence = evaluateWireToDomCoherence(
+                report.telemetry,
+                events.length > 0 ? events : trafficRecorder,
                 targetOs
             );
+            const { passed, status, score } = summarizeCoherenceChecks([...report.checks, ...wireToDomCoherence.checks]);
+            Object.assign(report, { wireToDomCoherence, passed, status, score });
         }
-        return this.coherenceReport;
+        return report;
     }
 
     /**
      * Start profile and initialize Camoufox Browser, BrowserContext, and Page
      */
-    async start(expectedStorageGeneration) {
+    async start(expectedStorageGeneration, createdProfile) {
+        const signal = this.options?.signal;
+        signal?.throwIfAborted();
+        while (this.#stopping) await waitForCamoufoxStartup(this.#stopping, signal);
+        signal?.throwIfAborted();
+        if (this.#starting) return this.#starting;
+
+        const controller = new AbortController();
+        const abort = () => controller.abort(signal.reason);
+        signal?.addEventListener('abort', abort, { once: true });
+        this.#startCancellation = controller;
+        this.#starting = this.#startSession(expectedStorageGeneration, createdProfile, controller.signal).finally(() => {
+            signal?.removeEventListener('abort', abort);
+            this.#startCancellation = null;
+            this.#starting = null;
+        });
+        return this.#starting;
+    }
+
+    async #startSession(expectedStorageGeneration, createdProfile, signal) {
+        const shouldAudit = this.options?.verifyCoherence || process.env.CAMOUFOX_AUDIT_ON_START === 'true';
+        let report = null;
+        const audit = async (session) => {
+            signal.throwIfAborted();
+            report = await this.#auditSession(session, session.metadata?.os, {}, signal);
+        };
+        const attempt = { createdProfile, beforeReady: shouldAudit ? audit : undefined };
         try {
             logger.info('Starting Camoufox profile', { profileId: this.profileId });
 
             const session = await camoufoxClient.startProfile(
                 this.profileId,
-                { ...this.options, profilesDir: this.#profilesDir ?? this.options?.profilesDir },
-                expectedStorageGeneration
+                { ...this.options, profilesDir: this.#profilesDir ?? this.options?.profilesDir, signal },
+                expectedStorageGeneration,
+                attempt
             );
-            this.#lifecycle = sessionLifecycles.get(session);
-            this.#profilesDir = this.#lifecycle.profilesDir;
+            const lifecycle = sessionLifecycles.get(session);
+            if (shouldAudit && !report) await audit(session);
+            signal.throwIfAborted();
+            if (!lifecycle.canReuse()) throw new Error('Camoufox profile closed during startup');
+            if (report || this.#lifecycle !== lifecycle) this.coherenceReport = report;
+            this.#lifecycle = lifecycle;
+            this.#profilesDir = lifecycle.profilesDir;
             this.context = session.context;
             this.lastTrafficAttribution = null;
             this.storageStatePath = session.storageStatePath;
@@ -1105,14 +1133,9 @@ export class CamoufoxProfile {
             this.trafficPaths = session.trafficPaths || null;
             this.fingerprintLedger = session.fingerprintLedger || null;
             this.securityGuards = session.securityGuards || null;
-            this.gpuPerformanceScaler = session.gpuPerformanceScaler || null;
 
             this.browser = session.browser;
             this.page = attachPageCompatibility(session.page, this.context, this);
-
-            if (this.options?.verifyCoherence || process.env.CAMOUFOX_AUDIT_ON_START === 'true') {
-                await this.auditCoherence(this.metadata?.os);
-            }
 
             logger.info('Camoufox profile started successfully', {
                 profileId: this.profileId,
@@ -1122,9 +1145,14 @@ export class CamoufoxProfile {
 
             return this;
         } catch (error) {
+            if (attempt.lifecycle) {
+                this.#lifecycle = attempt.lifecycle;
+                this.#profilesDir = attempt.lifecycle.profilesDir;
+                if (attempt.lifecycle.canReuse()) await this.#stopSession();
+            }
             logger.error('Failed to start Camoufox profile', {
                 profileId: this.profileId,
-                error: error.message
+                error: error?.message
             });
             throw error;
         }
@@ -1134,7 +1162,7 @@ export class CamoufoxProfile {
      * Get browser instance (starts profile if needed)
      */
     async getBrowser() {
-        if (!this.browser) {
+        if (this.#starting || this.#stopping || !this.#lifecycle?.canReuse()) {
             await this.start();
         }
         return this.browser;
@@ -1144,9 +1172,7 @@ export class CamoufoxProfile {
      * Get isolated Playwright BrowserContext instance (starts profile if needed)
      */
     async getContext() {
-        if (!this.context) {
-            await this.start();
-        }
+        await this.getBrowser();
         return this.context;
     }
 
@@ -1154,14 +1180,14 @@ export class CamoufoxProfile {
      * Get primary Page instance (creates one in the profile context if needed)
      */
     async getPage() {
+        const context = await this.getContext();
         if (!this.page || (typeof this.page.isClosed === 'function' && this.page.isClosed())) {
-            const context = await this.getContext();
             const pages = context.pages();
-            this.page = attachPageCompatibility(
-                pages[0] || (await context.newPage()),
-                context,
-                this
-            );
+            const page = pages[0] || await context.newPage();
+            if (this.context !== context || !this.#lifecycle?.canReuse()) {
+                throw new Error('Camoufox profile closed while opening a page');
+            }
+            this.page = attachPageCompatibility(page, context, this);
         }
         return this.page;
     }
@@ -1180,9 +1206,22 @@ export class CamoufoxProfile {
     }
 
     /**
-     * Stop profile (automatically saves storageState and flushes traffic attribution before closing)
+     * Stop profile, saving storage state and finalizing capture after native closure.
      */
-    async stop() {
+    stop() {
+        if (this.#stopping) return this.#stopping;
+        const starting = this.#starting;
+        this.#stopping = Promise.resolve().then(async () => {
+            await starting?.catch(() => {});
+            return this.#stopSession();
+        }).finally(() => {
+            this.#stopping = null;
+        });
+        this.#startCancellation?.abort(new Error('Camoufox profile startup cancelled by stop'));
+        return this.#stopping;
+    }
+
+    async #stopSession() {
         const lifecycle = this.#lifecycle;
         if (!lifecycle) return true;
 
@@ -1194,16 +1233,11 @@ export class CamoufoxProfile {
                         this.lastSecurityGuardStats = this.securityGuards.getStats();
                     } catch {}
                 }
-                if (this.gpuPerformanceScaler?.scalingWeights || this.metadata?.gpuPerformance) {
-                    this.lastGpuPerformanceSummary =
-                        this.gpuPerformanceScaler?.scalingWeights || this.metadata?.gpuPerformance;
-                }
                 this.lastTrafficAttribution = trafficAttribution;
                 this.browser = null;
                 this.context = null;
                 this.page = null;
                 this.securityGuards = null;
-                this.gpuPerformanceScaler = null;
             }
             return stopped;
         } catch (error) {
@@ -1240,44 +1274,71 @@ export class CamoufoxProfile {
  * Create and start a new Camoufox profile
  */
 export async function createAndStartProfile(profileName, proxy = null, options = {}) {
+    const { signal } = options;
+    signal?.throwIfAborted();
+    let profileData;
+    const opening = open();
     try {
-        validateCamoufoxNetworkPolicy(options, proxy || options.proxy || null);
-        const isAvailable = await camoufoxClient.checkCamoufoxConnection();
-        if (!isAvailable) {
-            throw new Error(
-                'Camoufox module is not available. Ensure the trusted camoufox package is installed.'
-            );
-        }
-
-        logger.info('Creating Camoufox profile...', { name: profileName });
-        const profileData = await camoufoxClient.createProfile(profileName, proxy, options);
-
-        if (!profileData || !profileData.id) {
-            throw new Error('Failed to create Camoufox profile: No profile ID returned');
-        }
-
-        const profileManager = new CamoufoxProfile(profileData.id, {
-            ...options,
-            profilesDir: path.dirname(profileData.profileDir),
-            proxy: profileData.proxy,
-            os: profileData.os,
-            geoip: profileData.geoip,
-            humanize: profileData.humanize
-        });
-
-        await profileManager.start(profileData._storageGeneration);
-
-        logger.info('Camoufox profile created and started', {
-            profileId: profileData.id,
-            name: profileData.title || profileName,
-            os: profileData.os,
-            storageStatePath: profileManager.storageStatePath
-        });
-
-        return profileManager;
+        return await waitForCamoufoxStartup(opening, signal);
     } catch (error) {
-        logger.error('Failed to create and start Camoufox profile', { error: error.message });
+        if (signal?.aborted && error === signal.reason && profileData) {
+            // If completion and cancellation coincide, the owned operation may still have returned a session.
+            opening.then(() => rollback()).catch(() => {});
+            throw startupError(error, 'stop-unconfirmed');
+        }
         throw error;
+    }
+
+    async function rollback() {
+        const profileCleanup = await rollbackCreatedProfile(profileData);
+        logger.info('Finished Camoufox startup rollback', { profileId: profileData.id, profileCleanup });
+        return profileCleanup;
+    }
+
+    function startupError(cause, profileCleanup) {
+        const error = new Error('Camoufox profile initialization failed', { cause });
+        if (cause?.name === 'AbortError' || (signal?.aborted && cause === signal.reason)) error.name = 'AbortError';
+        return Object.assign(error, { code: cause?.code, profileId: profileData.id, profileCleanup });
+    }
+
+    async function open() {
+        try {
+            validateCamoufoxNetworkPolicy(options, proxy || options.proxy || null);
+            const isAvailable = await camoufoxClient.checkCamoufoxConnection();
+            signal?.throwIfAborted();
+            if (!isAvailable) {
+                throw new Error(
+                    'Camoufox module is not available. Ensure the trusted camoufox package is installed.'
+                );
+            }
+
+            logger.info('Creating Camoufox profile...', { name: profileName });
+            profileData = await camoufoxClient.createProfile(profileName, proxy, options);
+            const profileManager = new CamoufoxProfile(profileData.id, {
+                ...options,
+                profilesDir: path.dirname(profileData.profileDir),
+                proxy: profileData.proxy,
+                os: profileData.os,
+                geoip: profileData.geoip,
+                humanize: profileData.humanize
+            });
+
+            await profileManager.start(profileData._storageGeneration, profileData);
+            signal?.throwIfAborted();
+
+            logger.info('Camoufox profile created and started', {
+                profileId: profileData.id,
+                name: profileData.title || profileName,
+                os: profileData.os,
+                storageStatePath: profileManager.storageStatePath
+            });
+
+            return profileManager;
+        } catch (error) {
+            logger.error('Failed to create and start Camoufox profile', { error: error?.message });
+            if (!profileData) throw error;
+            throw startupError(error, await rollback());
+        }
     }
 }
 

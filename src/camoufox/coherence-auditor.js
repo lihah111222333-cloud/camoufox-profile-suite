@@ -6,6 +6,7 @@
  * inspected by Google BotGuard, Arkose BDA, Meta Device Graph, and ByteDance JSVMP.
  */
 
+import { isIP } from 'node:net';
 import logger from '../utils/logger.js';
 import { readCaptureFile } from './capture-io.js';
 import {
@@ -62,11 +63,8 @@ import {
     attachZiniaoSecurityGuardsToContext,
     GPU_PERFORMANCE_SPEC_CATALOG,
     lookupGpuPerformanceSpec,
-    collectHostMacPerformanceBaseline,
     computeGpuPerformanceScalingWeights,
     scaleGpuExecutionDurationMs,
-    buildGpuPerformanceInitScript,
-    attachGpuPerformanceScalerToContext,
     validateGpuPerformanceScalingCoherence
 } from './device-presets.js';
 
@@ -122,11 +120,8 @@ export {
     attachZiniaoSecurityGuardsToContext,
     GPU_PERFORMANCE_SPEC_CATALOG,
     lookupGpuPerformanceSpec,
-    collectHostMacPerformanceBaseline,
     computeGpuPerformanceScalingWeights,
     scaleGpuExecutionDurationMs,
-    buildGpuPerformanceInitScript,
-    attachGpuPerformanceScalerToContext,
     validateGpuPerformanceScalingCoherence
 };
 
@@ -760,12 +755,8 @@ export async function collectBrowserFingerprint(page) {
                     : [];
         } catch {}
 
-        const webrtcInfo = {
-            available: typeof RTCPeerConnection !== 'undefined',
-            candidatePorts: [],
-            candidateIps: [],
-            privateIpLeaked: false
-        };
+        // API availability alone provides no evidence about ICE candidates.
+        const webrtcInfo = { available: typeof RTCPeerConnection !== 'undefined' };
 
         let fonts = [];
         try {
@@ -1079,13 +1070,6 @@ export async function collectBrowserFingerprint(page) {
             }
         }
 
-        const gpuPerformance =
-            typeof window !== 'undefined' &&
-            window.__camoufoxGpuPerformanceState &&
-            typeof window.__camoufoxGpuPerformanceState === 'object'
-                ? { ...window.__camoufoxGpuPerformanceState }
-                : null;
-
         return {
             navigator: navigatorInfo,
             prototypeIntegrity,
@@ -1104,10 +1088,25 @@ export async function collectBrowserFingerprint(page) {
             geckoApiSurface,
             webgpu,
             stackAndMediaHygiene,
-            storageEstimate,
-            ...(gpuPerformance ? { gpuPerformance, gpuPerformanceState: gpuPerformance } : {})
+            storageEstimate
         };
     });
+}
+
+function evidenceCheck(name, { issues, observed, success, unavailable }) {
+    if (issues.length > 0) return { name, passed: false, status: 'failed', details: issues.join('; ') };
+    if (!observed) return { name, passed: false, status: 'not-tested', details: unavailable };
+    return { name, passed: true, status: 'passed', details: success };
+}
+
+export function summarizeCoherenceChecks(checks) {
+    const testedChecks = checks.filter((check) => check.status !== 'not-tested');
+    const passedCount = testedChecks.filter((check) => check.passed).length;
+    if (testedChecks.length === 0) return { passed: false, status: 'not-tested', score: null, checks };
+    const passed = passedCount === checks.length;
+    const status = passed ? 'passed' : passedCount < testedChecks.length ? 'failed' : 'incomplete';
+    const score = Math.round((passedCount / checks.length) * 100);
+    return { passed, status, score, checks };
 }
 
 /**
@@ -1117,7 +1116,7 @@ export async function collectBrowserFingerprint(page) {
  *
  * @param {object} telemetry Output of `collectBrowserFingerprint(page)`
  * @param {string} [expectedOs] Expected target OS ('win'/'windows', 'mac'/'macos', 'lin'/'linux')
- * @returns {{ passed: boolean, score: number, checks: Array<{ name: string, passed: boolean, details: string }> }}
+ * @returns {{ passed: boolean, status: string, score: number | null, checks: Array<{ name: string, passed: boolean, status?: string, details: string }> }}
  */
 export function evaluatePlatformCoherence(telemetry, expectedOs) {
     if (!telemetry || typeof telemetry !== 'object') {
@@ -1631,6 +1630,12 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
     {
         const webrtc = telemetry.webrtc;
         const issues = [];
+        const checkIps = Boolean(webrtc?.expectedPublicIp) || webrtc?.blockPrivateIp !== false;
+        const candidateIps = checkIps && Array.isArray(webrtc?.candidateIps)
+            ? webrtc.candidateIps.filter((ip) => typeof ip === 'string').map((ip) => ip.trim()).filter((ip) => isIP(ip) !== 0)
+            : [];
+        const candidatePorts = Array.isArray(webrtc?.candidatePorts) ? webrtc.candidatePorts : [];
+        const range = targetOs ? CAMOUFOX_COHERENCE_CONSTANTS.ephemeralPortRanges[targetOs] : null;
 
         const isRfc1918PrivateIpv4 = (ip) => {
             if (typeof ip !== 'string') return false;
@@ -1650,53 +1655,40 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
             );
         };
 
-        if (webrtc && typeof webrtc === 'object') {
-            if (webrtc.privateIpLeaked === true) {
-                issues.push('WebRTC private LAN IP leak detected (privateIpLeaked=true)');
-            }
+        if (webrtc?.privateIpLeaked === true) {
+            issues.push('WebRTC private LAN IP leak detected (privateIpLeaked=true)');
+        }
 
-            if (
-                Array.isArray(webrtc.candidateIps) &&
-                (Boolean(webrtc.expectedPublicIp) || webrtc.blockPrivateIp !== false)
-            ) {
-                for (const ip of webrtc.candidateIps) {
-                    const isPrivateCandidate =
-                        isRfc1918PrivateIpv4(ip) ||
-                        (typeof ip === 'string' && ip.includes(':') && isLocalOrPrivateTarget(ip).isLocalOrPrivate);
-                    if (isPrivateCandidate) {
-                        issues.push(`WebRTC leaked RFC1918 private LAN IP "${ip}" in ICE candidates`);
-                    } else if (webrtc.expectedPublicIp && ip !== webrtc.expectedPublicIp) {
-                        issues.push(
-                            `WebRTC candidate IP "${ip}" does not match expected proxy public IP "${webrtc.expectedPublicIp}"`
-                        );
-                    }
-                }
+        for (const ip of candidateIps) {
+            const isPrivateCandidate =
+                isRfc1918PrivateIpv4(ip) || (ip.includes(':') && isLocalOrPrivateTarget(ip).isLocalOrPrivate);
+            if (isPrivateCandidate) {
+                issues.push(`WebRTC leaked RFC1918 private LAN IP "${ip}" in ICE candidates`);
+            } else if (webrtc.expectedPublicIp && ip !== webrtc.expectedPublicIp) {
+                issues.push(
+                    `WebRTC candidate IP "${ip}" does not match expected proxy public IP "${webrtc.expectedPublicIp}"`
+                );
             }
+        }
 
-            if (Array.isArray(webrtc.candidatePorts) && webrtc.candidatePorts.length > 0) {
-                const range = targetOs ? CAMOUFOX_COHERENCE_CONSTANTS.ephemeralPortRanges[targetOs] : null;
-                if (range) {
-                    const [minPort, maxPort] = range;
-                    for (const port of webrtc.candidatePorts) {
-                        const portNum = Number(port);
-                        if (!Number.isInteger(portNum) || portNum < minPort || portNum > maxPort) {
-                            issues.push(
-                                `WebRTC ICE candidate UDP port ${port} falls outside ${targetOs} ephemeral range [${minPort}–${maxPort}]`
-                            );
-                        }
-                    }
+        if (range) {
+            const [minPort, maxPort] = range;
+            for (const port of candidatePorts) {
+                const portNum = Number(port);
+                if (!Number.isInteger(portNum) || portNum < minPort || portNum > maxPort) {
+                    issues.push(
+                        `WebRTC ICE candidate UDP port ${port} falls outside ${targetOs} ephemeral range [${minPort}–${maxPort}]`
+                    );
                 }
             }
         }
 
-        const passed = issues.length === 0;
-        checks.push({
-            name: 'webrtc-network-coherence',
-            passed,
-            details: passed
-                ? 'WebRTC ICE candidates respect RFC1918 private IP protection and OS ephemeral UDP port range'
-                : issues.join('; ')
-        });
+        checks.push(evidenceCheck('webrtc-network-coherence', {
+            issues,
+            observed: candidateIps.length > 0 && candidatePorts.length > 0 && Boolean(range),
+            success: 'Observed WebRTC ICE addresses and ports satisfy the IP and ephemeral port checks',
+            unavailable: 'WebRTC ICE address and port evidence is unavailable for this check'
+        }));
     }
 
     // Check 10: SpeechSynthesis OS Voice Coherence
@@ -2065,7 +2057,7 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
         });
     }
 
-    // Check 16: Exact Hardware SKU, Device Model & Host-Weighted GPU Performance Anti-Penetration Coherence
+    // Check 16: Exact hardware SKU, browser version, and any supplied GPU fixture.
     {
         const skuValidation = validateHardwareModelSpec(telemetry, targetOs);
         const gpuPerfValidation = validateGpuPerformanceScalingCoherence(telemetry);
@@ -2095,7 +2087,7 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
             name: 'exact-hardware-sku-model-coherence',
             passed,
             details: passed
-                ? `Exact hardware model parameters${skuDesc} (CPU cores/threads, GPU SKU, RAM capacity, SSD storage tier, panel form-factor, WebGL limits, OS/browser version floor, and Host-Weighted GPU performance scaling) are 100% coherent`
+                ? `Exact hardware model parameters${skuDesc} and supplied diagnostic fields are coherent`
                 : combinedIssues.join('; ')
         });
     }
@@ -2178,15 +2170,7 @@ export function evaluatePlatformCoherence(telemetry, expectedOs) {
         });
     }
 
-    const passedCount = checks.filter((c) => c.passed).length;
-    const score = checks.length > 0 ? Math.round((passedCount / checks.length) * 100) : 0;
-    const passed = passedCount === checks.length;
-
-    return {
-        passed,
-        score,
-        checks
-    };
+    return summarizeCoherenceChecks(checks);
 }
 
 function isEgressRequestEvent(event) {
@@ -2353,9 +2337,10 @@ function normalizeEgressHeaders(event) {
  * @param {string | null} [expectedOs=null] Optional expected OS ('win' | 'mac' | 'lin')
  * @returns {{
  *   passed: boolean,
- *   score: number,
+ *   status: string,
+ *   score: number | null,
  *   inspectedRequests: number,
- *   checks: Array<{ name: string, passed: boolean, details: string }>
+ *   checks: Array<{ name: string, passed: boolean, status: string, details: string }>
  * }}
  */
 export function evaluateWireToDomCoherence(domTelemetry, trafficEventsOrSummary, expectedOs = null) {
@@ -2371,19 +2356,14 @@ export function evaluateWireToDomCoherence(domTelemetry, trafficEventsOrSummary,
     const targetOs = normalizeTargetOs(expectedOs);
 
     const egressEvents = extractEgressRequestEvents(trafficEventsOrSummary);
-    const inspectedRequests = egressEvents.length;
+    let inspectedRequests = 0;
+    let requestsWithUserAgent = 0;
+    let requestsWithAcceptLanguage = 0;
 
     const uaMismatches = [];
     const langMismatches = [];
     const clientHintsLeaks = [];
     const proxyHeaderLeaks = [];
-
-    if (!domUa) {
-        uaMismatches.push('DOM navigator.userAgent is missing or empty');
-    }
-    if (!domPrimaryLang) {
-        langMismatches.push('DOM navigator.language / navigator.languages[0] is missing or empty');
-    }
 
     const proxyLeakRegex = /^(x-forwarded-for|via|x-real-ip|forwarded)$/i;
 
@@ -2391,9 +2371,14 @@ export function evaluateWireToDomCoherence(domTelemetry, trafficEventsOrSummary,
         const ev = egressEvents[idx];
         const reqLabel = ev.url || ev.correlationId || `req#${idx + 1}`;
         const headers = normalizeEgressHeaders(ev);
+        if (headers.length === 0) continue;
+        inspectedRequests += 1;
+        let hasUserAgent = false;
+        let hasAcceptLanguage = false;
 
         for (const h of headers) {
             if (h.lowerName === 'user-agent') {
+                hasUserAgent = true;
                 if (domUa && h.value !== domUa) {
                     uaMismatches.push(
                         `Wire User-Agent "${h.value}" on ${reqLabel} does not match DOM navigator.userAgent "${domUa}"`
@@ -2413,6 +2398,7 @@ export function evaluateWireToDomCoherence(domTelemetry, trafficEventsOrSummary,
                     );
                 }
             } else if (h.lowerName === 'accept-language') {
+                hasAcceptLanguage = true;
                 if (domPrimaryLang) {
                     const wireValueLower = h.value.toLowerCase();
                     const domLangLower = domPrimaryLang.toLowerCase();
@@ -2433,53 +2419,39 @@ export function evaluateWireToDomCoherence(domTelemetry, trafficEventsOrSummary,
                 );
             }
         }
+        if (hasUserAgent) requestsWithUserAgent += 1;
+        if (hasAcceptLanguage) requestsWithAcceptLanguage += 1;
     }
 
+    const haveRequestHeaders = inspectedRequests > 0 && inspectedRequests === egressEvents.length;
     const checks = [
-        {
-            name: 'wire-ua-matches-dom-ua',
-            passed: uaMismatches.length === 0,
-            details:
-                uaMismatches.length === 0
-                    ? `All ${inspectedRequests} pre-TLS egress requests match DOM navigator.userAgent`
-                    : uaMismatches.join('; ')
-        },
-        {
-            name: 'wire-accept-language-matches-dom',
-            passed: langMismatches.length === 0,
-            details:
-                langMismatches.length === 0
-                    ? `All ${inspectedRequests} pre-TLS egress requests start with DOM primary language "${domPrimaryLang}"`
-                    : langMismatches.join('; ')
-        },
-        {
-            name: 'wire-no-chromium-client-hints',
-            passed: clientHintsLeaks.length === 0,
-            details:
-                clientHintsLeaks.length === 0
-                    ? 'Zero Sec-CH-UA* Chromium Client Hints headers present on pre-TLS Gecko egress traffic'
-                    : clientHintsLeaks.join('; ')
-        },
-        {
-            name: 'wire-no-proxy-leak-headers',
-            passed: proxyHeaderLeaks.length === 0,
-            details:
-                proxyHeaderLeaks.length === 0
-                    ? 'Zero proxy attribution headers (X-Forwarded-For, Via, X-Real-IP, Forwarded) present on egress traffic'
-                    : proxyHeaderLeaks.join('; ')
-        }
+        evidenceCheck('wire-ua-matches-dom-ua', {
+            issues: uaMismatches,
+            observed: haveRequestHeaders && Boolean(domUa) && requestsWithUserAgent === inspectedRequests,
+            success: `All ${inspectedRequests} pre-TLS egress requests match DOM navigator.userAgent`,
+            unavailable: 'DOM or captured request User-Agent evidence is missing'
+        }),
+        evidenceCheck('wire-accept-language-matches-dom', {
+            issues: langMismatches,
+            observed: haveRequestHeaders && Boolean(domPrimaryLang) && requestsWithAcceptLanguage === inspectedRequests,
+            success: `All ${inspectedRequests} pre-TLS egress requests start with DOM primary language "${domPrimaryLang}"`,
+            unavailable: 'DOM language or captured request Accept-Language evidence is missing'
+        }),
+        evidenceCheck('wire-no-chromium-client-hints', {
+            issues: clientHintsLeaks,
+            observed: haveRequestHeaders,
+            success: 'No Chromium Client Hint headers were observed in captured request headers',
+            unavailable: 'Captured request headers are missing'
+        }),
+        evidenceCheck('wire-no-proxy-leak-headers', {
+            issues: proxyHeaderLeaks,
+            observed: haveRequestHeaders,
+            success: 'No proxy attribution headers were observed in captured request headers',
+            unavailable: 'Captured request headers are missing'
+        })
     ];
 
-    const passedCount = checks.filter((c) => c.passed).length;
-    const score = checks.length > 0 ? Math.round((passedCount / checks.length) * 100) : 0;
-    const passed = passedCount === checks.length;
-
-    return {
-        passed,
-        score,
-        inspectedRequests,
-        checks
-    };
+    return { ...summarizeCoherenceChecks(checks), inspectedRequests };
 }
 
 /**
@@ -2490,10 +2462,12 @@ export function evaluateWireToDomCoherence(domTelemetry, trafficEventsOrSummary,
  * @param {string} [expectedOs] Expected OS ('win' | 'mac' | 'lin')
  * @returns {Promise<{
  *   passed: boolean,
- *   score: number,
+ *   status: string,
+ *   score: number | null,
  *   expectedOs: string | null,
- *   checks: Array<{ name: string, passed: boolean, details: string }>,
- *   telemetry: object,
+ *   checks: Array<{ name: string, passed: boolean, status?: string, details: string }>,
+ *   telemetry: object | null,
+ *   reason?: string,
  *   timestamp: string
  * }>}
  */
@@ -2514,22 +2488,24 @@ export async function auditProfileCoherence(page, expectedOs, options = {}) {
     });
 
     const collectedTelemetry = await collectBrowserFingerprint(page);
-    const telemetry =
-        collectedTelemetry && typeof collectedTelemetry === 'object'
-            ? { ...collectedTelemetry }
-            : {};
+    const userAgent = collectedTelemetry?.navigator?.userAgent;
+    if (typeof userAgent !== 'string' || !userAgent.trim()) {
+        const reason = 'Browser navigator observations are unavailable';
+        logger.warn(reason);
+        return {
+            ...summarizeCoherenceChecks([]),
+            expectedOs: normalizedOs || rawExpectedOs || null,
+            telemetry: null,
+            reason,
+            timestamp: new Date().toISOString()
+        };
+    }
+    const telemetry = { ...collectedTelemetry };
     if (opts.profileId && !telemetry.profileId) {
         telemetry.profileId = opts.profileId;
     }
     if (!telemetry.hardwareProfile && opts.hardwareProfile && typeof opts.hardwareProfile === 'object') {
         telemetry.hardwareProfile = { ...opts.hardwareProfile };
-    }
-    if (
-        collectedTelemetry?.gpuPerformance &&
-        typeof collectedTelemetry.gpuPerformance === 'object' &&
-        !telemetry.gpuPerformanceState
-    ) {
-        telemetry.gpuPerformanceState = { ...collectedTelemetry.gpuPerformance };
     }
     if (opts.gpuPerformance && typeof opts.gpuPerformance === 'object') {
         telemetry.gpuPerformance = { ...opts.gpuPerformance };
@@ -2537,26 +2513,26 @@ export async function auditProfileCoherence(page, expectedOs, options = {}) {
 
     const evaluation = evaluatePlatformCoherence(telemetry, normalizedOs || rawExpectedOs);
     const report = {
-        passed: evaluation.passed,
-        score: evaluation.score,
+        ...evaluation,
         expectedOs: normalizedOs || rawExpectedOs || null,
-        checks: evaluation.checks,
         telemetry,
         timestamp: new Date().toISOString()
     };
 
     if (report.passed) {
-        logger.info(`Camoufox profile coherence audit PASSED (${report.score}/100)`, {
+        logger.info(`Camoufox browser telemetry audit PASSED (${report.score}/100)`, {
             expectedOs: report.expectedOs,
             renderer: telemetry.webgl?.unmaskedRenderer,
             canvasHash: telemetry.canvas2d?.fnv1aHash,
             timeZone: telemetry.intl?.timeZone
         });
     } else {
-        const failedChecks = report.checks.filter((c) => !c.passed);
-        logger.warn(`Camoufox profile coherence audit FAILED (${report.score}/100)`, {
+        const failedChecks = report.checks.filter((c) => !c.passed && c.status !== 'not-tested');
+        const untestedChecks = report.checks.filter((c) => c.status === 'not-tested').map((c) => c.name);
+        logger.warn(`Camoufox browser telemetry audit ${report.status.toUpperCase()} (${report.score}/100)`, {
             expectedOs: report.expectedOs,
-            failedChecks
+            failedChecks,
+            untestedChecks
         });
     }
 
@@ -2616,11 +2592,8 @@ export default {
     attachZiniaoSecurityGuardsToContext,
     GPU_PERFORMANCE_SPEC_CATALOG,
     lookupGpuPerformanceSpec,
-    collectHostMacPerformanceBaseline,
     computeGpuPerformanceScalingWeights,
     scaleGpuExecutionDurationMs,
-    buildGpuPerformanceInitScript,
-    attachGpuPerformanceScalerToContext,
     validateGpuPerformanceScalingCoherence,
     normalizeTargetOs,
     gpuFitsOs,

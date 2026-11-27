@@ -21,8 +21,12 @@ function assertOwner(stats, filePath) {
     }
 }
 
-function openPrivateFile(filePath, access = fs.constants.O_RDONLY, { requireOwner = false, restrict = true } = {}) {
-    const existing = fs.lstatSync(filePath);
+function sameRegularFile(current, expected) {
+    return current.isFile() && current.dev === expected.dev && current.ino === expected.ino;
+}
+
+function openPrivateFile(filePath, access = fs.constants.O_RDONLY, { requireOwner = false, restrict = true } = {}, expectedFile) {
+    const existing = expectedFile ?? fs.lstatSync(filePath);
     if (!existing.isFile() || existing.nlink !== 1) {
         throw new Error(`Expected a regular file with one directory entry: ${filePath}`);
     }
@@ -30,7 +34,13 @@ function openPrivateFile(filePath, access = fs.constants.O_RDONLY, { requireOwne
     const fd = fs.openSync(filePath, access | OPEN_EXISTING);
     try {
         const opened = fs.fstatSync(fd);
-        if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== existing.dev || opened.ino !== existing.ino) {
+        const sameFile = sameRegularFile(opened, existing);
+        if (expectedFile && sameFile && opened.nlink === 0) {
+            if (requireOwner) assertOwner(opened, filePath);
+            // An unlinked marker can remain open. Only a missing path is retryable.
+            fs.lstatSync(filePath);
+        }
+        if (!sameFile || opened.nlink !== 1) {
             throw new Error(`File changed while opening: ${filePath}`);
         }
         if (requireOwner) assertOwner(opened, filePath);
@@ -73,9 +83,18 @@ export function restrictPrivateFile(filePath, options) {
 }
 
 export function readPrivateFile(filePath, encoding = 'utf8', options) {
-    const fd = openPrivateFile(filePath, fs.constants.O_RDONLY, options);
+    const expectedFile = options?.expectedFile;
+    const fd = openPrivateFile(filePath, fs.constants.O_RDONLY, options, expectedFile);
     try {
-        return fs.readFileSync(fd, encoding);
+        const contents = fs.readFileSync(fd, encoding);
+        if (expectedFile) {
+            const current = fs.lstatSync(filePath);
+            if (!sameRegularFile(current, expectedFile) || current.nlink !== 1) {
+                throw new Error(`File changed while reading: ${filePath}`);
+            }
+            if (options.requireOwner) assertOwner(current, filePath);
+        }
+        return contents;
     } finally {
         fs.closeSync(fd);
     }
@@ -90,7 +109,8 @@ export function writePrivateFile(filePath, data, options) {
         }
     }
 
-    const temporaryPath = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${randomUUID()}.tmp`);
+    const temporaryPath = options?.temporaryPath ??
+        path.join(path.dirname(filePath), `.${path.basename(filePath)}.${randomUUID()}.tmp`);
     const fd = fs.openSync(temporaryPath, 'wx', FILE_MODE);
     try {
         try {

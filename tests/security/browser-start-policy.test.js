@@ -160,6 +160,45 @@ test('all capture opt-outs reject pending and active reuse under the previous po
     assert.equal(launches.length, 1);
 });
 
+test('pending and active reuse reject new capture or narrowed native logging settings', async (t) => {
+    let releaseLaunch;
+    const gate = new Promise((resolve) => { releaseLaunch = resolve; });
+    const { options, launches } = setup(t, () => gate);
+    const initial = {
+        ...options,
+        recordTraffic: true,
+        recordBodies: true,
+        maxBodyBytes: 4096,
+        recordWireLog: false,
+        neckoMozLog: true,
+        neckoMozLogModules: 'timestamp,nsHttp:5,nsSocketTransport:5',
+        contextOptions: { acceptDownloads: true }
+    };
+    const changed = [
+        [{ recordHar: true }, /enabling HAR recording/],
+        [{ recordWireLog: true }, /enabling wire logging/],
+        [{ neckoMozLogModules: 'timestamp,nsHttp:3' }, /changing Necko logging modules/],
+        [{ maxBodyBytes: 1024 }, /changing the body recording limit/],
+        [{ contextOptions: { acceptDownloads: false } }, /context permissions/]
+    ];
+    const pending = startProfile('capture-options', initial);
+    try {
+        for (const [overrides, reason] of changed) {
+            const rejected = startProfile('capture-options', { ...initial, ...overrides }).then(() => null, (error) => error);
+            const outcome = await Promise.race([rejected, new Promise((resolve) => setImmediate(resolve))]);
+            assert.match(outcome?.message ?? '', reason);
+        }
+    } finally {
+        releaseLaunch();
+    }
+    const active = await pending;
+    for (const [overrides, reason] of changed) {
+        await assert.rejects(startProfile('capture-options', { ...initial, ...overrides }), reason);
+    }
+    assert.equal(await startProfile('capture-options', initial), active);
+    assert.equal(launches.length, 1);
+});
+
 test('TLS and Necko opt-outs also apply to active native logging without traffic capture', async (t) => {
     const { options, launches } = setup(t);
     const logging = { ...options, sslKeyLog: true, neckoMozLog: true };

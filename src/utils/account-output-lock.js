@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { describeProcessOwner, isDeadProcessOwner, readProcessOwner } from './process-owner.js';
 
 const WAIT_MS = 5_000;
 const WAIT_INTERVAL_MS = 25;
@@ -11,6 +12,14 @@ const OWNER_NAME = /^owner-([1-9][0-9]*)-[a-f0-9-]{36}$/;
 
 function lockFailure(message) {
     return Object.assign(new Error(message), { code: 'ACCOUNT_OUTPUT_LOCK_FAILED' });
+}
+
+function invalidLock(label) {
+    return lockFailure(`Invalid ${label} writer lock. Inspect ${label}.lock with all writers stopped.`);
+}
+
+function ownedByWriter(stat) {
+    return typeof process.geteuid !== 'function' || stat.uid === process.geteuid();
 }
 
 function removeEmptyLock(directory) {
@@ -31,33 +40,67 @@ function removeOwner(directory, owner) {
     removeEmptyLock(directory);
 }
 
+function removeSnapshot(directory, owner, label) {
+    const snapshot = path.join(directory, `${owner}.snapshot`);
+    try {
+        const stat = fs.lstatSync(snapshot);
+        if (!stat.isFile() || stat.nlink !== 1 || !ownedByWriter(stat)) throw invalidLock(label);
+        fs.unlinkSync(snapshot);
+    } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+    }
+}
+
 function discardDeadLock(directory, label) {
-    let owners;
     try {
         const existing = fs.lstatSync(directory);
-        if (!existing.isDirectory() || (typeof process.geteuid === 'function' && existing.uid !== process.geteuid())) {
-            throw lockFailure(`Invalid ${label} writer lock. Inspect ${label}.lock with all writers stopped.`);
+        if (!existing.isDirectory() || !ownedByWriter(existing)) throw invalidLock(label);
+        const entries = fs.readdirSync(directory);
+        if (!entries.length) {
+            removeEmptyLock(directory);
+            return;
         }
-        owners = fs.readdirSync(directory);
-    } catch (error) {
-        if (error.code === 'ENOENT') return;
-        throw error;
-    }
 
-    if (owners.length === 0) {
-        removeEmptyLock(directory);
-        return;
-    }
-    const [owner] = owners;
-    const pid = Number(OWNER_NAME.exec(owner)?.[1]);
-    if (owners.length !== 1 || !Number.isInteger(pid) || pid > 0x7fff_ffff) {
-        throw lockFailure(`Invalid ${label} writer lock. Inspect ${label}.lock with all writers stopped.`);
-    }
-    try {
-        process.kill(pid, 0);
+        const owner = entries.find((entry) => OWNER_NAME.test(entry));
+        const pid = Number(OWNER_NAME.exec(owner)?.[1]);
+        if (!Number.isInteger(pid) || pid > 0x7fff_ffff ||
+            entries.some((entry) => entry !== owner && entry !== `${owner}.snapshot`)) throw invalidLock(label);
+
+        const identity = readProcessOwner(path.join(directory, owner));
+        if (!identity || (!identity.host && entries.length !== 1)) throw invalidLock(label);
+        if (isDeadProcessOwner(pid, identity)) {
+            if (identity.host) removeSnapshot(directory, owner, label);
+            removeOwner(directory, owner);
+        }
     } catch (error) {
-        if (error.code === 'ESRCH') removeOwner(directory, owner);
-        else if (error.code !== 'EPERM') throw error;
+        // Release can remove the named marker while a waiter is reading it.
+        if (error.code !== 'ENOENT') throw error;
+    }
+}
+
+function warnCleanup(label) {
+    process.emitWarning(`Could not finish cleaning up the ${label} writer lock. Inspect its lock files with all writers stopped.`, {
+        code: 'ACCOUNT_OUTPUT_LOCK_CLEANUP_FAILED'
+    });
+}
+
+function releaseLock(directory, staging, owner, label) {
+    try {
+        removeSnapshot(directory, owner, label);
+        const entries = fs.readdirSync(directory);
+        if (entries.length !== 1 || entries[0] !== owner) throw invalidLock(label);
+        // Free the shared lock name first. A failure deleting the detached owner
+        // marker then leaves no private snapshot and cannot block the next writer.
+        let released = directory;
+        try {
+            fs.renameSync(directory, staging);
+            released = staging;
+        } catch {
+            // The ordinary owner-specific removal is still safe if renaming failed.
+        }
+        removeOwner(released, owner);
+    } catch {
+        warnCleanup(label);
     }
 }
 
@@ -71,7 +114,7 @@ export function withAccountOutputLock(filePath, operation) {
     try {
         // Publish the already nonempty directory atomically. A stopped writer's
         // unique owner name lets a later process remove only that owner's entry.
-        fs.closeSync(fs.openSync(path.join(staging, owner), 'wx', 0o600));
+        fs.writeFileSync(path.join(staging, owner), describeProcessOwner(), { flag: 'wx', mode: 0o600 });
         const deadline = performance.now() + WAIT_MS;
         for (;;) {
             try {
@@ -86,12 +129,17 @@ export function withAccountOutputLock(filePath, operation) {
                 Atomics.wait(waitBuffer, 0, 0, WAIT_INTERVAL_MS);
             }
         }
+    } catch (error) {
         try {
-            return operation();
-        } finally {
-            removeOwner(directory, owner);
+            removeOwner(staging, owner);
+        } catch {
+            warnCleanup(label);
         }
+        throw error;
+    }
+    try {
+        return operation(path.join(directory, `${owner}.snapshot`));
     } finally {
-        fs.rmSync(staging, { recursive: true, force: true });
+        releaseLock(directory, staging, owner, label);
     }
 }

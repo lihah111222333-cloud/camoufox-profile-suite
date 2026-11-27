@@ -30,12 +30,22 @@ function sameVersion(left, right) {
         left.ctimeNs === right.ctimeNs && left.mtimeNs === right.mtimeNs;
 }
 
-function resolveFilesystemPath(value) {
+export function resolveFilesystemPath(value) {
     const resolved = path.resolve(value);
     // These macOS system aliases are outside the supplied capture or output tree.
     return NOFOLLOW_ANY && /^\/(?:tmp|var|etc)(?:\/|$)/.test(resolved)
         ? `/private${resolved}`
         : resolved;
+}
+
+function resolveExistingAncestors(filePath) {
+    try {
+        return fs.realpathSync.native(filePath);
+    } catch (error) {
+        const parent = path.dirname(filePath);
+        if (error.code !== 'ENOENT' || parent === filePath) throw error;
+        return path.join(resolveExistingAncestors(parent), path.basename(filePath));
+    }
 }
 
 function openDirectoryEntry(entry) {
@@ -155,7 +165,7 @@ function withCaptureFile(trafficDir, components, { trustedLocal, maxBytes, flags
                 }
             };
             verifyFile();
-            return useFile(fd, Number(before.size), verifyFile);
+            return useFile(fd, Number(before.size), verifyFile, entry);
         } finally {
             fs.closeSync(fd);
         }
@@ -213,6 +223,20 @@ export function hashCapturePayload(trafficDir, relativePath, {
     return withCaptureFile(trafficDir, payloadFileComponents(relativePath), {
         trustedLocal, maxBytes, flags: fs.constants.O_RDONLY
     }, (fd, size, verifyFile) => hashFileBytes(fd, size, size, verifyFile));
+}
+
+/** Measure a payload already on disk without reading its contents. */
+export function measureCapturePayload(trafficDir, relativePath, { trustedLocal = false } = {}) {
+    return withCaptureFile(trafficDir, payloadFileComponents(relativePath), {
+        trustedLocal, maxBytes: trustedLocal ? MAX_LOCAL_BYTES : MAX_CAPTURE_BYTES, flags: fs.constants.O_RDONLY
+    }, (_fd, size) => size);
+}
+
+/** Remove a recorder-owned abandoned attachment after verifying its file identity. */
+export function removeCapturePayload(trafficDir, relativePath, { trustedLocal = false } = {}) {
+    return withCaptureFile(trafficDir, payloadFileComponents(relativePath), {
+        trustedLocal, maxBytes: trustedLocal ? MAX_LOCAL_BYTES : MAX_CAPTURE_BYTES, flags: fs.constants.O_RDONLY
+    }, (_fd, _size, _verifyFile, entry) => fs.unlinkSync(entry));
 }
 
 /** Read a fixed capture artifact, optionally allowing an absent file. */
@@ -339,11 +363,28 @@ export function truncateCaptureFile(trafficDir, fileName, expectedBytes, length,
 }
 
 /** Publish a private file through a temporary inode in the destination directory. */
-export function writeCaptureExport(outputPath, content, { replace = true } = {}) {
+export function writeCaptureExport(outputPath, content, { replace = true, protectedPaths = [], recordedWirePath } = {}) {
+    const resolvedOutput = resolveFilesystemPath(outputPath);
+    const protectedFiles = [...protectedPaths];
+    // An archived wire path can only veto publication at the selected destination.
+    if (typeof recordedWirePath === 'string' && path.isAbsolute(recordedWirePath)) {
+        const wirePath = resolveFilesystemPath(recordedWirePath);
+        const comparable = (value) => NOFOLLOW_ANY || process.platform === 'win32'
+            ? value.normalize('NFC').toLowerCase() : value;
+        if (comparable(wirePath) === comparable(resolvedOutput)) protectedFiles.push(wirePath);
+    }
+    const reserved = protectedFiles.map((filePath) => resolveExistingAncestors(resolveFilesystemPath(filePath)));
+    const physicalOutput = reserved.length ? resolveExistingAncestors(resolvedOutput) : resolvedOutput;
+    for (const source of reserved) {
+        const relative = path.relative(source, physicalOutput);
+        if (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) {
+            throw captureError('Capture export destination overlaps the input capture');
+        }
+    }
     // The standalone default is already relative to the operator's pinned cwd.
     const parent = path.dirname(path.resolve(outputPath));
     const useWorkingDirectory = !replace && parent === process.cwd();
-    const directory = useWorkingDirectory ? null : openDirectory(resolveFilesystemPath(parent), {
+    const directory = useWorkingDirectory ? null : openDirectory(path.dirname(resolvedOutput), {
         create: replace, trustedLocal: true
     });
     const lookup = directory?.lookup || '.';
@@ -355,6 +396,12 @@ export function writeCaptureExport(outputPath, content, { replace = true } = {})
             const existing = fs.lstatSync(target, { ...STAT_OPTIONS, throwIfNoEntry: false });
             if (existing && (!existing.isFile() || existing.nlink !== 1n)) {
                 throw captureError('Capture export destination must be an ordinary file');
+            }
+            if (existing && reserved.some((source) => {
+                const sourceNode = fs.lstatSync(source, { ...STAT_OPTIONS, throwIfNoEntry: false });
+                return sourceNode && sameNode(existing, sourceNode);
+            })) {
+                throw captureError('Capture export destination overlaps the input capture');
             }
         }
         const fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT |

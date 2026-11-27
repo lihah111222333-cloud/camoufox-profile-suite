@@ -156,7 +156,10 @@ test('controller trust and authorization can load from private state configurati
         'DOLPHIN_API_KEY=' + syntheticKey
     ].join('\n'));
 
-    responses.push({ status: 200 }, { status: 200 });
+    responses.push(
+        { status: 200, data: { success: true, data: [] } },
+        { status: 200, data: { list: [] } }
+    );
     assert.equal(await gpm.checkGPMConnection(), true);
     assert.equal(await dolphin.checkDolphinConnection(), true);
     assert.deepEqual(requests.map(request => new URL(request.url).origin), [gpmBase, dolphinBase]);
@@ -176,7 +179,7 @@ test('all GPM profile routes take a single opaque identifier', async t => {
     responses.push(
         { data: { data: { id: 'test-8_9' } } },
         { data: { data: { remote_debugging_address: 'https://gpm-controller.invalid:9443' } } },
-        { status: 200 },
+        { status: 200, data: { success: true } },
         { status: 204 }
     );
     assert.equal((await gpm.getProfile('test-8_9')).id, 'test-8_9');
@@ -192,23 +195,78 @@ test('all GPM profile routes take a single opaque identifier', async t => {
     assert.equal(new URL(requests[3].url).searchParams.get('mode'), '1');
 });
 
+test('GPM requires a successful profile list and refuses rejected starts with a debugger address', async t => {
+    const { gpm, responses } = await loadControllers(t);
+    for (const data of ['<html>Generic controller page</html>', { success: false, data: [] }, { success: true }]) {
+        responses.push({ status: 200, data });
+        assert.equal(await gpm.checkGPMConnection(), false);
+    }
+    responses.push({ status: 200, data: { success: true, data: [] } });
+    assert.equal(await gpm.checkGPMConnection(), true);
+
+    const data = { remote_debugging_address: 'https://gpm-controller.invalid:9443/' };
+    responses.push(
+        { status: 200, data: JSON.stringify({ success: false, data }) },
+        { status: 200, data: { success: true, data } }
+    );
+    await assert.rejects(gpm.startProfile('fixture'), /rejected profile startup/);
+    assert.equal((await gpm.startProfile('fixture')).remote_debugging_address, data.remote_debugging_address);
+    assert.deepEqual(responses, []);
+});
+
+test('GPM reports uncertain allocation and honors disabled extension setup', async t => {
+    const { gpm, requests, responses } = await loadControllers(t, { SETUP_OMO_CAPTCHA: 'false' });
+    const timeout = Object.assign(new Error('fixture timeout'), { code: 'ECONNABORTED' });
+    const refused = Object.assign(new Error('fixture connection refusal'), { code: 'ECONNREFUSED', request: {} });
+    const unknownAllocation = { code: 'PROFILE_ALLOCATION_UNCONFIRMED', profileCleanup: 'allocation-unconfirmed' };
+    responses.push(
+        timeout,
+        { status: 200, data: { success: true, data: {} } },
+        rejectedResponse(400, { success: false }),
+        { status: 200, data: { success: false } },
+        refused,
+        { status: 200, data: { success: true, data: { id: 'fixture' } } }
+    );
+    await assert.rejects(gpm.createProfile('fixture', proxy), unknownAllocation);
+    await assert.rejects(gpm.createProfile('fixture', proxy), unknownAllocation);
+    for (const message of [/HTTP 400/, /rejected profile creation/, /ECONNREFUSED/]) {
+        await assert.rejects(gpm.createProfile('fixture', proxy), error => {
+            assert.match(error.message, message);
+            assert.equal(error.profileCleanup, undefined);
+            return true;
+        });
+    }
+    assert.equal((await gpm.createProfile('fixture', proxy)).id, 'fixture');
+    await assert.rejects(gpm.createProfile('fixture', { ...proxy, type: 'https' }), error => {
+        assert.match(error.message, /does not support HTTPS proxies/);
+        assert.equal(error.profileCleanup, undefined);
+        return true;
+    });
+    assert.equal(requests.length, 6);
+    assert.ok(requests.every(request => !Object.hasOwn(request.data, 'extension_ids')));
+    assert.deepEqual(responses, []);
+});
+
 test('Dolphin profile operations require opaque IDs and preserve their type in JSON', async t => {
     const { dolphin, requests, responses } = await loadControllers(t);
     const invalid = { id: 'test-profile' };
     await assert.rejects(dolphin.startProfile(invalid), /Invalid browser controller profile ID/);
     await assert.rejects(dolphin.getProfile(invalid), /Invalid browser controller profile ID/);
-    await assert.rejects(dolphin.deleteProfile(invalid), /Invalid browser controller profile ID/);
+    await assert.rejects(dolphin.recycleProfile(invalid), /Invalid browser controller profile ID/);
+    await assert.rejects(dolphin.deleteProfile('fixture'), /Permanent Dolphin Anty profile deletion is unavailable/);
     await assert.rejects(dolphin.updateProfileProxy([invalid], proxy), /Invalid browser controller profile ID/);
     await assert.rejects(dolphin.updateProfileProxy([], proxy), /At least one/);
     assert.equal(await dolphin.stopProfile(invalid), false);
     assert.equal(requests.length, 0);
 
-    responses.push({ status: 204 }, { status: 204 }, { status: 200 });
+    responses.push({ status: 204 }, { status: 200, data: { success: true } }, { status: 200 });
     assert.equal(await dolphin.stopProfile(123), true);
-    assert.equal(await dolphin.deleteProfile('test-id_12'), true);
+    assert.equal(await dolphin.recycleProfile(123), true);
     await dolphin.updateProfileProxy([123, 'test-id_12'], proxy);
     assert.deepEqual(requests[0].data, { profileIds: [123] });
-    assert.deepEqual(requests[1].data, { profileIds: ['test-id_12'] });
+    assert.equal(requests[1].method, 'POST');
+    assert.equal(new URL(requests[1].url).pathname, '/api/profile/moveProfiletoRecycle');
+    assert.deepEqual(requests[1].data, { ids: ['123'] });
     assert.deepEqual(requests[2].data.ids, [123, 'test-id_12']);
 });
 
@@ -221,10 +279,112 @@ test('profile creation supplies only a valid opaque ID to managed callers', asyn
         { data: { id: 456 } }
     );
     await assert.rejects(gpm.createProfile('test profile'), /Invalid browser controller profile ID/);
-    await assert.rejects(dolphin.createProfile('test profile'), /Invalid browser controller profile ID/);
+    await assert.rejects(dolphin.createProfile('test profile'), {
+        code: 'PROFILE_ALLOCATION_UNCONFIRMED',
+        profileCleanup: 'allocation-unconfirmed'
+    });
     assert.equal((await gpm.createProfile('test profile')).id, 123);
     assert.equal((await dolphin.createProfile('test profile')).id, 456);
     assert.equal(requests.length, 4);
+});
+
+test('Dolphin checks for a successful profile-list response', async t => {
+    const { dolphin, requests, responses } = await loadControllers(t);
+    for (const response of [
+        { status: 200, data: '<html>generic login page</html>' },
+        { status: 200, data: {} },
+        { status: 200, data: { success: false, list: [] } },
+        { status: 202, data: { list: [] } },
+        { status: 204 }
+    ]) {
+        responses.push(response);
+        assert.equal(await dolphin.checkDolphinConnection(), false);
+    }
+    responses.push({ status: 200, data: '{"list":[]}' });
+    assert.equal(await dolphin.checkDolphinConnection(), true);
+    assert.ok(requests.every(request => new URL(request.url).pathname === '/api/profile/getProfiles'));
+    assert.deepEqual(responses, []);
+});
+
+test('Dolphin factory probes, reports uncertain allocations and recycles allocated profiles after startup failure', async t => {
+    const { load, requests, responses, root } = await loadControllers(t);
+    const puppeteer = path.join(root, 'node_modules', 'puppeteer-core');
+    await mkdir(puppeteer);
+    await writeFile(path.join(puppeteer, 'package.json'), '{"main":"index.cjs"}');
+    await writeFile(path.join(puppeteer, 'index.cjs'), 'module.exports = {};');
+    const { createAndStartProfile } = await load('src/dolphin/profile.js');
+
+    responses.push({ status: 200, data: '<html>generic login page</html>' });
+    await assert.rejects(createAndStartProfile('test profile', proxy), /API is not available/);
+    assert.equal(requests.length, 1);
+
+    responses.push({ status: 200, data: { list: [] } }, { status: 200, data: {} });
+    await assert.rejects(createAndStartProfile('test profile', proxy), {
+        code: 'PROFILE_ALLOCATION_UNCONFIRMED',
+        profileCleanup: 'allocation-unconfirmed'
+    });
+    const paths = () => requests.splice(0).map(request => new URL(request.url).pathname);
+    assert.deepEqual(paths(), [
+        '/api/profile/getProfiles',
+        '/api/profile/getProfiles',
+        '/api/profile/advancedCreateProfile'
+    ]);
+
+    t.mock.method(globalThis, 'setTimeout', callback => queueMicrotask(callback));
+    for (const [data, profileCleanup] of [[{ success: true }, 'recycled'], [{}, 'recycle-unconfirmed']]) {
+        responses.push(
+            { status: 200, data: { list: [] } },
+            { status: 200, data: { id: 'fixture-profile' } },
+            { status: 200, data: { success: false } },
+            { status: 204 },
+            { status: 200, data }
+        );
+        await assert.rejects(createAndStartProfile('test profile', proxy), {
+            profileId: 'fixture-profile',
+            profileCleanup
+        });
+        assert.deepEqual(paths(), [
+            '/api/profile/getProfiles',
+            '/api/profile/advancedCreateProfile',
+            '/api/browser/openBrowser',
+            '/api/browser/closeProfiles',
+            '/api/profile/moveProfiletoRecycle'
+        ]);
+    }
+    assert.deepEqual(responses, []);
+});
+
+test('Dolphin distinguishes an uncertain create from rejections before allocation', async t => {
+    const { dolphin, requests, responses } = await loadControllers(t);
+    const timeout = Object.assign(new Error('fixture timeout'), { code: 'ECONNABORTED' });
+    for (const response of [
+        timeout,
+        rejectedResponse(503, { message: proxy.password }),
+        { status: 200, data: '<html>generic login page</html>' }
+    ]) {
+        responses.push(response);
+        await assert.rejects(dolphin.createProfile('test profile', proxy), {
+            code: 'PROFILE_ALLOCATION_UNCONFIRMED',
+            profileCleanup: 'allocation-unconfirmed'
+        });
+    }
+    for (const response of [
+        rejectedResponse(403, { code: 50200, message: proxy.password }),
+        { status: 200, data: { success: false } }
+    ]) {
+        responses.push(response);
+        await assert.rejects(dolphin.createProfile('test profile', proxy), error => {
+            assert.equal(error.profileCleanup, undefined);
+            return true;
+        });
+    }
+    await assert.rejects(dolphin.createProfile('test profile', { ...proxy, port: 0 }), error => {
+        assert.equal(error.profileCleanup, undefined);
+        return true;
+    });
+    assert.equal(requests.length, 5);
+    assert.ok(requests.every(request => new URL(request.url).pathname === '/api/profile/advancedCreateProfile'));
+    assert.deepEqual(responses, []);
 });
 
 test('Dolphin only posts profile data to the selected destination', async t => {
@@ -237,7 +397,11 @@ test('Dolphin only posts profile data to the selected destination', async t => {
     const paths = () => requests.splice(0).map(request => new URL(request.url).pathname);
 
     responses.push(rejectedResponse(503, { message: proxy.password }));
-    await assert.rejects(dolphin.createProfile('test profile', proxy), { status: 503 });
+    await assert.rejects(dolphin.createProfile('test profile', proxy), error => {
+        assert.equal(error.status, 503);
+        assert.equal(error.profileCleanup, undefined);
+        return true;
+    });
     assert.deepEqual(paths(), [list]);
 
     responses.push({ data: { data: [unrelated] } }, rejectedResponse(403, { code: 50200, message: proxy.password }));
@@ -332,22 +496,49 @@ test('Dolphin folder command reports a safe failure from the controller', async 
     assert.equal(process.exitCode, 1);
 });
 
-test('controller clients reject an explicit negative stop or delete acknowledgement', async t => {
+test('controller clients require a positive stop, delete or recycle acknowledgement', async t => {
     const { gpm, dolphin, responses } = await loadControllers(t);
     const rejected = { status: 200, data: '{"success":false,"message":"test-proxy-password"}' };
     const closed = { status: 204 };
-    responses.push(rejected, rejected, rejected, rejected, { status: 200 }, closed, closed, closed,
+    const recycled = { status: 200, data: { success: true } };
+    responses.push(rejected, rejected, rejected, rejected, { status: 200, data: '{"success":true}' }, closed, closed, recycled,
         rejectedResponse(400, { message: 'Profile is not running' }), { status: 202 }, { status: 202 });
     assert.equal(await gpm.stopProfile('fixture'), false);
     await assert.rejects(gpm.deleteProfile('fixture'), /did not confirm profile deletion/);
     assert.equal(await dolphin.stopProfile('fixture'), false);
-    await assert.rejects(dolphin.deleteProfile('fixture'), /did not confirm profile deletion/);
+    await assert.rejects(dolphin.recycleProfile('fixture'), /did not confirm profile recycling/);
     assert.equal(await gpm.stopProfile('fixture'), true);
     assert.equal(await gpm.deleteProfile('fixture'), true);
     assert.equal(await dolphin.stopProfile('fixture'), true);
-    assert.equal(await dolphin.deleteProfile('fixture'), true);
+    assert.equal(await dolphin.recycleProfile('fixture'), true);
     assert.equal(await gpm.stopProfile('fixture'), true);
     assert.equal(await dolphin.stopProfile('fixture'), false);
-    await assert.rejects(dolphin.deleteProfile('fixture'), /did not confirm profile deletion/);
+    await assert.rejects(dolphin.recycleProfile('fixture'), /did not confirm profile recycling/);
+    assert.deepEqual(responses, []);
+});
+
+test('stop, delete and recycle reject HTML, ambiguous 200 responses and unknown 404 routes', async t => {
+    const { gpm, dolphin, responses } = await loadControllers(t);
+    const ambiguous = [
+        { status: 200, data: '<html>Generic controller page</html>' },
+        { status: 200, data: {} },
+        { status: 200, data: '' },
+        rejectedResponse(404, { message: 'Not Found' }),
+        rejectedResponse(404, '<html>Route not found</html>')
+    ];
+    for (const [client, remove] of [[gpm, gpm.deleteProfile], [dolphin, dolphin.recycleProfile]]) {
+        for (const response of ambiguous) {
+            responses.push(response, response);
+            assert.equal(await client.stopProfile('fixture'), false);
+            await assert.rejects(remove('fixture'), /did not confirm profile (deletion|recycling)|HTTP 404/);
+        }
+    }
+
+    responses.push(
+        rejectedResponse(404, '{"success":false,"message":"Profile not found"}'),
+        rejectedResponse(404, { success: false, message: 'Profile not found' })
+    );
+    assert.equal(await gpm.stopProfile('fixture'), true);
+    assert.equal(await gpm.deleteProfile('fixture'), true);
     assert.deepEqual(responses, []);
 });

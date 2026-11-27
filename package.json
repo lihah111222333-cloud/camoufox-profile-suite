@@ -8,13 +8,13 @@
     "gmail-account-creator": "bin/gmail-account-creator.js"
   },
   "files": [
-    ".env.example",
-    "ENV_VARIABLES.md",
-    "LICENSE",
-    "README.md",
-    "README_AR.md",
-    "SETUP.md",
-    "USAGE.md",
+    "/.env.example",
+    "/ENV_VARIABLES.md",
+    "/LICENSE",
+    "/README.md",
+    "/README_AR.md",
+    "/SETUP.md",
+    "/USAGE.md",
     "assets/README.md",
     "assets/deposit-btc-bsc.jpeg",
     "assets/deposit-usdt-bsc.jpeg",
@@ -74,6 +74,7 @@
     "src/utils/name-generator.js",
     "src/utils/private-env.js",
     "src/utils/private-storage.js",
+    "src/utils/process-owner.js",
     "src/utils/proxy-manager.js",
     "src/utils/proxy-protocol.js",
     "src/utils/state-paths.js"

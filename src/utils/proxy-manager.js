@@ -12,17 +12,24 @@ import { ensureStateDirectory, LEGACY_DIRECTORY, PACKAGE_ROOT, STATE_DIRECTORY }
 const PROXY_INVENTORY = path.join('config', 'proxies.txt');
 const PROXIES_FILE = path.join(STATE_DIRECTORY, PROXY_INVENTORY);
 const PROXY_FILE_OPTIONS = { requireOwner: true };
-const INVALID_INVENTORY = 'Invalid proxy configuration in config/proxies.txt. Check the indicated lines.';
+const INVALID_INVENTORY = 'Invalid proxy configuration in config/proxies.txt. Check the indicated lines. ' +
+    'Keep the configured scheme and percent-encode credential delimiters in a URL such as ' +
+    'http://user:pass%40word%3Aend@proxy.example:8080.';
 
 function proxyConfigurationError(message) {
     return Object.assign(new Error(message), { code: 'PROXY_CONFIGURATION_ERROR' });
 }
 
 function hasUnselectedLegacyInventory() {
-    if (STATE_DIRECTORY === PACKAGE_ROOT || LEGACY_DIRECTORY === PACKAGE_ROOT) return false;
+    const selected = [STATE_DIRECTORY, LEGACY_DIRECTORY].filter(Boolean);
+    if (selected.includes(PACKAGE_ROOT)) return false;
     try {
         fs.lstatSync(path.join(PACKAGE_ROOT, PROXY_INVENTORY));
-        return true;
+        const root = fs.statSync(PACKAGE_ROOT, { bigint: true });
+        return !selected.some((directory) => {
+            const stats = fs.statSync(directory, { bigint: true, throwIfNoEntry: false });
+            return stats?.isDirectory() && stats.dev === root.dev && stats.ino === root.ino;
+        });
     } catch (error) {
         if (error.code === 'ENOENT') return false;
         throw proxyConfigurationError('Could not check for an existing installation proxy inventory');
@@ -86,93 +93,64 @@ class ProxyManager {
      */
     parseProxyLine(rawLine) {
         if (!rawLine || typeof rawLine !== 'string') return null;
-        let line = rawLine.trim();
+        const line = rawLine.trim();
         if (!line || line.startsWith('#')) return null;
 
-        // Normalize unschemed user:pass@host:port lines by prepending http://
-        if (!line.includes('://') && line.includes('@')) {
-            const atIdx = line.lastIndexOf('@');
-            const afterAt = line.slice(atIdx + 1);
-            if (this._splitHostAndRemainder(afterAt.replace(/\/+$/, ''))) {
-                line = `http://${line}`;
-            }
-        }
-
-        let type = 'http';
-        let ip = '';
-        let port = '';
-        let username = '';
-        let password = '';
-
-        // 1. URL scheme format: protocol://[user:pass@]host:port or protocol://host:port:user:pass
-        const schemeMatch = line.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(.+)$/);
-        if (schemeMatch) {
-            type = schemeMatch[1].toLowerCase();
-            const rest = schemeMatch[2].trim().replace(/\/+$/, '');
-            if (rest.includes('@')) {
-                const lastAt = rest.lastIndexOf('@');
-                const authPart = rest.slice(0, lastAt);
-                const hostPart = rest.slice(lastAt + 1);
-                const colonIdx = authPart.indexOf(':');
+        const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(line);
+        const type = scheme?.[1].toLowerCase() ?? 'http';
+        const rest = scheme ? line.slice(scheme[0].length).trim() : line;
+        const colonForm = this._splitHostAndRemainder(rest);
+        const lastAt = rest.lastIndexOf('@');
+        if (lastAt !== -1) {
+            const destination = this._splitHostAndRemainder(rest.slice(lastAt + 1).replace(/\/+$/, ''));
+            if (destination && destination.extra.length === 0) {
+                // Both formats can recognize an endpoint. Require explicit credential encoding.
+                if (colonForm) return null;
+                const [username, ...password] = rest.slice(0, lastAt).split(':');
                 try {
-                    username = decodeURIComponent(colonIdx >= 0 ? authPart.slice(0, colonIdx) : authPart);
-                    if (colonIdx >= 0) password = decodeURIComponent(authPart.slice(colonIdx + 1));
+                    return {
+                        ip: destination.ip,
+                        port: destination.port,
+                        username: decodeURIComponent(username).trim(),
+                        password: decodeURIComponent(password.join(':')).trim(),
+                        type,
+                        raw: scheme ? line : `http://${line}`
+                    };
                 } catch {
                     return null;
                 }
-                const parsedHost = this._splitHostAndRemainder(hostPart);
-                if (!parsedHost || parsedHost.extra.length > 0) return null;
-                ip = parsedHost.ip;
-                port = parsedHost.port;
-            } else {
-                const parsedHost = this._splitHostAndRemainder(rest);
-                if (!parsedHost) return null;
-                ip = parsedHost.ip;
-                port = parsedHost.port;
-                username = parsedHost.extra[0] || '';
-                password = parsedHost.extra.slice(1).join(':');
             }
-        } else {
-            // 2. Unschemed host:port[:user[:pass]] or [ipv6]:port[:user[:pass]]
-            const parsedHost = this._splitHostAndRemainder(line);
-            if (!parsedHost) return null;
-            ip = parsedHost.ip;
-            port = parsedHost.port;
-            username = parsedHost.extra[0] || '';
-            password = parsedHost.extra.slice(1).join(':');
         }
 
-        const portNum = Number.parseInt(port, 10);
-        if (!ip || !/^\d+$/.test(port) || Number.isNaN(portNum) || portNum < 1 || portNum > 65535) {
-            return null;
-        }
-
+        const endpoint = colonForm ?? (scheme ? this._splitHostAndRemainder(rest.replace(/\/+$/, '')) : null);
+        if (!endpoint) return null;
+        const { ip, port, extra: [username = '', ...password] } = endpoint;
         return {
-            ip: ip.trim(),
-            port: String(portNum),
+            ip,
+            port,
             username: username.trim(),
-            password: password.trim(),
+            password: password.join(':').trim(),
             type,
             raw: line
         };
     }
 
     _splitHostAndRemainder(input) {
-        if (input.startsWith('[')) {
-            const closeIdx = input.indexOf(']');
-            if (closeIdx <= 1 || input[closeIdx + 1] !== ':') return null;
-            const ip = input.slice(0, closeIdx + 1);
-            const afterBracket = input.slice(closeIdx + 2).split(':');
-            const port = (afterBracket[0] || '').trim();
-            return { ip, port, extra: afterBracket.slice(1) };
+        const hostEnd = input.startsWith('[') ? input.indexOf(']') + 1 : input.indexOf(':');
+        if (hostEnd <= 0 || input[hostEnd] !== ':') return null;
+        const ip = input.slice(0, hostEnd).trim();
+        const [port, ...extra] = input.slice(hostEnd + 1).split(':');
+        const portNumber = Number(port);
+        if (!ip || /[\s\u0000-\u001f\u007f\\/?#@%]/.test(ip) ||
+            !/^\d+$/.test(port.trim()) || portNumber < 1 || portNumber > 65535) {
+            return null;
         }
-        const parts = input.split(':');
-        if (parts.length < 2) return null;
-        return {
-            ip: parts[0].trim(),
-            port: parts[1].trim(),
-            extra: parts.slice(2)
-        };
+        try {
+            new URL(`http://${ip}`);
+        } catch {
+            return null;
+        }
+        return { ip, port: String(portNumber), extra };
     }
 
     /**

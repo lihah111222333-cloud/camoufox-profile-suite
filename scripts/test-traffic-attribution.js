@@ -570,7 +570,7 @@ async function runTests() {
 
                 // An authentication upload leaves only metadata, even with body capture enabled.
                 assert.equal(egress1.postDataSha256, null);
-                assert.equal(egress1.postDataBytes, 0);
+                assert.equal(egress1.postDataBytes, null);
                 assert.equal(egress1.bodyPreview, null);
                 assert.equal(egress1.payloadFile, null);
                 assert.equal(egress1.bodyOmittedReason, 'sensitive-or-unsupported-url');
@@ -696,7 +696,7 @@ async function runTests() {
                         assert.equal(record.attribution.stepIndex, expectedIndex);
                         assert.equal(record.attribution.profileId, 'traffic-test-2');
                         assert.equal(record.attribution.accountId, 'acct-verified-777');
-                        assert.equal(record.attribution.accountEmail, 'alice.verified777@gmail.com');
+                        assert.equal(record.attribution.accountEmail, null);
                         assert.equal(record.attribution.os, 'macos');
                         assert.equal(record.attribution.proxyServer, 'socks5://198.51.100.77:1080');
                     }
@@ -896,11 +896,13 @@ async function runTests() {
                 mockWs.sendFrame(outboundFrame1);
                 mockWs.receiveFrame(inboundFrame1);
                 mockWs.sendFrame(outboundFrame2);
+                mockWs.receiveFrame('');
                 mockWs.closeSocket();
 
                 const summary = await profile.getTrafficAttribution();
                 assert.equal(summary.totals.wsFramesSent, 2);
-                assert.equal(summary.totals.wsFramesReceived, 1);
+                assert.equal(summary.totals.wsFramesReceived, 2);
+                assert.equal(summary.totals.unknownWsFramesReceived, 0);
 
                 const events = readNdjsonFile(profile.trafficPaths.trafficNdjsonPath);
                 const wsOpen = events.filter((e) => e.type === 'ws-open');
@@ -910,7 +912,7 @@ async function runTests() {
 
                 assert.equal(wsOpen.length, 1);
                 assert.equal(wsEgress.length, 2);
-                assert.equal(wsIngress.length, 1);
+                assert.equal(wsIngress.length, 2);
                 assert.equal(wsClose.length, 1);
 
                 const wsCorrId = wsOpen[0].correlationId;
@@ -918,6 +920,7 @@ async function runTests() {
                 assert.equal(wsEgress[0].correlationId, wsCorrId);
                 assert.equal(wsEgress[1].correlationId, wsCorrId);
                 assert.equal(wsIngress[0].correlationId, wsCorrId);
+                assert.equal(wsIngress[1].correlationId, wsCorrId);
                 assert.equal(wsClose[0].correlationId, wsCorrId);
 
                 const frameEvents = [wsEgress[0], wsEgress[1], wsIngress[0]];
@@ -925,9 +928,12 @@ async function runTests() {
                 for (const [index, event] of frameEvents.entries()) {
                     const body = frameBodies[index];
                     assert.equal(event.bodyPreview, null);
+                    assert.equal(event.payloadBytes, Buffer.byteLength(body));
                     assert.equal(event.payloadSha256, sha256Hex(body));
                     assert.equal(fs.readFileSync(path.join(profile.trafficPaths.trafficDir, event.payloadFile), 'utf8'), body);
                 }
+                assert.equal(wsIngress[1].payloadBytes, 0);
+                assert.equal(wsIngress[1].payloadFile, null);
                 assert.equal(wsIngress[0].attribution.actionStep, 'step-websocket-handshake');
 
                 await profile.delete();
@@ -1061,14 +1067,14 @@ async function runTests() {
 
                 // Verify isolated attribution-index.json per profile
                 assert.equal(winIndex.session.profileId, 'profile-traffic-win');
-                assert.equal(winIndex.session.accountEmail, 'win.user@gmail.com');
+                assert.equal(winIndex.session.accountEmail, null);
                 assert.equal(winIndex.session.os, 'windows');
                 assert.equal(winIndex.session.proxyServer, 'http://10.100.1.1:8080');
                 assert.ok(winIndex.byActionStep['win-step-signup']);
                 assert.equal(winIndex.byActionStep['mac-step-login'], undefined);
 
                 assert.equal(macIndex.session.profileId, 'profile-traffic-mac');
-                assert.equal(macIndex.session.accountEmail, 'mac.user@gmail.com');
+                assert.equal(macIndex.session.accountEmail, null);
                 assert.equal(macIndex.session.os, 'macos');
                 assert.equal(macIndex.session.proxyServer, 'socks5://10.100.2.2:1080');
                 assert.ok(macIndex.byActionStep['mac-step-login']);
@@ -1236,7 +1242,14 @@ async function runTests() {
                     }
                 }
                 await emitHttpTransaction(noBodiesContext, reqNoBody, resNoBody);
-                await profileNoBodies.getTrafficAttribution();
+                const noBodiesPage = await profileNoBodies.getPage();
+                const noBodiesSocket = createMockWebSocket('wss://fixture.test/metadata-only');
+                noBodiesPage.emit('websocket', noBodiesSocket);
+                noBodiesSocket.receiveFrame('private synthetic frame');
+                noBodiesSocket.closeSocket();
+                const noBodiesSummary = await profileNoBodies.getTrafficAttribution();
+                assert.equal(noBodiesSummary.totals.wsFramesReceived, 1);
+                assert.equal(noBodiesSummary.totals.unknownWsFramesReceived, 1);
 
                 assert.equal(bodyReads, 0);
                 const payloadFiles = fs.readdirSync(profileNoBodies.trafficPaths.payloadsDir);
@@ -1249,7 +1262,10 @@ async function runTests() {
                 const noBodyEvents = readNdjsonFile(profileNoBodies.trafficPaths.trafficNdjsonPath);
                 const noBodyEgress = noBodyEvents.find((e) => e.type === 'egress');
                 const noBodyIngress = noBodyEvents.find((e) => e.type === 'ingress');
-                for (const event of [noBodyEgress, noBodyIngress]) {
+                const noBodyFrame = noBodyEvents.find((e) => e.type === 'ws-ingress');
+                assert.equal(noBodyEgress.postDataBytes, null);
+                assert.equal(noBodyFrame.payloadBytes, null);
+                for (const event of [noBodyEgress, noBodyIngress, noBodyFrame]) {
                     assert.equal(event.recordBodies, false);
                     assert.equal(event.bodyOmittedReason, 'body-recording-disabled');
                     assert.equal(event.bodyPreview, null);

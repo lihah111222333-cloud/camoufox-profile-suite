@@ -18,6 +18,8 @@ async function loadAdapters(t) {
     await writeFile(path.join(root, 'package.json'), '{"type":"module"}');
 
     const env = {
+        GMAIL_CREATOR_STATE_DIR: root,
+        GMAIL_CREATOR_LEGACY_DIR: path.join(root, 'missing-legacy'),
         GPM_API_URL: 'https://gpm-controller.invalid:7443',
         DOLPHIN_API_URL: 'https://dolphin-controller.invalid:7443',
         DOLPHIN_FOLDER_ID: 'fixture-folder',
@@ -41,13 +43,16 @@ async function loadAdapters(t) {
     const sockets = [];
     const connections = [];
     const responses = [];
-    const state = { connectionErrors: [], socketErrors: [] };
+    const state = { connectionErrors: [], socketErrors: [], socketEvents: [] };
     const fakeBrowser = {
         async pages() { return []; },
         async newPage() {
+            let closed = false;
             return {
                 async evaluateOnNewDocument() {},
-                async url() { return 'about:blank'; }
+                async url() { return 'about:blank'; },
+                isClosed: () => closed,
+                async close() { closed = true; }
             };
         }
     };
@@ -76,20 +81,30 @@ async function loadAdapters(t) {
             async connect(options) {
                 connections.push(options);
                 if (state.connectionErrors.length) throw state.connectionErrors.shift();
-                return fakeBrowser;
+                return { ...fakeBrowser, disconnect: () => options.transport.close() };
             }
         },
         ws: class extends EventEmitter {
             constructor(url, options) {
                 super();
-                sockets.push({ url: String(url), options });
+                this.record = { url: String(url), options };
+                sockets.push(this.record);
                 const error = state.socketErrors.shift();
-                queueMicrotask(() => {
+                const event = state.socketEvents.shift();
+                if (event !== 'hold') queueMicrotask(() => {
                     if (error) this.emit('error', error);
+                    else if (event === 'close') this.close();
                     else this.emit('open');
                 });
             }
-            close() { this.emit('close'); }
+            close() {
+                this.record.closed = true;
+                this.emit('close');
+            }
+            terminate() {
+                this.record.terminated = true;
+                this.close();
+            }
         }
     };
     globalThis[fixtureKey] = stubs;
@@ -103,9 +118,10 @@ async function loadAdapters(t) {
     }
 
     const load = name => import(pathToFileURL(path.join(root, 'src', name)).href);
-    const [gpm, dolphin, gologin, gpmProfile, dolphinProfile, proxyManager] = await Promise.all([
+    const [gpm, dolphin, gologin, gpmProfile, dolphinProfile, proxyManager, controllerUrl] = await Promise.all([
         load('gpmlogin/client.js'), load('dolphin/client.js'), load('gologin/client.js'),
-        load('gpmlogin/profile.js'), load('dolphin/profile.js'), load('utils/proxy-manager.js')
+        load('gpmlogin/profile.js'), load('dolphin/profile.js'), load('utils/proxy-manager.js'),
+        load('utils/controller-url.js')
     ]);
     return {
         requests,
@@ -117,6 +133,7 @@ async function loadAdapters(t) {
         dolphin,
         gologin: gologin.default,
         proxyManager: proxyManager.default,
+        connectBrowser: controllerUrl.connectBrowser,
         GpmProfile: gpmProfile.default,
         DolphinProfile: dolphinProfile.default
     };
@@ -142,7 +159,7 @@ function assertWebSockets(sockets, connections, expected) {
 test('GPM and Dolphin control and proxy transport policies', async t => {
     const {
         requests, sockets, connections, responses, state, gpm, dolphin, gologin,
-        proxyManager, GpmProfile, DolphinProfile
+        proxyManager, GpmProfile, DolphinProfile, connectBrowser
     } = await loadAdapters(t);
     t.mock.method(globalThis, 'setTimeout', callback => queueMicrotask(callback));
     let proxyRequests = 0;
@@ -159,6 +176,7 @@ test('GPM and Dolphin control and proxy transport policies', async t => {
             responses.length = 0;
             state.connectionErrors.length = 0;
             state.socketErrors.length = 0;
+            state.socketEvents.length = 0;
             proxyRequests = 0;
             await body();
             assert.equal(responses.length, 0);
@@ -239,6 +257,64 @@ test('GPM and Dolphin control and proxy transport policies', async t => {
         }
     });
 
+    await run('an idle handshake times out and a peer close settles the connection immediately', async () => {
+        const endpoint = new URL('wss://gpm-controller.invalid:9443/devtools/browser/fixture');
+        const driver = { connect() { assert.fail('A failed handshake must not reach Puppeteer'); } };
+        state.socketEvents.push('hold', 'close');
+
+        await assert.rejects(connectBrowser(driver, endpoint, { timeout: 15 }), {
+            name: 'ControllerConnectionError',
+            code: 'CONTROLLER_CONNECTION_TIMEOUT',
+            message: /connection timed out/
+        });
+        assert.equal(sockets[0].terminated, true);
+        assert.equal(sockets[0].closed, true);
+        await assert.rejects(connectBrowser(driver, endpoint), {
+            name: 'ControllerConnectionError',
+            code: 'CONTROLLER_CONNECTION_CLOSED',
+            message: /closed before attachment/
+        });
+        assert.equal(sockets[1].closed, true);
+    });
+
+    await run('managed startup reports a peer close without another attachment or REST launch', async () => {
+        const gpmEndpoint = 'wss://gpm-controller.invalid:9443/devtools/browser/fixture';
+        const dolphinEndpoint = 'wss://dolphin-controller.invalid:9443/devtools/browser/fixture';
+        const closed = { name: 'ControllerConnectionError', code: 'CONTROLLER_CONNECTION_CLOSED' };
+        responses.push({ data: { remote_debugging_address: gpmEndpoint } });
+        state.socketEvents.push('close');
+        await assert.rejects(new GpmProfile('fixture').start(), closed);
+
+        responses.push({ ws: dolphinEndpoint });
+        state.socketEvents.push('close');
+        await assert.rejects(new DolphinProfile('fixture').start(), closed);
+
+        assert.deepEqual(requests.map(request => new URL(request.url).pathname), [
+            '/api/v3/profiles/start/fixture',
+            '/api/browser/openBrowser'
+        ]);
+        assert.deepEqual(sockets.map(socket => socket.url), [gpmEndpoint, dolphinEndpoint]);
+        assert.equal(connections.length, 0);
+    });
+
+    await run('a WebSocket with an unfinished Puppeteer attachment is terminated at the deadline', async () => {
+        const endpoint = new URL('wss://gpm-controller.invalid:9443/devtools/browser/fixture');
+        let attachmentClosed = false;
+        const driver = {
+            async connect({ transport }) {
+                return new Promise((resolve, reject) => {
+                    transport.onclose = () => {
+                        attachmentClosed = true;
+                        reject(new Error('Fixture attachment closed'));
+                    };
+                });
+            }
+        };
+        await assert.rejects(connectBrowser(driver, endpoint, { timeout: 15 }), /connection timed out/);
+        assert.equal(attachmentClosed, true);
+        assert.equal(sockets[0].terminated, true);
+    });
+
     await run('Dolphin preserves HTTPS on initial and refreshed WebSocket URLs', async () => {
         const initial = 'https://dolphin-controller.invalid:9443/devtools/browser/initial';
         const refreshed = 'https://dolphin-controller.invalid:9444/devtools/browser/refreshed';
@@ -252,18 +328,36 @@ test('GPM and Dolphin control and proxy transport policies', async t => {
     });
 
     await run('remote plaintext URLs and a Dolphin refresh downgrade fail before attachment', async () => {
-        await assert.rejects(new GpmProfile('fixture', 'http://127.example.invalid:9222').start(), /require HTTPS or WSS/);
+        const plaintextRejected = { name: 'ControllerUrlError', message: /require HTTPS or WSS/ };
+        await assert.rejects(new GpmProfile('fixture', 'http://127.example.invalid:9222').start(), plaintextRejected);
         await assert.rejects(new DolphinProfile('fixture', 'ws://dolphin-controller.invalid:9443/cdp').start(),
-            /require HTTPS or WSS/);
+            plaintextRejected);
         assert.equal(requests.length, 0);
         assert.equal(sockets.length, 0);
 
         const initial = 'wss://dolphin-controller.invalid:9443/devtools/browser/initial';
-        responses.push({ ws: 'ws://127.0.0.1:9443/devtools/browser/fixture' });
+        responses.push({ ws: initial }, { ws: 'ws://127.0.0.1:9443/devtools/browser/fixture' });
         state.connectionErrors.push(new Error('Fixture attachment unavailable'));
-        await assert.rejects(new DolphinProfile('fixture', initial).start(), /downgraded/);
-        assertSecureHttp(requests[0]);
+        await assert.rejects(new DolphinProfile('fixture').start(), {
+            name: 'ControllerUrlError', message: /downgraded/
+        });
+        assert.equal(requests.length, 2);
+        requests.forEach(assertSecureHttp);
         assertWebSockets(sockets, connections, [initial]);
+    });
+
+    await run('an explicitly supplied Dolphin endpoint retries without contacting the REST controller', async () => {
+        const endpoint = 'wss://borrowed-controller.invalid:9443/devtools/browser/fixture';
+        state.connectionErrors.push(new Error('Fixture attachment unavailable'));
+        const profile = await new DolphinProfile('fixture', endpoint).start();
+        const { page } = profile;
+        assert.equal(await profile.stop(), false);
+        assert.equal(page.isClosed(), true);
+        await assert.rejects(profile.recycle(), /requires a bound REST controller/);
+        await assert.rejects(profile.delete(), /Permanent Dolphin Anty profile deletion is unavailable/);
+        assert.equal(requests.length, 0);
+        assertWebSockets(sockets, connections, [endpoint, endpoint]);
+        assert.ok(sockets.every(socket => socket.closed));
     });
 
     await run('legacy loopback HTTP discovery and local WebSocket endpoints still attach', async () => {

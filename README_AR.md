@@ -42,7 +42,7 @@
 
 ## حول المشروع (About)
 
-**منشئ حسابات Gmail** أداة **Node.js** تفتح مسار إنشاء حساب Google في بروفايل متصفح وتسجّل نتيجة المحاولة. تعالج الواجهة الحقول الأولية التي يمكن التحقق منها وتسلّم إدخال كلمة المرور والتحقق والموافقة وتأكيد الحساب إلى صاحبه. تُسجّل حالة `MANUAL_SIGNUP_REQUIRED` عند التسليم ويحاول التطبيق إيقاف البروفايل المُدار. أكمل الخطوات المتبقية وتحقق من هوية الحساب في متصفح موثوق.
+**منشئ حسابات Gmail** أداة **Node.js** تفتح مسار إنشاء حساب Google في بروفايل متصفح وتسجّل نتيجة المحاولة. تعالج الواجهة الحقول الأولية التي يمكن التحقق منها وتُسجّل حالة `MANUAL_SIGNUP_REQUIRED` عندما تتطلب الخطوة التالية تدخل صاحب الحساب. انتظر تأكيد إيقاف البروفايل المُدار قبل إكمال الخطوات المتبقية في متصفح موثوق تتحكم فيه.
 
 | | |
 |--|--|
@@ -200,7 +200,7 @@ npm run list-folders
 3. **إنشاء بروفايل** باسم يتضمن بادئة `Gmail_` والوقت، ثم **تشغيله** عبر GPM أو Dolphin.  
 4. **ربط Puppeteer** بعنوان التصحيح البعيد (remote debugging) للمتصفح داخل البروفايل.  
 5. **فتح مسار التسجيل** في `src/gmail/creator.js` ومعالجة الحقول الأولية المدعومة بعد التحقق من الصفحة.
-6. تسليم إدخال كلمة المرور والتحقق والموافقة وتأكيد الحساب والصفحات غير المعروفة إلى صاحب الحساب.
+6. عند ظهور كلمة المرور أو التحقق أو طلب اختياري أو الموافقة أو تأكيد الحساب أو صفحة غير معروفة، يسجّل التطبيق الحاجة إلى تدخل صاحب الحساب ويطلب إيقاف البروفايل.
 7. حفظ حالة المحاولة في `results.json` دون تخزين كلمات المرور أو رموز التحقق أو بيانات اعتماد البروكسي.
 8. محاولة إيقاف البروفايل وتسجيل أي حالة إيقاف أو حذف تعذّر تأكيدها في `summary.json`.
 
@@ -385,8 +385,9 @@ flowchart TD
 
 | الدالة | الوظيفة |
 |--------|---------|
-| `checkDolphinConnection` | التحقق من المفتاح والوصول. |
-| `createProfile` / `startProfile` / `stopProfile` / `deleteProfile` / `getProfile` | دورة حياة البروفايل. |
+| `checkDolphinConnection` | التحقق من أن الواجهة تعيد قائمة البروفايلات. |
+| `createProfile` / `startProfile` / `stopProfile` / `getProfile` | دورة حياة البروفايل. |
+| `recycleProfile` / `deleteProfile` | ينقل الأول البروفايل إلى سلة المحذوفات ويتحقق من التأكيد. يُبلغ الثاني بأن الحذف النهائي غير مدعوم. |
 | `updateProfileProxy` | تطبيق بروكسي على بروفايلات. |
 | `getFolderList`, `getAllFolders`, `findFolderByName`, `createFolder`, `getFirstAvailableFolder`, `getOrCreateFolder` | إدارة المجلدات. |
 
@@ -394,7 +395,8 @@ flowchart TD
 
 | الطريقة | الوظيفة |
 |---------|---------|
-| `start`, `getBrowser`, `getPage`, `stop`, `delete` | مثل GPM من ناحية الدور. |
+| `start`, `getBrowser`, `getPage`, `stop` | تشغيل البروفايل والاتصال به وإيقافه. |
+| `recycle` / `delete` | ينقل الأول البروفايل إلى سلة المحذوفات. يُبلغ الثاني بأن الحذف النهائي غير مدعوم. |
 | `createAndStartProfile` *(مصدَّرة)* | مصنع جاهز لـ Dolphin. |
 
 ### صنف `GoLoginProfile` في `src/gologin/profile.js`
@@ -512,19 +514,18 @@ flowchart TD
 
 1. حدّث `version` في `package.json` وادفع إلى `main`.  
 2. `git tag v1.0.1 && git push origin v1.0.1`  
-3. سير العمل **Release** يبني الحزمة ويُنشئ صفحة إصدار مع الملحق.  
-4. عند **نشر** الإصدار، سير **Publish to GitHub Packages** ينشر النسخة على سجل npm لدى GitHub.
+3. يتحقق سير العمل **Release** من مطابقة الوسم لإصدار `package.json`، ويشغّل اختبارات الأمان، ويفحص محتويات حزمة npm.
+4. يرفق سير العمل الحزمة التي تم التحقق منها بصفحة الإصدار وينشر الملف نفسه في GitHub Packages.
 
 ### الخيار ب — من واجهة GitHub: «Create a new release»
 
 1. افتح [**Releases**](https://github.com/code-root/gmail-account-creator/releases) ثم **Create a new release** (أو **Draft a new release**).  
-2. اختر وسمًا (أنشئ وسمًا جديدًا `v1.0.x` على `main` إن لزم)، اكتب العنوان والملاحظات.  
-3. انشر الإصدار.  
-   - **ملاحظة:** ملف **`.tgz`** يُرفَق تلقائياً عند **دفع الوسم** (الخيار أ). إن أنشأت الإصدار يدوياً فقط من الواجهة دون دفع وسم مطابق، شغّل `npm pack` محلياً وأرفق الملف، أو ادفع الوسم لاحقاً لتشغيل سير العمل.
+2. اختر وسمًا يطابق إصدار `package.json` في الالتزام الموسوم، ثم اكتب العنوان والملاحظات.
+3. انشر الإصدار ليبدأ سير العمل التحقق من الحزمة ونشرها في GitHub Packages. لإرفاق ملف **`.tgz`** تلقائيًا بصفحة الإصدار، استخدم الخيار أ.
 
 #### إذا كانت GitHub Actions معطّلة (مثلاً بسبب الفوترة)
 
-بدون Actions يمكنك: (1) تشغيل `npm pack` ورفع الملف من **Create a new release** أو عبر `gh release create`؛ (2) تنفيذ `npm publish` محلياً بتوكن يملك `write:packages` وسجل `npm.pkg.github.com` — راجع [توثيق GitHub](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-npm-registry).
+أنشئ الحزمة وتحقق منها محليًا من نسخة نظيفة من الوسم المطابق. ارفع ملف **`.tgz`** الذي اجتاز التحقق إلى صفحة الإصدار وانشر الملف نفسه في سجل GitHub Packages. [خطوات التحقق والنشر المحلي](README.md#if-github-actions-are-blocked-eg-billing)
 
 ### التثبيت من GitHub Packages
 
@@ -550,7 +551,7 @@ gmail-account-creator
 
 ### النشر التلقائي
 
-عند **نشر** إصدار GitHub (Release published)، سير العمل **Publish to GitHub Packages** (`.github/workflows/publish-github-packages.yml`) ينفّذ `npm publish` باستخدام `GITHUB_TOKEN`.
+ينشر سير العمل **Release** الحزمة التي تم التحقق منها في GitHub Packages باستخدام `GITHUB_TOKEN` عند دفع وسم إصدار أو نشر إصدار من واجهة GitHub.
 
 ---
 
@@ -559,10 +560,9 @@ gmail-account-creator
 المشروع يستخدم **Node + ESM** بدون اختبارات Jest مدمجة في `package.json`. السيرات المضمّنة:
 
 1. **CI** يثبّت التبعيات ويفحص الصياغة ويشغّل اختبارات الأمان عند الدفع أو فتح طلب دمج — `.github/workflows/ci.yml`
-2. **Release** يشغّل اختبارات الأمان عند دفع وسم `v*` قبل إرفاق حزمة npm — `.github/workflows/release.yml`
-3. **نشر الحزمة** يشغّل اختبارات الأمان قبل نشر الحزمة عند نشر إصدار — `.github/workflows/publish-github-packages.yml`
-4. **Dependabot (اختياري):** تحديثات أسبوعية لـ `npm`.  
-5. **عدم رفع أسرار:** التأكد أن `.env` غير مرفوع.
+2. **Release** يتحقق من الوسم ويشغّل اختبارات الأمان ويفحص حزمة npm قبل نشرها في GitHub Packages. يؤدي دفع الوسم أيضًا إلى إرفاق الحزمة بصفحة الإصدار. ملف سير العمل هو `.github/workflows/release.yml`.
+3. **Dependabot (اختياري):** تحديثات أسبوعية لـ `npm`.
+4. **عدم رفع أسرار:** التأكد أن `.env` غير مرفوع.
 
 شغّل `npm run test:security` من نسخة من الشيفرة المصدرية بعد تثبيت التبعيات. للتحقق من إصدار مثبّت، شغّل الاختبارات من وسم الإصدار المطابق.
 

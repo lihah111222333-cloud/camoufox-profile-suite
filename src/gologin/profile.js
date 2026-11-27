@@ -9,18 +9,64 @@ import { requireControllerProfileId } from '../utils/controller-id.js';
 import { GoLoginClient, getGoLoginApiKey } from './client.js';
 import config from '../config.js';
 
+const launchTimeout = 120000;
+const browserOperationTimeout = 10000;
+
 function bindGoLoginSession() {
     const token = getGoLoginApiKey();
     return {
         client: new GoLoginClient(token),
-        createSdk: () => GologinApi({ token })
+        createSdk: () => {
+            try {
+                return GologinApi({ token });
+            } catch {
+                throw new Error('Could not initialize GoLogin SDK');
+            }
+        }
     };
+}
+
+class GoLoginWaitError extends Error {}
+
+function waitFor(pending, timeout, message, signal, onAbandon) {
+    let timer;
+    let onAbort;
+    const deadline = new Promise((_, reject) => {
+        const abandon = error => {
+            onAbandon?.();
+            reject(error);
+        };
+        onAbort = () => abandon(signal.reason);
+        if (signal?.aborted) return onAbort();
+        signal?.addEventListener('abort', onAbort, { once: true });
+        timer = setTimeout(() => abandon(new GoLoginWaitError(message)), timeout);
+    });
+    return Promise.race([pending, deadline]).finally(() => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+    });
+}
+
+function cleanupError(profileId, profileCleanup, message, cause) {
+    return Object.assign(new Error(message, { cause }), { profileId, profileCleanup });
 }
 
 class GoLoginProfile {
     #profileId;
     #gologinApi;
     #session;
+    #startController;
+    #starting;
+    #launching;
+    #ownedBrowser;
+    #closing;
+    #stopping;
+    #stoppingSdk;
+    #deleting;
+    #deleteAttempted = false;
+    #deleted = false;
+    #needsCleanup = false;
+    #stopConfirmed = false;
 
     constructor(profileId, gologinApi = null, session = null) {
         this.#profileId = requireControllerProfileId(profileId);
@@ -38,371 +84,196 @@ class GoLoginProfile {
         return this.#gologinApi;
     }
 
-    /**
-     * Start profile and get browser instance
-     * بدء البروفايل والحصول على متصفح
-     */
-    async start() {
+    start() {
+        if (this.#deleted || this.#deleting) return Promise.reject(new Error('GoLogin profile is being deleted or was deleted'));
+        if (this.#deleteAttempted) return Promise.reject(new Error('GoLogin profile deletion is unconfirmed'));
+        if (this.#stopping) return Promise.reject(new Error('GoLogin profile shutdown is in progress'));
+        if (this.#starting) return this.#starting;
+        if (this.browser) return Promise.resolve(this);
+        if (this.#needsCleanup || this.#stoppingSdk) {
+            return Promise.reject(new Error('GoLogin profile shutdown is unconfirmed'));
+        }
+
+        this.#startController = new AbortController();
+        const { signal } = this.#startController;
+        this.#starting = Promise.resolve().then(() => this.#startBrowser(signal)).finally(() => {
+            this.#starting = null;
+            this.#startController = null;
+        });
+        return this.#starting;
+    }
+
+    async #startBrowser(signal) {
+        signal.throwIfAborted();
+        if (!this.#gologinApi) this.#session ??= bindGoLoginSession();
         try {
-            logger.info('Starting GoLogin profile (Remote Mode)', { profileId: this.profileId });
+            this.#gologinApi ??= this.#session.createSdk();
 
-            if (!this.#gologinApi) {
-                this.#session ??= bindGoLoginSession();
-                this.#gologinApi = this.#session.createSdk();
-            }
+            const browser = await this.#launchBrowser(signal);
+            signal.throwIfAborted();
+            if (!browser) throw new GoLoginWaitError('GoLogin launch returned no browser');
 
-            // Start browser using Remote Mode (Cloud Browser)
-            logger.info('Starting GoLogin browser (Remote Mode, may take 30-60 seconds)...');
-            
-            // Retry logic with proper error handling for remote mode
-            let browser;
-            let retries = 5;
-            let lastError;
-            
-            for (let attempt = 1; attempt <= retries; attempt++) {
-                try {
-                    logger.info(`Starting browser attempt ${attempt}/${retries} (Remote Mode, may take 30-60 seconds)...`);
-                    
-                    // Remote Mode uses cloud browser - no local browser needed
-                    const startPromise = this.gologinApi.launch({ 
-                        profileId: this.profileId,
-                        cloud: true // Use Remote Mode (Cloud Browser)
-                    });
-                    const timeoutPromise = new Promise((_, reject) => 
-                        setTimeout(() => reject(new Error('Connection timeout after 120 seconds')), 120000)
-                    );
-                    
-                    const result = await Promise.race([startPromise, timeoutPromise]);
-                    browser = result.browser;
-                    
-                    if (browser) {
-                        logger.info('Browser started successfully (Remote Mode)');
-                        break;
-                    } else {
-                        lastError = new Error('Browser launch returned null');
-                        if (attempt < retries) {
-                            const waitTime = Math.min(attempt * 10000, 30000); // Progressive backoff: 10s, 20s, 30s, 30s
-                            logger.warn(`Attempt ${attempt} failed, retrying in ${waitTime/1000}s...`);
-                            await new Promise(resolve => setTimeout(resolve, waitTime));
-                        }
-                    }
-                } catch (e) {
-                    lastError = e;
-                    const isTimeout = e.message.includes('timeout') || 
-                                     e.message.includes('disconnected') || 
-                                     e.message.includes('TLS') ||
-                                     e.message.includes('ECONNRESET');
-                    logger.warn(`GoLogin start attempt ${attempt} failed`, { 
-                        error: e.message,
-                        isTimeout,
-                        stack: isTimeout ? undefined : e.stack
-                    });
-                    
-                    if (attempt < retries) {
-                        const waitTime = Math.min(attempt * 10000, 30000); // Progressive backoff: 10s, 20s, 30s, 30s
-                        logger.info(`Waiting ${waitTime/1000}s before retry (Remote servers may be slow)...`);
-                        await new Promise(resolve => setTimeout(resolve, waitTime));
-                    }
-                }
-            }
-            
-            if (!browser) {
-                logger.error('GoLogin start failed after all retries', { 
-                    error: lastError?.message
-                });
-                throw new Error(`Failed to start GoLogin profile: ${lastError?.message || 'Unknown error'}`);
-            }
-
-            // Browser is already connected via Remote Mode
+            const creatingPage = Promise.resolve().then(() => {
+                signal.throwIfAborted();
+                return browser.newPage();
+            });
+            const page = await waitFor(creatingPage, browserOperationTimeout, 'GoLogin page creation timed out', signal);
+            signal.throwIfAborted();
+            if (!page) throw new GoLoginWaitError('GoLogin page creation returned no page');
             this.browser = browser;
-            this.page = await this.browser.newPage();
-
-            logger.info('Profile started successfully (Remote Mode)', { profileId: this.profileId });
+            this.page = page;
+            logger.info('GoLogin profile started', { profileId: this.profileId });
             return this;
         } catch (error) {
-            logger.error('Failed to start profile', { profileId: this.profileId, error: error.message });
-            throw error;
+            // A pending launch retains ownership of its eventual handle. Shutdown takes over on cancellation.
+            if (!this.#launching && !signal.aborted) await this.#closeBrowser();
+            throw error instanceof GoLoginWaitError ? error : new Error('Could not initialize GoLogin browser');
         }
     }
 
-    /**
-     * Get browser instance (creates new if needed)
-     * الحصول على متصفح (إنشاء جديد إذا لزم الأمر)
-     */
+    #launchBrowser(signal) {
+        let abandoned = false;
+        this.#launching = Promise.resolve().then(async () => {
+            signal.throwIfAborted();
+            this.#needsCleanup = true;
+            this.#stopConfirmed = false;
+            const result = await this.#gologinApi.launch({ profileId: String(this.profileId), cloud: true });
+            this.#ownedBrowser = result?.browser;
+            if (abandoned) {
+                if (!await this.#closeBrowser()) {
+                    logger.error('Could not close a late GoLogin browser', { profileId: this.profileId });
+                }
+                return;
+            }
+            return this.#ownedBrowser;
+        }).finally(() => {
+            this.#launching = null;
+        });
+        return waitFor(this.#launching, launchTimeout, 'GoLogin browser launch timed out', signal, () => {
+            abandoned = true;
+        });
+    }
+
     async getBrowser() {
-        if (!this.browser) {
-            await this.start();
-        }
+        await this.start();
         return this.browser;
     }
 
-    /**
-     * Get page instance
-     * الحصول على صفحة
-     */
     async getPage() {
-        if (!this.page) {
-            const browser = await this.getBrowser();
-            const pages = await browser.pages();
-            this.page = pages[0] || await browser.newPage();
-        }
+        await this.start();
         return this.page;
     }
 
-    /**
-     * Stop profile
-     * إيقاف البروفايل
-     */
-    async stop() {
-        let stopped = false;
-        if (this.browser) {
-            try {
-                await this.browser.close();
-                this.browser = null;
-                this.page = null;
-                stopped = true;
-            } catch (error) {
-                logger.warn('Error closing GoLogin browser', { profileId: this.profileId, error: error.message });
-            }
-        }
-
-        try {
-            if (typeof this.#gologinApi?.stop === 'function') {
-                stopped = (await this.#gologinApi.stop()) !== false;
-            }
-            if (!stopped) {
-                logger.warn('GoLogin session stop could not be confirmed', { profileId: this.profileId });
-                return false;
-            }
-            this.browser = null;
-            this.page = null;
-            logger.info('Profile stopped', { profileId: this.profileId });
+    #closeBrowser() {
+        const browser = this.#ownedBrowser;
+        if (!browser) return Promise.resolve(true);
+        this.#closing ??= Promise.resolve().then(() => browser.close()).then(result => {
+            if (result === false) return false;
+            this.#ownedBrowser = null;
+            if (typeof this.#gologinApi?.stop !== 'function') this.#stopConfirmed = true;
             return true;
-        } catch (error) {
-            logger.warn('Error stopping profile', { profileId: this.profileId, error: error.message });
-            return false;
-        }
+        }, () => false).finally(() => {
+            this.#closing = null;
+        });
+        return waitFor(this.#closing, browserOperationTimeout, 'GoLogin browser close timed out').catch(() => false);
     }
 
-    /**
-     * Delete profile
-     * حذف البروفايل
-     */
-    async delete() {
-        try {
-            if (this.#gologinApi && !this.#session) {
-                throw new Error('Deleting an externally managed GoLogin profile requires a bound REST credential');
-            }
-            this.#session ??= bindGoLoginSession();
-            await this.stop();
-            await this.#session.client.deleteProfile(this.profileId);
-            logger.info('Profile deleted', { profileId: this.profileId });
-            return true;
-        } catch (error) {
-            logger.error('Failed to delete profile', { profileId: this.profileId, error: error.message });
-            throw error;
+    async #stopBrowser() {
+        if (this.#launching) return false;
+        this.browser = null;
+        this.page = null;
+        if (!this.#needsCleanup && !this.#gologinApi && this.#session) return true;
+        const closed = await this.#closeBrowser();
+        if (!this.#stopConfirmed && typeof this.#gologinApi?.stop === 'function') {
+            this.#needsCleanup = true;
+            this.#stoppingSdk ??= Promise.resolve().then(() => this.#gologinApi.stop()).then(result => {
+                this.#stopConfirmed = result !== false;
+            }, () => {}).finally(() => {
+                this.#stoppingSdk = null;
+            });
+            await waitFor(this.#stoppingSdk, browserOperationTimeout, 'GoLogin session stop timed out').catch(() => {});
         }
+        if (!closed || !this.#stopConfirmed) return false;
+        this.#needsCleanup = false;
+        return true;
+    }
+
+    stop() {
+        this.#stopping ??= Promise.resolve().then(async () => {
+            this.#startController?.abort(new GoLoginWaitError('GoLogin startup interrupted by shutdown'));
+            await this.#starting?.catch(() => {});
+            const stopped = await this.#stopBrowser();
+            if (stopped) logger.info('GoLogin profile stopped', { profileId: this.profileId });
+            else logger.warn('GoLogin session stop could not be confirmed', { profileId: this.profileId });
+            return stopped;
+        }).finally(() => {
+            this.#stopping = null;
+        });
+        return this.#stopping;
+    }
+
+    delete() {
+        if (this.#deleted) return Promise.resolve(true);
+        this.#deleting ??= this.#deleteProfile().finally(() => {
+            this.#deleting = null;
+        });
+        return this.#deleting;
+    }
+
+    async #deleteProfile() {
+        if (this.#deleteAttempted) {
+            throw cleanupError(this.profileId, 'delete-unconfirmed', 'GoLogin profile deletion is unconfirmed');
+        }
+        if (this.#gologinApi && !this.#session) {
+            throw new Error('Deleting an externally managed GoLogin profile requires a bound REST credential');
+        }
+        if (await this.stop() !== true) {
+            throw cleanupError(this.profileId, 'stop-unconfirmed', 'GoLogin profile shutdown is unconfirmed');
+        }
+        let deleted;
+        try {
+            this.#session ??= bindGoLoginSession();
+            this.#deleteAttempted = true;
+            deleted = await this.#session.client.deleteProfile(this.profileId);
+        } catch {
+            // The caller can reconcile the profile by ID using the original tenant.
+        }
+        if (deleted !== true) {
+            throw cleanupError(this.profileId, 'delete-unconfirmed', 'GoLogin profile deletion is unconfirmed');
+        }
+        this.#deleted = true;
+        logger.info('GoLogin profile deleted', { profileId: this.profileId });
+        return true;
     }
 }
 
-/**
- * Create and start a new profile
- * إنشاء وبدء بروفايل جديد
- */
+/** Create and start a new GoLogin profile. */
 export async function createAndStartProfile(name, proxy = null) {
+    let profile;
     try {
         const session = bindGoLoginSession();
-        const gologinApi = session.createSdk();
-        
-        // Create profile using gologinClient (uses /browser/quick - more efficient)
-        // This reduces API calls and works better with free tier
-        logger.info('Creating GoLogin profile using quick method (Android)...');
-        // Use config to determine if proxy testing should be enabled
-        const testProxy = config.app.testProxy !== false;
-        const profile = await session.client.createProfileWithProxy(name, proxy, testProxy);
-        const profileManager = new GoLoginProfile(profile.id, gologinApi, session);
-        const { profileId } = profileManager;
-        logger.info('Profile created', { profileId, name });
+        const created = await session.client.createProfileWithProxy(name, proxy, config.app.testProxy !== false);
+        profile = new GoLoginProfile(created.id, null, session);
+        const { profileId } = profile;
 
-        // Wait a bit after profile creation to ensure it's fully initialized on GoLogin servers
-        // الانتظار قليلاً بعد إنشاء البروفايل لضمان تهيئته بالكامل على خوادم GoLogin
-        logger.info('Waiting for profile initialization...');
-        await new Promise(resolve => setTimeout(resolve, 5000)); // 5 seconds delay (increased for better reliability)
-        
-        // Verify profile is ready by checking it exists
-        // التحقق من أن البروفايل جاهز عن طريق التحقق من وجوده
+        await new Promise(resolve => setTimeout(resolve, 5000));
         try {
             await session.client.getProfile(profileId);
-            logger.info('Profile verified and ready', { profileId });
-        } catch (verifyError) {
-            logger.warn('Profile verification failed, continuing anyway', { 
-                profileId,
-                error: verifyError.message 
-            });
+        } catch {
+            logger.warn('GoLogin profile lookup failed before startup', { profileId });
         }
-
-        // Start browser (Remote Mode - may take 30-60 seconds)
-        logger.info('Starting GoLogin browser (Remote Mode, may take 30-60 seconds)...');
-        
-        // Retry logic for browser start with longer timeouts for remote mode
-        // خطأ 500 يعني مشكلة في خادم GoLogin - نحتاج محاولات أكثر وانتظار أطول
-        let browser;
-        let retries = 8; // زيادة المحاولات من 5 إلى 8
-        let lastError;
-        let serverErrorCount = 0; // تتبع عدد أخطاء الخادم
-        
-        for (let attempt = 1; attempt <= retries; attempt++) {
-            try {
-                logger.info(`Starting browser attempt ${attempt}/${retries} (Remote Mode, may take 60-120 seconds)...`);
-                
-                // Remote Mode uses cloud browser - no local browser needed
-                // Add exponential backoff delay before launch for server errors
-                // إضافة تأخير تدريجي قبل البدء للأخطاء من الخادم
-                if (serverErrorCount > 0 && attempt > 1) {
-                    const backoffDelay = Math.min(Math.pow(2, serverErrorCount - 1) * 2000, 30000); // 2s, 4s, 8s, 16s, max 30s
-                    logger.info(`Waiting ${backoffDelay/1000}s before launch (exponential backoff for server errors)...`);
-                    await new Promise(resolve => setTimeout(resolve, backoffDelay));
-                }
-                
-                const launchResult = await Promise.race([
-                    gologinApi.launch({ 
-                        profileId,
-                        cloud: true // Use Remote Mode (Cloud Browser)
-                    }).catch(async (launchError) => {
-                        // If launch fails with 500, wait a bit and try to verify profile
-                        if (launchError.message.includes('500') || launchError.message.includes('Unexpected server response')) {
-                            logger.warn('Launch failed with server error, verifying profile status...', { 
-                                profileId
-                            });
-                            // Wait a bit and verify profile exists
-                            await new Promise(resolve => setTimeout(resolve, 3000));
-                            try {
-                                await session.client.getProfile(profileId);
-                                logger.info('Profile exists, server may be busy');
-                            } catch (e) {
-                                logger.warn('Profile verification failed', { error: e.message });
-                            }
-                        }
-                        throw launchError;
-                    }),
-                    new Promise((_, reject) => 
-                        setTimeout(() => reject(new Error(`Launch timeout after ${serverErrorCount >= 3 ? 180 : 120} seconds`)), 
-                        serverErrorCount >= 3 ? 180000 : 120000)
-                    )
-                ]);
-                
-                browser = launchResult?.browser;
-                
-                // Verify browser connection is actually working
-                if (browser) {
-                    try {
-                        // Test connection by getting pages (this will fail if connection is bad)
-                        const pages = await Promise.race([
-                            browser.pages(),
-                            new Promise((_, reject) => 
-                                setTimeout(() => reject(new Error('Browser connection test timeout')), 10000)
-                            )
-                        ]);
-                        logger.info('Browser started successfully (Remote Mode)', { 
-                            profileId,
-                            pagesCount: pages.length 
-                        });
-                        break;
-                    } catch (connectionError) {
-                        // Browser object exists but connection is bad
-                        lastError = new Error(`Browser connection failed: ${connectionError.message}`);
-                        logger.warn('Browser connection test failed', { 
-                            error: connectionError.message,
-                            attempt 
-                        });
-                        // Close bad connection
-                        try {
-                            await browser.close();
-                        } catch (e) {
-                            // Ignore close errors
-                        }
-                        browser = null;
-                    }
-                } else {
-                    lastError = new Error('Browser launch returned null');
-                }
-                
-                if (!browser && attempt < retries) {
-                    const waitTime = Math.min(attempt * 10000, 30000);
-                    logger.warn(`Attempt ${attempt} failed, retrying in ${waitTime/1000}s...`);
-                    await new Promise(resolve => setTimeout(resolve, waitTime));
-                }
-            } catch (e) {
-                lastError = e;
-                const isServerError = e.message.includes('500') || 
-                                    e.message.includes('502') || 
-                                    e.message.includes('503') ||
-                                    e.message.includes('504') ||
-                                    e.message.includes('Unexpected server response') ||
-                                    e.message.includes('ECONNREFUSED') ||
-                                    e.message.includes('socket hang up');
-                const isTimeout = e.message.includes('timeout') || 
-                                 e.message.includes('disconnected') || 
-                                 e.message.includes('TLS') ||
-                                 e.message.includes('ECONNRESET');
-                
-                if (isServerError) {
-                    serverErrorCount++;
-                }
-                
-                logger.warn(`GoLogin start attempt ${attempt} failed`, { 
-                    error: e.message,
-                    isServerError,
-                    isTimeout,
-                    serverErrorCount,
-                    profileId,
-                    // إضافة معلومات إضافية للأخطاء المتكررة
-                    suggestion: isServerError && serverErrorCount >= 3 
-                        ? 'خادم GoLogin يواجه مشاكل. جرب لاحقاً أو تحقق من حالة الخدمة.'
-                        : undefined,
-                    stack: (isServerError || isTimeout) ? undefined : e.stack
-                });
-                
-                if (attempt < retries) {
-                    // زيادة وقت الانتظار للأخطاء المتكررة من الخادم
-                    // Use exponential backoff with jitter for better distribution
-                    let waitTime;
-                    if (isServerError) {
-                        // Exponential backoff: 15s, 30s, 60s, 90s, 120s
-                        const baseWait = Math.min(15000 * Math.pow(2, Math.min(serverErrorCount - 1, 3)), 120000);
-                        // Add jitter (±20%) to avoid thundering herd
-                        const jitter = baseWait * 0.2 * (Math.random() * 2 - 1);
-                        waitTime = Math.max(10000, baseWait + jitter);
-                    } else {
-                        waitTime = Math.min(attempt * 10000, 30000); // 10s, 20s, 30s, 30s
-                    }
-                    
-                    logger.info(`Waiting ${Math.round(waitTime/1000)}s before retry (${isServerError ? `Server error (${serverErrorCount} times)` : 'Remote servers may be slow'})...`);
-                    await new Promise(resolve => setTimeout(resolve, waitTime));
-                }
-            }
-        }
-        
-        if (!browser) {
-            logger.error('GoLogin start failed after all retries', { 
-                error: lastError?.message
-            });
-            throw new Error(`Failed to start GoLogin profile: ${lastError?.message || 'Unknown error'}`);
-        }
-
-        // Browser is already connected via Remote Mode
-        const page = await browser.newPage();
-        
-        profileManager.browser = browser;
-        profileManager.page = page;
-        
-        logger.info('Profile created and started (Remote Mode)', { profileId, name });
-        return profileManager;
+        return await profile.start();
     } catch (error) {
-        logger.error('Failed to create and start profile', { error: error.message });
-        throw error;
+        if (!profile) throw error;
+        let profileCleanup = 'deleted';
+        try {
+            await profile.delete();
+        } catch (cleanup) {
+            profileCleanup = cleanup.profileCleanup ?? 'stop-unconfirmed';
+        }
+        logger.error('GoLogin profile initialization failed', { profileId: profile.profileId, profileCleanup });
+        throw cleanupError(profile.profileId, profileCleanup, 'GoLogin profile initialization failed', error);
     }
 }
 
 export default GoLoginProfile;
-

@@ -8,6 +8,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { queryProfileTraffic, formatCliReport } from '../../scripts/query-traffic-attribution.js';
+import { CookieLineage } from '../../src/camoufox/cookie-lineage.js';
 import { attachPageCompatibility } from '../../src/camoufox/profile.js';
 import { CamoufoxTrafficRecorder, verifyTrafficIntegrity } from '../../src/camoufox/traffic-recorder.js';
 
@@ -157,6 +158,60 @@ test('recorder bounds repeated cookie history while the ledger keeps the complet
     assert.deepEqual(complete.valueHistory.slice(-256), recent.valueHistory);
     assert.deepEqual(complete.sentInCorrelationIds.slice(-256), recent.sentInCorrelationIds);
     assert.deepEqual((await new CamoufoxTrafficRecorder(options).stop()).cookieLineage.Repeated, recent);
+});
+
+test('late cookie observations preserve observation order and correct earlier send attribution', async (t) => {
+    let clock = Date.parse('2026-05-01T10:00:00Z');
+    t.mock.method(Date, 'now', () => clock);
+    const { recorder, context, trafficDir, options } = fixture(t);
+    let finishOlder;
+    const olderHeaders = new Promise((resolve) => { finishOlder = resolve; });
+    const url = 'https://fixture.invalid/';
+    const olderRequest = request(url);
+    context.emit('request', olderRequest);
+    context.emit('response', {
+        request: () => olderRequest,
+        url: olderRequest.url,
+        status: () => 200,
+        headersArray: () => olderHeaders
+    });
+
+    clock += 1;
+    emitCookie(context, url, 'Sample=older');
+    setCookie(context, url, ['Sample=newer; Path=/']);
+    emitCookie(context, url, 'Sample=newer');
+    // Keep the newer set and both sends in the ledger before the older read settles.
+    try {
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(events(recorder).filter((event) => event.cookieObservations?.length).length, 3);
+    } finally {
+        finishOlder([{ name: 'Set-Cookie', value: 'Sample=older; Path=/' }]);
+    }
+    const summary = await recorder.stop();
+    const lineage = summary.cookieLineage.Sample;
+
+    assert.equal(lineage.firstSetAt, '2026-05-01T10:00:00.000Z');
+    assert.equal(lineage.lastSetAt, '2026-05-01T10:00:00.001Z');
+    assert.equal(lineage.lastValueSha256, digest('newer'));
+    assert.deepEqual(lineage.valueHistory.map(({ valueSha256 }) => valueSha256), [digest('older'), digest('newer')]);
+    assert.equal(lineage.sentCount, 2);
+    assert.equal(lineage.matchesLatestSetCookie, true);
+    assert.deepEqual(queryProfileTraffic({ trafficDir, cookie: 'Sample' }).cookie, lineage);
+    assert.deepEqual((await new CamoufoxTrafficRecorder(options).stop()).cookieLineage.Sample, lineage);
+});
+
+test('legacy cookie events with equal timestamps keep their stored order', () => {
+    const common = { timestamp: '2026-05-01T10:00:00.000Z', url: 'https://fixture.invalid/' };
+    const lineage = new CookieLineage();
+    lineage.observeAll([
+        { ...common, seq: 20, type: 'ingress', headers: { 'Set-Cookie': 'Sample=first' } },
+        { ...common, seq: 10, type: 'ingress', headers: { 'Set-Cookie': 'Sample=second' } },
+        { ...common, seq: 30, type: 'egress', headers: { Cookie: 'Sample=second' } }
+    ]);
+    const sample = lineage.snapshot().Sample;
+    assert.deepEqual(sample.valueHistory.map(({ valueSha256 }) => valueSha256), [digest('first'), digest('second')]);
+    assert.equal(sample.lastValueSha256, digest('second'));
+    assert.equal(sample.sentCount, 1);
 });
 
 test('security blocks, cookies, and platform correlations are projected from intact events', async (t) => {

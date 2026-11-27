@@ -2,6 +2,7 @@ import { Agent as HttpAgent } from 'node:http';
 import { Agent as HttpsAgent } from 'node:https';
 import { createRequire } from 'node:module';
 import { isIPv4 } from 'node:net';
+import { clearTimeout as clearConnectionTimeout, setTimeout as setConnectionTimeout } from 'node:timers';
 
 export const controllerRequestOptions = {
     maxRedirects: 0,
@@ -16,7 +17,18 @@ const absoluteUrl = /^[a-z][a-z0-9+.-]*:\/\//i;
 const require = createRequire(import.meta.url);
 let WebSocket;
 
-export class ControllerUrlError extends Error {}
+export class ControllerUrlError extends Error {
+    name = 'ControllerUrlError';
+}
+
+export class ControllerConnectionError extends Error {
+    name = 'ControllerConnectionError';
+
+    constructor(code, message) {
+        super(message);
+        this.code = code;
+    }
+}
 
 function isLoopback(hostname) {
     return hostname === 'localhost' || isLoopbackAddress(hostname);
@@ -91,13 +103,30 @@ export function toWebSocketUrl(url) {
     return endpoint;
 }
 
-export async function connectBrowser(puppeteer, endpoint) {
+export async function controllerDelay(ms, signal) {
+    signal?.throwIfAborted();
+    await new Promise((resolve, reject) => {
+        const abort = () => {
+            clearTimeout(timer);
+            reject(signal.reason);
+        };
+        const timer = setTimeout(() => {
+            signal?.removeEventListener('abort', abort);
+            resolve();
+        }, ms);
+        signal?.addEventListener('abort', abort, { once: true });
+    });
+}
+
+export async function connectBrowser(puppeteer, endpoint, { signal, timeout = 10000 } = {}) {
+    signal?.throwIfAborted();
     if (!WebSocket) {
         try {
             // Use the same WebSocket client installed for Puppeteer, including nested dependencies.
             WebSocket = createRequire(require.resolve('puppeteer-core'))('ws');
         } catch {
-            throw new ControllerUrlError('The installed Puppeteer does not provide a supported WebSocket client');
+            throw new ControllerConnectionError('CONTROLLER_WEBSOCKET_UNAVAILABLE',
+                'The installed Puppeteer does not provide a supported WebSocket client');
         }
     }
 
@@ -108,22 +137,56 @@ export async function connectBrowser(puppeteer, endpoint) {
         perMessageDeflate: false,
         maxPayload: 256 * 1024 * 1024
     });
-    await new Promise((resolve, reject) => {
-        socket.once('open', resolve);
-        socket.on('error', reject);
-    });
-
     const transport = {
         send: message => socket.send(message),
         close: () => socket.close()
     };
+    let terminated = false;
+    let rejectConnection;
+    const terminate = () => {
+        if (terminated) return;
+        terminated = true;
+        socket.terminate();
+    };
+    const abort = () => {
+        rejectConnection?.(signal.reason);
+        terminate();
+    };
+    socket.on('error', error => rejectConnection?.(error));
     socket.on('message', message => transport.onmessage?.(message.toString()));
-    socket.on('close', () => transport.onclose?.());
+    socket.once('close', () => {
+        terminated = true;
+        rejectConnection?.(new ControllerConnectionError('CONTROLLER_CONNECTION_CLOSED',
+            'Browser controller connection closed before attachment'));
+        transport.onclose?.();
+    });
 
+    let timer;
     try {
-        return await puppeteer.connect({ transport, ignoreHTTPSErrors: false, defaultViewport: null });
+        return await new Promise((resolve, reject) => {
+            rejectConnection = reject;
+            socket.once('open', async () => {
+                if (terminated) return;
+                try {
+                    resolve(await puppeteer.connect({ transport, ignoreHTTPSErrors: false, defaultViewport: null }));
+                } catch (error) {
+                    reject(error);
+                }
+            });
+            timer = setConnectionTimeout(() => {
+                reject(new ControllerConnectionError('CONTROLLER_CONNECTION_TIMEOUT',
+                    'Browser controller connection timed out'));
+            }, timeout);
+            signal?.addEventListener('abort', abort, { once: true });
+            if (signal?.aborted) abort();
+        });
     } catch (error) {
-        socket.close();
+        terminate();
         throw error;
+    } finally {
+        // After attachment, the profile manager can close its own pages before disconnecting.
+        signal?.removeEventListener('abort', abort);
+        clearConnectionTimeout(timer);
+        rejectConnection = null;
     }
 }

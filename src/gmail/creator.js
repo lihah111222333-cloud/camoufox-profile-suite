@@ -4,9 +4,7 @@ import logger from '../utils/logger.js';
 import {
     getSignupStage,
     GOOGLE_ACCOUNTS_ORIGIN,
-    ManualSignupRequiredError,
-    requirePostUsernameStage,
-    skipOptionalRecoveryEmail
+    ManualSignupRequiredError
 } from './credential-handoff.js';
 
 const GMAIL_URL = 'https://gmail.com';
@@ -23,7 +21,7 @@ function setRegistrationStep(page, profile, step, metadata = {}) {
     }
 }
 
-async function navigateToSignUp(page) {
+async function navigateToSignUp(page, signal) {
     try {
         logger.info('Navigating to Gmail signin page first');
         
@@ -31,11 +29,13 @@ async function navigateToSignUp(page) {
         // Try with different wait strategies if proxy auth fails
         // محاولة باستراتيجيات انتظار مختلفة إذا فشلت مصادقة البروكسي
         try {
+            signal?.throwIfAborted();
             await page.goto(GMAIL_URL, { 
                 waitUntil: 'networkidle2', 
                 timeout: 60000 
             });
         } catch (gotoError) {
+            signal?.throwIfAborted();
             // If proxy auth error, try with domcontentloaded (faster, less strict)
             // إذا كان خطأ مصادقة البروكسي، جرب مع domcontentloaded (أسرع، أقل صرامة)
             if (gotoError.message.includes('ERR_UNEXPECTED_PROXY_AUTH') || 
@@ -43,20 +43,24 @@ async function navigateToSignUp(page) {
                 logger.warn('Proxy auth error detected, retrying with domcontentloaded', { 
                     error: gotoError.message 
                 });
+                signal?.throwIfAborted();
                 await page.goto(GMAIL_URL, { 
                     waitUntil: 'domcontentloaded', 
                     timeout: 30000 
                 });
                 // Wait a bit for page to load
+                signal?.throwIfAborted();
                 await page.waitForTimeout(3000);
             } else {
                 throw gotoError;
             }
         }
         
+        signal?.throwIfAborted();
         logger.info('Navigated to Gmail signin page');
    
     } catch (error) {
+        signal?.throwIfAborted();
         logger.error('Failed to navigate to sign up page', { 
             error: error.message,
             errorType: error.name,
@@ -82,11 +86,13 @@ const USERNAME_FIELDS = [
     { selector: 'input[name="Username"]', dataKey: 'username' }
 ];
 
-async function advanceSignupStep(page, address, stage, accountData) {
+async function advanceSignupStep(page, address, stage, accountData, signal) {
     let handle;
     try {
         // Pin the transport to the observed main document before passing any candidate values.
+        signal?.throwIfAborted();
         handle = await page.evaluateHandle(() => document);
+        signal?.throwIfAborted();
         const current = await handle.evaluate(expectedDocument => ({
             address: location.href,
             origin: window.origin,
@@ -208,15 +214,19 @@ async function advanceSignupStep(page, address, stage, accountData) {
             return 'advanced';
         }, { address, origin: GOOGLE_ACCOUNTS_ORIGIN, stage, values, openMenu });
 
+        signal?.throwIfAborted();
         let result = await interact(true);
         if (result === 'opened-menu') {
+            signal?.throwIfAborted();
             await page.waitForTimeout(1000);
+            signal?.throwIfAborted();
             result = await interact(false);
         }
         if (result !== 'advanced') {
             throw new ManualSignupRequiredError(result === 'changed' ? 'untrusted-page' : 'completion');
         }
     } catch (error) {
+        signal?.throwIfAborted();
         if (error instanceof ManualSignupRequiredError) throw error;
         throw new ManualSignupRequiredError('untrusted-page');
     } finally {
@@ -232,44 +242,47 @@ async function advanceSignupStep(page, address, stage, accountData) {
 
 export async function createGmailAccount(page, accountData, options = {}) {
     const profile = options?.profile;
+    const signal = options?.signal;
     try {
+        signal?.throwIfAborted();
         setRegistrationStep(page, profile, 'gmail:init');
-        let advancedUsername = false;
         if (['about:blank', 'chrome://newtab/'].includes(page.url())) {
             setRegistrationStep(page, profile, 'gmail:navigate-signup');
-            await navigateToSignUp(page);
+            await navigateToSignUp(page, signal);
 
             // A username belongs to this attempt only after our own name step.
             let advancedName = false;
-            for (const [step, telemetryStep] of [
+            const initialSteps = [
                 ['sign-in', 'gmail:navigate-signup'],
                 ['name', 'gmail:fill-name-form'],
                 ['username', 'gmail:fill-username']
-            ]) {
+            ];
+            for (const [step, telemetryStep] of initialSteps) {
+                signal?.throwIfAborted();
                 const address = page.url();
                 if (getSignupStage(address) !== step) continue;
                 if (step === 'username' && !advancedName) break;
                 setRegistrationStep(page, profile, telemetryStep);
-                await advanceSignupStep(page, address, step, accountData);
+                await advanceSignupStep(page, address, step, accountData, signal);
+                signal?.throwIfAborted();
+                if (step === 'username') break;
                 advancedName ||= step === 'name';
-                advancedUsername = step === 'username';
+                const nextStage = getSignupStage(page.url());
+                if (nextStage !== 'unknown' && !initialSteps.some(([initial]) => initial === nextStage)) break;
                 await page.waitForTimeout(2000);
             }
         }
 
-        // A pre-existing page provides no evidence of a signup started by this attempt.
+        // Handoff reads only the latest URL. The account holder decides how to handle optional prompts.
+        signal?.throwIfAborted();
         const stage = getSignupStage(page.url());
         if (!stage) throw new ManualSignupRequiredError('untrusted-page');
-        if (!advancedUsername) {
-            if (stage === 'phone' || stage === 'verification') throw new ManualSignupRequiredError('verification');
-            if (stage === 'recovery-email' || stage === 'password') throw new ManualSignupRequiredError(stage);
-        } else {
-            await requirePostUsernameStage(page);
-            await skipOptionalRecoveryEmail(page);
-        }
+        if (stage === 'phone' || stage === 'verification') throw new ManualSignupRequiredError('verification');
+        if (stage === 'recovery-email' || stage === 'password') throw new ManualSignupRequiredError(stage);
         // Account home is also reached by existing sessions and proves no new account identity.
         throw new ManualSignupRequiredError('completion');
     } catch (error) {
+        signal?.throwIfAborted();
         if (!(error instanceof ManualSignupRequiredError)) throw error;
         setRegistrationStep(page, profile, 'gmail:manual-signup', { stage: error.stage });
         logger.warn(error.message, { stage: error.stage });

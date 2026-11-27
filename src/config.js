@@ -4,11 +4,11 @@
  */
 
 import { parseAccountCount, parseThreadCount } from './utils/cli-counts.js';
-import { loadPrivateEnvironment } from './utils/private-env.js';
+import { loadApplicationEnvironment } from './utils/private-env.js';
 import { getDefaultProfilesDirectory } from './utils/state-paths.js';
 
 try {
-    loadPrivateEnvironment('.env', '.emv', () => !process.env.PROFILE_SERVICE && !process.env.DOLPHIN_API_KEY);
+    loadApplicationEnvironment();
 } catch (error) {
     throw Object.assign(error, { code: 'PRIVATE_ENV_CONFIGURATION_ERROR' });
 }
@@ -41,7 +41,6 @@ export const config = {
                   .map((p) => parseInt(p.trim(), 10))
                   .filter((p) => Number.isInteger(p) && p >= 1 && p <= 65535)
             : [],
-        enableGpuPerformanceScaling: process.env.CAMOUFOX_GPU_PERFORMANCE_SCALING !== 'false', // Default: true (Host-Mac-calibrated GPU performance weighting)
         canvasSkipHosts: process.env.CAMOUFOX_CANVAS_SKIP_HOSTS
             ? process.env.CAMOUFOX_CANVAS_SKIP_HOSTS.split(',')
                   .map((h) => h.trim())
@@ -85,7 +84,8 @@ export const config = {
         retryDelay: 5000,
         get accountsCount() { return parseAccountCount(configuredAccountsCount); },
         get threadsCount() { return parseThreadCount(configuredThreadsCount); },
-        testProxy: process.env.TEST_PROXY !== 'false' // Default: true, set TEST_PROXY=false to disable
+        testProxy: process.env.TEST_PROXY !== 'false', // Controls the optional proxy preflight.
+        allowDirectConnection: process.env.CAMOUFOX_ALLOW_DIRECT === 'true'
     }
 };
 

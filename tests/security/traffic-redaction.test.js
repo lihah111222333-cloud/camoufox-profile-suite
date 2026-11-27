@@ -8,6 +8,9 @@ import test from 'node:test';
 import {
     CamoufoxTrafficRecorder, exportTrafficToHar, extractPlatformSignatures, redactProxyUrl, redactUrlSecrets
 } from '../../src/camoufox/traffic-recorder.js';
+import {
+    redactDiagnosticMetadata, redactDiagnosticText, redactSensitiveHeaders, redactTriggerAction
+} from '../../src/camoufox/traffic-redaction.js';
 import { createProfile } from '../../src/camoufox/client.js';
 import { queryProfileTraffic, reconstructTransactionWireDump } from '../../scripts/query-traffic-attribution.js';
 
@@ -18,6 +21,7 @@ const publicProfile = 'profile-legacy-1710000000001-42';
 const proxyAddress = 'socks5://proxy.example.test:1080';
 const compactProxy = proxyAddress + ':fixture-proxy-user:fixture-proxy@password:tail';
 const fixtureToken = 'fixture-session-field';
+const fixtureSignature = 'fixture-signing-material';
 const nestedUrl = 'https://fixture.invalid/callback?access_token=' + fixtureToken + '&view=compact';
 const requestUrl = 'https://fixture.invalid/outer?return_to=' +
     encodeURIComponent(encodeURIComponent(nestedUrl)) + '&scope=one&scope=two&code=1379&x-guest-token=' + fixtureToken;
@@ -58,6 +62,178 @@ test('URL masking is constant, recursive, bounded, and preserves ordinary parame
     assert.equal(redactUrlSecrets('/next?return_to=' + 'a'.repeat(65_536)), mask);
 });
 
+const privatePlatformFields = new Map([
+    ['verifyFp', 'verifyFp'], ['s_v_web_id', 's_v_web_id'], ['msToken', 'msToken'], ['odin_tt', 'odin_tt'],
+    ['ttwid', 'ttwid'], ['X-Ig-Www-Claim', 'x-ig-www-claim'],
+    ['fc_token', 'fc-token'], ['cf-turnstile-response', 'cf-turnstile-response']
+]);
+
+test('known private platform fields hide values and stable digests across projections', () => {
+    const parameters = [...privatePlatformFields.keys()].map(name => [name, fixtureToken]);
+    const url = 'https://fixture.invalid/events?' + new URLSearchParams([...parameters, ['view', 'compact']]);
+    const headers = Object.fromEntries([...parameters, ['Accept', 'text/plain'], ['CF-Ray', 'fixture-request-label']]);
+    const safeUrl = redactUrlSecrets(url);
+    const safeHeaders = redactSensitiveHeaders({ headers }).headers;
+    for (const name of privatePlatformFields.keys()) {
+        assert.equal(new URL(safeUrl).searchParams.get(name), mask, name);
+        assert.equal(safeHeaders[name], mask, name);
+    }
+    assert.equal(new URL(safeUrl).searchParams.get('view'), 'compact');
+    assert.equal(safeHeaders.Accept, 'text/plain');
+    assert.equal(safeHeaders['CF-Ray'], 'fixture-request-label');
+
+    const signatures = extractPlatformSignatures({ url, headers });
+    for (const signatureName of privatePlatformFields.values()) {
+        const matches = signatures.filter(signature => signature.signatureName === signatureName);
+        assert.equal(matches.length, 2, signatureName);
+        for (const signature of matches) {
+            assert.equal(signature.maskedPreview, mask);
+            assert.equal(signature.valueSha256, null);
+            assert.equal(signature.valueLength, null);
+        }
+    }
+    const archivedSignature = {
+        signatureName: 'verifyFp', location: 'header', valueLength: 10,
+        maskedPreview: 'fixture-preview-label', valueSha256: 'fixture-digest-label'
+    };
+    assert.deepEqual(redactDiagnosticMetadata(archivedSignature), {
+        signatureName: 'verifyFp', location: 'header', valueLength: null, maskedPreview: mask, valueSha256: null
+    });
+});
+
+const encodedQueryEmail = 'fixture.reader%40department%2einvalid';
+
+test('URL identity masking inspects decoded free-text parameters and preserves ordinary context', () => {
+    const url = 'https://fixture.invalid/find?q=Note+' + encodedQueryEmail + '&q=One%2eTwo&view=compact';
+    const sanitized = redactUrlSecrets(url);
+    assert.deepEqual([...new URL(sanitized).searchParams], [
+        ['q', 'Note ' + mask], ['q', 'One.Two'], ['view', 'compact']
+    ]);
+    assert.ok(sanitized.includes('q=One%2eTwo'));
+    assert.equal(redactUrlSecrets(sanitized), sanitized);
+    const twiceEncoded = encodeURIComponent(encodedQueryEmail);
+    const nested = new URL(redactUrlSecrets('https://fixture.invalid/find?q=' + twiceEncoded));
+    assert.equal(decodeURIComponent(nested.searchParams.get('q')), mask);
+    const encodedDomain = 'fixture.reader@département.invalid'.replace('é', '%C3%A9');
+    assert.equal(new URL(redactUrlSecrets('https://fixture.invalid/find?q=' + encodedDomain)).searchParams.get('q'), mask);
+});
+
+const diagnosticUrl = 'https://fixture.invalid/collection(review)?token=' + fixtureToken;
+const localFileUrl = 'file:///Users/fixture-operator/Documents/fixture-local-document.pdf';
+
+test('diagnostic URL redaction preserves legal path and surrounding punctuation', () => {
+    assert.equal(redactDiagnosticText('Connection failed (' + diagnosticUrl + '). Try again.'),
+        'Connection failed (https://fixture.invalid/collection(review)?token=' + mask + '). Try again.');
+    assert.equal(redactDiagnosticText('Failure: redirect response\n  Location: next?token=' + fixtureToken + '&view=compact'),
+        'Failure: redirect response\n  Location: next?token=' + mask + '&view=compact');
+    assert.equal(redactDiagnosticText('Failure: request headers\n  Authorization: Bearer\r\n  fixture:' + fixtureToken),
+        'Failure: request headers\n  Authorization: Bearer ' + mask);
+});
+
+test('local file references retain the scheme and omit the path', () => {
+    assert.equal(redactUrlSecrets(localFileUrl), 'file:' + mask);
+    assert.equal(redactUrlSecrets('jar:' + localFileUrl + '!/sample'), 'jar:file:' + mask);
+    assert.equal(redactUrlSecrets('https://fixture.invalid/?next=' + encodeURIComponent(localFileUrl)),
+        'https://fixture.invalid/?next=' + encodeURIComponent('file:' + mask));
+    assert.equal(redactDiagnosticText('Blocked "' + localFileUrl + '"'), 'Blocked "file:' + mask + '"');
+    assert.equal(redactDiagnosticText('Blocked "file:///Users/fixture-operator/Fixture Review.pdf".'),
+        'Blocked "file:' + mask + '".');
+    const trigger = redactTriggerAction({ actionType: 'page.goto', target: localFileUrl, metadata: { url: localFileUrl } });
+    assert.equal(trigger.target, 'file:' + mask);
+    assert.equal(trigger.metadata.url, trigger.target);
+
+    const archived = {
+        type: 'request-failed', correlationId: 'fixture-local-failure', url: localFileUrl,
+        pathname: new URL(localFileUrl).pathname, method: 'GET', failureText: 'Denied "' + localFileUrl + '"'
+    };
+    const wire = reconstructTransactionWireDump({
+        profileId: 'fixture', trafficDir: '/unused', correlationId: archived.correlationId,
+        events: [archived], recordBodies: false
+    });
+    assert.equal(wire.failed.pathname, mask);
+    assert.equal(wire.failed.method, 'GET');
+    assert.ok(!JSON.stringify(wire).includes('fixture-operator'));
+});
+
+test('Signed URLs mask authentication material while retaining diagnostic parameters', () => {
+    const fixtures = [
+        ['X-Amz-Signature X-Amz-Credential X-Amz-Security-Token', 'X-Amz-Expires=3600'],
+        ['X-Goog-Signature X-Goog-Credential', 'X-Goog-SignedHeaders=host'],
+        ['Policy Signature Key-Pair-Id', 'download=inline'],
+        ['sig', 'sv=2025-01-01&sp=r'],
+        ['AWSAccessKeyId Signature', 'Expires=12345'],
+        ['GoogleAccessId Signature', 'Expires=12345'],
+        ['auth_key', 'view=compact']
+    ];
+    for (const [fields, publicQuery] of fixtures) {
+        const query = value => fields.split(' ').map(field => `${field}=${value}`).join('&');
+        const url = `//files.example.test/items/123?${query(fixtureSignature)}&${publicQuery}`;
+        const expected = `//files.example.test/items/123?${query(mask)}&${publicQuery}`;
+        assert.equal(redactUrlSecrets(url), expected);
+        assert.equal(redactUrlSecrets(expected), expected);
+    }
+    const signedRelative = '/report?X%2dAmz%2dSignature=' + fixtureSignature + '&view=compact';
+    const maskedRelative = '/report?X%2dAmz%2dSignature=' + mask + '&view=compact';
+    assert.equal(redactUrlSecrets('/next?target=' + encodeURIComponent(signedRelative)),
+        '/next?target=' + encodeURIComponent(maskedRelative));
+    const publicPolicy = '/report?policy=organization&view=compact';
+    assert.equal(redactUrlSecrets(publicPolicy), publicPolicy);
+    const { searchParams } = redactDiagnosticMetadata({
+        searchParams: { Policy: fixtureSignature, Signature: fixtureSignature, 'Key-Pair-Id': fixtureSignature }
+    });
+    assert.deepEqual(searchParams, { Policy: mask, Signature: mask, 'Key-Pair-Id': mask });
+});
+
+test('Authentication headers retain their names, order, and recognized schemes', () => {
+    const credentialHeaders = {
+        'X-Auth-Token': fixtureToken,
+        'x-access-token': fixtureToken,
+        'X-Goog-Api-Key': fixtureToken,
+        'Private-Token': fixtureToken,
+        'Authentication-Info': `nextnonce="${fixtureToken}"`,
+        'X-Amz-Security-Token': fixtureToken,
+        'X-Session-Id': fixtureToken,
+        'X-Auth': fixtureToken,
+        'X-Signature': fixtureToken
+    };
+    const ordinaryHeaders = {
+        'X-Auth-Token-Status': 'accepted',
+        Accept: 'text/plain'
+    };
+    const headers = { ...credentialHeaders, 'X-Authorization': `Bearer ${fixtureToken}`, ...ordinaryHeaders };
+    const expected = {
+        ...Object.fromEntries(Object.keys(credentialHeaders).map(name => [name, mask])),
+        'X-Authorization': `Bearer ${mask}`,
+        ...ordinaryHeaders
+    };
+    const headersArray = Object.entries(headers).map(([name, value]) => ({ name, value }));
+    headersArray.push({ name: 'X-Auth-Token', value: fixtureSignature });
+    const firstPass = redactSensitiveHeaders({ headers, headersArray });
+    assert.deepEqual(firstPass, {
+        headers: expected,
+        headersArray: [...Object.entries(expected).map(([name, value]) => ({ name, value })),
+            { name: 'X-Auth-Token', value: mask }]
+    });
+    assert.deepEqual(redactSensitiveHeaders(firstPass), firstPass);
+    assert.equal(redactDiagnosticText(`X-Auth-Token: ${fixtureToken}\nAccept: text/plain`),
+        `X-Auth-Token: ${mask}\nAccept: text/plain`);
+});
+
+test('Link masking covers URL-valued parameters and preserves ordinary attributes', () => {
+    const link = value => `<https://files.example.test/doc?sig=${value}&view=compact>; rel="next"; ` +
+        `anchor="related?X-Goog-Signature=${value}&page=2"; title="A, B; C", ` +
+        `<../ordinary?page=1>; rel=prev; context='#/archive?token=${value}'`;
+    const output = redactSensitiveHeaders({ headers: { Link: link(fixtureSignature) } });
+    assert.equal(output.headers.Link, link(mask));
+    assert.deepEqual(redactSensitiveHeaders(output), output);
+    const escaped = String.raw`</doc>; anchor="relative?s\ig=${fixtureSignature}&view=compact"`;
+    assert.equal(redactSensitiveHeaders({ headers: { Link: escaped } }).headers.Link,
+        `</doc>; anchor="relative?sig=${mask}&view=compact"`);
+    assert.equal(redactDiagnosticMetadata({ headers: { Link: link(fixtureSignature) } }).headers.Link, link(mask));
+    const folded = value => 'Link:\t' + link(value).replace('; anchor=', ';\r\n anchor=');
+    assert.equal(redactDiagnosticText(folded(fixtureSignature)), folded(mask));
+});
+
 test('proxy descriptors project only the recognized endpoint', () => {
     const fixtures = [
         [compactProxy, proxyAddress],
@@ -84,7 +260,8 @@ function legacyFixtureRecords() {
     };
     const metadata = { email: fixtureEmail, firstName: 'fixture-first-name', lastName: 'fixture-last-name', step: 'browse' };
     const egress = {
-        type: 'egress', correlationId: 'offline-fixture', method: 'GET', url: requestUrl, attribution, metadata,
+        type: 'egress', correlationId: 'offline-fixture', method: 'GET',
+        url: requestUrl + '&X-Amz-Signature=' + fixtureSignature, attribution, metadata,
         headers: { 'X-CSRF-Token': fixtureToken, 'X-Guest-Token': fixtureToken },
         headersArray: [
             { name: 'X-Guest-Token', value: fixtureToken },
@@ -98,14 +275,19 @@ function legacyFixtureRecords() {
     };
     const ingress = {
         type: 'ingress', correlationId: egress.correlationId, status: 302, url: requestUrl, attribution,
-        headers: { Location: location, 'X-Csrftoken': fixtureToken }
+        headers: {
+            Location: location,
+            'X-Csrftoken': fixtureToken,
+            'X-Auth-Token': fixtureToken,
+            Link: `</resource>; rel="help"; anchor="related?sig=${fixtureSignature}&view=compact"`
+        }
     };
     return { attribution, metadata, egress, ingress };
 }
 
 function assertShareable(report) {
     for (const identity of [fixtureEmail, 'diagnostic-fixture', 'fixture-first-name', 'fixture-last-name',
-        'fixture-personal-id', 'fixture-proxy-user', 'fixture-proxy@password', fixtureToken, 'fixture-digest']) {
+        'fixture-personal-id', 'fixture-proxy-user', 'fixture-proxy@password', fixtureToken, fixtureSignature, 'fixture-digest']) {
         assert.ok(!JSON.stringify(report).includes(identity), 'a synthetic private field survived the projection');
     }
 }
@@ -193,6 +375,54 @@ test('metadata-only recorder masks credentials consistently in the wire, ledger 
     }
 });
 
+test('stored and exported traffic omit private URL and signature metadata', async (t) => {
+    const root = directory(t);
+    const recorder = new CamoufoxTrafficRecorder({
+        profileDir: root, harPath: path.join(root, 'traffic.har'), recordBodies: false
+    });
+    const transport = new EventEmitter();
+    recorder.attachContext(transport);
+    recorder.recordTriggerAction('page.goto', localFileUrl, { url: localFileUrl });
+    const blocked = recorder.recordSecurityBlock({
+        type: 'internal-scheme-probe', targetUrl: localFileUrl, matchedScheme: 'file',
+        reason: 'Blocked "' + localFileUrl + '"'
+    });
+    const request = {
+        url: () => 'https://fixture.invalid/find?q=' + encodedQueryEmail + '&view=compact',
+        method: () => 'GET',
+        headers: () => ({ Accept: 'text/plain', VerifyFp: fixtureSignature }),
+        failure: () => ({ errorText: 'Connection failed (' + diagnosticUrl + ').' })
+    };
+    transport.emit('request', request);
+    transport.emit('requestfailed', request);
+    await recorder.stop();
+
+    const { log } = recorder.exportHar();
+    const requestEntry = log.entries.find(entry => entry.request.method === 'GET' && !entry._camoufoxSecurityBlock);
+    const blockedEntry = log.entries.find(entry => entry._camoufoxSecurityBlock);
+    assert.deepEqual(requestEntry.request.queryString, [{ name: 'q', value: mask }, { name: 'view', value: 'compact' }]);
+    assert.equal(requestEntry.request.headers.find(({ name }) => name === 'VerifyFp').value, mask);
+    assert.match(requestEntry._attribution.failureText, /collection\(review\)\?token=\[REDACTED\]/);
+    assert.equal(blockedEntry.request.url, 'file:' + mask);
+    assert.equal(blockedEntry._camoufoxSecurityBlock.matchedScheme, 'file');
+
+    const signatures = queryProfileTraffic({ trafficDir: recorder.trafficDir, signatures: true });
+    assert.equal(signatures.count, 1);
+    assert.equal(signatures.signatures[0].valueSha256, null);
+    const block = queryProfileTraffic({ trafficDir: recorder.trafficDir, correlation: blocked.correlationId });
+    assert.equal(block.securityBlock.url, 'file:' + mask);
+    const record = queryProfileTraffic({ trafficDir: recorder.trafficDir, correlation: requestEntry._attribution.correlationId });
+    assert.match(record.wireDump, /collection\(review\)\?token=\[REDACTED\]/);
+
+    for (const file of [recorder.trafficNdjsonPath, recorder.preTlsWireLogPath, recorder.harPath]) {
+        const saved = fs.readFileSync(file, 'utf8');
+        for (const marker of [encodedQueryEmail, 'fixture.reader@department.invalid', 'fixture-operator',
+            'fixture-local-document', fixtureToken, fixtureSignature]) {
+            assert.ok(!saved.includes(marker), path.basename(file));
+        }
+    }
+});
+
 test('legacy archive profile lookup, JSON and HAR use the anonymous profile label', (t) => {
     const root = directory(t);
     const trafficDir = path.join(root, legacyProfile, 'traffic');
@@ -217,9 +447,14 @@ test('legacy archive profile lookup, JSON and HAR use the anonymous profile labe
     assertShareable(report);
 
     const { log } = exportTrafficToHar(trafficDir, path.join(root, 'review.har'));
-    assert.equal(log.entries[0]._attribution.profileId, publicProfile);
-    assert.equal(log.entries[0]._attribution.accountEmail, null);
-    assert.equal(log.entries[0]._attribution.proxyServer, proxyAddress);
+    const [entry] = log.entries;
+    assert.equal(entry._attribution.profileId, publicProfile);
+    assert.equal(entry._attribution.accountEmail, null);
+    assert.equal(entry._attribution.proxyServer, proxyAddress);
+    assert.ok(entry.request.queryString.some(({ name, value }) => name === 'X-Amz-Signature' && value === mask));
+    assert.ok(entry.response.headers.some(({ name, value }) => name === 'X-Auth-Token' && value === mask));
+    assert.equal(entry.response.headers.find(({ name }) => name === 'Link').value,
+        `</resource>; rel="help"; anchor="related?sig=${mask}&view=compact"`);
     assertShareable(log);
     assert.deepEqual(fs.readFileSync(ledgerPath), initialLedger);
 });

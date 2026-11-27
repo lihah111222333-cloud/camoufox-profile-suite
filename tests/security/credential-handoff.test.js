@@ -4,11 +4,9 @@ import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { runInNewContext } from 'node:vm';
 import {
     getSignupStage,
-    requirePostUsernameStage,
-    skipOptionalRecoveryEmail
+    ManualSignupRequiredError
 } from '../../src/gmail/credential-handoff.js';
 
 const GOOGLE_ACCOUNTS_ORIGIN = 'https://accounts.google.com';
@@ -16,60 +14,10 @@ const RECOVERY_URL = `${GOOGLE_ACCOUNTS_ORIGIN}/v3/signin/addrecoveryemail?signu
 const CONFIRMATION_URL = `${GOOGLE_ACCOUNTS_ORIGIN}/v3/signin/confirmation`;
 const PHONE_URL = `${GOOGLE_ACCOUNTS_ORIGIN}/v3/signin/collectemailphone`;
 
-function makePageFixture({
-    initialUrl = RECOVERY_URL,
-    documentUrl = initialUrl,
-    nextUrl = CONFIRMATION_URL,
-    topLevel = true,
-    documentOrigin,
-    controls = [{ label: 'Skip', type: 'button' }],
-    emailValue = ''
-} = {}) {
-    let currentUrl = initialUrl;
-    const clicked = [];
-    const location = new URL(documentUrl);
-    const window = {
-        origin: documentOrigin ?? location.origin,
-        getComputedStyle: () => ({ visibility: 'visible', opacity: '1' })
-    };
-    window.top = topLevel ? window : {};
-
-    const document = {
-        querySelectorAll(selector) {
-            if (['input[type="email"], input[name="recoveryEmail"]', 'input[type="tel"], input[name="phoneNumberId"]']
-                .includes(selector)) {
-                return [{ value: emailValue }];
-            }
-            assert.equal(selector, 'button[type="button"]');
-            return controls.filter(control => control.type === 'button').map(control => ({
-                textContent: control.label,
-                matches: () => Boolean(control.disabled),
-                getAttribute: () => null,
-                getClientRects: () => control.hidden ? [] : [{}],
-                click: () => {
-                    clicked.push(control.label);
-                    currentUrl = nextUrl;
-                }
-            }));
-        }
-    };
-
-    return {
-        page: {
-            url: () => currentUrl,
-            evaluate: async (action, argument) => runInNewContext(`(${action})(argument)`, {
-                window, location, document, argument
-            }),
-            waitForTimeout: async () => {}
-        },
-        clicked
-    };
-}
-
-const manualStage = stage => ({ code: 'MANUAL_SIGNUP_REQUIRED', stage });
-
 test('Signup stage classification requires an exact HTTPS origin and a pathname step', () => {
     assert.equal(getSignupStage(RECOVERY_URL), 'recovery-email');
+    assert.equal(getSignupStage(PHONE_URL), 'phone');
+    assert.equal(getSignupStage(CONFIRMATION_URL), 'confirmation');
     assert.equal(getSignupStage(`${GOOGLE_ACCOUNTS_ORIGIN}/?next=addrecoveryemail`), 'unknown');
     assert.equal(getSignupStage(`${GOOGLE_ACCOUNTS_ORIGIN}/addrecoveryemail-notice`), 'unknown');
     assert.equal(getSignupStage('https://myaccount.google.com/'), 'account-home');
@@ -86,70 +34,13 @@ test('Signup stage classification requires an exact HTTPS origin and a pathname 
     }
 });
 
-test('Recovery skips the explicit button in the actual allowed document', async () => {
-    const { page, clicked } = makePageFixture({
-        controls: [{ label: 'Next', type: 'submit' }, { label: 'Skip', type: 'button' }]
-    });
-    assert.equal(await skipOptionalRecoveryEmail(page), 'confirmation');
-    assert.deepEqual(clicked, ['Skip']);
-});
-
-test('Recovery refuses a replacement document, changed step, subframe, or opaque origin', async () => {
-    for (const disagreement of [
-        { documentUrl: 'https://example.invalid/v3/signin/addrecoveryemail' },
-        { documentUrl: PHONE_URL },
-        { documentUrl: RECOVERY_URL + '&changed=1' },
-        { topLevel: false },
-        { documentOrigin: 'null' }
-    ]) {
-        const { page, clicked } = makePageFixture(disagreement);
-        await assert.rejects(skipOptionalRecoveryEmail(page), manualStage('recovery-email'));
-        assert.deepEqual(clicked, []);
+test('Manual signup reports a stage without directing the operator to the managed page', () => {
+    for (const stage of ['password', 'verification', 'recovery-email', 'untrusted-page', 'completion']) {
+        const error = new ManualSignupRequiredError(stage);
+        assert.equal(error.code, 'MANUAL_SIGNUP_REQUIRED');
+        assert.equal(error.stage, stage);
+        assert.equal(error.message, 'Manual signup is required');
     }
-});
-
-test('Recovery hands off when skipping is ambiguous, submits a form, or could involve a prefilled address', async () => {
-    for (const options of [
-        { controls: [{ label: 'Next', type: 'button' }] },
-        { controls: [{ label: 'Skip', type: 'submit' }] },
-        { controls: [{ label: 'Do not skip', type: 'button' }] },
-        { controls: [{ label: 'Skip', type: 'button', hidden: true }] },
-        { controls: [{ label: 'Skip', type: 'button', disabled: true }] },
-        { controls: [{ label: 'Skip', type: 'button' }, { label: 'Skip', type: 'button' }] },
-        { emailValue: 'operator@example.invalid' }
-    ]) {
-        const { page, clicked } = makePageFixture(options);
-        await assert.rejects(skipOptionalRecoveryEmail(page), manualStage('recovery-email'));
-        assert.deepEqual(clicked, []);
-    }
-
-    const { page, clicked } = makePageFixture({ nextUrl: RECOVERY_URL });
-    await assert.rejects(skipOptionalRecoveryEmail(page), manualStage('recovery-email'));
-    assert.deepEqual(clicked, ['Skip']);
-});
-
-test('Password and verification stop without any browser operation; an optional phone step can skip', async () => {
-    await assert.rejects(requirePostUsernameStage({
-        url: () => `${GOOGLE_ACCOUNTS_ORIGIN}/signup/password`
-    }), manualStage('password'));
-    await assert.rejects(requirePostUsernameStage({
-        url: () => `${GOOGLE_ACCOUNTS_ORIGIN}/challenge/sms`
-    }), manualStage('verification'));
-    await assert.rejects(requirePostUsernameStage({
-        url: () => 'https://example.invalid/signup/password'
-    }), manualStage('untrusted-page'));
-
-    const requiredPhone = makePageFixture({ initialUrl: PHONE_URL, controls: [] });
-    await assert.rejects(requirePostUsernameStage(requiredPhone.page), manualStage('verification'));
-    assert.deepEqual(requiredPhone.clicked, []);
-
-    const prefilledPhone = makePageFixture({ initialUrl: PHONE_URL, emailValue: '+1-555-0100' });
-    await assert.rejects(requirePostUsernameStage(prefilledPhone.page), manualStage('verification'));
-    assert.deepEqual(prefilledPhone.clicked, []);
-
-    const optionalPhone = makePageFixture({ initialUrl: PHONE_URL });
-    await requirePostUsernameStage(optionalPhone.page);
-    assert.deepEqual(optionalPhone.clicked, ['Skip']);
 });
 
 test('App diagnostics omit credentials and preserve private log permissions across runs', async t => {

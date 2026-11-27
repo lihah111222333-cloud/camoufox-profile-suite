@@ -4,6 +4,7 @@
  *
  * Usage:
  *   node scripts/verify-camoufox-coherence.js [--dry-run] [--check-env] [--os=windows|macos|linux]
+ * Normal invocation requires live evidence. The dry-run and check-env modes evaluate fixtures.
  */
 
 import fs from 'fs';
@@ -349,25 +350,6 @@ function createSyntheticPage(targetOs) {
 }
 
 /**
- * Execute auditProfileCoherence supporting both (page, targetOs) and (page, { expectedOs, os }) signatures
- */
-async function executeAudit(page, targetOs) {
-    try {
-        const report = await auditProfileCoherence(page, targetOs);
-        if (report && (report.coherent === true || report.passed === true)) {
-            return report;
-        }
-        const altReport = await auditProfileCoherence(page, { expectedOs: targetOs, os: targetOs });
-        if (altReport && (altReport.coherent === true || altReport.passed === true)) {
-            return altReport;
-        }
-        return report || altReport;
-    } catch (firstErr) {
-        return await auditProfileCoherence(page, { expectedOs: targetOs, os: targetOs });
-    }
-}
-
-/**
  * Inspect local Camoufox SDK and Playwright dependency availability
  */
 function checkEnvironment() {
@@ -440,7 +422,6 @@ async function runDiagnostic() {
     console.log('🦊 Camoufox Cross-OS Fingerprint Coherence Diagnostic CLI');
     console.log('================================================================================\n');
 
-    if (!forceDryRun) await import('../src/config.js');
     const envStatus = checkEnvironment();
     console.log(`📦 Node Version         : ${envStatus.nodeVersion}`);
     console.log(`💻 Host Platform        : ${envStatus.hostPlatform} (${envStatus.hostArch})`);
@@ -449,19 +430,28 @@ async function runDiagnostic() {
     console.log(`🎯 Target OS Profiles   : ${osTargets.join(', ')}\n`);
 
     const results = [];
-    let overallPassed = true;
+    const statusLabels = {
+        passed: 'PASS',
+        failed: 'FAIL',
+        incomplete: 'INCOMPLETE (checks not tested)',
+        'not-tested': 'NOT TESTED'
+    };
 
     for (const targetOs of osTargets) {
         console.log(`--------------------------------------------------------------------------------`);
         console.log(`🔍 Auditing OS Target: [${targetOs.toUpperCase()}]`);
 
         let session = null;
-        let mode = forceDryRun || !envStatus.camoufoxSdkInstalled ? 'dry-run-synthetic' : 'live-browser';
         let auditReport = null;
-        let fallbackReason = null;
+        let unavailableReason = null;
 
-        if (mode === 'live-browser') {
+        if (forceDryRun) {
+            auditReport = await auditProfileCoherence(createSyntheticPage(targetOs), targetOs);
+        } else if (!envStatus.camoufoxSdkInstalled) {
+            unavailableReason = 'Camoufox SDK is unavailable';
+        } else {
             try {
+                await import('../src/config.js');
                 const { createAndStartProfile } = await import('../src/camoufox/profile.js');
                 session = await createAndStartProfile(`diag-${targetOs}-${Date.now()}`, null, {
                     os: targetOs,
@@ -475,12 +465,10 @@ async function runDiagnostic() {
                 if (!page) {
                     throw new Error('Camoufox session started without an active Playwright Page or BrowserContext');
                 }
-                auditReport = await executeAudit(page, targetOs);
+                auditReport = await auditProfileCoherence(page, targetOs);
+                unavailableReason = auditReport.reason ?? null;
             } catch {
-                fallbackReason = 'Live Camoufox audit unavailable';
-                console.warn(`⚠️  Live Camoufox audit unavailable for ${targetOs}.`);
-                console.warn(`   🔄 Falling back to synthetic coherence rule verification for [${targetOs}]...`);
-                mode = 'dry-run-synthetic-fallback';
+                unavailableReason = session ? 'Live browser evidence could not be collected' : 'Camoufox browser could not be started';
             } finally {
                 if (session && typeof session.stop === 'function') {
                     await session.stop().catch(() => {});
@@ -494,54 +482,56 @@ async function runDiagnostic() {
             }
         }
 
-        if (!auditReport) {
-            const syntheticPage = createSyntheticPage(targetOs);
-            auditReport = await executeAudit(syntheticPage, targetOs);
-        }
-
-        const passed = Boolean(auditReport?.coherent ?? auditReport?.passed ?? (auditReport?.mismatches?.length === 0));
-        if (!passed) {
-            overallPassed = false;
-        }
+        const status = auditReport?.status ?? 'not-tested';
+        const passed = status === 'passed';
+        const mode = forceDryRun
+            ? 'dry-run-synthetic'
+            : status === 'not-tested' ? 'live-browser-unavailable' : 'live-browser';
+        const checks = auditReport?.checks ?? [];
+        const scoreSummary = auditReport?.score == null ? '' : ` (${auditReport.score}/100, ${checks.length} checks)`;
 
         console.log(`   Mode      : ${mode}`);
-        console.log(`   Coherent  : ${passed ? '✅ PASS' : '❌ FAIL'} (${auditReport?.score ?? 0}/100, ${auditReport?.checks?.length ?? 0} checks)`);
-        const gpuPerf = auditReport?.telemetry?.gpuPerformance;
-        if (gpuPerf) {
-            console.log(
-                `   GPU Scale : Target="${gpuPerf.targetGpuSpec?.model || gpuPerf.targetGpuModel}" vs Host="${gpuPerf.hostBaseline?.hostChipModel || 'Host Mac'}" -> computeTimeMultiplier=${gpuPerf.computeTimeMultiplier}x`
-            );
-        }
-        const failedChecks = (auditReport?.checks || []).filter((c) => !c.passed);
+        console.log(`   Result    : ${statusLabels[status]}${scoreSummary}`);
+        if (unavailableReason) console.log(`   Reason    : ${unavailableReason}`);
+        const failedChecks = checks.filter((check) => !check.passed && check.status !== 'not-tested');
         if (failedChecks.length > 0) {
-            console.log(`   Issues    : ${failedChecks.map((c) => `${c.name}: ${c.details}`).join(' | ')}`);
-        } else if (auditReport?.mismatches?.length > 0) {
-            console.log(`   Issues    : ${auditReport.mismatches.join(' | ')}`);
-        } else if (auditReport?.issues?.length > 0) {
-            console.log(`   Issues    : ${auditReport.issues.join(' | ')}`);
+            console.log(`   Failed    : ${failedChecks.map((check) => check.name).join(', ')}`);
+        }
+        const untestedChecks = checks.filter((check) => check.status === 'not-tested');
+        if (untestedChecks.length > 0) {
+            console.log(`   Not tested: ${untestedChecks.map((check) => check.name).join(', ')}`);
         }
 
         results.push({
             targetOs,
             mode,
+            status,
             passed,
-            fallbackReason,
+            unavailableReason,
             auditReport
         });
     }
 
-    console.log(`--------------------------------------------------------------------------------`);
-    console.log(`🛡️  Auditing Negative Control: [ADVERSARIAL JS-STEALTH & ENGINE MISMATCH]`);
-    const negativeControl = runAdversarialNegativeControl();
-    console.log(`   Tamper Detection : ${negativeControl.caughtAll ? '✅ CAUGHT ALL ANOMALIES' : '❌ MISSED ANOMALY'}`);
-    console.log(`   Flagged Checks   : ${negativeControl.failedChecks.join(', ')}`);
-    if (!negativeControl.caughtAll) {
-        overallPassed = false;
+    const negativeControl = forceDryRun ? runAdversarialNegativeControl() : null;
+    if (negativeControl) {
+        console.log('--------------------------------------------------------------------------------');
+        console.log(`   Synthetic negative control: ${negativeControl.caughtAll ? 'PASS' : 'FAIL'}`);
+        console.log(`   Flagged checks: ${negativeControl.failedChecks.join(', ')}`);
     }
 
+    let overallStatus = 'passed';
+    if (negativeControl?.caughtAll === false || results.some(({ status }) => status === 'failed')) {
+        overallStatus = 'failed';
+    } else if (results.every(({ status }) => status === 'not-tested')) {
+        overallStatus = 'not-tested';
+    } else if (results.some(({ passed }) => !passed)) {
+        overallStatus = 'incomplete';
+    }
+    const overallPassed = overallStatus === 'passed';
     const summaryReport = {
         timestamp: new Date().toISOString(),
         environment: envStatus,
+        overallStatus,
         overallPassed,
         negativeControl,
         results
@@ -555,7 +545,8 @@ async function runDiagnostic() {
     writeCaptureExport(reportPath, `${JSON.stringify(summaryReport, null, 2)}\n`, { replace: containsLiveAudit });
     console.log(`\n================================================================================`);
     console.log(`📄 Diagnostic report written to: ${reportPath}`);
-    console.log(`🏁 Overall Coherence Status: ${overallPassed ? '✅ PASSED' : '❌ FAILED'}`);
+    const auditLabel = forceDryRun ? 'Synthetic rule verification' : 'Live browser audit';
+    console.log(`🏁 ${auditLabel}: ${statusLabels[overallStatus]}`);
     console.log(`================================================================================\n`);
 
     if (!overallPassed) {

@@ -139,7 +139,7 @@
               },
               "example": {
                 "folderColor": "#3370FF",
-                "folderName": "test folder",
+                "folderName": "Example folder",
                 "sortOrder": 0
               }
             }
@@ -226,8 +226,8 @@
               },
               "example": {
                 "ids": [
-                  "2c92b02398a1a32a0198a1faf5610000",
-                  "2c92b02398a246e10198a25039760004"
+                  "REPLACE_WITH_FOLDER_ID_1",
+                  "REPLACE_WITH_FOLDER_ID_2"
                 ]
               }
             }
@@ -300,14 +300,14 @@
                 "folderInfos": [
                   {
                     "folderColor": "#3370FF",
-                    "folderName": "Default folder 25740",
-                    "id": "2c92b0239753bd0f019753d12ab10008",
+                    "folderName": "Example folder",
+                    "id": "REPLACE_WITH_FOLDER_ID_3",
                     "sortOrder": 2
                   },
                   {
                     "folderColor": "#3370FF",
-                    "folderName": "sdfds test",
-                    "id": "2c92b02394915838019491f61f160010",
+                    "folderName": "Example folder",
+                    "id": "REPLACE_WITH_FOLDER_ID_4",
                     "sortOrder": 33
                   }
                 ]
@@ -396,15 +396,15 @@
                     {
                       "createdBy": "Bryan",
                       "createdTime": "2025-04-17 06:45:47",
-                      "id": "72c466b0f532486588a98c02a6267ef2",
+                      "id": "REPLACE_WITH_PROFILE_ID_1",
                       "openTime": "2025-04-22 23:44:43",
                       "os": "Win32",
                       "owner": "Bryan",
                       "product": "chrome",
                       "profileFolder": {
                         "folderColor": "#FB9247",
-                        "folderName": "Social Media",
-                        "id": "2c92b02392f6578a0192fae0e4c40011"
+                        "folderName": "Example folder",
+                        "id": "REPLACE_WITH_FOLDER_ID_5"
                       },
                       "proxy": {
                         "duplicateCheck": false,
@@ -413,7 +413,7 @@
                         "protocol": "direct",
                         "proxyMethod": 0
                       },
-                      "seq": 18,
+                      "seq": 0,
                       "sort": 0,
                       "started": 0,
                       "status": 2,
@@ -496,7 +496,7 @@
                 "os": "MacIntel",
                 "product": "chrome",
                 "title": "Test title",
-                "folderId": "2c92b02398a25c370198a267782d000a",
+                "folderId": "REPLACE_WITH_FOLDER_ID_6",
                 "coreVersion": "138"
               }
             }
@@ -512,8 +512,8 @@
                   "properties": {}
                 },
                 "example": {
-                  "folderId": "2c92b02398a25c370198a267782d000a",
-                  "id": "2af3516e6e50404a8589fe2e0f3cdf06",
+                  "folderId": "REPLACE_WITH_FOLDER_ID_6",
+                  "id": "REPLACE_WITH_PROFILE_ID_2",
                   "title": "Test title"
                 }
               }
@@ -891,7 +891,7 @@
                 }
               },
               "example": {
-                "folderId": "2c964438972097f6019734b8105a028f",
+                "folderId": "REPLACE_WITH_FOLDER_ID_7",
                 "title": "add",
                 "fingerprint": {
                   "coreVersion": "140",
@@ -931,17 +931,17 @@
                   "1": {
                     "summary": "Success",
                     "value": {
-                      "folderId": "2c92b02398a25c370198a267782d000a",
-                      "id": "2af3516e6e50404a8589fe2e0f3cdf06",
+                      "folderId": "REPLACE_WITH_FOLDER_ID_6",
+                      "id": "REPLACE_WITH_PROFILE_ID_2",
                       "title": "Test title"
                     }
                   },
                   "2": {
                     "summary": "Success",
                     "value": {
-                      "folderId": "2c964438972097f6019734b8105a028f",
-                      "id": "e15b7abd980941bdb2789505ce28208f",
-                      "seq": 233,
+                      "folderId": "REPLACE_WITH_FOLDER_ID_7",
+                      "id": "REPLACE_WITH_PROFILE_ID_3",
+                      "seq": 0,
                       "title": "add"
                     }
                   }
@@ -994,7 +994,7 @@
                 ]
               },
               "example": {
-                "profileId": "d6255fc4f8fe4e8fbe2b419d880897b2"
+                "profileId": "REPLACE_WITH_PROFILE_ID_4"
               }
             }
           }
@@ -1012,19 +1012,19 @@
                   "allowMultipleOpenings": 1,
                   "autofillList": [],
                   "belongToMe": false,
-                  "cookie": "[{\"domain\":\"example.com\",\"expirationDate\":1765528457,\"hostOnly\":false,\"httpOnly\":true,\"name\":\"NID\",\"path\":\"/\",\"sameSite\":\"no_restriction\",\"secure\":true,\"session\":false,\"storeId\":\"0\",\"value\":\"REPLACE_WITH_COOKIE_VALUE\"},{\"domain\":\"example.com\",\"hostOnly\":false,\"httpOnly\":false,\"name\":\"ProfileId\",\"path\":\"/\",\"sameSite\":\"unspecified\",\"secure\":true,\"session\":true,\"storeId\":\"0\",\"value\":\"REPLACE_WITH_COOKIE_VALUE\"},{\"domain\":\"example.com\",\"hostOnly\":false,\"httpOnly\":false,\"name\":\"ServerPort\",\"path\":\"/\",\"sameSite\":\"unspecified\",\"secure\":true,\"session\":true,\"storeId\":\"0\",\"value\":\"REPLACE_WITH_COOKIE_VALUE\"},{\"domain\":\"example.com\",\"expirationDate\":1767082340.019446,\"hostOnly\":false,\"httpOnly\":true,\"name\":\"NID\",\"path\":\"/\",\"sameSite\":\"no_restriction\",\"secure\":true,\"session\":false,\"storeId\":\"0\",\"value\":\"REPLACE_WITH_COOKIE_VALUE\"}]",
+                  "cookie": "[{\"domain\":\"example.invalid\",\"hostOnly\":true,\"httpOnly\":true,\"name\":\"example_session\",\"path\":\"/\",\"sameSite\":\"strict\",\"secure\":true,\"session\":true,\"value\":\"REPLACE_WITH_COOKIE_VALUE\"}]",
                   "extensionInfoList": [],
                   "fingerprint": {
                     "architecture": "x86",
                     "audioContextNoise": true,
-                    "audioContextNoiseValue": 20,
+                    "audioContextNoiseValue": 0,
                     "bitNess": 64,
                     "canvasNoise": true,
-                    "canvasNoiseValue": 289424,
+                    "canvasNoiseValue": 0,
                     "clientRectsNoise": true,
-                    "clientRectsNoiseValue": 62439,
+                    "clientRectsNoiseValue": 0,
                     "colorDepth": 24,
-                    "computerName": "DESKTOP-3UNCUZ3L",
+                    "computerName": "REPLACE_WITH_COMPUTER_NAME",
                     "coreVersion": "134",
                     "deviceInfoEnabled": true,
                     "deviceMemory": 8,
@@ -1032,7 +1032,7 @@
                     "doNotTrack": false,
                     "enablePlugins": false,
                     "enableSSL": false,
-                    "fonts": "Chiller;Chiller;Chiller-Regular,Miriam Mono CLM;Miriam Mono CLM Book Oblique;MiriamMonoCLM-BookOblique,Franklin Gothic Heavy;Franklin Gothic Heavy;FranklinGothic-Heavy,Bodoni MT;Bodoni MT Bold Italic;BodoniMT-BoldItalic,Noto Sans;Noto Sans SemiBold Display;Noto-Sans-SemiBold-Display,Pristina;Pristina;Pristina-Regular,Noto Sans;Noto Sans SemiBold;Noto-Sans-SemiBold,Gill Sans MT;Gill Sans MT Bold Italic;GillSansMT-BoldItalic,Italic;Italic_IV50;Italic_IV50,Monospac821 BT;Monospace 821 BT;Monospace821BT-Roman",
+                    "fonts": "Example Font",
                     "geolocation": 2,
                     "geolocationFollowIp": true,
                     "hardwareConcurrency": 6,
@@ -1040,10 +1040,10 @@
                     "iswow64": false,
                     "kernelVersion": "134",
                     "languageFollowIp": true,
-                    "macAddr": "80-32-53-E7-8B-28",
+                    "macAddr": "00:00:00:00:00:00",
                     "mediaDeviceNoise": true,
-                    "mediaDeviceNoiseValue": "{\"videoinput\":[\"Integrated Camera (174f:181d)\",\"Integrated Webcam (0bda:576d)\",\"USB2.0 UVC HD Webcam (13d3:5188)\"],\"audiooutput\":[\"ZoomAudioDevice (Virtual)\",\"Communications - Speaker/HP (3- Realtek High Definition Audio)\",\"GX32 (2- NVIDIA High Definition Audio)\"],\"audioinput\":[\"Default - Digital Microphone (Cirrus Logic High Definition Audio)\",\"Digital Microphone (Cirrus Logic High Definition Audio)\",\"Default - Internal Microphone (Conexant 20672 SmartAudio HD)\"]}",
-                    "modelName": "DESKTOP-LSRDOVBP",
+                    "mediaDeviceNoiseValue": "{\"videoinput\":[],\"audiooutput\":[],\"audioinput\":[]}",
+                    "modelName": "REPLACE_WITH_MODEL_NAME",
                     "navigatorVendor": "Google Inc.",
                     "openHeight": 720,
                     "openWidth": 1280,
@@ -1055,176 +1055,7 @@
                     "randomFonts": true,
                     "resolutionType": 1,
                     "speechVoiceNoise": true,
-                    "speechVoiceNoiseValue": [
-                      {
-                        "default": false,
-                        "is_remote": false,
-                        "lang": "en-US",
-                        "name": "Microsoft David - English (United States)",
-                        "voice_uri": "Microsoft David - English (United States)"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": false,
-                        "lang": "id-ID",
-                        "name": "Microsoft Gadis Online (Natural) - Indonesian (Indonesia)",
-                        "voice_uri": "Microsoft Gadis Online (Natural) - Indonesian (Indonesia)"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": false,
-                        "lang": "uk-UA",
-                        "name": "Microsoft Polina Online (Natural) - Ukrainian (Ukraine)",
-                        "voice_uri": "Microsoft Polina Online (Natural) - Ukrainian (Ukraine)"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": false,
-                        "lang": "zh-CN",
-                        "name": "Microsoft Huihui - Chinese (Simplified, PRC)",
-                        "voice_uri": "Microsoft Huihui - Chinese (Simplified, PRC)"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": false,
-                        "lang": "zh-CN",
-                        "name": "Microsoft Kangkang - Chinese (Simplified, PRC)",
-                        "voice_uri": "Microsoft Kangkang - Chinese (Simplified, PRC)"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": false,
-                        "lang": "zh-CN",
-                        "name": "Microsoft Yaoyao - Chinese (Simplified, PRC)",
-                        "voice_uri": "Microsoft Yaoyao - Chinese (Simplified, PRC)"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": true,
-                        "lang": "zh-CN",
-                        "name": "Google 普通话（中国大陆）",
-                        "voice_uri": "Google 普通话（中国大陆）"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": true,
-                        "lang": "zh-HK",
-                        "name": "Google 粤語（香港）",
-                        "voice_uri": "Google 粤語（香港）"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": true,
-                        "lang": "zh-TW",
-                        "name": "Google 國語（臺灣）",
-                        "voice_uri": "Google 國語（臺灣）"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": true,
-                        "lang": "ja-JP",
-                        "name": "Google 日本語",
-                        "voice_uri": "Google 日本語"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": true,
-                        "lang": "de-DE",
-                        "name": "Google Deutsch",
-                        "voice_uri": "Google Deutsch"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": true,
-                        "lang": "en-US",
-                        "name": "Google US English",
-                        "voice_uri": "Google US English"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": true,
-                        "lang": "en-GB",
-                        "name": "Google UK English Female",
-                        "voice_uri": "Google UK English Female"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": true,
-                        "lang": "en-GB",
-                        "name": "Google UK English Male",
-                        "voice_uri": "Google UK English Male"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": true,
-                        "lang": "es-ES",
-                        "name": "Google español",
-                        "voice_uri": "Google español"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": true,
-                        "lang": "es-US",
-                        "name": "Google español de Estados Unidos",
-                        "voice_uri": "Google español de Estados Unidos"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": true,
-                        "lang": "fr-FR",
-                        "name": "Google français",
-                        "voice_uri": "Google français"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": true,
-                        "lang": "hi-IN",
-                        "name": "Google हिन्दी",
-                        "voice_uri": "Google हिन्दी"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": true,
-                        "lang": "id-ID",
-                        "name": "Google Bahasa Indonesia",
-                        "voice_uri": "Google Bahasa Indonesia"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": true,
-                        "lang": "pl-PL",
-                        "name": "Google polski",
-                        "voice_uri": "Google polski"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": true,
-                        "lang": "ru-RU",
-                        "name": "Google русский",
-                        "voice_uri": "Google русский"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": true,
-                        "lang": "pt-BR",
-                        "name": "Google português do Brasil",
-                        "voice_uri": "Google português do Brasil"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": true,
-                        "lang": "it-IT",
-                        "name": "Google italiano",
-                        "voice_uri": "Google italiano"
-                      },
-                      {
-                        "default": false,
-                        "is_remote": true,
-                        "lang": "ko-KR",
-                        "name": "Google 한국의",
-                        "voice_uri": "Google 한국의"
-                      }
-                    ],
+                    "speechVoiceNoiseValue": [],
                     "timeZoneFollowIp": true,
                     "totalDiskSpace": 2397913088,
                     "uaFullVersion": "134.0.6998.178",
@@ -1237,15 +1068,15 @@
                     "webGLRender": "ANGLE (AMD, AMD Radeon Pro WX 3100 Direct3D11 vs_5_0 ps_5_0, D3D11-31.0.14051.5006)",
                     "webRTC": "privacy",
                     "webglNoise": true,
-                    "webglNoiseValue": 449854,
+                    "webglNoiseValue": 0,
                     "webglParametersCode": "18",
                     "webgpu": {
                       "architecture": "gcn-4",
                       "vendor": "amd"
                     }
                   },
-                  "folderName": "Default folder 25740",
-                  "id": "d6255fc4f8fe4e8fbe2b419d880897b2",
+                  "folderName": "Example folder",
+                  "id": "REPLACE_WITH_PROFILE_ID_4",
                   "preference": {
                     "blockClipboard": false,
                     "blockGoogleTranslation": false,
@@ -1281,7 +1112,7 @@
                     "proxyPassword": "REPLACE_WITH_PROXY_PASSWORD",
                     "proxyUsername": "REPLACE_WITH_PROXY_USERNAME"
                   },
-                  "seq": 36,
+                  "seq": 0,
                   "sk": "REPLACE_WITH_SECRET_KEY",
                   "status": 0,
                   "workbench": 1
@@ -1333,10 +1164,10 @@
               },
               "example": {
                 "ids": [
-                  "d6255fc4f8fe4e8fbe2b419d880897b2",
-                  "c5071a3595aa4934b2645198afe40478"
+                  "REPLACE_WITH_PROFILE_ID_4",
+                  "REPLACE_WITH_PROFILE_ID_5"
                 ],
-                "folderId": "2c92b02398a25c370198a267782d000a"
+                "folderId": "REPLACE_WITH_FOLDER_ID_6"
               }
             }
           }
@@ -1423,7 +1254,7 @@
                 "proxyPassword": "REPLACE_WITH_PROXY_PASSWORD",
                 "proxyUsername": "REPLACE_WITH_PROXY_USERNAME",
                 "ids": [
-                  "d6255fc4f8fe4e8fbe2b419d880897b2"
+                  "REPLACE_WITH_PROFILE_ID_4"
                 ]
               }
             }
@@ -1495,7 +1326,7 @@
                 "extractionUrl": "https://proxy.example.com/extraction",
                 "extractMethod": 1,
                 "ids": [
-                  "59f60bfed2814e4a9fa488651835efbe"
+                  "REPLACE_WITH_PROFILE_ID_6"
                 ]
               }
             }
@@ -1552,9 +1383,9 @@
               },
               "example": {
                 "ids": [
-                  "ab7f0892eaac42398b608d569ef3c195"
+                  "REPLACE_WITH_PROFILE_ID_7"
                 ],
-                "proxyId": "bed85775f1fe43b38e29e1be8e07e5cf"
+                "proxyId": "REPLACE_WITH_PROXY_ID_1"
               }
             }
           }
@@ -1661,7 +1492,7 @@
                 "properties": {}
               },
               "example": {
-                "profileId": "d878e732552a422e87942b2a4938265c"
+                "profileId": "REPLACE_WITH_PROFILE_ID_8"
               }
             }
           }
@@ -1676,10 +1507,10 @@
                   "properties": {}
                 },
                 "example": {
-                  "ws": "ws://127.0.0.1:59948/devtools/browser/e45a2b5b-4984-47c5-85f8-3ff90ca27185",
-                  "port": 59948,
-                  "pid": 36339,
-                  "seq": 36
+                  "ws": "ws://example.invalid:9222/devtools/browser/00000000-0000-0000-0000-000000000000",
+                  "port": 9222,
+                  "pid": 0,
+                  "seq": 0
                 }
               }
             },
@@ -1727,7 +1558,7 @@
               },
               "example": {
                 "profileIds": [
-                  "d6255fc4f8fe4e8fbe2b419d880897b2"
+                  "REPLACE_WITH_PROFILE_ID_4"
                 ]
               }
             }
@@ -2269,7 +2100,7 @@
                 "extractMethod": 0,
                 "extractionUrl": "https://proxy.example.com/extraction",
                 "publicViewing": 0,
-                "id": "78c9c3971d8f4b00ace9ae4ee695df0f"
+                "id": "REPLACE_WITH_PROXY_ID_2"
               }
             }
           }
@@ -8876,7 +8707,7 @@
           "name_session": {
             "type": "string",
             "description": "Any identifier, e.g. UUIDv4, used to identify the running synchronizer session. All profiles in the same session will mirror the actions of **Owned** profile.",
-            "example": "3eb9bb76-1683-453c-9e46-27e9198c718a"
+            "example": "00000000-0000-0000-0000-000000000000"
           },
           "plan": {
             "type": "string",

@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { readCaptureFile, readCapturePayload } from '../../src/camoufox/capture-io.js';
-import { exportTrafficToHar } from '../../src/camoufox/traffic-recorder.js';
+import { CamoufoxTrafficRecorder, exportTrafficToHar } from '../../src/camoufox/traffic-recorder.js';
 import { queryProfileTraffic } from '../../scripts/query-traffic-attribution.js';
 
 const cliPath = fileURLToPath(new URL('../../scripts/query-traffic-attribution.js', import.meta.url));
@@ -39,8 +41,9 @@ function transaction(request = {}, response = {}) {
 test('in-tree files survive HAR and wire export with credential fields filtered', { skip: !supported }, (t) => {
     const { trafficDir, payloadsDir, operatorDir } = fixture(t);
     fs.mkdirSync(path.join(payloadsDir, 'nested'));
+    const responseFile = 'res-2-a123456789ab.json';
     fs.writeFileSync(path.join(payloadsDir, 'nested', 'request.json'), '{"count":2,"message":"legacy-body-value"}');
-    fs.writeFileSync(path.join(payloadsDir, 'response.json'), '{"success":true,"password":"legacy-body-value"}');
+    fs.writeFileSync(path.join(payloadsDir, responseFile), '{"success":true,"password":"legacy-body-value"}');
     fs.writeFileSync(path.join(trafficDir, 'attribution-index.json'), JSON.stringify({ session: { recordBodies: true } }));
     writeEvents(trafficDir, transaction({
         payloadFile: 'payloads/nested/request.json',
@@ -55,7 +58,7 @@ test('in-tree files survive HAR and wire export with credential fields filtered'
         ],
         attribution: { proxyServer: 'http://person:legacy-proxy-value@fixture.example:8080' }
     }, {
-        payloadFile: 'payloads/response.json',
+        payloadFile: 'payloads/' + responseFile,
         recordBodies: true,
         headers: {
             'Set-Cookie': 'session=legacy-set-cookie; HttpOnly',
@@ -68,6 +71,8 @@ test('in-tree files survive HAR and wire export with credential fields filtered'
     assert.equal(wire.requestPayload, '{"count":2}');
     assert.equal(wire.responsePayload, '{"success":true}');
     assert.equal(wire.requestPayloadExistsOnDisk, true);
+    assert.equal(wire.responsePayloadExistsOnDisk, true);
+    assert.equal(wire.responsePayloadFile, null);
     assert.match(wire.wireDump, /Cookie: \[REDACTED\]/);
 
     const outputPath = path.join(operatorDir, 'selected.har');
@@ -78,6 +83,9 @@ test('in-tree files survive HAR and wire export with credential fields filtered'
     assert.equal(entry.request.queryString[0].value, 'compact');
     assert.equal(entry.response.redirectURL, '/v1/next?token=[REDACTED]');
     assert.equal(entry._attribution.requestPayloadFile, 'payloads/nested/request.json');
+    assert.equal(entry._attribution.responsePayloadFile, null);
+    assert.doesNotMatch(JSON.stringify(wire), /a123456789ab/);
+    assert.doesNotMatch(fs.readFileSync(outputPath, 'utf8'), /a123456789ab/);
     assert.doesNotMatch(JSON.stringify(wire), /legacy-(body|cookie|auth|referrer|proxy|set-cookie|location)/);
     assert.doesNotMatch(fs.readFileSync(outputPath, 'utf8'), /legacy-(body|cookie|auth|referrer|proxy|set-cookie|location)/);
 });
@@ -312,6 +320,42 @@ test('default CLI export is private and exclusive, and an explicit file may be a
     assert.deepEqual(fs.readdirSync(ordinaryDirectory), []);
 });
 
+test('explicit HAR destinations preserve reserved source capture storage', { skip: !supported }, (t) => {
+    const { trafficDir, payloadsDir } = fixture(t);
+    writeEvents(trafficDir, transaction());
+    const ledger = path.join(trafficDir, 'traffic.ndjson');
+    const index = path.join(trafficDir, 'attribution-index.json');
+    const attachment = path.join(payloadsDir, 'retained.json');
+    fs.writeFileSync(index, JSON.stringify({ session: { recordBodies: false } }));
+    fs.writeFileSync(attachment, '{}');
+
+    const originals = new Map([ledger, index, attachment].map((file) => [file, fs.readFileSync(file)]));
+    const caseAlias = path.join(trafficDir, 'Traffic.ndjson');
+    if (fs.lstatSync(caseAlias, { throwIfNoEntry: false })?.ino === fs.lstatSync(ledger).ino) {
+        assert.throws(() => exportTrafficToHar(trafficDir, caseAlias), { code: 'ERR_CAPTURE_UNSAFE' });
+    }
+    for (const file of originals.keys()) {
+        assert.throws(() => exportTrafficToHar(trafficDir, file), { code: 'ERR_CAPTURE_UNSAFE' });
+    }
+    const absentParent = path.join(payloadsDir, 'absent');
+    assert.throws(() => exportTrafficToHar(trafficDir, path.join(absentParent, 'new.har')), { code: 'ERR_CAPTURE_UNSAFE' });
+    assert.equal(fs.existsSync(absentParent), false);
+    const aliasDirectory = path.join(trafficDir, 'PAYLOADS');
+    const aliasParent = path.join(aliasDirectory, 'absent');
+    const aliasOutput = path.join(aliasParent, 'new.har');
+    if (fs.existsSync(aliasDirectory)) {
+        assert.throws(() => exportTrafficToHar(trafficDir, aliasOutput), { code: 'ERR_CAPTURE_UNSAFE' });
+        assert.equal(fs.existsSync(aliasParent), false);
+    } else {
+        assert.equal(exportTrafficToHar(trafficDir, aliasOutput).entryCount, 1);
+    }
+    for (const [file, original] of originals) assert.deepEqual(fs.readFileSync(file), original);
+
+    const independentOutput = path.join(trafficDir, 'selected.har');
+    assert.equal(exportTrafficToHar(trafficDir, independentOutput).entryCount, 1);
+    assert.equal(JSON.parse(fs.readFileSync(independentOutput)).log.entries.length, 1);
+});
+
 test('an optional absent ledger is distinguishable from an unsafe archive input', (t) => {
     const { trafficDir, operatorDir } = fixture(t);
     assert.equal(readCaptureFile(trafficDir, 'traffic.ndjson', { optional: true }), null);
@@ -320,4 +364,142 @@ test('an optional absent ledger is distinguishable from an unsafe archive input'
     assert.equal(readCaptureFile(trafficDir, 'traffic.ndjson', {
         trustedLocal: true, maxBytes: 129 * 1024 * 1024
     }).includes('transaction-1'), true);
+});
+
+test('HAR regression preserves historical attribution and explicit nulls under filters', { skip: !supported }, (t) => {
+    const { trafficDir, operatorDir } = fixture(t);
+    const [historyRequest, historyResponse] = transaction({
+        attribution: { traceId: 'earlier', accountId: null, proxyServer: null }
+    }, { traceId: 'earlier' });
+    const [latestRequest, latestResponse] = transaction({
+        correlationId: 'latest', attribution: { traceId: 'later', accountId: null, proxyServer: null }
+    }, { correlationId: 'latest', traceId: 'later' });
+    const [knownRequest, knownResponse] = transaction({ correlationId: 'known', traceId: 'later' }, {
+        correlationId: 'known', traceId: 'later'
+    });
+    const [legacyRequest, legacyResponse] = transaction({ correlationId: 'legacy' }, { correlationId: 'legacy' });
+    writeEvents(trafficDir, [historyRequest, historyResponse, latestRequest, latestResponse,
+        knownRequest, knownResponse, legacyRequest, legacyResponse]);
+    const proxyServer = 'http://proxy.example:8432';
+    fs.writeFileSync(path.join(trafficDir, 'attribution-index.json'), JSON.stringify({
+        session: { traceId: 'later', accountId: 37, proxyServer, recordBodies: false }
+    }));
+
+    for (const [correlationId, traceId, accountId, proxy] of [
+        ['transaction-1', 'earlier', null, null], ['latest', 'later', null, null],
+        ['known', 'later', 37, proxyServer], ['legacy', null, null, null]
+    ]) {
+        const result = queryProfileTraffic({
+            trafficDir, correlationId, exportHar: path.join(operatorDir, 'selected.har')
+        });
+        assert.equal(result.entryCount, 1);
+        const attribution = result.log.entries[0]._attribution;
+        assert.deepEqual([attribution.traceId, attribution.accountId, attribution.proxyServer], [traceId, accountId, proxy]);
+    }
+});
+
+test('HAR regression rejects a replaced ledger for an earlier recorder', { skip: !supported }, async (t) => {
+    const { trafficDir, operatorDir } = fixture(t);
+    const record = async (name, resetTrafficOnStart) => {
+        const recorder = new CamoufoxTrafficRecorder({
+            trafficDir, traceId: 'fixed-trace', recordWireLog: false, resetTrafficOnStart
+        });
+        const context = new EventEmitter();
+        await recorder.attachContext(context);
+        context.emit('request', { method: () => 'GET', url: () => `https://fixture.example/${name}`, headers: () => ({}) });
+        await recorder.stop();
+        return recorder;
+    };
+    const earlier = await record('earlier', false);
+    const output = path.join(operatorDir, 'earlier.har');
+    earlier.exportHar(output);
+    const original = fs.readFileSync(output);
+    const replacement = await record('replacement', true);
+    assert.throws(() => earlier.exportHar(output), /session|ledger/i);
+    assert.deepEqual(fs.readFileSync(output), original);
+    assert.equal(replacement.buildHarArchive().log.entries[0].request.url, 'https://fixture.example/replacement');
+});
+
+test('HAR regression preserves local native and custom wire artifacts', { skip: !supported }, async (t) => {
+    const { trafficDir, operatorDir } = fixture(t);
+    const ledger = path.join(trafficDir, 'traffic.ndjson');
+    const nativeDir = path.join(path.dirname(trafficDir), '.native');
+    const nativeLog = path.join(nativeDir, 'necko-pre-tls.moz_log');
+    const wireLog = path.join(operatorDir, 'local-wire.log');
+    const recorder = new CamoufoxTrafficRecorder({ trafficDir, preTlsWireLogPath: wireLog });
+    fs.mkdirSync(nativeDir, { recursive: true });
+    fs.writeFileSync(nativeLog, 'Synthetic native diagnostics\n');
+    const context = new EventEmitter();
+    await recorder.attachContext(context);
+    context.emit('request', { method: () => 'GET', url: () => 'https://fixture.example/notes', headers: () => ({}) });
+    await recorder.stop();
+    const index = JSON.parse(fs.readFileSync(recorder.attributionIndexPath, 'utf8'));
+    assert.equal(index.artifacts.trafficNdjsonPath, ledger);
+    assert.equal(index.artifacts.preTlsWireLogPath, wireLog);
+
+    for (const target of [nativeLog, wireLog]) {
+        const original = fs.readFileSync(target);
+        assert.throws(() => exportTrafficToHar(trafficDir, target), { code: 'ERR_CAPTURE_UNSAFE' });
+        assert.deepEqual(fs.readFileSync(target), original);
+        assert.throws(() => recorder.exportHar(target), { code: 'ERR_CAPTURE_UNSAFE' });
+        assert.deepEqual(fs.readFileSync(target), original);
+    }
+    assert.equal(exportTrafficToHar(trafficDir, path.join(operatorDir, 'ordinary.har')).entryCount, 1);
+});
+
+test('HAR regression preserves existing output when the source directory is missing', { skip: !supported }, (t) => {
+    const { trafficDir, operatorDir } = fixture(t);
+    const output = path.join(operatorDir, 'existing.har');
+    fs.writeFileSync(output, 'Original synthetic archive\n');
+    const original = fs.readFileSync(output);
+    assert.throws(() => exportTrafficToHar(path.join(trafficDir, 'missing'), output), { code: 'ENOENT' });
+    assert.deepEqual(fs.readFileSync(output), original);
+    assert.equal(exportTrafficToHar(trafficDir, output).entryCount, 0);
+});
+
+test('HAR regression rejects corrupt ledger rows and retains a recoverable unfinished append', { skip: !supported }, (t) => {
+    const { trafficDir, operatorDir } = fixture(t);
+    const output = path.join(operatorDir, 'existing.har');
+    const ledger = path.join(trafficDir, 'traffic.ndjson');
+    const [egress, ingress] = transaction();
+    fs.writeFileSync(output, 'Original synthetic archive\n');
+    const original = fs.readFileSync(output);
+    fs.writeFileSync(ledger, `${JSON.stringify(egress)}\n{"type":\n${JSON.stringify(ingress)}\n`);
+    assert.throws(() => exportTrafficToHar(trafficDir, output), /Invalid JSON/);
+    assert.deepEqual(fs.readFileSync(output), original);
+    fs.writeFileSync(ledger, `${JSON.stringify(egress)}\n{"type":`);
+    assert.equal(exportTrafficToHar(trafficDir, output).entryCount, 1);
+});
+
+test('HAR regression validates any recorded attachment digest before projecting it', { skip: !supported }, (t) => {
+    const { trafficDir, payloadsDir, operatorDir } = fixture(t);
+    const output = path.join(operatorDir, 'existing.har');
+    const payloadFile = 'payloads/body.json';
+    const attachment = path.join(payloadsDir, 'body.json');
+    const body = '{"count":1}';
+    const changed = '{"count":2}';
+    const digest = createHash('sha256').update(body).digest('hex');
+    const proof = { sha256: digest, bytes: Buffer.byteLength(body) };
+    const session = { recordBodies: true };
+    const index = path.join(trafficDir, 'attribution-index.json');
+    for (const [eventEvidence, integrity] of [
+        [{ postDataSha256: digest, postDataBytes: proof.bytes }, undefined],
+        [{ payloadStorage: { status: 'stored', ...proof } }, undefined],
+        [{}, { payloadManifest: { [payloadFile]: proof } }]
+    ]) {
+        fs.writeFileSync(index, JSON.stringify({ session, integrity }));
+        writeEvents(trafficDir, transaction({ payloadFile, mimeType: 'application/json', recordBodies: true, ...eventEvidence }));
+        fs.writeFileSync(attachment, body);
+        assert.equal(exportTrafficToHar(trafficDir, output).log.entries[0].request.postData.text, body);
+        const previous = fs.readFileSync(output);
+        fs.writeFileSync(attachment, changed);
+        assert.throws(() => exportTrafficToHar(trafficDir, output), /attachment.*evidence/i);
+        assert.deepEqual(fs.readFileSync(output), previous);
+        const report = queryProfileTraffic({ trafficDir, correlationId: 'transaction-1' });
+        assert.equal(report.requestPayload, null);
+        assert.equal(report.requestPayloadOmittedReason, 'payload-integrity');
+        fs.unlinkSync(attachment);
+        assert.throws(() => exportTrafficToHar(trafficDir, output), /attachment.*evidence/i);
+        assert.deepEqual(fs.readFileSync(output), previous);
+    }
 });

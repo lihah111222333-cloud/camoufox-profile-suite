@@ -16,13 +16,27 @@ const ORDER_STATUS = {
 class SmsVerifyKeyError extends Error {}
 class SmsVerifyCanceledError extends Error {}
 
+// A receipt can require reconciliation even if the provider never returned an order ID.
 class SmsVerifyOrderError extends Error {
     constructor(message, orderId, status) {
         super(message);
         this.name = 'SmsVerifyOrderError';
         this.orderId = orderId;
         this.status = status;
+        if (status === 'RECONCILIATION_REQUIRED') this.retryable = false;
     }
+}
+
+function unconfirmedPurchase(orderId = null) {
+    return new SmsVerifyOrderError(
+        'SMS Verification purchase is unconfirmed. Reconcile the order before ordering again.',
+        orderId,
+        'RECONCILIATION_REQUIRED'
+    );
+}
+
+function isPriceRefusal(response) {
+    return typeof response === 'string' && response.startsWith('WRONG_MAX_PRICE:');
 }
 
 function getApiKey() {
@@ -48,8 +62,9 @@ function getLang() {
  */
 async function makeRequest(action, params = {}) {
     const apiKey = getApiKey();
-    let response;
-    let data;
+    const isPurchase = action === 'getNumber' || action === 'getNumberV2';
+    let requestUrl;
+    let signal;
     try {
         const queryParams = { ...params, api_key: apiKey, action, lang: getLang() };
         const url = new URL(SMS_VERIFY_API_URL);
@@ -58,15 +73,24 @@ async function makeRequest(action, params = {}) {
                 url.searchParams.append(name, String(value));
             }
         }
+        requestUrl = url.toString();
+        signal = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(30000) : undefined;
+    } catch {
+        throw new Error('SMS Verification API request could not be prepared');
+    }
 
-        response = await fetch(url.toString(), {
+    let response;
+    let data;
+    try {
+        response = await fetch(requestUrl, {
             method: 'GET',
             redirect: 'error',
-            signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(30000) : undefined
+            signal
         });
         data = await response.text();
     } catch {
         // Transport errors can contain the key-bearing request URL.
+        if (isPurchase) throw unconfirmedPurchase();
         throw new Error('SMS Verification API request failed');
     }
 
@@ -76,13 +100,18 @@ async function makeRequest(action, params = {}) {
         // Keep string response format (e.g. ACCESS_NUMBER:..., BAD_KEY).
     }
 
-    if (data === 'BAD_KEY') {
+    const clientError = response.status >= 400 && response.status < 500;
+    if (data === 'BAD_KEY' && (!isPurchase || response.ok || clientError)) {
         throw new SmsVerifyKeyError('BAD_KEY');
     }
 
     if (!response.ok) {
+        const availabilityRefusal = data === 'NO_NUMBERS' || data === 'NO_BALANCE';
+        if (isPurchase && !(clientError && (availabilityRefusal || isPriceRefusal(data)))) {
+            throw unconfirmedPurchase();
+        }
         // Caller handling relies on these error codes. Discard other response text.
-        const knownError = data === 'NO_NUMBERS' || data === 'NO_BALANCE' ? ` (${data})` : '';
+        const knownError = availabilityRefusal ? ` (${data})` : '';
         throw new Error(`SMS Verification API returned HTTP ${response.status}${knownError}`);
     }
 
@@ -143,6 +172,16 @@ function numberOrderParams(service, country, operator, { maxPrice }) {
     return { service, country, operator, maxPrice };
 }
 
+function parseOrderId(value) {
+    const id = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : value;
+    return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+function isPhoneNumber(value) {
+    if (typeof value === 'string') return /^\+?\d+$/.test(value);
+    return Number.isSafeInteger(value) && value > 0;
+}
+
 /**
  * Buy a number for SMS verification
  * @param {string} service - Service code (e.g., 'fu' for Snapchat)
@@ -151,6 +190,7 @@ function numberOrderParams(service, country, operator, { maxPrice }) {
  * @param {Object} options - Additional options
  * @param {number} [options.maxPrice] - Positive, finite spending cap
  * @returns {Promise<{id: number, phone: string, price?: number}>}
+ * @throws {SmsVerifyOrderError} An unconfirmed purchase requires reconciliation before ordering again.
  */
 export async function buySmsVerifyNumber(service = 'fu', country = 16, operator = 'any', options = {}) {
     const response = await makeRequest('getNumber', numberOrderParams(service, country, operator, options));
@@ -163,19 +203,19 @@ export async function buySmsVerifyNumber(service = 'fu', country = 16, operator 
         if (response === 'NO_NUMBERS') {
             throw new Error('No phone numbers available for the requested service, country and operator');
         }
-        if (response.startsWith('WRONG_MAX_PRICE:')) {
+        if (isPriceRefusal(response)) {
             throw new Error('Price too low for the requested SMS number');
         }
         if (response.startsWith('ACCESS_NUMBER:')) {
             const parts = response.split(':');
-            const id = parseInt(parts[1]);
+            const id = parseOrderId(parts[1]);
             const phone = parts[2];
-
+            if (id === null || parts.length !== 3 || !isPhoneNumber(phone)) throw unconfirmedPurchase(id);
             return { id, phone };
         }
     }
 
-    throw new Error('Unexpected response from SMS Verification API');
+    throw unconfirmedPurchase();
 }
 
 /**
@@ -186,6 +226,7 @@ export async function buySmsVerifyNumber(service = 'fu', country = 16, operator 
  * @param {Object} options - Additional options
  * @param {number} [options.maxPrice] - Positive, finite spending cap
  * @returns {Promise<Object>} Order data
+ * @throws {SmsVerifyOrderError} An unconfirmed purchase requires reconciliation before ordering again.
  */
 export async function buySmsVerifyNumberV2(service = 'fu', country = 16, operator = 'any', options = {}) {
     const response = await makeRequest('getNumberV2', numberOrderParams(service, country, operator, options));
@@ -193,10 +234,14 @@ export async function buySmsVerifyNumberV2(service = 'fu', country = 16, operato
     if (typeof response === 'string') {
         if (response === 'NO_BALANCE') throw new Error('Insufficient balance');
         if (response === 'NO_NUMBERS') throw new Error('No numbers available');
-        if (response.startsWith('WRONG_MAX_PRICE:')) {
+        if (isPriceRefusal(response)) {
             throw new Error('Price too low for the requested SMS number');
         }
     }
+
+    if (!response || typeof response !== 'object' || Array.isArray(response)) throw unconfirmedPurchase();
+    const id = parseOrderId(response.activationId);
+    if (id === null || !isPhoneNumber(response.phoneNumber)) throw unconfirmedPurchase(id);
 
     return {
         id: response.activationId,
@@ -362,7 +407,7 @@ export async function waitForSmsVerifyCode(orderId, maxWaitTime = 300000, checkI
  * @param {number} options.maxWaitTime - Max wait time for SMS
  * @param {number} [options.maxPrice] - Positive, finite spending cap
  * @returns {Promise<{phone: string, code: string, orderId: number}>}
- * @throws {SmsVerifyOrderError} After purchase, includes orderId and status when order cleanup needs review or has canceled the order.
+ * @throws {SmsVerifyOrderError} Includes status and an orderId when known. Reconciliation-required errors are not retryable.
  */
 export async function buyNumberAndGetSMS({
     service = 'fu',

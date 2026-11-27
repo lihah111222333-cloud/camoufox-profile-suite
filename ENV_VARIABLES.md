@@ -59,6 +59,9 @@ CAMOUFOX_CANVAS_NOISE=true
 # URL filtering checks browser-visible destinations.
 CAMOUFOX_PORT_SCAN_MODE=url-only
 
+# Explicitly allow a direct connection in URL-only mode when the proxy inventory is empty.
+CAMOUFOX_ALLOW_DIRECT=false
+
 # Optional: run in-browser C++ fingerprint coherence audit automatically on profile startup
 CAMOUFOX_AUDIT_ON_START=false
 
@@ -87,9 +90,15 @@ CAMOUFOX_TRAFFIC_MAX_BODY_BYTES=5242880
 
 In a deployment that forces browser traffic through a controlled proxy, `CAMOUFOX_PORT_SCAN_MODE=managed-proxy` checks the selected profile proxy against `CAMOUFOX_MANAGED_EGRESS_ORIGIN`. Set the origin to the operator's existing proxy scheme, host and explicit port, without credentials. The proxy owns the policy for the resolved destination IP on every connection, including redirected requests. Its ACL must be verified at the proxy. The `transport` setting requires verified enforcement and stops if the launcher cannot provide it.
 
+Startup requires a valid proxy inventory with at least one entry by default. If you intend Camoufox in `url-only` mode to use the system's public egress when the inventory is empty, set `CAMOUFOX_ALLOW_DIRECT=true`. `TEST_PROXY=false` disables the optional proxy preflight. Managed proxy mode always requires its configured proxy.
+
 The recorder defaults to metadata. Enabling `CAMOUFOX_RECORD_BODIES` stores eligible raw attachments under the profile's private `traffic/payloads/` directory. Redacted wire and HAR views can include a restricted set of fields from eligible complete structured bodies. Reconstruct older wire data through the attribution CLI and review exported data before sharing it. Keep raw attachments, native TLS keys and native Necko logs private.
 
 When reopening a profile with old native logs inside `traffic/`, the app keeps the original archive and its manifest together under the profile's private `.native/legacy-*/traffic/` directory. The current recorder writes the traffic archive under `traffic/` and native diagnostics under `.native/`.
+
+Ordinary attribution reports omit Cookie value digests. The explicit `--cookies` and `--cookie` queries include those digests for private investigation. Historical raw ledgers and logs retain the data originally written to them.
+
+When a HAR-only export fails, the recorder keeps the captured data in private scratch storage. After correcting the output problem, call `stopProfile(profileId, { profilesDir })` again to retry the original export. An ordinary startup leaves a pending export for the operator to resolve.
 
 ## Host filesystem permissions
 

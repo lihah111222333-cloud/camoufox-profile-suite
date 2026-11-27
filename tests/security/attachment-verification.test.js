@@ -75,7 +75,7 @@ for (const [variant, maxBodyBytes] of [['complete', 1024], ['truncated', 4]]) {
 test('recovery restores a committed truncated attachment when no index checkpoint exists', async (t) => {
     const { trafficDir, open, recorder, indexPath } = fixture(t, { maxBodyBytes: 4 });
     request(recorder, Buffer.from('synthetic crash fixture'));
-    await recorder.flushSummary();
+    await recorder.stop();
     fs.unlinkSync(indexPath);
     await open().stop();
     const restored = verifyTrafficIntegrity(trafficDir);
@@ -180,6 +180,7 @@ test('an attachment write failure remains visible in the chain, HAR and strict v
 test('wire summaries skip disabled undeclared files and bound enabled file reads', async (t) => {
     const disabled = fixture(t);
     const wirePath = disabled.recorder.preTlsWireLogPath;
+    await disabled.recorder.stop();
     fs.mkdirSync(wirePath);
     const resumed = disabled.open();
     assert.equal((await resumed.stop()).integrity.preTlsWireLogSha256, null);
@@ -196,10 +197,13 @@ test('wire summaries skip disabled undeclared files and bound enabled file reads
 });
 
 test('disabling wire logging preserves a verified checkpoint with a recoverable appended suffix', async (t) => {
-    const { trafficDir, open, recorder } = fixture(t, { recordWireLog: true });
+    const { trafficDir, open, recorder, indexPath } = fixture(t, { recordWireLog: true });
     recorder.recordSecurityBlock({ type: 'fixture' });
     await recorder.flushSummary();
+    const checkpoint = fs.readFileSync(indexPath);
     recorder.recordSecurityBlock({ type: 'fixture', url: 'https://fixture.invalid' });
+    await recorder.stop();
+    fs.writeFileSync(indexPath, checkpoint);
 
     const resumed = open({ recordWireLog: false });
     await resumed.stop();

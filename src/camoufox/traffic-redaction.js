@@ -1,32 +1,69 @@
 const SESSION_TOKEN_FIELD =
     '(?:x[-_]?)?(?:csrf|xsrf)(?:[-_]?token)?|passport[-_]?csrf[-_]?token|(?:x[-_]?)?guest[-_]?token|ct0|lsd|x-fb-lsd';
+const AUTHORIZATION_HEADER = '(?:x-)?(?:proxy-)?authorization';
+const CREDENTIAL_FIELD =
+    '(?:x[-_]?)?(?:(?:(?:auth(?:entication|orization)?|access|refresh|id|session|security|' +
+    'api|bearer|client|user|private|job|deploy)[-_]?)?token|(?:api|auth|access|subscription)[-_]?key|client[-_]?secret)';
+const SIGNATURE_FIELD = '(?:x[-_]?)?sig(?:nature)?|hmac';
+const CLOUD_SIGNATURE_FIELD =
+    'x[-_](?:amz|goog|oss)[-_](?:signature|credential|security[-_]token)|x-amz-s3session-token';
+const CLOUDFRONT_KEY_ID = 'key-pair-id';
+const PRIVATE_PLATFORM_FIELD =
+    'mstoken|verifyfp|s_v_web_id|odin_tt|ttwid|x-ig-www-claim|fc[-_]token|cf-turnstile-response';
 
-export const SENSITIVE_HEADER_REGEX = new RegExp(
-    '^(?:cookie2?|set-cookie2?|authorization|proxy-authorization|x-proxy-authorization|x-api-key|omocaptcha-key|' +
-    SESSION_TOKEN_FIELD + ')$', 'i'
+const SENSITIVE_HEADER_NAME =
+    '(?:cookie2?|set-cookie2?|(?:proxy-)?authentication-info|(?:x-)?authentication|x-auth|(?:x-)?session-id|' +
+    AUTHORIZATION_HEADER + '|' +
+    'omocaptcha-key|x-goog-api-key|x-rapidapi-key|ocp-apim-subscription-key|x-auth-request-access-token|' +
+    'x-(?:shopify-access|vault)-token|cf-access-(?:jwt-assertion|client-secret)|' +
+    CREDENTIAL_FIELD + '|' + SIGNATURE_FIELD + '|' + CLOUD_SIGNATURE_FIELD + '|' + SESSION_TOKEN_FIELD + '|' +
+    PRIVATE_PLATFORM_FIELD + ')';
+export const SENSITIVE_HEADER_REGEX = new RegExp('^' + SENSITIVE_HEADER_NAME + '$', 'i');
+const DIAGNOSTIC_CREDENTIAL_HEADER_REGEX = new RegExp(
+    '^([ \\t]*)(' + SENSITIVE_HEADER_NAME + '):[ \\t]*([^\\r\\n]*(?:\\r?\\n[ \\t][^\\r\\n]*)*)', 'gmi'
 );
 
 export const SENSITIVE_URL_PARAM_REGEX = new RegExp(
-    '^(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|session[_-]?(?:id|token)|' +
-    'authorization[_-]?code|code|client[_-]?secret|password|passwd|pwd|secret|private[_-]?key|' +
-    SESSION_TOKEN_FIELD + ')$', 'i'
+    '^(?:session[_-]?id|authorization[_-]?code|code|password|passwd|pwd|secret|private[_-]?key|' +
+    '(?:aws|oss)?access[-_]?key[-_]?id|googleaccessid|' + CLOUDFRONT_KEY_ID + '|' +
+    CREDENTIAL_FIELD + '|' + SIGNATURE_FIELD + '|' + CLOUD_SIGNATURE_FIELD + '|' +
+    SESSION_TOKEN_FIELD + '|' + PRIVATE_PLATFORM_FIELD + ')$', 'i'
 );
 
 const URL_HEADER_REGEX =
     /^(?::path|referer|referrer|origin|sec-websocket-origin|location|content-location|destination|.+[-_]ur[il])$/i;
 const URL_METADATA_KEY_REGEX = /(?:url|uri|href|referrer|referer|location|origin|destination)$/i;
-const AUTHORIZATION_HEADER_REGEX = /^(?:authorization|(?:x-)?proxy-authorization)$/i;
+const AUTHORIZATION_HEADER_REGEX = new RegExp('^' + AUTHORIZATION_HEADER + '$', 'i');
+const LINK_HEADER_REGEX = /^link$/i;
+const REFRESH_HEADER_REGEX = /^refresh$/i;
+const LINK_COMPONENT_REGEX =
+    /<([^<>]*)>|(;\s*[-\w!#$%&'*+.^`|~]+\s*=\s*)(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([^;,\s]+))/g;
 const MASK = '[REDACTED]';
-const URL_REFERENCE_REGEX = /(?:[a-z][a-z\d+.-]{0,31}:\/\/|\/|\.\.?\/)[^\s"'<>()]+/gi;
+const PRIVATE_URL_SCHEME = '(?:(?:blob|filesystem|view-source|jar):){0,4}(?:data|javascript|file):';
+const PRIVATE_URL_PREFIX_REGEX = new RegExp('^(\\s*' + PRIVATE_URL_SCHEME + ')', 'i');
+const QUOTED_PRIVATE_URL_REGEX = new RegExp('(["\'])(' + PRIVATE_URL_SCHEME + '[^\\r\\n]*?)\\1', 'gi');
+const URL_REFERENCE_REGEX = new RegExp(
+    '(?:\\b(?:' + PRIVATE_URL_SCHEME + '|[a-z][a-z\\d+.-]{0,31}://)|\\.\\.?/|/)[^\\s"\'<>]+', 'gi'
+);
+const PRIVATE_URL_COMPONENTS = Object.freeze({
+    host: 'unknown',
+    hostname: 'unknown',
+    port: null,
+    pathname: MASK,
+    search: '',
+    searchParams: Object.freeze({})
+});
 const URL_VALUE_REGEX = /^(?:[a-z][a-z\d+.-]*:|\/|\.\.?\/|[?#])|^[^\s?#]+[?#][^#]*=/i;
 const ENCODED_URL_SYNTAX_REGEX = /%(?:25)*(?:23|2f|3a|3d|3f|40)/i;
+const ENCODED_EMAIL_SYNTAX_REGEX = /@[^@\s]*%/;
 const MAX_URL_BYTES = 64 * 1024;
 const MAX_NESTED_URL_DEPTH = 4;
 const MAX_URL_DECODING_PASSES = 4;
 const ACCOUNT_FIELD_REGEX =
     /^(?:(?:account[-_]?)?e[-_]?mail(?:[-_]?address)?|(?:account[-_]?)?user[-_]?name|(?:first|last|full|given|family|display|profile)[-_]?name)$/i;
 // Start at a token boundary so a long ordinary value is scanned once.
-const EMAIL_REGEX = /(?<![a-z\d._%+-])[a-z\d._%+-]+(?:@|%40)[a-z\d-]+(?:\.[a-z\d-]+)+/gi;
+const EMAIL_REGEX =
+    /(?<![\p{L}\p{N}\p{M}._%+-])[\p{L}\p{N}\p{M}._%+-]+(?:@|%40)[\p{L}\p{N}\p{M}-]+(?:\.[\p{L}\p{N}\p{M}-]+)+/giu;
 const LEGACY_PROFILE_REGEX = /\bGmail_[a-z\d._-]{1,80}?_(\d{13})(?:_(\d{1,8}))?(?![a-z\d_-])/gi;
 const LEGACY_MASK_REGEX = /\[REDACTED:[a-f\d]{8}\]|%5BREDACTED%3A[a-f\d]{8}%5D/gi;
 const PROXY_SCHEMES = new Set(['http', 'https', 'socks4', 'socks5', 'socks5h']);
@@ -99,22 +136,21 @@ function exceedsUrlLimit(value) {
 function redactUrlValue(raw, depth = 0) {
     let value = raw;
     for (let decodingPass = 0; decodingPass <= MAX_URL_DECODING_PASSES; decodingPass += 1) {
-        if (URL_VALUE_REGEX.test(value.trim())) {
-            if (depth > MAX_NESTED_URL_DEPTH) return MASK;
+        const isUrl = URL_VALUE_REGEX.test(value.trim());
+        if (isUrl && depth > MAX_NESTED_URL_DEPTH) return MASK;
 
-            const sanitized = redactUrl(value, depth);
-            if (sanitized !== value) {
-                try {
-                    let encoded = sanitized;
-                    for (let i = 0; i < decodingPass; i += 1) encoded = encodeURIComponent(encoded);
-                    return encoded;
-                } catch {
-                    return MASK;
-                }
+        const sanitized = isUrl ? redactUrl(value, depth) : redactDiagnosticIdentity(value);
+        if (sanitized !== value) {
+            try {
+                let encoded = sanitized;
+                for (let i = 0; i < decodingPass; i += 1) encoded = encodeURIComponent(encoded);
+                return encoded;
+            } catch {
+                return MASK;
             }
-            if (/[?#]/.test(value) && value.includes('=')) return raw;
         }
-        if (!ENCODED_URL_SYNTAX_REGEX.test(value)) return raw;
+        if (isUrl && /[?#]/.test(value) && value.includes('=')) return raw;
+        if (!ENCODED_URL_SYNTAX_REGEX.test(value) && !ENCODED_EMAIL_SYNTAX_REGEX.test(value)) return raw;
         if (exceedsUrlLimit(value)) return MASK;
 
         const decoded = decodeParameter(value);
@@ -126,23 +162,27 @@ function redactUrlValue(raw, depth = 0) {
 
 function redactParameters(parameters, depth) {
     if (!parameters.includes('=')) return parameters;
-    return parameters.split('&').map((pair) => {
+    const pairs = parameters.split('&').map((pair) => {
         const equals = pair.indexOf('=');
+        const decodedName = equals > 0 ? decodeParameter(pair.slice(0, equals)).trim() : '';
+        return { pair, equals, decodedName };
+    });
+    const hasCloudFrontKey = pairs.some(({ decodedName }) => decodedName.toLowerCase() === CLOUDFRONT_KEY_ID);
+    return pairs.map(({ pair, equals, decodedName }) => {
         if (equals <= 0) return pair;
-        const name = pair.slice(0, equals);
-        const decodedName = decodeParameter(name).trim();
         const value = SENSITIVE_URL_PARAM_REGEX.test(decodedName) ||
-            SENSITIVE_HEADER_REGEX.test(decodedName) || ACCOUNT_FIELD_REGEX.test(decodedName)
+            SENSITIVE_HEADER_REGEX.test(decodedName) || ACCOUNT_FIELD_REGEX.test(decodedName) ||
+            (hasCloudFrontKey && /^policy$/i.test(decodedName))
             ? MASK
             : redactUrlValue(pair.slice(equals + 1), depth + 1);
-        return name + '=' + value;
+        return pair.slice(0, equals + 1) + value;
     }).join('&');
 }
 
 function redactUrl(value, depth) {
     if (exceedsUrlLimit(value)) return MASK;
-    const opaqueUrl = /^(\s*(?:data|javascript):)/i.exec(value);
-    if (opaqueUrl) return opaqueUrl[1] + MASK;
+    const privateUrl = PRIVATE_URL_PREFIX_REGEX.exec(value);
+    if (privateUrl) return privateUrl[1] + MASK;
 
     // Strip userinfo while preserving the original form of absolute and relative references.
     const url = redactDiagnosticIdentity(value.replace(/^(\s*(?:[a-z][a-z\d+.-]*:)?\/\/)[^/?#]*@/i, '$1'))
@@ -179,13 +219,52 @@ function redactCredentialHeader(name, value) {
     return scheme ? `${scheme} ${MASK}` : MASK;
 }
 
+function redactLinkHeader(value) {
+    return value.replace(LINK_COMPONENT_REGEX, (component, reference, prefix, doubleQuoted, singleQuoted, token) => {
+        if (reference !== undefined) return '<' + redactUrlSecrets(reference) + '>';
+
+        const quote = doubleQuoted !== undefined ? '"' : singleQuoted !== undefined ? "'" : '';
+        const parameter = quote ? (doubleQuoted ?? singleQuoted).replace(/\\([^\r\n])/g, '$1') : token;
+        const projected = parameter.replace(/\S+/g, redactUrlSecrets);
+        if (projected === parameter) return component;
+
+        const formatted = quote ? projected.replace(/\\/g, '\\\\').replaceAll(quote, '\\' + quote) : projected;
+        return prefix + quote + formatted + quote;
+    });
+}
+
+function redactUrlReference(reference) {
+    // Closing parentheses from surrounding prose can follow a URL with balanced parentheses of its own.
+    let parenthesisEnd = reference.length;
+    while (parenthesisEnd > 0 && '.,;:!?'.includes(reference[parenthesisEnd - 1])) parenthesisEnd -= 1;
+    let parenthesisStart = parenthesisEnd;
+    while (parenthesisStart > 0 && reference[parenthesisStart - 1] === ')') parenthesisStart -= 1;
+    if (parenthesisStart === parenthesisEnd) return redactUrlSecrets(reference);
+
+    let openParentheses = 0;
+    for (let i = 0; i < parenthesisStart; i += 1) {
+        if (reference[i] === '(') openParentheses += 1;
+        else if (reference[i] === ')' && openParentheses > 0) openParentheses -= 1;
+    }
+    if (openParentheses >= parenthesisEnd - parenthesisStart) return redactUrlSecrets(reference);
+
+    const end = parenthesisStart + openParentheses;
+    return redactUrlSecrets(reference.slice(0, end)) + reference.slice(end);
+}
+
 export function redactDiagnosticText(rawText) {
     const cleaned = String(rawText ?? '')
-        .replace(/^([ \t]*)([\w-]+):[ \t]*([^\r\n]*)(?:\r?\n[ \t][^\r\n]*)*/gm,
-            (line, indent, name, value) => SENSITIVE_HEADER_REGEX.test(name)
-                ? `${indent}${name}: ${redactCredentialHeader(name, value)}`
-                : line)
-        .replace(URL_REFERENCE_REGEX, redactUrlSecrets)
+        .replace(DIAGNOSTIC_CREDENTIAL_HEADER_REGEX,
+            (_, indent, name, value) => indent + name + ': ' + redactCredentialHeader(name, value))
+        .replace(/^([ \t]*)(:?[\w-]+)(:[ \t]*)([^\r\n]*(?:\r?\n(?![ \t]+:?[\w-]+:)[ \t]+[^\r\n]*)*)/gm,
+            (line, indent, name, separator, value) => {
+                if (LINK_HEADER_REGEX.test(name) || URL_HEADER_REGEX.test(name) || REFRESH_HEADER_REGEX.test(name)) {
+                    return indent + name + separator + redactHeaderValue(name, value);
+                }
+                return line;
+            })
+        .replace(QUOTED_PRIVATE_URL_REGEX, (_, quote, url) => quote + redactUrlSecrets(url) + quote)
+        .replace(URL_REFERENCE_REGEX, redactUrlReference)
         .replace(LEGACY_MASK_REGEX, MASK);
     return redactDiagnosticIdentity(cleaned);
 }
@@ -194,8 +273,8 @@ function redactHeaderValue(rawName, rawValue) {
     const name = rawName.trim();
     const value = String(rawValue ?? '');
     if (SENSITIVE_HEADER_REGEX.test(name)) return redactCredentialHeader(name, value);
-    if (/^link$/i.test(name)) return value.replace(/<([^>]+)>/g, (_, url) => `<${redactUrlSecrets(url)}>`);
-    if (/^refresh$/i.test(name)) {
+    if (LINK_HEADER_REGEX.test(name)) return redactLinkHeader(value);
+    if (REFRESH_HEADER_REGEX.test(name)) {
         return value.replace(/(\burl\s*=\s*)(?:(['"])(.*?)\2|(.*))$/i,
             (_, prefix, quote, quotedUrl, unquotedUrl) =>
                 `${prefix}${quote ?? ''}${redactUrlSecrets(quotedUrl ?? unquotedUrl)}${quote ?? ''}`);
@@ -234,6 +313,9 @@ export function redactDiagnosticMetadata(metadata) {
         if (/^headersArray$/i.test(key) && Array.isArray(value)) {
             return Object.freeze(redactSensitiveHeaders({ headersArray: value }).headersArray.map(Object.freeze));
         }
+        if (/^headers$/i.test(key) && typeof value === 'object' && !Array.isArray(value)) {
+            return Object.freeze(redactSensitiveHeaders({ headers: value }).headers);
+        }
         if (typeof value === 'string') {
             if (URL_METADATA_KEY_REGEX.test(key) || /^search$/i.test(key)) {
                 return redactUrlSecrets(redactUrlValue(value));
@@ -246,14 +328,26 @@ export function redactDiagnosticMetadata(metadata) {
 
         visited.add(value);
         const sensitiveSignature = typeof value.signatureName === 'string' &&
-            (value.location === 'body' || SENSITIVE_URL_PARAM_REGEX.test(value.signatureName));
+            (value.location === 'body' || SENSITIVE_URL_PARAM_REGEX.test(value.signatureName) ||
+                SENSITIVE_HEADER_REGEX.test(value.signatureName));
+        const url = value.url ?? value.targetUrl;
+        const privateUrl = typeof url === 'string' && PRIVATE_URL_PREFIX_REGEX.test(url);
+        const searchParams = /^searchParams$/i.test(key);
+        const hasCloudFrontKey = searchParams && Object.keys(value)
+            .some(name => name.trim().toLowerCase() === CLOUDFRONT_KEY_ID);
         const copyEntry = ([name, item]) => {
+            if (privateUrl && Object.hasOwn(PRIVATE_URL_COMPONENTS, name)) {
+                return [name, PRIVATE_URL_COMPONENTS[name]];
+            }
             if (sensitiveSignature) {
                 if (name === 'maskedPreview') return [name, MASK];
                 if (/^(?:rawValue|value|valueLength|valueSha256)$/.test(name)) return [name, null];
             }
-            if (/^searchParams$/i.test(key)) {
-                const sanitize = (param) => copy(typeof param === 'string' ? redactUrlValue(param, 1) : param, name);
+            if (searchParams) {
+                const parameterName = name.trim();
+                const sanitize = (param) => hasCloudFrontKey && /^policy$/i.test(parameterName)
+                    ? MASK
+                    : copy(typeof param === 'string' ? redactUrlValue(param, 1) : param, parameterName);
                 return [name, Array.isArray(item) ? Object.freeze(item.map(sanitize)) : sanitize(item)];
             }
             return [name, copy(item, name)];
