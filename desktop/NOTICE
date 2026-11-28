@@ -1,0 +1,19 @@
+Camoufox Studio Web/Desktop UI Shell
+License: GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)
+
+This `desktop/` UI directory incorporates and adapts open-source UI code and design patterns from:
+
+1. Fury Antidetect Browser (`https://github.com/furyteamtop/fury-antidetect-browser`)
+   Copyright 2026 Bogdan Shapovalov and the Fury authors
+   Licensed under AGPL-3.0-or-later
+   Used for the React desktop layout, profile table, profile editor, proxy manager,
+   bookmarks/extensions/trash views, command palette, theme system, and i18n dictionaries.
+
+2. Donut Browser (`https://github.com/donutbrowser/donutbrowser`)
+   Copyright Donut Browser contributors
+   Licensed under AGPL-3.0-or-later
+   UI design patterns selectively absorbed for KPI overview cards, gradient SVG
+   bandwidth/traffic sparkline, profile handoff status indicators, metadata summary
+   cards, and lab diagnostic panels.
+
+See `LICENSE` in this directory for the full text of the GNU Affero General Public License v3.0.

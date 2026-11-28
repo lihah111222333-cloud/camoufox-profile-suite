@@ -83,3 +83,11 @@ _shared_sslkeylog.txt
 *.moz_log*
 *.har
 
+
+# Local HTTP Desktop UI shell build artifacts
+desktop/node_modules/
+desktop/dist/
+desktop/src-tauri/target/
+desktop/src-tauri/resources/
+__pycache__/
+*.pyc

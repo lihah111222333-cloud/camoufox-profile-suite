@@ -23,6 +23,7 @@
     "docs/openapi-default.json",
     "scripts/audit-adspower-profiles.js",
     "scripts/check-distribution.mjs",
+    "scripts/ensure-camoufox-baseline.js",
     "scripts/list-dolphin-folders.js",
     "scripts/omocaptcha-extension.js",
     "scripts/query-traffic-attribution.js",
@@ -33,6 +34,7 @@
     "scripts/verify-camoufox-coherence.js",
     "src/camoufox/capture-export-policy.js",
     "src/camoufox/capture-io.js",
+    "src/camoufox/capture-transaction-identity.js",
     "src/camoufox/client.js",
     "src/camoufox/coherence-auditor.js",
     "src/camoufox/cookie-lineage.js",
@@ -64,6 +66,7 @@
     "src/providers/sms-verification-api.js",
     "src/utils/account-output-lock.js",
     "src/utils/account-results.js",
+    "src/utils/application-config.js",
     "src/utils/cli-counts.js",
     "src/utils/controller-id.js",
     "src/utils/controller-request.js",
@@ -82,6 +85,11 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
+    "ui": "node desktop/server.mjs",
+    "ui:build": "npm --prefix desktop run build",
+    "desktop:build": "npm --prefix desktop run app:build",
+    "setup:camoufox": "node scripts/ensure-camoufox-baseline.js",
+    "postinstall": "node scripts/ensure-camoufox-baseline.js --postinstall",
     "list-folders": "node scripts/list-dolphin-folders.js",
     "verify-camoufox": "node scripts/verify-camoufox-coherence.js",
     "audit-traffic": "node scripts/query-traffic-attribution.js",
@@ -121,8 +129,10 @@
   },
   "dependencies": {
     "axios": "^1.6.0",
+    "camoufox": "^0.5.9",
     "dotenv": "^16.3.0",
     "gologin": "^2.1.33",
+    "playwright-core": "1.62.0",
     "puppeteer-core": "^21.0.0"
   }
 }

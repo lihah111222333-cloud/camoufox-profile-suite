@@ -1,0 +1,52 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Camoufox Studio",
+  "version": "1.0.0",
+  "identifier": "dev.camoufox.studio",
+  "build": {
+    "devUrl": "http://127.0.0.1:5273",
+    "frontendDist": "../dist",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build && node scripts/stage-resources.mjs"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Camoufox Studio",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 960,
+        "minHeight": 600,
+        "resizable": true,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app",
+      "dmg"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns"
+    ],
+    "resources": [
+      "resources/suite/**/*"
+    ],
+    "copyright": "Camoufox Studio (AGPL-3.0-or-later; adapted from Fury & Donut Browser)",
+    "category": "DeveloperTool",
+    "shortDescription": "Camoufox anti-detect profile manager & coherence auditor",
+    "longDescription": "Local-first Camoufox profile manager with 37 SKU-verified hardware presets, 17-check cross-OS fingerprint coherence auditing, pre-TLS traffic attribution, and isolated browser launching.",
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  }
+}
