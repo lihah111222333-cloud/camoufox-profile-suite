@@ -31,17 +31,26 @@ export function readCaptureExportIndex(trafficDir, { trustedLocal = false, recor
         reason = 'unreadable-index';
     }
 
-    const session = indexData?.session;
+    return { indexData, bodyPolicy: captureBodyPolicy(indexData?.session, { recordBodies, reason }) };
+}
+
+export function captureBodyPolicy(session, { recordBodies, reason = null } = {}) {
     const traceId = session?.traceId ?? null;
+    const recordingNamespace = session?.recordingNamespace;
     if (!reason) {
         if (recordBodies === false) reason = 'export-disabled';
         else if (session?.recordBodies === false) reason = 'capture-disabled';
         else if (session?.recordBodies !== true) reason = 'missing-session-policy';
         else if (traceId !== null && (typeof traceId !== 'string' || !traceId.trim())) {
             reason = 'invalid-session-policy';
+        } else if (recordingNamespace !== undefined && (
+            traceId === null || typeof recordingNamespace !== 'string' ||
+            !RECORDING_NAMESPACE_REGEX.test('corr-' + recordingNamespace + '-1')
+        )) {
+            reason = 'invalid-session-policy';
         }
     }
-    return { indexData, bodyPolicy: { recordBodies: reason === null, traceId, reason } };
+    return { recordBodies: reason === null, traceId, recordingNamespace, reason };
 }
 
 export function captureEventTraceId(event) {
@@ -115,7 +124,11 @@ export function createCaptureProfileContinuityCheck() {
 }
 
 export function capturePolicyAllowsBody(bodyPolicy, event) {
-    return Boolean(event && bodyPolicy.recordBodies && captureEventTraceId(event) === bodyPolicy.traceId);
+    if (!event || !bodyPolicy.recordBodies || captureEventTraceId(event) !== bodyPolicy.traceId) return false;
+    const { recordingNamespace } = bodyPolicy;
+    if (recordingNamespace === undefined) return true;
+    const match = typeof event.correlationId === 'string' && RECORDING_NAMESPACE_REGEX.exec(event.correlationId);
+    return Boolean(match && match[1] + '-' + match[2] === recordingNamespace);
 }
 
 /** Index observed redirects before exporting any of their body attachments. */

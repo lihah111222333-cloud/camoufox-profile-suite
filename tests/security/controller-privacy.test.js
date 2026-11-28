@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -605,10 +606,41 @@ test('Dolphin folder command reports configured status and escapes folder fields
     const listing = output.join('\n');
     assert.match(listing, /DOLPHIN_API_KEY configured: true/);
     assert.ok(!listing.includes(syntheticKey));
-    for (const escaped of ['test-id\\u{0085}tail', 'test-name\\u{000a}line\\u{001b}', '#3370FF\\u{202e}', '5\\u{000d}6']) {
+    for (const escaped of ['test-id\\u{0085}tail', 'test-name\\u{000a}line\\u{001b}', '#3370FF\\u{202e}', 'عدد البروفايلات: —']) {
         assert.ok(listing.includes(escaped), escaped);
     }
     assert.doesNotMatch(listing, /[\x1b\u0085\u202e\r]/);
+});
+
+test('Dolphin folder command distinguishes an unknown profile count from zero', async t => {
+    const { load, output, responses } = await loadControllers(t);
+    responses.push({ data: [
+        { id: 'missing' },
+        { id: 'zero', resourceCount: 0 },
+        { id: 'invalid', resourceCount: -1 },
+        { id: 'invalid-fallback', browserProfilesData: 'unknown' },
+        { id: 'enumerated', browserProfilesData: [{}] },
+        { id: 'empty', browserProfilesData: [] }
+    ] });
+    await load('scripts/list-dolphin-folders.js');
+    const counts = output.flatMap(line => {
+        const match = /^   عدد البروفايلات: (.+)/.exec(line);
+        return match ? [match[1]] : [];
+    });
+    assert.deepEqual(counts, ['—', '0', '—', '—', '1', '0']);
+    assert.equal(process.exitCode ?? 0, 0);
+});
+
+test('Dolphin folder command reports the private configuration error category', async t => {
+    const { root, appStateDir } = await loadControllers(t);
+    await mkdir(path.join(appStateDir, '.env'), { recursive: true, mode: 0o700 });
+    const run = spawnSync(process.execPath, ['scripts/list-dolphin-folders.js'], {
+        cwd: root, encoding: 'utf8', timeout: 5000
+    });
+    assert.equal(run.status, 1, run.error?.message || run.stderr);
+    assert.equal(run.stdout, '');
+    assert.match(run.stderr, /Could not read \.env as a private configuration file/);
+    assert.doesNotMatch(run.stderr, /controller-privacy-|^\s*at /m);
 });
 
 test('Dolphin folder command reports a safe failure from the controller', async t => {

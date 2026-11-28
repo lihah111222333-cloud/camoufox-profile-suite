@@ -24,10 +24,10 @@ let defaultEnvironmentLoaded = false;
 export function getGoLoginApiKey() {
     if (!defaultEnvironmentLoaded) {
         loadApplicationEnvironment({ includeGoLoginFallback: true });
-        defaultEnvironmentLoaded = true;
     }
     const apiKey = process.env.GOLOGIN_API_KEY;
     if (!apiKey) throw new Error('GOLOGIN_API_KEY is not set');
+    defaultEnvironmentLoaded = true;
     return apiKey;
 }
 

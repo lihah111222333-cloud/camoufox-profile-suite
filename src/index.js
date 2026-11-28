@@ -167,7 +167,8 @@ async function saveResult(resultsFile, result, logger) {
  * إنشاء حساب Gmail واحد
  */
 async function createAccount(accountNumber = null) {
-    const { default: config } = await import('./config.js');
+    const { loadApplicationConfig } = await import('./utils/application-config.js');
+    const config = loadApplicationConfig();
     const { resultsFile } = await prepareAccountOutputs();
     const { result, failure } = await createAccountWithRuntime(await loadRuntime(config, resultsFile), accountNumber);
     if (result.errorCode === MANUAL_SIGNUP_REQUIRED) {
@@ -500,8 +501,12 @@ async function main({ signal, failIfAllAttemptsFail = false, notifyManualHandoff
         return;
     }
     const countOptions = parseRunCountOptions(args);
-    const { default: config } = await import('./config.js');
-    const { accountsCount, threadsCount: requestedThreads } = resolveRunCounts(countOptions);
+    const { loadApplicationConfig } = await import('./utils/application-config.js');
+    let counts;
+    const config = loadApplicationConfig(env => {
+        counts = resolveRunCounts(countOptions, env);
+    });
+    const { accountsCount, threadsCount: requestedThreads } = counts;
     const threadsCount = Math.min(requestedThreads, accountsCount);
     signal?.throwIfAborted();
     const { resultsFile, summaryFile, cleanupReview } = await prepareAccountOutputs(signal);

@@ -660,6 +660,17 @@ test('fragment routes redact encoded identity and keep ordinary paths and querie
     const ordinaryPath = routePrefix + 'quarter%2Ejson' + query;
     assert.equal(redactUrlSecrets(routePrefix + encodedRouteEmail + query), routePrefix + mask + query);
     assert.equal(redactUrlSecrets(ordinaryPath), ordinaryPath);
+    assert.equal(redactUrlSecrets(routePrefix + encodedRouteEmail), routePrefix + mask);
+    assert.equal(redactUrlSecrets(routePrefix + mask), routePrefix + mask);
+    assert.equal(redactUrlSecrets(routePrefix + 'quarter%2Ejson'), routePrefix + 'quarter%2Ejson');
+});
+
+test('fragment route projection preserves token masking in credential parameters', () => {
+    const params = 'access_token=fixture-access&state=done&state=again';
+    const safeParams = 'access_token=' + mask + '&state=done&state=again';
+    for (const prefix of ['/app#', '/app#/inbox&', '/app#/inbox?']) {
+        assert.equal(redactUrlSecrets(prefix + params), prefix + safeParams);
+    }
 });
 
 test('Content-Disposition projects plain and extended filename identity values', () => {
@@ -712,8 +723,8 @@ test('new recordings and legacy exports share URL and response-header privacy', 
     const refreshToken = 'fixture-private-refresh';
     const mapToken = 'fixture-private-map';
     const message = 'fixture-private-subject';
-    const frameUrl = routePrefix + encodedRouteEmail + '?view=compact';
-    const safeFrameUrl = routePrefix + mask + '?view=compact';
+    const frameUrl = routePrefix + encodedRouteEmail;
+    const safeFrameUrl = routePrefix + mask;
     const sourceUrl = 'https://fixture.invalid/logout?id_token_hint=' + idHint + '&view=compact';
     const safeSourceUrl = 'https://fixture.invalid/logout?id_token_hint=' + mask + '&view=compact';
     const headers = {
@@ -801,7 +812,8 @@ test('legacy group projection retains a count for each colliding private step', 
     const records = steps.flatMap((actionStep, i) => Array.from({ length: stepCounts[i] }, (_, j) => ({
         type: 'egress', timestamp: '2025-01-01T00:00:00.000Z', correlationId: 'tx-' + i + '-' + j,
         url: 'https://fixture.invalid/items', method: 'GET', actionStep, stepIndex: i + 1,
-        attribution: { ...session, actionStep, stepIndex: i + 1 }
+        attribution: { ...session, actionStep, stepIndex: i + 1 },
+        triggerAction: { actionId: 'action-' + i, actionStep, stepIndex: i + 1 }
     })));
     const byActionStep = Object.fromEntries(steps.map((name, i) => [name, { requests: stepCounts[i] }]));
     const ledgerPath = path.join(trafficDir, 'traffic.ndjson');
@@ -814,15 +826,81 @@ test('legacy group projection retains a count for each colliding private step', 
     const report = queryProfileTraffic({ trafficDir });
     assert.equal(report.totals.totalRequests, 6);
     assert.equal(report.transactions.length, 6);
-    assert.deepEqual(report.byActionStep, {
-        [mask + ' 2']: { requests: 1 },
-        [mask + ' 3']: { requests: 2 },
-        [mask]: { requests: 1 },
-        [mask + ' 1']: { requests: 1 },
-        review: { requests: 1 }
-    });
+    const expected = {
+        [mask + ' 2']: 1, [mask + ' 3']: 2, [mask]: 1, [mask + ' 1']: 1, review: 1
+    };
+    const filtered = queryProfileTraffic({ trafficDir, domain: 'fixture.invalid' });
+    for (const result of [report, filtered]) {
+        assert.deepEqual(Object.fromEntries(Object.entries(result.byActionStep)
+            .map(([step, stats]) => [step, stats.requests])), expected);
+        const expectedLabels = [mask + ' 2', mask + ' 3', mask + ' 3', mask, mask + ' 1', 'review'];
+        assert.deepEqual(result.transactions.map(({ actionStep }) => actionStep), expectedLabels);
+        assert.deepEqual(result.transactions.map(({ triggerAction }) => triggerAction.actionStep), expectedLabels);
+        assert.equal(JSON.stringify(result).includes(fixtureEmail), false);
+    }
     assert.equal(fs.readFileSync(ledgerPath, 'utf8'), ledger);
     assert.equal(fs.readFileSync(indexPath, 'utf8'), index);
+    const wire = queryProfileTraffic({ trafficDir, correlation: 'tx-1-0' });
+    assert.equal(wire.actionStep, mask + ' 3');
+    assert.equal(wire.triggerAction.actionStep, wire.actionStep);
+});
+
+test('recorded steps retain distinct projected labels and keep intentional repeat counts', async (t) => {
+    const root = directory(t);
+    const options = { profileDir: root, harPath: path.join(root, 'traffic.har') };
+    const recorder = new CamoufoxTrafficRecorder(options);
+    const transport = new EventEmitter();
+    recorder.attachContext(transport);
+    const first = 'Export for ' + fixtureEmail;
+    const second = 'Export for another@fixture.invalid';
+    const literal = 'Export for ' + mask;
+    const send = (name, status) => {
+        const step = recorder.setStep(name);
+        assert.equal(recorder.updateAttribution({ actionStep: name }).stepIndex, step.stepIndex);
+        const request = { url: () => 'https://fixture.invalid/catalog', method: () => 'GET' };
+        transport.emit('request', request);
+        transport.emit('response', { request: () => request, url: request.url, status: () => status });
+    };
+    send(first, 200);
+    send(second, 403);
+    send(first, 204);
+    send(literal, 202);
+    const live = await recorder.stop();
+
+    const ledger = fs.readFileSync(recorder.trafficNdjsonPath, 'utf8');
+    const events = ledger.trimEnd().split('\n').map(JSON.parse);
+    const transitions = events.filter(({ type }) => type === 'step-transition');
+    const [firstLabel, secondLabel, returnLabel, literalLabel] = transitions.map(({ actionStep }) => actionStep);
+    assert.equal(firstLabel, returnLabel);
+    assert.equal(new Set([firstLabel, secondLabel, literalLabel]).size, 3);
+    assert.equal(transitions[2].previousStep, secondLabel);
+    assert.equal(transitions[2].previousStepIndex, 2);
+
+    const har = recorder.exportHar().log;
+    const report = queryProfileTraffic({ trafficDir: recorder.trafficDir });
+    const scoped = queryProfileTraffic({ trafficDir: recorder.trafficDir, domain: 'fixture.invalid' });
+    const labels = [firstLabel, secondLabel, firstLabel, literalLabel];
+    assert.deepEqual(har.entries.map(entry => entry._attribution.actionStep), labels);
+    assert.deepEqual(report.transactions.map(transaction => transaction.actionStep), labels);
+    assert.deepEqual(scoped.transactions.map(transaction => transaction.actionStep), labels);
+    for (const groups of [live.byActionStep, report.byActionStep, scoped.byActionStep]) {
+        assert.equal(groups[firstLabel].requests, 2);
+        assert.deepEqual(groups[firstLabel].statusCounts, { 200: 1, 204: 1 });
+        assert.equal(groups[secondLabel].requests, 1);
+        assert.deepEqual(groups[secondLabel].statusCounts, { 403: 1 });
+        assert.equal(groups[literalLabel].requests, 1);
+    }
+    const selected = queryProfileTraffic({ trafficDir: recorder.trafficDir, step: secondLabel });
+    assert.deepEqual(selected.transactions.map(transaction => transaction.status), [403]);
+    const reopened = await new CamoufoxTrafficRecorder(options).stop();
+    for (const label of new Set(labels)) {
+        assert.deepEqual(reopened.byActionStep[label], live.byActionStep[label]);
+    }
+    assert.equal(fs.readFileSync(recorder.trafficNdjsonPath, 'utf8'), ledger);
+    for (const output of [ledger, JSON.stringify(har), JSON.stringify(report), JSON.stringify(scoped)]) {
+        assert.equal(output.includes(fixtureEmail), false);
+        assert.equal(output.includes('another@fixture.invalid'), false);
+    }
 });
 
 test('legacy archive profile lookup, JSON and HAR use the anonymous profile label', (t) => {

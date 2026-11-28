@@ -7,7 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import logger from './logger.js';
 import { parseProxyAddress } from './proxy-protocol.js';
-import { ensurePrivateDirectory, readPrivateFile } from './private-storage.js';
+import { decodePrivateUtf8, ensurePrivateDirectory, readPrivateFile } from './private-storage.js';
 import {
     ensureStateDirectory, getLegacyDirectory, getStateDirectory, PACKAGE_ROOT, validateExistingStateDirectory
 } from './state-paths.js';
@@ -38,13 +38,17 @@ function hasUnselectedLegacyInventory(directories = [getStateDirectory(), getLeg
     }
 }
 
+function readInventoryFile(filePath) {
+    return decodePrivateUtf8(readPrivateFile(filePath, null, PROXY_FILE_OPTIONS));
+}
+
 function readProxyInventory() {
     const stateDirectory = validateExistingStateDirectory() ? getStateDirectory() : undefined;
     const directories = [stateDirectory, getLegacyDirectory()];
     for (const directory of directories) {
         if (!directory) continue;
         try {
-            return readPrivateFile(path.join(directory, PROXY_INVENTORY), 'utf8', PROXY_FILE_OPTIONS);
+            return readInventoryFile(path.join(directory, PROXY_INVENTORY));
         } catch (error) {
             if (error.code !== 'ENOENT') throw error;
         }
@@ -62,7 +66,7 @@ function readProxyInventory() {
         fd = fs.openSync(proxiesFile, 'wx', 0o600);
     } catch (error) {
         if (error.code !== 'EEXIST') throw error;
-        return readPrivateFile(proxiesFile, 'utf8', PROXY_FILE_OPTIONS);
+        return readInventoryFile(proxiesFile);
     }
 
     try {
@@ -110,7 +114,10 @@ class ProxyManager {
         let content;
         try {
             content = readProxyInventory();
-        } catch {
+        } catch (error) {
+            if (error.code === 'ERR_ENCODING_INVALID_ENCODED_DATA') {
+                throw proxyConfigurationError('Invalid UTF-8 in config/proxies.txt');
+            }
             throw proxyConfigurationError('Could not safely read or create config/proxies.txt');
         }
 

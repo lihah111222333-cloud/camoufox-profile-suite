@@ -1,8 +1,6 @@
 /**
  * List the folders available to the configured Dolphin Anty account.
  */
-import config from '../src/config.js';
-import { getAllFolders } from '../src/dolphin/client.js';
 import { ControllerRequestError } from '../src/utils/controller-request.js';
 import { ControllerUrlError } from '../src/utils/controller-url.js';
 
@@ -16,7 +14,16 @@ function terminalValue(value) {
     });
 }
 
+function folderProfileCount({ resourceCount, browserProfilesData }) {
+    const count = typeof resourceCount === 'string' && /^[0-9]+$/.test(resourceCount.trim())
+        ? Number(resourceCount)
+        : resourceCount;
+    if (Number.isSafeInteger(count) && count >= 0) return count;
+    return Array.isArray(browserProfilesData) ? browserProfilesData.length : null;
+}
+
 async function listAllFolders() {
+    const { default: config } = await import('../src/config.js');
     console.log('🔍 جارٍ جلب قائمة المجلدات...');
     const apiKeyConfigured = config.dolphin.apiKey.trim() !== '';
     console.log(`🔑 DOLPHIN_API_KEY configured: ${apiKeyConfigured}`);
@@ -27,6 +34,7 @@ async function listAllFolders() {
         return;
     }
 
+    const { getAllFolders } = await import('../src/dolphin/client.js');
     const allFolders = await getAllFolders();
     console.log(`\n✅ تم العثور على ${allFolders.length} مجلد.\n`);
     if (allFolders.length === 0) {
@@ -38,7 +46,7 @@ async function listAllFolders() {
         const folderId = terminalValue(folder?.id ?? folder?.folderId);
         const folderName = terminalValue(folder?.folderName ?? folder?.name ?? 'بدون اسم');
         const folderColor = terminalValue(folder?.folderColor ?? folder?.color ?? '#3370FF');
-        const resourceCount = terminalValue(folder?.resourceCount ?? folder?.browserProfilesData?.length ?? 0);
+        const resourceCount = terminalValue(folderProfileCount(folder));
 
         console.log(`📁 المجلد ${index + 1}`);
         console.log(`   الاسم: ${folderName}`);
@@ -53,7 +61,8 @@ async function listAllFolders() {
 
 await listAllFolders().catch(error => {
     console.error('❌ خطأ في جلب المجلدات.');
-    if (error instanceof ControllerRequestError || error instanceof ControllerUrlError) {
+    if (error?.code === 'PRIVATE_ENV_CONFIGURATION_ERROR' ||
+        error instanceof ControllerRequestError || error instanceof ControllerUrlError) {
         console.error(`   ${error.message}`);
     }
     if (error?.status === 401 || error?.status === 403) {

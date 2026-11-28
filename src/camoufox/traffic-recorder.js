@@ -25,13 +25,17 @@ import {
     writeCaptureExport
 } from './capture-io.js';
 import {
-    captureEventProfileId, captureEventTraceId, capturePolicyAllowsBody,
-    createCaptureProfileContinuityCheck, createCaptureRedirectBodyCheck, observedProfileIdentity, readCaptureExportIndex
+    captureBodyPolicy, captureEventProfileId, captureEventTraceId, capturePolicyAllowsBody,
+    createCaptureProfileContinuityCheck, createCaptureRedirectBodyCheck, readCaptureExportIndex
 } from './capture-export-policy.js';
+import {
+    captureEventAccountId, captureIdentityObservation, captureTransactionPhase, createCaptureTransactionIndex
+} from './capture-transaction-identity.js';
 import { CookieLineage, deriveCookieObservations, PRIMARY_COOKIE_JAR } from './cookie-lineage.js';
 import {
     acquireTrafficDirectoryLease, archiveLegacyNativeLogs, assertExternalNativePath, assertProfileLease,
-    captureWriterLeaseDirectory, inspectProfileDirectory, locateProfile, releaseProfileLease, validateProfileId
+    captureWriterLeaseDirectory, inspectProfileDirectory, locateProfile, PRIVATE_NATIVE_LOG, releaseProfileLease,
+    validateProfileId
 } from './profile-storage.js';
 import {
     allowsTrafficBody, isBodylessHttpResponse, projectTrafficBody, redirectDropsUpload, sampleTrafficBody, shareableBodyFormat
@@ -888,7 +892,7 @@ function readNativeLogFile(filePath) {
     });
 }
 
-function parseSslKeyLogBytes(rawBuffer) {
+function parseSslKeyLogBytes(rawBuffer, { formatOnly = false } = {}) {
     if (!rawBuffer) {
         return {
             exists: false,
@@ -903,9 +907,7 @@ function parseSslKeyLogBytes(rawBuffer) {
         };
     }
 
-    const sha256 = crypto.createHash('sha256').update(rawBuffer).digest('hex');
-    const bytes = rawBuffer.byteLength;
-    const lines = rawBuffer.toString('utf8').split(/\r?\n/);
+    const text = rawBuffer.toString('utf8');
 
     let entryCount = 0;
     let malformedLineCount = 0;
@@ -914,8 +916,12 @@ function parseSslKeyLogBytes(rawBuffer) {
     const tls13ClientRandoms = new Set();
     const tls12ClientRandoms = new Set();
 
-    for (const line of lines) {
-        const trimmed = line.trim();
+    let offset = 0;
+    while (offset < text.length) {
+        const newline = text.indexOf('\n', offset);
+        const end = newline < 0 ? text.length : newline;
+        const trimmed = text.slice(offset, end).trim();
+        offset = end + 1;
         if (!trimmed || trimmed.startsWith('#')) {
             continue;
         }
@@ -928,6 +934,7 @@ function parseSslKeyLogBytes(rawBuffer) {
             /^[0-9a-fA-F]{16,256}$/.test(parts[2]) &&
             parts[2].length % 2 === 0
         ) {
+            if (formatOnly) continue;
             const label = parts[0].toUpperCase();
             const clientRandom = parts[1].toLowerCase();
             entryCount += 1;
@@ -948,10 +955,11 @@ function parseSslKeyLogBytes(rawBuffer) {
         }
     }
 
+    if (formatOnly) return { malformedLineCount };
     return {
         exists: true,
-        sha256,
-        bytes,
+        sha256: crypto.createHash('sha256').update(rawBuffer).digest('hex'),
+        bytes: rawBuffer.byteLength,
         entryCount,
         uniqueClientRandoms: allClientRandoms.size,
         tls13SessionCount: tls13ClientRandoms.size,
@@ -1546,6 +1554,7 @@ function omittedNativeSummary(describe, bytes) {
 }
 
 function captureNativeFile(nativeDir, file, trustedLocal, describe, checkpoint) {
+    restrictPrivateFile(path.join(nativeDir, file), PRIVATE_NATIVE_LOG);
     const options = { trustedLocal, maxBytes: MAX_INTEGRITY_LOG_BYTES };
     const raw = readNativeFileForSummary(nativeDir, file, options);
     if (raw) {
@@ -1646,7 +1655,7 @@ function verifyProfileNativeGenerations(index, nativeDir, { trustedLocal, check,
     };
 
     for (const [prefix, entry] of Object.entries(index?.integrity.nativeArtifacts ?? {})) {
-        const verifyGeneration = (generation, describe) => {
+        const verifyGeneration = (generation, describe, current = false) => {
             const { previous, ...evidence } = generation;
             const file = evidence.file ?? INTEGRITY_ARTIFACTS[prefix];
             const closed = evidence.closed ?? Boolean(index.session?.endedAt);
@@ -1656,11 +1665,20 @@ function verifyProfileNativeGenerations(index, nativeDir, { trustedLocal, check,
                 const childSummary = inspect(child, child.file, closed, describe);
                 if (childSummary) childReports.push({ file: child.file, summary: childSummary });
             }
-            if (summary) summaries[prefix] = summarizeNeckoWithChildren(summary, childReports);
+            if (summary && current) summaries[prefix] = summarizeNeckoWithChildren(summary, childReports);
+            if (!current && summary?.malformedLineCount > 0) {
+                check(() => {
+                    throw new Error(`Archived NSS key log ${file} contains ${summary.malformedLineCount} malformed line(s)`);
+                });
+            }
             return { ...evidence, file, closed };
         };
-        const generation = verifyGeneration(entry, descriptions[prefix]);
-        const previous = (entry.previous ?? []).map((older) => verifyGeneration(older));
+        const describe = descriptions[prefix];
+        const generation = verifyGeneration(entry, describe, true);
+        const describeOlder = describe && prefix === 'sslKeyLog'
+            ? (raw) => parseSslKeyLogBytes(raw, { formatOnly: true })
+            : undefined;
+        const previous = (entry.previous ?? []).map((older) => verifyGeneration(older, describeOlder));
         artifacts[prefix] = { ...generation, ...(previous.length > 0 ? { previous } : {}) };
     }
     if (nativeDir && Object.keys(descriptions).length > 0) {
@@ -1814,6 +1832,8 @@ export class CamoufoxTrafficRecorder {
     // Undefined until a request is recorded. Null means a single source cannot be established.
     #singleRequestPage;
     #profileChangedAfterCapture = false;
+    #stepLabels = new Map();
+    #projectedStepLabels = new Set();
 
     /**
      * @param {object} [options]
@@ -1948,7 +1968,7 @@ export class CamoufoxTrafficRecorder {
         this.traceIdShort = String(traceId).replace(/[^a-zA-Z0-9]/g, '').slice(0, 8) || 'trace000';
         this.correlationNamespace = `${this.traceIdShort}-${crypto.randomUUID()}`;
 
-        const initialStep = redactDiagnosticText(options.actionStep || 'init');
+        const initialStep = String(options.actionStep || 'init');
         const redactedProxy = redactProxyUrl(options.proxyServer || options.proxy || null);
 
         this.attribution = {
@@ -1957,7 +1977,7 @@ export class CamoufoxTrafficRecorder {
             accountId: options.accountId ?? null,
             os: options.os ? String(options.os).toLowerCase() : detectDefaultOs(),
             proxyServer: redactedProxy,
-            actionStep: initialStep,
+            actionStep: redactDiagnosticText(initialStep),
             stepIndex: 0
         };
 
@@ -2065,7 +2085,12 @@ export class CamoufoxTrafficRecorder {
                 if (stats?.isFile()) wireFiles.set(`${stats.dev}:${stats.ino}`, Number(stats.size));
             }
             for (const bytes of wireFiles.values()) this.captureBytes += bytes;
-            this._ensureStepRecord(this.attribution.actionStep, this.attribution.stepIndex);
+            const { actionStep, stepIndex } = this.attribution;
+            const label = this.#stepLabel(initialStep, actionStep, stepIndex);
+            this.attribution.actionStep = label;
+            this.#stepLabels.set(initialStep, label);
+            if (label !== initialStep) this.#projectedStepLabels.add(label);
+            this._ensureStepRecord(label, stepIndex);
         } catch (error) {
             releaseProfileLease(this.#captureLease);
             throw error;
@@ -2104,10 +2129,7 @@ export class CamoufoxTrafficRecorder {
         const existingIndex = readTrafficIndex(this.trafficDir, { optional: true, trustedLocal });
         if (existingIndex) {
             verifyLedgerCheckpoint(existingIndex.integrity, validEvents, { allowLaterEvents: true });
-            this.resumedWireBodyPolicy = {
-                recordBodies: existingIndex.session?.recordBodies === true,
-                traceId: existingIndex.session?.traceId ?? null
-            };
+            this.resumedWireBodyPolicy = captureBodyPolicy(existingIndex.session);
             this.profileNativeArtifacts = verifyProfileNativeGenerations(existingIndex, this.profileNativeDir, {
                 trustedLocal,
                 check: (verify) => verify()
@@ -2640,15 +2662,15 @@ export class CamoufoxTrafficRecorder {
             assertExternalNativePath(this.trafficDir, nativeLogPath);
             const parent = path.dirname(nativeLogPath);
             if (parent === this.profileNativeDir) {
-                ensurePrivateDirectory(parent);
+                ensurePrivateDirectory(parent, PRIVATE_NATIVE_LOG);
             } else {
                 fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
             }
             try {
-                restrictPrivateFile(nativeLogPath);
+                restrictPrivateFile(nativeLogPath, PRIVATE_NATIVE_LOG);
             } catch (error) {
                 if (error.code !== 'ENOENT') throw error;
-                appendPrivateFile(nativeLogPath, initialText);
+                appendPrivateFile(nativeLogPath, initialText, PRIVATE_NATIVE_LOG);
             }
         }
         if (this.recordWireLog && !fs.existsSync(this.preTlsWireLogPath)) {
@@ -2713,7 +2735,7 @@ export class CamoufoxTrafficRecorder {
 
         this._ensureDirectories();
         const line = `${cleanLabel} ${cleanRandom} ${cleanSecret}`;
-        appendPrivateFile(this.sslKeyLogPath, `${line}\n`);
+        appendPrivateFile(this.sslKeyLogPath, `${line}\n`, PRIVATE_NATIVE_LOG);
         return {
             label: cleanLabel,
             clientRandomHex: cleanRandom,
@@ -2745,7 +2767,7 @@ export class CamoufoxTrafficRecorder {
 
         this._ensureDirectories();
         const normalized = text.endsWith('\n') ? text : `${text}\n`;
-        appendPrivateFile(this.neckoMozLogPath, normalized);
+        appendPrivateFile(this.neckoMozLogPath, normalized, PRIVATE_NATIVE_LOG);
         return {
             neckoMozLogPath: this.neckoMozLogPath,
             appendedBytes: Buffer.byteLength(normalized, 'utf8')
@@ -2805,7 +2827,8 @@ export class CamoufoxTrafficRecorder {
         }
         if (partial.actionStep !== undefined && partial.actionStep !== null) {
             const nextStep = String(partial.actionStep);
-            if (nextStep !== this.attribution.actionStep) {
+            const currentLabel = this.attribution.actionStep;
+            if (nextStep !== currentLabel && this.#stepLabels.get(nextStep.trim() || 'unnamed-step') !== currentLabel) {
                 this.setStep(nextStep, partial.metadata || {});
             }
         }
@@ -2823,12 +2846,15 @@ export class CamoufoxTrafficRecorder {
      */
     setStep(stepName, metadata = {}) {
         if (!this._canStartRecording()) return this.getAttributionSnapshot();
-        const cleanedStep = redactDiagnosticText(stepName || 'unnamed-step').trim() || 'unnamed-step';
+        const rawStep = String(stepName || 'unnamed-step');
+        const input = rawStep.trim() || 'unnamed-step';
         const previousStep = this.attribution.actionStep;
         const previousStepIndex = this.attribution.stepIndex;
 
         const seq = this._nextSeq();
         const stepIndex = previousStepIndex + 1;
+        const cleanedStep = redactDiagnosticText(rawStep).trim() || 'unnamed-step';
+        const label = this.#stepLabel(input, cleanedStep, stepIndex);
         const recorded = this._appendNdjsonEvent({
             type: 'step-transition',
             eventType: 'step-transition',
@@ -2839,15 +2865,17 @@ export class CamoufoxTrafficRecorder {
             seq,
             previousStep,
             previousStepIndex,
-            actionStep: cleanedStep,
+            actionStep: label,
             stepIndex,
             metadata: redactDiagnosticMetadata(metadata),
-            attribution: { ...this.getAttributionSnapshot(), actionStep: cleanedStep, stepIndex }
+            attribution: { ...this.getAttributionSnapshot(), actionStep: label, stepIndex }
         });
         if (recorded) {
             this.attribution.stepIndex = stepIndex;
-            this.attribution.actionStep = cleanedStep;
-            this._ensureStepRecord(cleanedStep, stepIndex);
+            this.attribution.actionStep = label;
+            this.#stepLabels.set(input, label);
+            if (label !== input) this.#projectedStepLabels.add(label);
+            this._ensureStepRecord(label, stepIndex);
         }
         return this.getAttributionSnapshot();
     }
@@ -2945,6 +2973,22 @@ export class CamoufoxTrafficRecorder {
             this.captureStoppedReason = 'storage-limit';
         }
         return !this.captureStoppedReason;
+    }
+
+    #stepLabel(input, projected, stepIndex) {
+        const previousLabel = this.#stepLabels.get(input);
+        if (previousLabel !== undefined) return previousLabel;
+        // Only labels with proven original equality share a projected bucket in this recording.
+        if (!this.byActionStep.has(projected) ||
+            (input === projected && !this.#projectedStepLabels.has(projected))) return projected;
+
+        let label;
+        let suffix = stepIndex;
+        do {
+            label = projected + ' [' + suffix + ']';
+            suffix += 1;
+        } while (this.byActionStep.has(label));
+        return label;
     }
 
     /**
@@ -3075,8 +3119,25 @@ export class CamoufoxTrafficRecorder {
             record.eventHash = computeEventHash(record);
             return `${separator}${JSON.stringify(record)}\n`;
         };
+        const omitBodyPreview = () => {
+            record.postData = null;
+            record.bodyPreview = null;
+            record.bodyPreviewTruncated = true;
+        };
+        // Egress stores the preview twice. Skip an obvious overrun before serializing the row.
+        if (record.type === 'egress' && typeof record.bodyPreview === 'string' &&
+            record.bodyPreview.length > MAX_HAR_EVENT_BYTES / 2) {
+            omitBodyPreview();
+        }
         let line = encode();
         let bytes = Buffer.byteLength(line, 'utf8');
+        // The reader counts the serialized event without its newline separators.
+        if (record.type === 'egress' && typeof record.bodyPreview === 'string' &&
+            bytes - separator.length - 1 > MAX_HAR_EVENT_BYTES) {
+            omitBodyPreview();
+            line = encode();
+            bytes = Buffer.byteLength(line, 'utf8');
+        }
         const omitAttachment = (status, reason) => {
             payloadBuffer = null;
             record.payloadFile = null;
@@ -3715,6 +3776,16 @@ export class CamoufoxTrafficRecorder {
             if (matching.some(({ event }) => captureEventTraceId(event) !== traceId)) {
                 return 'Correlation ID matches multiple recording sessions in the selected traffic capture';
             }
+            const accounts = new Set(matching.map(({ event }) => captureEventAccountId(event)).filter((id) => id !== null));
+            if (accounts.size > 1) return 'Correlation ID matches multiple recorded accounts';
+            const ownership = createCaptureTransactionIndex(events);
+            const transaction = ownership.get(matching[0]?.event);
+            if (transaction?.hasProfileConflict || transaction?.hasAmbiguousAlias) {
+                return 'Correlation ID has ambiguous recorded profile identity';
+            }
+            if (matching.some(({ event }) => ownership.get(event) !== transaction)) {
+                return 'Correlation ID matches multiple recorded transactions';
+            }
             const requestUrl = matching.find(({ event }) => event.type === 'egress')?.event.url;
             const { bodyPolicy } = readCaptureExportIndex(this.trafficDir, {
                 recordBodies: this.recordBodies, trustedLocal
@@ -3728,11 +3799,11 @@ export class CamoufoxTrafficRecorder {
             for (const { index, event } of matching) {
                 const currentEvent = ownsCurrentEvents && index >= this.harStartEventCount &&
                     index < this.chainedEventCount;
+                // Use the grant read at resume for historical rows after the index is replaced.
                 const priorPolicy = this.resumedWireBodyPolicy;
                 const bodyAllowed = currentEvent
                     ? capturePolicyAllowsBody(currentPolicy, event)
-                    : capturePolicyAllowsBody(bodyPolicy, event) &&
-                        (!priorPolicy || capturePolicyAllowsBody(priorPolicy, event));
+                    : bodyPolicy.recordBodies && capturePolicyAllowsBody(priorPolicy ?? bodyPolicy, event);
                 const actionStep = redactDiagnosticText(event.attribution?.actionStep || event.actionStep || 'init');
                 if (event.type === 'egress' || event.type === 'ingress') {
                     const { text: bodyPreview } = readCaptureExportBody(this.trafficDir, event, {
@@ -4872,8 +4943,19 @@ export class CamoufoxTrafficRecorder {
                     file: evidence.file, summary
                 })));
             }
-            const summary = describe(readNativeLogFile(logPath));
-            return logPath ? { ...summary, scope: 'external-file' } : summary;
+            if (!logPath) return describe(null);
+            let summary;
+            try {
+                summary = describe(readNativeLogFile(logPath));
+            } catch (error) {
+                if (error.code !== 'ERR_CAPTURE_TOO_LARGE') throw error;
+                // Read only the file size. An external log remains outside the integrity manifest.
+                const observed = hashCaptureFile(path.dirname(logPath), file, {
+                    trustedLocal: true, optional: true, prefixBytes: 0
+                });
+                summary = observed ? omittedNativeSummary(describe, observed.bytes) : describe(null);
+            }
+            return { ...summary, scope: 'external-file' };
         };
         const sslKeyLogSummary = checkpoint?.sslKeyLog ?? readLog('sslKeyLog', this.sslKeyLogPath, parseSslKeyLogBytes);
         const neckoMozLogSummary = checkpoint?.neckoMozLog ?? readLog('neckoMozLog', this.neckoMozLogPath, parseNeckoMozLogBytes);
@@ -4914,6 +4996,7 @@ export class CamoufoxTrafficRecorder {
                 os: this.attribution.os,
                 proxyServer: this.attribution.proxyServer,
                 recordBodies: this.recordBodies,
+                recordingNamespace: this.correlationNamespace,
                 startedAt: this.startedAt,
                 endedAt: this.endedAt,
                 totalDurationMs
@@ -5112,6 +5195,8 @@ export class CamoufoxTrafficRecorder {
     #detachRecordingListeners() {
         if (this.stopped) return;
         this.stopped = true;
+        this.#stepLabels.clear();
+        this.#projectedStepLabels.clear();
         this.activeFrameTriggers = new WeakMap();
         for (const dispose of this.webSocketDisposers) dispose();
         for (const dispose of this.listenerDisposers) dispose();
@@ -5328,7 +5413,8 @@ export function readCaptureExportBody(trafficDir, event, {
     payloadManifest
 } = {}) {
     const omitted = { byteLength: null, text: null, payloadFile: null };
-    if (!event || recordBodies !== true || event.recordBodies === false ||
+    // An attachment can exist in a legacy archive without a recorded grant.
+    if (!event || recordBodies !== true || event.recordBodies !== true ||
         event.bodyOmittedReason || event.payloadTruncated ||
         !allowsTrafficBody(url) || (event.url && event.url !== url && !allowsTrafficBody(event.url))) {
         return omitted;
@@ -5386,7 +5472,7 @@ export function readCaptureExportBody(trafficDir, event, {
     }
 
     // The preview flag covers inline text independently of the attachment flag.
-    if (event.recordBodies !== true || event.bodyPreviewTruncated) return omitted;
+    if (event.bodyPreviewTruncated) return omitted;
     const preview = event.bodyPreview ?? event.postData;
     if (typeof preview !== 'string') return omitted;
     const previewBytes = Buffer.byteLength(preview);
@@ -5476,10 +5562,10 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
         items.push(item);
     };
     const redirects = bodyPolicy.recordBodies ? createCaptureRedirectBodyCheck() : undefined;
-    const readBody = (event, url, mimeType) => {
+    const readBody = (event, url, mimeType, transaction) => {
         const maxBytes = Math.min(remainingBodyBytes, remainingBytes);
         const body = readCaptureExportBody(resolvedTrafficDir, event, {
-            recordBodies: capturePolicyAllowsBody(bodyPolicy, event), redirects,
+            recordBodies: !transaction.hasSharedCorrelation && capturePolicyAllowsBody(bodyPolicy, event), redirects,
             trustedLocal, url, mimeType, maxBytes, payloadManifest
         });
         if (body.reason === 'body-byte-limit') throw harLimitError('body byte');
@@ -5523,7 +5609,7 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
         return pagesMap.get(pageKey);
     };
 
-    const txMap = new Map();
+    const transactionRows = [];
     const observedProfileIds = validateCaptureProfile ? new Set() : null;
     const observedProfileTraces = validateCaptureProfile ? new Set() : null;
     let profileContinuityUnproven = false;
@@ -5584,45 +5670,12 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
             continue;
         }
 
-        if (!ev.correlationId) continue;
-        if (
-            ev.type !== 'egress' &&
-            ev.type !== 'ingress' &&
-            ev.type !== 'request-finished' &&
-            ev.type !== 'request-failed' &&
-            ev.type !== 'security-block'
-        ) {
-            continue;
-        }
-
+        if (!ev.correlationId || !captureTransactionPhase(ev)) continue;
+        // A transaction contributes at most three HTTP lifecycle observations.
+        if (transactionRows.length >= MAX_HAR_ENTRIES * 3) throw harLimitError('transaction count');
         correlationIds.add(ev.correlationId);
         if (ev.redirectedFromCorrelationId) correlationIds.add(ev.redirectedFromCorrelationId);
-        const txKey = JSON.stringify([traceId, ev.correlationId]);
-        if (!txMap.has(txKey)) {
-            if (txMap.size >= MAX_HAR_ENTRIES) throw harLimitError('transaction count');
-            txMap.set(txKey, {
-                correlationId: ev.correlationId,
-                traceId,
-                profileId: null,
-                egress: null,
-                ingress: null,
-                finished: null,
-                failed: null,
-                securityBlock: null
-            });
-        }
-        const tx = txMap.get(txKey);
-        const recorded = observedProfileIdentity([tx.profileId, captureEventProfileId(ev)]);
-        if (recorded.profileIdentity === 'mixed') {
-            throw harIntegrityError('HAR transaction has multiple recorded profile identities');
-        }
-        tx.profileId = recorded.profileId;
-        // Retain slices of the bounded ledger. Inflate each transaction only when building its entry.
-        if (ev.type === 'egress') tx.egress = rawLine;
-        else if (ev.type === 'ingress') tx.ingress = rawLine;
-        else if (ev.type === 'request-finished') tx.finished = rawLine;
-        else if (ev.type === 'request-failed') tx.failed = rawLine;
-        else if (ev.type === 'security-block') tx.securityBlock = rawLine;
+        transactionRows.push({ ...captureIdentityObservation(ev), rawLine });
     }
 
     if (contextual && (eventCount !== sessionEnd || chainHead !== sessionRange.head)) {
@@ -5638,15 +5691,27 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
 
     validateCaptureProfile?.(observedProfileIds, indexData?.session, observedProfileTraces, profileContinuityUnproven);
 
+    const { transactions } = createCaptureTransactionIndex(transactionRows);
+    if (transactions.length > MAX_HAR_ENTRIES) throw harLimitError('transaction count');
+    for (const transaction of transactions) {
+        if (transaction.hasProfileConflict) throw harIntegrityError('HAR transaction has multiple recorded profile identities');
+        if (transaction.hasAmbiguousAlias && transaction.hasSharedCorrelation) {
+            throw harIntegrityError('HAR transaction has ambiguous recorded profile identity');
+        }
+        if (transaction.hasConflictingPhases) throw harIntegrityError('HAR transaction has repeated lifecycle observations');
+    }
+
     const displayCorrelationId = createCorrelationIdProjection(correlationIds);
-    const decodeEvent = (rawLine) => rawLine ? JSON.parse(rawLine.toString('utf8').trim()) : null;
-    for (const tx of txMap.values()) {
-        const { correlationId, traceId } = tx;
-        const egress = decodeEvent(tx.egress);
-        const ingress = decodeEvent(tx.ingress);
-        const finished = decodeEvent(tx.finished);
-        const failed = decodeEvent(tx.failed);
-        const securityBlock = decodeEvent(tx.securityBlock);
+    for (const transaction of transactions) {
+        const { correlationId, traceId } = transaction;
+        const observations = new Map(transaction.observations.map(({ type, rawLine }) => [
+            type, JSON.parse(rawLine.toString('utf8').trim())
+        ]));
+        const egress = observations.get('egress');
+        const ingress = observations.get('ingress');
+        const finished = observations.get('request-finished');
+        const failed = observations.get('request-failed');
+        const securityBlock = observations.get('security-block');
 
         const transactionSession = sessionForTrace(traceId);
         const transactionEvents = [egress, ingress, failed, securityBlock, finished].filter(Boolean);
@@ -5674,7 +5739,10 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
             correlationId, url: rawUrl, actionStep, triggerAction, status
         })) continue;
         if (matchTransaction) countPayloadIssues([egress, ingress]);
-        foundRequiredCorrelation ||= correlationId === requiredCorrelationId;
+        if (correlationId === requiredCorrelationId) {
+            if (foundRequiredCorrelation) throw harIntegrityError('Correlation ID matches multiple transactions in the HAR selection');
+            foundRequiredCorrelation = true;
+        }
         includesStoppedSession ||= traceId === (sessionMeta.traceId ?? null);
 
         const startedDateTime =
@@ -5739,7 +5807,7 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
         // Reconstruct request postData from payloadFile on disk or inline preview
         const reqMimeType = egress?.mimeType ||
             reqHeaders.find((h) => h.name.toLowerCase() === 'content-type')?.value || '';
-        const requestBody = readBody(egress, rawUrl, reqMimeType);
+        const requestBody = readBody(egress, rawUrl, reqMimeType, transaction);
         const reqBodyText = requestBody.text || '';
         const reqBodySize = harSize(finished?.sizes?.requestBodySize) ?? harSize(egress?.postDataBytes) ??
             requestBody.byteLength ?? -1;
@@ -5759,7 +5827,7 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
             (resContentTypeHeader ? resContentTypeHeader.split(';')[0].trim() : '') ||
             'application/octet-stream';
 
-        const responseBody = readBody(ingress, rawUrl, resMimeType);
+        const responseBody = readBody(ingress, rawUrl, resMimeType, transaction);
         const resBodyText = responseBody.text || '';
         const responseStatus = Number(status ?? 0);
         const responseWithoutBody = isBodylessHttpResponse(method, responseStatus);
@@ -5854,7 +5922,8 @@ function buildHarFromTrafficDir(trafficDir, fallbackSession = {}, {
                 triggerAction: triggerAction ? redactTriggerAction(redactDiagnosticMetadata(triggerAction)) : null,
                 ...redactDiagnosticMetadata({
                     profileId: attributed('profileId') || fallbackSession?.profileId || 'default-profile',
-                    accountId: attributed('accountId') ?? null,
+                    accountId: transaction.accountId ??
+                        (transaction.hasSharedCorrelation ? null : attributed('accountId') ?? null),
                     traceId,
                     os: attributed('os') ?? null
                 }),

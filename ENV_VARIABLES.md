@@ -8,6 +8,8 @@ The app can read legacy configuration and import sanitized history when the corr
 
 Within the selected configuration directory, settings supplied by the launch environment take precedence over `.env`. An empty `PROFILE_SERVICE` is treated as unset. If the service is still unset, `.emv` can supply fallback settings. Once a service is selected, `.emv` is read for a missing GoLogin key when GoLogin configuration is requested. Applications and direct SDK callers use the same profile storage and deployment network configuration. A launch `DOTENV_KEY` is validated when a selected encrypted configuration file is read.
 
+When a configuration read uses both vault files, the first decrypted vault selects the environment for both. Key rotation can use different keys for that same environment. If the default GoLogin key was missing, an explicit lookup can read it after the file is corrected. Once a file credential is loaded, a new process reads later file changes.
+
 Concurrent runs append to `results.json`. `summary.json` holds the latest completed run. If a write times out while another process owns the lock, stop all writers sharing this state directory before inspecting a stranded `results.json.lock` or `summary.json.lock`.
 
 `ACCOUNTS_COUNT` and `THREADS_COUNT` accept positive safe integers in decimal notation. Both default to 1. Concurrency is capped at the requested account count. Explicit `--accounts=N` / `-a=N` and `--threads=N` / `-t=N` take precedence over the environment values.
@@ -16,7 +18,23 @@ Concurrent runs append to `results.json`. `summary.json` holds the latest comple
 
 Use separate state and profile directories for different machines or PID namespaces. A lock created in the same system boot and PID namespace can be recovered after a hostname change when the owner has exited. This uses local boot information on Linux and macOS when available. The app also understands earlier lock formats and retains its hostname and PID checks. Locks from a different hostname with unavailable or different boot information are kept for operator review.
 
+The application adds an exit guard to a dedicated profile lease before invoking the launcher. Confirmed exit clears the guard. Verify the native resource has exited before archiving a lease with this guard.
+
 If a lock's owner cannot be verified, stop and verify that all writers on every machine using that directory have exited. If any writer may still be active, leave the directory in place and start in separate state and profile directories. Once all writers have stopped, make a private backup before moving the affected lock directory to a private archive outside the live store. Preserve the entire lock, including any staged snapshot, together with the committed output for review. Account output locks sit beside `results.json` and `summary.json`. A profile lease sits under `.camoufox-leases~` and a capture writer lease sits beside its capture directory.
+
+### Retrying a local Camoufox profile deletion
+
+Use `getProfileDeletionTarget(profileId, { profilesDir })` from `src/camoufox/client.js` before dispatching a deletion that you may retry. Save the returned target as JSON with the pending request. The helper returns `null` when the profile is absent.
+
+```js
+const deletionTarget = getProfileDeletionTarget(profileId, { profilesDir });
+if (deletionTarget) {
+    // Persist this target with the request before calling deleteProfile.
+    await deleteProfile(profileId, { profilesDir, deletionTarget });
+}
+```
+
+Retry using the saved target, original ID and same store. A matching staged directory is cleaned up. If the original generation is no longer staged and a different generation occupies the ID, the call reports `ERR_CAMOUFOX_PROFILE_STALE` and preserves the new generation. Use a new target for a new deletion request. A call with only the ID and store still cleans any pending deletion for that ID before considering the current profile.
 
 ### Running an older version
 

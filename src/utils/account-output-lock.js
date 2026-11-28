@@ -8,11 +8,13 @@ import { describeProcessOwner, processOwnerStatus, readProcessOwner } from './pr
 const WAIT_MS = 5_000;
 const WAIT_INTERVAL_MS = 25;
 const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
-const LOCK_COLLISION = new Set(['EEXIST', 'ENOTEMPTY', 'EPERM', 'EACCES', 'EISDIR', 'ENOTDIR']);
+const LOCK_COLLISION = new Set(['EEXIST', 'ENOTEMPTY', 'EISDIR', 'ENOTDIR']);
+const LOCK_PERMISSION_FAILURE = new Set(['EPERM', 'EACCES']);
 const OWNER_NAME = /^owner-([1-9][0-9]*)-[a-f0-9-]{36}$/;
+const pendingReleases = new Map();
 
-function lockFailure(message) {
-    return Object.assign(new Error(message), { code: 'ACCOUNT_OUTPUT_LOCK_FAILED' });
+function lockFailure(message, cause) {
+    return Object.assign(new Error(message, cause && { cause }), { code: 'ACCOUNT_OUTPUT_LOCK_FAILED' });
 }
 
 function invalidLock(label) {
@@ -20,7 +22,7 @@ function invalidLock(label) {
 }
 
 function ownedByWriter(stat) {
-    return typeof process.geteuid !== 'function' || stat.uid === process.geteuid();
+    return typeof process.geteuid !== 'function' || Number(stat.uid) === process.geteuid();
 }
 
 function removeEmptyLock(directory) {
@@ -54,7 +56,8 @@ function removeSnapshot(directory, owner, label) {
 
 function discardDeadLock(directory, label) {
     try {
-        const existing = fs.lstatSync(directory);
+        const existing = fs.lstatSync(directory, { throwIfNoEntry: false });
+        if (!existing) return 'missing';
         if (!existing.isDirectory() || !ownedByWriter(existing)) throw invalidLock(label);
         const entries = fs.readdirSync(directory);
         if (!entries.length) {
@@ -87,23 +90,41 @@ function warnCleanup(label) {
     });
 }
 
-function releaseLock(directory, staging, owner, label) {
-    try {
-        removeSnapshot(directory, owner, label);
-        const entries = fs.readdirSync(directory);
-        if (entries.length !== 1 || entries[0] !== owner) throw invalidLock(label);
-        // Free the shared lock name first. A failure deleting the detached owner
-        // marker then leaves no private snapshot and cannot block the next writer.
+function releaseLock(lock) {
+    const { directory, staging, owner, label, dev, ino } = lock;
+    pendingReleases.delete(directory);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
         let released = directory;
         try {
-            fs.renameSync(directory, staging);
-            released = staging;
-        } catch {
-            // The ordinary owner-specific removal is still safe if renaming failed.
+            const current = fs.lstatSync(directory, { bigint: true, throwIfNoEntry: false });
+            if (!current || current.dev !== dev || current.ino !== ino) return;
+            if (!current.isDirectory() || !ownedByWriter(current)) throw invalidLock(label);
+            const entries = fs.readdirSync(directory);
+            if (entries.length === 0) {
+                removeEmptyLock(directory);
+                return;
+            }
+            if (!entries.includes(owner) ||
+                entries.some((entry) => entry !== owner && entry !== `${owner}.snapshot`)) throw invalidLock(label);
+            removeSnapshot(directory, owner, label);
+            // Free the shared name before removing the detached owner marker.
+            try {
+                fs.renameSync(directory, staging);
+                released = staging;
+            } catch {
+                // The unique owner marker can still be removed in place.
+            }
+            removeOwner(released, owner);
+            return;
+        } catch (error) {
+            if (released === directory && error.code === 'EIO') {
+                if (attempt === 0) continue;
+                // A later write in this process can retry this exact directory and owner.
+                pendingReleases.set(directory, lock);
+            }
+            warnCleanup(label);
+            return;
         }
-        removeOwner(released, owner);
-    } catch {
-        warnCleanup(label);
     }
 }
 
@@ -119,15 +140,33 @@ function* acquireAccountOutputLock(filePath) {
         // Publish the already nonempty directory atomically. A stopped writer's
         // unique owner name lets a later process remove only that owner's entry.
         fs.writeFileSync(path.join(staging, owner), describeProcessOwner(), { flag: 'wx', mode: 0o600 });
+        const { dev, ino } = fs.lstatSync(staging, { bigint: true });
         const deadline = performance.now() + WAIT_MS;
+        let retriedMissingLock = false;
+        let retriedRelease;
         for (;;) {
+            const pendingRelease = pendingReleases.get(directory);
+            if (pendingRelease && pendingRelease !== retriedRelease) {
+                retriedRelease = pendingRelease;
+                releaseLock(pendingRelease);
+            }
             try {
                 fs.renameSync(staging, directory);
                 acquired = true;
-                return { directory, staging, owner, label };
+                return { directory, staging, owner, label, dev, ino };
             } catch (error) {
-                if (!LOCK_COLLISION.has(error.code)) throw error;
+                const permissionFailure = LOCK_PERMISSION_FAILURE.has(error.code);
+                if (!permissionFailure && !LOCK_COLLISION.has(error.code)) throw error;
                 const status = discardDeadLock(directory, label);
+                if (permissionFailure && status === 'missing') {
+                    // A real incumbent might have just released the name.
+                    if (retriedMissingLock) {
+                        throw lockFailure(`Could not publish the ${label} writer lock (${error.code}). Check the output directory permissions.`, error);
+                    }
+                    retriedMissingLock = true;
+                    continue;
+                }
+                retriedMissingLock = false;
                 if (performance.now() >= deadline) {
                     if (status === 'unverified') {
                         throw lockFailure(`Timed out waiting for the ${label} writer lock. The owner could not be verified. Follow the lock recovery steps in ENV_VARIABLES.md.`);
@@ -148,11 +187,11 @@ function* acquireAccountOutputLock(filePath) {
     }
 }
 
-function runLocked({ directory, staging, owner, label }, operation) {
+function runLocked(lock, operation) {
     try {
-        return operation(path.join(directory, `${owner}.snapshot`));
+        return operation(path.join(lock.directory, `${lock.owner}.snapshot`));
     } finally {
-        releaseLock(directory, staging, owner, label);
+        releaseLock(lock);
     }
 }
 

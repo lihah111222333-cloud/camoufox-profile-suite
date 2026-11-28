@@ -3,7 +3,7 @@
  * Open-source C++-patched Firefox antidetect replacement for Dolphin Anty & GPM Login
  */
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
 import { isDeepStrictEqual } from 'node:util';
@@ -30,6 +30,7 @@ import {
     assertProfileIdentity,
     assertProfileLease,
     assertProfileLeaseIdle,
+    confirmProfileLeaseNativeExit,
     ensureProfileStorageAt,
     initializeProfileStorageAt,
     inspectProfileDirectory,
@@ -40,6 +41,7 @@ import {
     PROFILE_LEASE_DIRECTORY,
     readProfileMetadata,
     readStorageState,
+    writeProfileMetadata,
     writeStorageState,
     releaseProfileLease,
     removeStagedProfileDeletions,
@@ -597,7 +599,7 @@ export async function createProfile(profileName, proxy = null, options = {}) {
         const profilesDir = options.profilesDir || getDefaultProfilesDirectory();
         const location = locateProfile(profileId, profilesDir, true);
         const requestedProxy = proxy || options.proxy || null;
-        const savedMetadata = readProfileMetadata(location, { readOnly: true });
+        const savedMetadata = readProfileMetadata(location);
         const managedProxyBinding = validateCamoufoxNetworkPolicy(options, requestedProxy, savedMetadata);
         if (savedMetadata) {
             throw Object.assign(new Error('Camoufox profile ID already exists'), { code: 'EEXIST' });
@@ -705,24 +707,38 @@ export async function getProfile(profileId, options = {}) {
 }
 
 /**
- * List all saved Camoufox profiles on disk.
+ * List all saved Camoufox profiles on disk. Reject incomplete listings.
  */
 export async function listProfiles(profilesDir = getConfiguredProfilesDirectory()) {
-    const root = resolveProfilesRoot(profilesDir);
-    if (!fs.existsSync(root)) return [];
+    let root;
+    let entries;
+    try {
+        root = resolveProfilesRoot(profilesDir);
+        entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch (error) {
+        if (error.code === 'ENOENT') return [];
+        throw Object.assign(new Error('Could not list the Camoufox profiles directory'), {
+            code: 'ERR_CAMOUFOX_PROFILE_LIST_FAILED'
+        });
+    }
 
     const profiles = [];
-    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    let unreadableCount = 0;
+    for (const entry of entries) {
         if (!entry.isDirectory() || entry.name === PROFILE_LEASE_DIRECTORY) continue;
         try {
             const metadata = readProfileMetadata(locateProfile(entry.name, root));
             if (metadata) profiles.push(metadata);
-        } catch (error) {
-            logger.warn('Skipping unreadable profile metadata', {
-                profileId: entry.name,
-                error: error.message
-            });
+            else unreadableCount += 1;
+        } catch {
+            unreadableCount += 1;
         }
+    }
+    if (unreadableCount > 0) {
+        throw Object.assign(new Error('Could not read all Camoufox profile metadata'), {
+            code: 'ERR_CAMOUFOX_PROFILE_LIST_INCOMPLETE',
+            unreadableCount
+        });
     }
     return profiles;
 }
@@ -1006,7 +1022,7 @@ function publishHarScratch({ directory, index, harPath, storageGeneration }, wri
     savePublication({ previousTarget, published: true });
 }
 
-function recoverPendingHar(location) {
+function recoverPendingHar(location, deletionIdentity) {
     const { profileDir, id: profileId } = location;
     const directory = path.join(profileDir, '.native', '~har-scratch');
     if (!inspectProfileDirectory({ profileDir: directory })) return true;
@@ -1015,6 +1031,7 @@ function recoverPendingHar(location) {
     let published = false;
     try {
         lease = acquireProfileLease(location);
+        if (deletionIdentity) assertProfileIdentity(location, deletionIdentity);
         const identity = inspectProfileForDeletion(location);
         if (!identity) return false;
         const trafficDir = path.join(profileDir, 'traffic');
@@ -1040,7 +1057,8 @@ function recoverPendingHar(location) {
         });
         return true;
     } catch (error) {
-        if (error.code === 'ERR_CAMOUFOX_PROFILE_BUSY') throw error;
+        if (error.code === 'ERR_CAMOUFOX_PROFILE_BUSY' ||
+            (deletionIdentity && error.code === 'ERR_CAMOUFOX_PROFILE_STALE')) throw error;
         logger.warn(published ? 'Could not remove published Camoufox HAR scratch' :
             'Could not confirm Camoufox HAR publication. Capture preserved for retry.', {
             profileId,
@@ -1227,6 +1245,8 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
         let browser = null;
         let context = null;
         let ownsBrowser = false;
+        let nativeExitGuarded = false;
+        let nativeLaunchAttempted = false;
         let securityGuards = null;
         let trafficRecorder = null;
         let nativeLogsClosed = false;
@@ -1458,6 +1478,11 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
                     sslKeyLog
                 });
 
+                if (typeof launchFn !== 'function') throw new TypeError('Camoufox dedicated launcher is unavailable');
+                // Reserve the exit guard before the resource can outlive its controller.
+                nativeExitGuarded = true;
+                retainProfileLeaseForNativeExit(lease);
+                nativeLaunchAttempted = true;
                 browser = await launchFn(launchOpts);
                 ownsBrowser = true;
                 signal?.throwIfAborted();
@@ -1573,6 +1598,7 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
                 location,
                 lease,
                 identity,
+                nativeExitGuarded,
                 hasClosedContext,
                 ...reuseSettings,
                 recording: trafficRecorder,
@@ -1613,6 +1639,8 @@ export async function startProfile(requestedProfileId, options = {}, expectedSto
                 location,
                 browser,
                 ownsBrowser,
+                nativeExitGuarded,
+                nativeExitUnconfirmed: nativeLaunchAttempted && !browser,
                 context,
                 hasClosedContext,
                 securityGuards,
@@ -1795,7 +1823,12 @@ async function closeNativeProfile(session) {
         session.contextClosed ||= session.browserClosed;
     }
     if (!session.contextClosed) session.closingSnapshot = null;
-    if (session.nativeExitUnconfirmed) retainProfileLeaseForNativeExit(session.lease);
+    if (session.nativeExitUnconfirmed) {
+        if (!session.nativeExitGuarded) retainProfileLeaseForNativeExit(session.lease);
+    } else if (session.nativeExitGuarded && session.browserClosed) {
+        confirmProfileLeaseNativeExit(session.lease);
+        session.nativeExitGuarded = false;
+    }
     return session.contextClosed && session.browserClosed;
 }
 
@@ -1877,7 +1910,7 @@ function matchesProfileSession(session) {
     }
 }
 
-function stopProfileAt(location, expected = null) {
+function stopProfileAt(location, expected = null, deletionIdentity) {
     const { id: profileId, key } = location;
     if (expected) {
         const current = activeProfiles.get(key);
@@ -1894,11 +1927,12 @@ function stopProfileAt(location, expected = null) {
 
     const stopPromise = (async () => {
         await Promise.allSettled([pendingProfileStarts.get(key)?.promise, pendingProfileSaves.get(key)?.promise]);
+        if (deletionIdentity) assertProfileIdentity(location, deletionIdentity);
         const session = activeProfiles.get(key);
         if (!session) {
             if (expected) return false;
             assertProfileLeaseIdle(location);
-            return recoverPendingHar(location);
+            return recoverPendingHar(location, deletionIdentity);
         }
         if (expected && (session !== expected || !matchesProfileSession(session))) return false;
 
@@ -1924,7 +1958,8 @@ function stopProfileAt(location, expected = null) {
         if (session.stopResult) logger.info('Camoufox profile stopped', { profileId });
         return session.stopResult;
     })().catch((error) => {
-        if (error.code === 'ERR_CAMOUFOX_PROFILE_BUSY' || error.code === 'ERR_CAMOUFOX_NATIVE_EXIT_UNCONFIRMED') throw error;
+        if (error.code === 'ERR_CAMOUFOX_PROFILE_BUSY' || error.code === 'ERR_CAMOUFOX_NATIVE_EXIT_UNCONFIRMED' ||
+            (deletionIdentity && error.code === 'ERR_CAMOUFOX_PROFILE_STALE')) throw error;
         logger.warn('Error stopping Camoufox profile', { profileId, error: redactDiagnosticText(error.message) });
         return false;
     }).finally(() => {
@@ -1935,11 +1970,42 @@ function stopProfileAt(location, expected = null) {
     return stopPromise;
 }
 
+function deletionTargetKey(location) {
+    return createHash('sha256').update(location.key).digest('hex');
+}
+
 /**
- * Delete a profile and remove its persistent storage directory (`profiles/<profileId>/`).
+ * Capture a JSON-serializable target for a local deletion that may need to be retried.
+ */
+export function getProfileDeletionTarget(profileId, options = {}) {
+    const location = locateProfile(profileId, options.profilesDir || getConfiguredProfilesDirectory());
+    const identity = inspectProfileForDeletion(location);
+    if (!identity) return null;
+    return Object.freeze({
+        key: deletionTargetKey(location),
+        dev: String(identity.dev),
+        ino: String(identity.ino),
+        generation: identity.generation
+    });
+}
+
+/**
+ * Delete a profile by ID, optionally restricting the request to a captured deletion target.
  */
 export async function deleteProfile(profileId, options = {}) {
-    return deleteProfileAt(locateProfile(profileId, options.profilesDir || getConfiguredProfilesDirectory()));
+    const location = locateProfile(profileId, options.profilesDir || getConfiguredProfilesDirectory());
+    if (!Object.hasOwn(options, 'deletionTarget')) return deleteProfileAt(location);
+
+    const target = options.deletionTarget;
+    if (target?.key !== deletionTargetKey(location) ||
+        ![target.dev, target.ino].every((value) => typeof value === 'string' && /^-?\d{1,20}$/.test(value)) ||
+        (target.generation != null && typeof target.generation !== 'string')) {
+        throw Object.assign(new TypeError('Invalid Camoufox profile deletion target'), {
+            code: 'ERR_CAMOUFOX_INVALID_DELETION_TARGET'
+        });
+    }
+    const identity = { dev: BigInt(target.dev), ino: BigInt(target.ino), generation: target.generation };
+    return deleteProfileAt(location, null, undefined, identity);
 }
 
 export async function rollbackCreatedProfile(created) {
@@ -1953,11 +2019,12 @@ export async function rollbackCreatedProfile(created) {
     }
 }
 
-function deleteProfileAt(location, expected = null, stop) {
+function deleteProfileAt(location, expected = null, stop, deletionIdentity = null) {
     const { profileDir, key } = location;
     const deleting = pendingProfileDeletes.get(key);
     if (deleting) {
-        if (expected && deleting.expected !== expected) {
+        if ((expected && deleting.expected !== expected) ||
+            !isDeepStrictEqual(deletionIdentity, deleting.deletionIdentity)) {
             throw new Error('Another Camoufox profile deletion is in progress');
         }
         return deleting.promise;
@@ -1977,7 +2044,8 @@ function deleteProfileAt(location, expected = null, stop) {
         const staging = acquireProfileDeletionStaging(location);
         try {
             // A retry finishes the detached generation before considering the live ID.
-            if ((!expected || expected.identity) && removeStagedProfileDeletions(staging, expected?.identity)) {
+            const stagedIdentity = deletionIdentity ?? expected?.identity;
+            if ((!expected || stagedIdentity) && removeStagedProfileDeletions(staging, stagedIdentity)) {
                 if (expected) expected.deleted = true;
                 return true;
             }
@@ -1991,13 +2059,15 @@ function deleteProfileAt(location, expected = null, stop) {
             }
             checkSession();
             const checked = inspectProfileForDeletion(location);
-            if (expected) assertProfileIdentity(location, expected.identity);
+            if (expected || (deletionIdentity && checked)) {
+                assertProfileIdentity(location, expected?.identity ?? deletionIdentity);
+            }
             if (!checked && activeProfiles.has(key)) {
                 throw new Error('Active Camoufox profile directory is missing');
             }
             const session = activeProfiles.get(key) ?? expected;
             if (!stop && checked && (pendingProfileStops.has(key) || !session?.cleanupConfirmed)) {
-                const stopped = await stopProfileAt(location, expected);
+                const stopped = await stopProfileAt(location, expected, deletionIdentity);
                 if (session?.nativeExitUnconfirmed) throw nativeExitUnconfirmedError();
                 if (!stopped && !session?.cleanupConfirmed) {
                     throw new Error('Could not stop Camoufox profile before deletion');
@@ -2016,10 +2086,10 @@ function deleteProfileAt(location, expected = null, stop) {
                     }
                     return true;
                 }
-                const identity = expected?.identity ?? checked;
+                const identity = expected?.identity ?? deletionIdentity ?? checked;
                 const deletion = acquireProfileTrafficDeletionLease(profileDir);
                 try {
-                    stageProfileDeletion(location, staging, identity);
+                    stageProfileDeletion(location, staging, identity, lease);
                     staged = true;
                 } finally {
                     releaseProfileLease(deletion);
@@ -2031,7 +2101,7 @@ function deleteProfileAt(location, expected = null, stop) {
                 }
                 if (!retained || staged) releaseProfileLease(lease);
             }
-            removeStagedProfileDeletions(staging, expected?.identity ?? checked);
+            removeStagedProfileDeletions(staging, expected?.identity ?? deletionIdentity ?? checked);
             if (expected) expected.deleted = true;
             if (retained) retained.deleted = true;
             logger.info('Camoufox profile deleted', { profileId: location.id, profileDir });
@@ -2043,7 +2113,7 @@ function deleteProfileAt(location, expected = null, stop) {
         pendingProfileDeletes.delete(key);
         updateProcessCleanupHooks();
     });
-    pendingProfileDeletes.set(key, { expected, promise: deletePromise });
+    pendingProfileDeletes.set(key, { expected, deletionIdentity, promise: deletePromise });
     return deletePromise;
 }
 
@@ -2080,17 +2150,18 @@ export async function updateProfileProxy(profileIds, proxy, options = {}) {
             };
             try {
                 if (existing) {
-                    writePrivateFile(getProfileMetadataPath(location.id, location.profilesDir), JSON.stringify(updated, null, 2));
+                    writeProfileMetadata(getProfileMetadataPath(location.id, location.profilesDir), updated);
                 } else {
                     initializeProfileStorageAt(location, updated);
                 }
-            } catch {
+            } catch (error) {
                 const remainingProfileIds = profiles.slice(updatedProfileIds.length).map(({ location }) => location.id);
                 throw Object.assign(new Error('Could not complete the Camoufox proxy update'), {
                     code: 'ERR_CAMOUFOX_PROXY_UPDATE_FAILED',
                     updatedProfileIds,
                     failedProfileId: location.id,
-                    remainingProfileIds
+                    remainingProfileIds,
+                    ...(error?.cleanupPending === true && { cleanupPending: true })
                 });
             }
             updatedProfileIds.push(location.id);
@@ -2218,6 +2289,7 @@ export default {
     createProfile,
     startProfile,
     stopProfile,
+    getProfileDeletionTarget,
     deleteProfile,
     getProfile,
     listProfiles,

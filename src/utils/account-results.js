@@ -31,6 +31,7 @@ const UNRESOLVED_PROFILE_CLEANUP = new Set([
 const PROFILE_CLEANUP = new Set(['stopped', 'deleted', 'recycled', ...UNRESOLVED_PROFILE_CLEANUP]);
 const RESULT_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const SUMMARY_CLEANUP_SOURCE = /^[a-f0-9]{64}$/;
+const PRECISE_TIMESTAMP = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3})(?:Z|[+-]\d{2}:\d{2})$/;
 const MANUAL_STAGES = new Set(['password', 'verification', 'recovery-email', 'untrusted-page', 'completion']);
 const outputDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
@@ -233,19 +234,34 @@ function uniquePositions(records, keyFor) {
     return indexed;
 }
 
-function legacyCleanupKey({ profileId, profileType, profileCleanup, success }) {
-    const hasProfileId = (typeof profileId === 'string' && profileId.length > 0) ||
+function parsePreciseCleanupTime(value) {
+    const match = typeof value === 'string' && PRECISE_TIMESTAMP.exec(value);
+    if (!match || match[0] !== value) return NaN;
+    // Verify the calendar before applying any offset. Date.parse can roll invalid dates forward.
+    const wallTime = match[1] + 'Z';
+    const calendar = new Date(wallTime);
+    if (!Number.isFinite(calendar.getTime()) || calendar.toISOString() !== wallTime) return NaN;
+    return Date.parse(value);
+}
+
+function legacyCleanupKey({ profileId, profileType, timestamp, success }) {
+    const hasProfileId = (typeof profileId === 'string' && profileId.trim().length > 0) ||
         (Number.isSafeInteger(profileId) && profileId >= 0);
-    if (!needsProfileCleanupReview(profileCleanup) || !hasProfileId) return;
-    return JSON.stringify([profileId, profileType ?? null, profileCleanup, success]);
+    if (!hasProfileId || typeof profileType !== 'string' || !profileType.trim()) return;
+    const attemptTime = parsePreciseCleanupTime(timestamp);
+    if (!Number.isFinite(attemptTime)) return;
+    return JSON.stringify([profileId, profileType, attemptTime, success]);
 }
 
 function recoverSummaryCleanup(resultsFile, summary, withLock) {
     return updateResults(resultsFile, (results) => {
         const resultsById = uniquePositions(results, ({ resultId }) => resultId);
-        const legacyResults = uniquePositions(results, legacyCleanupKey);
-        const legacySummary = uniquePositions(summary.results, legacyCleanupKey);
+        const needsLegacyMatch = summary.results.some((entry) => !entry.resultId &&
+            needsProfileCleanupReview(entry.profileCleanup) && legacyCleanupKey(entry) !== undefined);
+        const legacySummary = needsLegacyMatch ? uniquePositions(summary.results, legacyCleanupKey) : new Map();
+        const legacyResults = legacySummary.size ? uniquePositions(results, legacyCleanupKey) : new Map();
         const recovered = new Set(results.map(({ summaryCleanupSource }) => summaryCleanupSource));
+        const finishedAt = parsePreciseCleanupTime(summary.timestamp);
 
         for (const [index, entry] of summary.results.entries()) {
             if (!needsProfileCleanupReview(entry.profileCleanup)) continue;
@@ -275,13 +291,24 @@ function recoverSummaryCleanup(resultsFile, summary, withLock) {
                 continue;
             }
 
-            // An older summary may omit the result ID. Match only a single equivalent
-            // unresolved cleanup state, accounting for reused controller profile IDs.
-            const legacyKey = legacyCleanupKey(entry);
-            const legacyResult = !resultId && legacySummary.get(legacyKey) === index &&
-                results[legacyResults.get(legacyKey)];
-            if (legacyResult && (timestamp == null || legacyResult.timestamp == null ||
-                timestamp === legacyResult.timestamp)) continue;
+            // Older summaries lack result IDs. A profile ID alone can belong to several attempts.
+            const legacyKey = resultId ? undefined : legacyCleanupKey(entry);
+            const legacyPosition = legacySummary.get(legacyKey) === index
+                ? legacyResults.get(legacyKey) : undefined;
+            const legacyResult = results[legacyPosition];
+            const legacyStatus = legacyResult?.profileCleanup;
+            if (legacyResult && !(parsePreciseCleanupTime(timestamp) > finishedAt ||
+                parsePreciseCleanupTime(legacyResult.createdAt) > finishedAt) &&
+                (legacyStatus === profileCleanup || legacyStatus === 'pending' || profileCleanup === 'pending' ||
+                    !needsProfileCleanupReview(legacyStatus))) {
+                results[legacyPosition] = savedAccountRecord({
+                    ...legacyResult,
+                    resultId: legacyResult.resultId ?? randomUUID(),
+                    summaryCleanupSource: legacyResult.summaryCleanupSource ?? source,
+                    profileCleanup: legacyStatus === undefined || legacyStatus === 'pending' ? profileCleanup : legacyStatus
+                });
+                continue;
+            }
 
             results.push(savedAccountRecord({
                 ...pickScalars(entry, ['success', 'profileId', 'profileType', 'profileCleanup', 'timestamp',

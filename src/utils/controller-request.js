@@ -23,11 +23,18 @@ export class ControllerRequestError extends Error {
 function controllerRequestError(operation, error, getProviderCode) {
     const status = error?.response?.status;
     const code = error?.code;
-    return new ControllerRequestError(operation, {
+    const failure = new ControllerRequestError(operation, {
         status: Number.isInteger(status) && status >= 100 && status <= 599 ? status : undefined,
         transportCode: beforeConnectionCodes.has(code) || uncertainRequestCodes.has(code) ? code : undefined,
         providerCode: getProviderCode?.(error?.response?.data)
     });
+    const couldHaveReachedController = error?.request || error?.response || uncertainRequestCodes.has(code);
+    if (couldHaveReachedController && !beforeConnectionCodes.has(code)) {
+        const rejected = (failure.status >= 400 && failure.status < 500 && failure.status !== 408) ||
+            controllerRejected(error?.response?.data);
+        if (!rejected) failure.outcomeUnconfirmed = true;
+    }
+    return failure;
 }
 
 export async function sendControllerRequest(operation, send, getProviderCode) {
@@ -42,6 +49,10 @@ export function controllerRequestFailedBeforeDispatch(error) {
     return error instanceof ControllerRequestError && error.status === undefined && beforeConnectionCodes.has(error.transportCode);
 }
 
+export function controllerRequestOutcomeUnconfirmed(error) {
+    return error instanceof ControllerRequestError && error.outcomeUnconfirmed === true;
+}
+
 export function profileAllocationUnconfirmed(error) {
     return Object.assign(error, {
         code: 'PROFILE_ALLOCATION_UNCONFIRMED',
@@ -54,10 +65,7 @@ export async function sendControllerProfileCreate(operation, send, getProviderCo
         return await send();
     } catch (error) {
         const failure = controllerRequestError(operation, error, getProviderCode);
-        const { status } = failure;
-        const rejected = (status >= 400 && status < 500 && status !== 408) || controllerRejected(error?.response?.data);
-        const dispatched = error?.request || error?.response || uncertainRequestCodes.has(error?.code);
-        if (dispatched && !rejected && !beforeConnectionCodes.has(error?.code)) {
+        if (controllerRequestOutcomeUnconfirmed(failure)) {
             throw profileAllocationUnconfirmed(failure);
         }
         throw failure;

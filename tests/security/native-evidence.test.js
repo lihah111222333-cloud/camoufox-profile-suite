@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -176,4 +177,88 @@ test('Necko generation selection preserves previously unassigned child logs', as
             if (child) assert.equal(fs.readFileSync(historicalChild, 'utf8'), historicalRequest);
         });
     }
+});
+
+test('native capture rejects grant ACLs on its directory and on newly created children', {
+    skip: process.platform !== 'darwin'
+}, async (t) => {
+    const { nativeDir, create, indexPath, verify } = fixture(t);
+    fs.mkdirSync(nativeDir, { mode: 0o700 });
+    execFileSync('/bin/chmod', ['+a', 'group:everyone allow list,search,file_inherit', nativeDir]);
+    assert.throws(() => create(), { code: 'PRIVATE_STORAGE_ACL_ERROR' });
+    assert.deepEqual(fs.readdirSync(nativeDir), []);
+
+    execFileSync('/bin/chmod', ['-N', nativeDir]);
+    const recorder = create();
+    await recorder.flushSummary();
+    const checkpoint = fs.readFileSync(indexPath);
+    const child = recorder.neckoMozLogPath + '.child-1';
+    fs.writeFileSync(child, nativeRequest, { mode: 0o600 });
+    execFileSync('/bin/chmod', ['+a', 'group:everyone allow read', child]);
+
+    await assert.rejects(recorder.flushSummary(), { code: 'PRIVATE_STORAGE_ACL_ERROR' });
+    assert.deepEqual(fs.readFileSync(indexPath), checkpoint);
+    assert.equal(fs.readFileSync(child, 'utf8'), nativeRequest);
+
+    execFileSync('/bin/chmod', ['-N', child]);
+    execFileSync('/bin/chmod', ['+a', 'group:everyone deny delete', child]);
+    try {
+        const closed = await recorder.stop();
+        assert.equal(closed.integrity.nativeArtifacts.neckoMozLog.closed, true);
+        assert.equal(closed.neckoMozLog.requestBlockCount, 1);
+        assert.equal(verify().valid, true);
+        assert.match(execFileSync('/bin/ls', ['-led', child], { encoding: 'utf8' }), /everyone deny delete/);
+    } finally {
+        execFileSync('/bin/chmod', ['-N', child]);
+    }
+});
+
+test('an archived malformed NSS generation remains invalid after recording a new generation', async (t) => {
+    const { create, verify } = fixture(t, { sslKeyLog: true, neckoMozLog: false });
+    const first = create();
+    fs.appendFileSync(first.sslKeyLogPath, 'synthetic-incomplete-line');
+    await first.stop();
+    assert.equal(verify().valid, false);
+    const retained = fs.readFileSync(first.sslKeyLogPath);
+
+    const second = create();
+    assert.notEqual(second.sslKeyLogPath, first.sslKeyLogPath);
+    await second.stop();
+    assert.deepEqual(fs.readFileSync(first.sslKeyLogPath), retained);
+
+    const verdict = verify();
+    assert.equal(verdict.valid, false);
+    assert.equal(verdict.sslKeyLog.malformedLineCount, 0);
+    assert.deepEqual(verdict.unverifiedNativeArtifacts, []);
+    assert.deepEqual(verdict.errors, ['Archived NSS key log sslkeylog.txt contains 1 malformed line(s)']);
+});
+
+test('oversized external native logs stay unverified without blocking a final summary', async (t) => {
+    const { create, root, verify } = fixture(t);
+    const externalDir = path.join(root, 'external');
+    const neckoMozLogPath = path.join(externalDir, 'necko.log');
+    const sslKeyLogPath = path.join(externalDir, 'nss.log');
+    const recorder = create({ neckoMozLogPath, sslKeyLogPath });
+    recorder.recordNeckoMozLogBlock(nativeRequest);
+    assert.equal((await recorder.flushSummary()).neckoMozLog.requestBlockCount, 1);
+
+    const bytes = 128 * 1024 * 1024 + 1;
+    for (const log of [neckoMozLogPath, sslKeyLogPath]) fs.truncateSync(log, bytes);
+    const final = await recorder.stop();
+
+    assert.ok(final.session.endedAt);
+    assert.equal(final.integrity.nativeArtifacts, undefined);
+    for (const [kind, log] of [['neckoMozLog', neckoMozLogPath], ['sslKeyLog', sslKeyLogPath]]) {
+        assert.equal(final[kind].exists, true);
+        assert.equal(final[kind].bytes, bytes);
+        assert.equal(final[kind].scope, 'external-file');
+        assert.equal(final[kind].diagnosticsOmitted, 'size-limit');
+        assert.equal(final[kind].sha256, null);
+        assert.equal(final.artifacts[kind + 'Path'], null);
+        assert.equal(fs.statSync(log).size, bytes);
+    }
+    assert.deepEqual(verify().unverifiedNativeArtifacts, [
+        'sslkeylog.txt (external log)',
+        'necko-pre-tls.moz_log (external log)'
+    ]);
 });

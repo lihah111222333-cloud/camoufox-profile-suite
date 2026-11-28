@@ -837,6 +837,91 @@ test('wire reports when a recording stopped at its event limit', { skip: !suppor
     assert.match(formatCliReport(wire), /Capture stopped.*event-limit/);
 });
 
+test('ordinary CLI reports incomplete coverage after the capture event limit', { skip: !supported }, async (t) => {
+    const { profilesDir } = fixture(t);
+    const recorder = new CamoufoxTrafficRecorder({
+        profilesDir, profileId: 'fixture', maxCaptureEvents: 1,
+        recordWireLog: false, sslKeyLog: false, neckoMozLog: false
+    });
+    recorder.setStep('observed');
+    recorder.setStep('later');
+    const index = await recorder.stop();
+    assert.equal(index.captureLimits.stoppedReason, 'event-limit');
+
+    const run = (...args) => spawnSync(process.execPath, [
+        cliPath, '--profiles-dir=' + profilesDir, ...args
+    ], { encoding: 'utf8' });
+    const limited = run('--step=later', '--json');
+    assert.equal(limited.status, 0, limited.stderr);
+    const result = JSON.parse(limited.stdout);
+    assert.equal(result.eventsCount, 0);
+    assert.deepEqual(result.captureLimits, { stoppedReason: 'event-limit' });
+
+    const list = run('--json');
+    assert.equal(list.status, 0, list.stderr);
+    assert.deepEqual(JSON.parse(list.stdout).profiles[0].captureLimits, result.captureLimits);
+
+    for (const args of [[], ['--step=later'], ['--anomalies-only']]) {
+        const report = run(...args);
+        assert.equal(report.status, 0, report.stderr);
+        assert.match(report.stdout, /Capture coverage is incomplete.*event-limit/);
+    }
+});
+
+test('ordinary CLI distinguishes missing recording sources from verified zero events', { skip: !supported }, async (t) => {
+    const { root, profilesDir } = fixture(t);
+    const incompleteDir = path.join(profilesDir, 'interrupted', 'traffic');
+    fs.mkdirSync(incompleteDir, { recursive: true });
+    const options = {
+        profilesDir, recordWireLog: false, sslKeyLog: false, neckoMozLog: false
+    };
+    const empty = new CamoufoxTrafficRecorder({ ...options, profileId: 'empty' });
+    const emptyIndex = await empty.stop();
+    assert.equal(emptyIndex.integrity.eventCount, 0);
+    assert.equal(fs.existsSync(empty.trafficNdjsonPath), false);
+    emptyIndex.totals.totalRequests = 17;
+    fs.writeFileSync(empty.attributionIndexPath, JSON.stringify(emptyIndex));
+
+    const partial = new CamoufoxTrafficRecorder({ ...options, profileId: 'missing-ledger' });
+    partial.setStep('observed');
+    await partial.stop();
+    const heldLedger = path.join(root, 'held-ledger.ndjson');
+    fs.renameSync(partial.trafficNdjsonPath, heldLedger);
+
+    const run = (...args) => spawnSync(process.execPath, [
+        cliPath, '--profiles-dir=' + profilesDir, ...args, '--json'
+    ], { encoding: 'utf8' });
+    const control = run('--step=absent');
+    assert.equal(control.status, 0, control.stderr);
+    assert.equal(JSON.parse(control.stdout).eventsCount, 0);
+    assert.equal(JSON.parse(control.stdout).captureLimits, undefined);
+
+    const list = run();
+    assert.equal(list.status, 0, list.stderr);
+    const profiles = JSON.parse(list.stdout).profiles;
+    assert.deepEqual(profiles.map(({ profileId }) => profileId), ['empty']);
+    assert.equal(profiles[0].totals.totalRequests, 0);
+    const direct = run('--profile=empty');
+    assert.equal(direct.status, 0, direct.stderr);
+    assert.equal(JSON.parse(direct.stdout).totals.totalRequests, 0);
+    for (const args of [
+        ['--traffic-dir=' + incompleteDir], ['--profile=interrupted'], ['--profile=missing-ledger']
+    ]) {
+        const refused = run(...args);
+        assert.equal(refused.status, 1);
+        assert.equal(refused.stdout, '');
+        assert.match(refused.stderr, /Traffic ledger is missing.*zero-event checkpoint/);
+    }
+    assert.equal(fs.existsSync(partial.trafficNdjsonPath), false);
+
+    const ledgerBefore = fs.readFileSync(heldLedger);
+    fs.renameSync(heldLedger, partial.trafficNdjsonPath);
+    const restored = run('--profile=missing-ledger', '--step=observed');
+    assert.equal(restored.status, 0, restored.stderr);
+    assert.equal(JSON.parse(restored.stdout).eventsCount, 1);
+    assert.deepEqual(fs.readFileSync(partial.trafficNdjsonPath), ledgerBefore);
+});
+
 test('query reports the wire name from integrity metadata and supports the old default', { skip: !supported }, (t) => {
     const { root, profilesDir } = fixture(t);
     const trafficDir = writeProfile(profilesDir, 'fixture', sample('fixture-item', 'https://reports.example/item'));

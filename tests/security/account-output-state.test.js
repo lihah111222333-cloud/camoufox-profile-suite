@@ -11,7 +11,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import {
     appendAccountResult, migrateExistingAccountOutputs, migrateExistingAccountOutputsAsync,
-    recordAccountCleanup, writeRunSummary, writeRunSummaryAsync
+    readSavedAccountCleanup, recordAccountCleanup, writeRunSummary, writeRunSummaryAsync
 } from '../../src/utils/account-results.js';
 import { describeProcessOwner, readProcessOwner } from '../../src/utils/process-owner.js';
 import { ensurePrivateDirectory, writePrivateFile } from '../../src/utils/private-storage.js';
@@ -29,6 +29,18 @@ function temporaryDirectory(t) {
 
 function readJson(file) {
     return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+async function reviewInNewProcess(results, summary, legacyDirectory) {
+    const review = [
+        'const [module, results, summary, legacyDirectory] = process.argv.slice(1);',
+        'const { migrateExistingAccountOutputsAsync } = await import(module);',
+        'console.log(JSON.stringify(await migrateExistingAccountOutputsAsync(results, summary, { legacyDirectory })));'
+    ].join('\n');
+    const args = ['--input-type=module', '--eval', review, outputsModule, results, summary];
+    if (legacyDirectory) args.push(legacyDirectory);
+    const { stdout } = await runFile(process.execPath, args, { timeout: 12_000 });
+    return JSON.parse(stdout);
 }
 
 test('concurrent writer processes preserve every result while migrating shared history', async (t) => {
@@ -208,6 +220,151 @@ test('committed writes return their result ID when removing the detached owner f
     assert.equal(cleanupWarning.mock.callCount(), 2);
     assert.equal(fs.existsSync(lock), false);
     assert.deepEqual(readJson(output).map((record) => record.resultId), [committed.resultId, next.resultId]);
+});
+
+test('a writer can release its own lock after a transient cleanup I/O error', async (t) => {
+    for (const count of [1, 2]) {
+        await t.test(count === 1 ? 'retry on release' : 'retry before the next write', (t) => {
+            const root = temporaryDirectory(t);
+            const output = path.join(root, 'results.json');
+            const lock = output + '.lock';
+            const list = fs.readdirSync;
+            let failures = 0;
+            t.mock.method(fs, 'readdirSync', (directory, ...options) => {
+                if (directory === lock && fs.existsSync(output) && failures < count) {
+                    failures += 1;
+                    throw Object.assign(new Error('fixture lock release'), { code: 'EIO' });
+                }
+                return list(directory, ...options);
+            });
+            const warning = t.mock.method(process, 'emitWarning', () => {});
+
+            const first = appendAccountResult(output, { success: true, profileId: 'first' });
+            assert.equal(failures, count);
+            assert.equal(warning.mock.callCount(), count === 1 ? 0 : 1);
+            assert.equal(fs.existsSync(lock), count === 2);
+            assert.deepEqual(readJson(output), [first]);
+
+            const second = appendAccountResult(output, { success: true, profileId: 'second' });
+            assert.deepEqual(readJson(output), [first, second]);
+            assert.deepEqual(fs.readdirSync(root), ['results.json']);
+        });
+    }
+});
+
+test('a pending release preserves a different active owner and its snapshot', async (t) => {
+    const root = temporaryDirectory(t);
+    const output = path.join(root, 'results.json');
+    const lock = output + '.lock';
+    const archived = path.join(root, 'archived-lock');
+    const release = path.join(root, 'release-fixture');
+    const list = fs.readdirSync;
+    const readFault = t.mock.method(fs, 'readdirSync', (directory, ...options) => {
+        if (directory === lock && fs.existsSync(output)) {
+            throw Object.assign(new Error('fixture lock release'), { code: 'EIO' });
+        }
+        return list(directory, ...options);
+    });
+    t.mock.method(process, 'emitWarning', () => {});
+    const committed = appendAccountResult(output, { success: true });
+    readFault.mock.restore();
+
+    const originalEntries = fs.readdirSync(lock);
+    fs.renameSync(lock, archived);
+    const holder = childProcess.spawn(process.execPath, [
+        '--input-type=module', '--eval', [
+            'import fs from "node:fs";',
+            'const [module, output, release] = process.argv.slice(1);',
+            'const { withAccountOutputLock } = await import(module);',
+            'const pause = new Int32Array(new SharedArrayBuffer(4));',
+            'withAccountOutputLock(output, (snapshot) => {',
+            '    fs.writeFileSync(snapshot, "fixture snapshot", { mode: 0o600 });',
+            '    fs.writeSync(1, "holding");',
+            '    for (let elapsed = 0; elapsed < 5_000 && !fs.existsSync(release); elapsed += 20) {',
+            '        Atomics.wait(pause, 0, 0, 20);',
+            '    }',
+            '});'
+        ].join('\n'), lockModule, output, release
+    ], { stdio: ['ignore', 'pipe', 'ignore'] });
+    const closed = once(holder, 'close');
+    try {
+        await once(holder.stdout, 'data', { signal: AbortSignal.timeout(4_000) });
+        const [owner] = fs.readdirSync(lock).sort();
+        assert.ok(owner.startsWith('owner-' + holder.pid + '-'));
+        const replacement = path.join(lock, owner);
+        const metadata = fs.readFileSync(replacement, 'utf8');
+        const contended = new Error('waiting for fixture owner');
+        t.mock.method(Atomics, 'wait', () => { throw contended; });
+        assert.throws(() => appendAccountResult(output, { success: true }), (error) => error === contended);
+        assert.equal(fs.readFileSync(replacement, 'utf8'), metadata);
+        assert.equal(fs.readFileSync(replacement + '.snapshot', 'utf8'), 'fixture snapshot');
+        assert.deepEqual(fs.readdirSync(archived), originalEntries);
+        assert.deepEqual(readJson(output), [committed]);
+    } finally {
+        fs.writeFileSync(release, '');
+        assert.deepEqual(await closed, [0, null]);
+    }
+});
+
+test('a permissions failure with no incumbent reports a lock publication error', {
+    skip: process.platform === 'win32' || process.geteuid?.() === 0
+}, (t) => {
+    const root = temporaryDirectory(t);
+    const output = path.join(root, 'results.json');
+    const lock = output + '.lock';
+    const committed = appendAccountResult(output, { success: true });
+    const rename = fs.renameSync;
+    let attempts = 0;
+    const limited = t.mock.method(fs, 'renameSync', (from, to) => {
+        if (to === lock && ++attempts === 1) fs.chmodSync(root, 0o500);
+        return rename(from, to);
+    });
+    const warning = t.mock.method(process, 'emitWarning', () => {});
+    try {
+        assert.throws(
+            () => appendAccountResult(output, { success: true }),
+            (error) => error.code === 'ACCOUNT_OUTPUT_LOCK_FAILED' && error.cause?.code === 'EACCES' &&
+                /Could not publish/.test(error.message) && !error.message.includes(root)
+        );
+        assert.equal(attempts, 2);
+        assert.equal(fs.existsSync(lock), false);
+        assert.deepEqual(readJson(output), [committed]);
+        assert.equal(warning.mock.callCount(), 1);
+    } finally {
+        limited.mock.restore();
+        fs.chmodSync(root, 0o700);
+    }
+    const recovered = appendAccountResult(output, { success: true });
+    assert.deepEqual(readJson(output), [committed, recovered]);
+});
+
+test('a permission-style collision still allows handoff from an active owner', (t) => {
+    const root = temporaryDirectory(t);
+    const output = path.join(root, 'results.json');
+    const lock = output + '.lock';
+    const first = appendAccountResult(output, { success: true, profileId: 'first' });
+    fs.mkdirSync(lock, { mode: 0o700 });
+    const marker = path.join(lock, 'owner-' + process.pid + '-068fd614-aceb-46c0-90b9-8b329991e448');
+    const identity = describeProcessOwner();
+    fs.writeFileSync(marker, identity, { mode: 0o600 });
+
+    const rename = fs.renameSync;
+    t.mock.method(fs, 'renameSync', (from, to) => {
+        if (to === lock && fs.existsSync(lock)) {
+            throw Object.assign(new Error('fixture occupied destination'), { code: 'EACCES' });
+        }
+        return rename(from, to);
+    });
+    const waiting = t.mock.method(Atomics, 'wait', () => {
+        assert.equal(fs.readFileSync(marker, 'utf8'), identity);
+        fs.unlinkSync(marker);
+        fs.rmdirSync(lock);
+    });
+
+    const second = appendAccountResult(output, { success: true, profileId: 'second' });
+    assert.equal(waiting.mock.callCount(), 1);
+    assert.deepEqual(readJson(output), [first, second]);
+    assert.deepEqual(fs.readdirSync(root), ['results.json']);
 });
 
 test('finishing a write preserves unexpected content in the lock directory', (t) => {
@@ -714,6 +871,132 @@ test('summary cleanup reconciles the same result and preserves a different attem
     assert.deepEqual(migrateExistingAccountOutputs(results, summary), review.slice(1));
 });
 
+test('a legacy cleanup summary cannot adopt a later result with a reused profile ID', async (t) => {
+    for (const [label, timestamp] of [
+        ['missing attempt time', undefined],
+        ['matching attempt time with a later creation time', '2026-01-01T00:00:00.000Z']
+    ]) {
+        await t.test(label, async (t) => {
+            const state = temporaryDirectory(t);
+            const legacyDirectory = temporaryDirectory(t);
+            const results = path.join(state, 'results.json');
+            const summary = path.join(state, 'summary.json');
+            const legacySummary = path.join(legacyDirectory, 'summary.json');
+            const older = {
+                success: false, profileType: 'GPM Login', profileId: 'reused-profile',
+                profileCleanup: 'stop-unconfirmed', error: 'Account creation failed', timestamp
+            };
+            const current = {
+                ...older, resultId: '068fd614-aceb-46c0-90b9-8b329991e448',
+                timestamp: timestamp ?? '2026-01-02T00:00:00.000Z', createdAt: '2026-01-02T00:00:00.050Z'
+            };
+            const historical = JSON.stringify({
+                timestamp: '2026-01-01T00:01:00.000Z', results: [older]
+            });
+            fs.writeFileSync(results, JSON.stringify([current]), { mode: 0o600 });
+            fs.writeFileSync(legacySummary, historical, { mode: 0o600 });
+
+            const review = await migrateExistingAccountOutputsAsync(results, summary, { legacyDirectory });
+            assert.equal(review.length, 2);
+            assert.equal(review[0].resultId, current.resultId);
+            assert.ok(review[1].resultId);
+            assert.notEqual(review[1].resultId, current.resultId);
+            assert.deepEqual(await reviewInNewProcess(results, summary, legacyDirectory), review);
+
+            const stopped = recordAccountCleanup(results, current.resultId, 'stopped');
+            await writeRunSummaryAsync(summary, { timestamp: '2026-01-02T00:01:00.000Z', results: [stopped] });
+            assert.deepEqual(await reviewInNewProcess(results, summary, legacyDirectory), [review[1]]);
+            assert.deepEqual(readJson(results).map(({ resultId, profileCleanup }) => [resultId, profileCleanup]), [
+                [current.resultId, 'stopped'], [review[1].resultId, 'stop-unconfirmed']
+            ]);
+            assert.equal(fs.readFileSync(legacySummary, 'utf8'), historical);
+        });
+    }
+});
+
+test('a legacy cleanup summary requires a precise zoned attempt time', async (t) => {
+    const uncertain = [
+        '2026', '01/02/2026', '2026-01-02', '2026-01-02T03:04:05.678',
+        '2026-01-02T03:04:05Z', '2026-02-30T00:00:00.000Z'
+    ];
+    const cases = uncertain.map((timestamp) => [timestamp, timestamp, 2]);
+    cases.push(['2026-03-03T03:04:05.678Z', '2026-03-03T08:34:05.678+05:30', 1]);
+    for (const [resultTime, summaryTime, count] of cases) {
+        await t.test(summaryTime, async (t) => {
+            const state = temporaryDirectory(t);
+            const results = path.join(state, 'results.json');
+            const summary = path.join(state, 'summary.json');
+            const attempt = {
+                success: true, profileType: 'GPM Login', profileId: 'reused-profile',
+                profileCleanup: 'stop-unconfirmed'
+            };
+            const resultId = '068fd614-aceb-46c0-90b9-8b329991e448';
+            fs.writeFileSync(results, JSON.stringify([{
+                ...attempt, resultId, timestamp: resultTime, createdAt: '2026-03-03T03:04:05.700Z'
+            }]), { mode: 0o600 });
+            fs.writeFileSync(summary, JSON.stringify({
+                timestamp: '2026-03-03T03:05:00.000Z', results: [{ ...attempt, timestamp: summaryTime }]
+            }), { mode: 0o600 });
+
+            const review = migrateExistingAccountOutputs(results, summary);
+            assert.equal(review.length, count);
+            assert.equal(review[0].resultId, resultId);
+            assert.deepEqual(await reviewInNewProcess(results, summary), review);
+        });
+    }
+});
+
+test('a legacy cleanup summary cannot revive a confirmed result after a failed replacement', async (t) => {
+    for (const profileCleanup of ['stop-unconfirmed', 'stopped']) {
+        await t.test(profileCleanup, async (t) => {
+            const state = temporaryDirectory(t);
+            const results = path.join(state, 'results.json');
+            const summary = path.join(state, 'summary.json');
+            const attempt = {
+                success: true, profileType: 'GPM Login', profileId: 'existing-profile',
+                timestamp: '2026-01-01T00:00:00.000Z'
+            };
+            const original = {
+                ...attempt, resultId: '068fd614-aceb-46c0-90b9-8b329991e448',
+                createdAt: '2026-01-01T00:00:00.050Z', profileCleanup
+            };
+            fs.writeFileSync(results, JSON.stringify([original]), { mode: 0o600 });
+            fs.writeFileSync(summary, JSON.stringify({
+                timestamp: '2026-01-01T00:01:00.000Z',
+                results: [{ ...attempt, profileCleanup: 'stop-unconfirmed' }]
+            }), { mode: 0o600 });
+
+            const review = migrateExistingAccountOutputs(results, summary);
+            assert.deepEqual(review, profileCleanup === 'stopped' ? [] : [
+                { entry: 1, resultId: original.resultId, profileCleanup: 'stop-unconfirmed' }
+            ]);
+            const stopped = recordAccountCleanup(results, original.resultId, 'stopped');
+            const oldSummary = fs.readFileSync(summary);
+            const rename = fs.renameSync;
+            const stub = t.mock.method(fs, 'renameSync', (from, to) => {
+                if (to === summary) throw Object.assign(new Error('Synthetic replacement error'), { code: 'EIO' });
+                return rename(from, to);
+            });
+            try {
+                await assert.rejects(writeRunSummaryAsync(summary, { results: [stopped] }), { code: 'EIO' });
+            } finally {
+                stub.mock.restore();
+            }
+            assert.deepEqual(fs.readFileSync(summary), oldSummary);
+            assert.deepEqual(readSavedAccountCleanup(results, original), {
+                resultId: original.resultId, profileCleanup: 'stopped'
+            });
+            assert.deepEqual(await reviewInNewProcess(results, summary), []);
+            assert.deepEqual(await reviewInNewProcess(results, summary), []);
+            assert.match(stopped.summaryCleanupSource, /^[a-f0-9]{64}$/);
+            assert.deepEqual(readJson(results), [stopped]);
+            await writeRunSummaryAsync(summary, { results: [stopped] });
+            assert.equal(readJson(summary).results[0].profileCleanup, 'stopped');
+            assert.deepEqual(fs.readdirSync(state).sort(), ['results.json', 'summary.json']);
+        });
+    }
+});
+
 test('a failed summary cleanup recovery keeps the source for retry', (t) => {
     const state = temporaryDirectory(t);
     const results = path.join(state, 'results.json');
@@ -825,7 +1108,7 @@ function installedCli(t) {
     fs.mkdirSync(home);
     const files = [
         'bin/gmail-account-creator.js', 'src/index.js', 'src/config.js', 'config/names.json',
-        ...['account-output-lock', 'account-results', 'cli-counts', 'controller-id', 'logger',
+        ...['account-output-lock', 'account-results', 'application-config', 'cli-counts', 'controller-id', 'logger',
             'name-generator', 'private-storage', 'process-owner', 'state-paths']
             .map((name) => 'src/utils/' + name + '.js')
     ];

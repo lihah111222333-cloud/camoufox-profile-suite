@@ -273,10 +273,15 @@ function redactUrl(value, depth) {
 
     const fragment = url.slice(fragmentStart + 1);
     const fragmentQueryStart = fragment.indexOf('?');
-    const sanitizedFragment = fragmentQueryStart < 0
-        ? redactParameters(fragment, depth)
-        : redactUrlPathIdentity(fragment.slice(0, fragmentQueryStart)) + '?' +
+    let sanitizedFragment;
+    if (fragmentQueryStart >= 0) {
+        sanitizedFragment = redactUrlPathIdentity(fragment.slice(0, fragmentQueryStart)) + '?' +
             redactParameters(fragment.slice(fragmentQueryStart + 1), depth);
+    } else if (/^!?\/[^&=]*$/.test(fragment)) {
+        sanitizedFragment = redactUrlPathIdentity(fragment);
+    } else {
+        sanitizedFragment = redactParameters(fragment, depth);
+    }
     const result = base + '#' + sanitizedFragment;
     return exceedsUrlLimit(result) ? MASK : result;
 }

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createCipheriv, randomBytes } from 'node:crypto';
 import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -430,6 +431,124 @@ test('SDK configuration retries use the corrected files after a fallback read fa
     assert.equal(result.status, 0, result.stderr);
 });
 
+test('Vault fallback keeps the environment selected by the primary vault', async t => {
+    const root = await makeFixture(t);
+    const staging = Buffer.alloc(32, 11);
+    const rotated = Buffer.alloc(32, 22);
+    const production = Buffer.alloc(32, 33);
+    function record(environment, key, settings) {
+        const nonce = randomBytes(12);
+        const cipher = createCipheriv('aes-256-gcm', key, nonce);
+        const ciphertext = Buffer.concat([cipher.update(settings, 'utf8'), cipher.final()]);
+        const encoded = Buffer.concat([nonce, ciphertext, cipher.getAuthTag()]).toString('base64');
+        return 'DOTENV_VAULT_' + environment.toUpperCase() + '=' + encoded + '\n';
+    }
+    const key = (environment, secret) =>
+        'dotenv://:key_' + secret.toString('hex') + '@fixture.invalid/vault?environment=' + environment;
+    await writeFile(path.join(root, '.env.vault'),
+        record('staging', staging, 'DOLPHIN_API_URL=https://staging.invalid\n') +
+        record('production', production, 'DOLPHIN_API_URL=https://production.invalid\n'), { mode: 0o600 });
+    const fallback = path.join(root, '.emv.vault');
+    const productionFallback = record('production', production, 'PROFILE_SERVICE=dolphin\nDOLPHIN_API_KEY=fixture-production\n');
+    await writeFile(fallback, productionFallback, { mode: 0o600 });
+
+    const mixedKeys = key('staging', staging) + ',' + key('production', production);
+    const rejected = runModule(root, `
+        import assert from 'node:assert/strict';
+        import application from './src/index.js';
+        await assert.rejects(application.main(), {
+            code: 'PRIVATE_ENV_CONFIGURATION_ERROR',
+            message: 'Could not parse environment configuration in .emv.vault'
+        });
+        assert.equal(process.env.DOLPHIN_API_URL, undefined);
+        assert.equal(process.env.DOLPHIN_API_KEY, undefined);
+    `, { DOTENV_KEY: mixedKeys, LOG_LEVEL: 'silent' });
+    assert.equal(rejected.status, 0, rejected.stderr);
+
+    await writeFile(fallback, productionFallback +
+        record('staging', rotated, 'PROFILE_SERVICE=dolphin\nDOLPHIN_API_KEY=fixture-staging\n'));
+    const paired = runModule(root, `
+        import assert from 'node:assert/strict';
+        import { loadApplicationEnvironment } from './src/utils/private-env.js';
+        const env = loadApplicationEnvironment();
+        assert.equal(env.DOLPHIN_API_URL, 'https://staging.invalid');
+        assert.equal(env.DOLPHIN_API_KEY, 'fixture-staging');
+    `, { DOTENV_KEY: mixedKeys + ',' + key('staging', rotated) });
+    assert.equal(paired.status, 0, paired.stderr);
+});
+
+test('Rejected application settings leave the SDK free to read a corrected profile store', async t => {
+    const root = await makeFixture(t);
+    const oldStore = path.join(root, 'previous');
+    const currentStore = path.join(root, 'current');
+    for (const [store, title] of [[oldStore, 'previous'], [currentStore, 'current']]) {
+        const profile = path.join(store, 'same-id');
+        await mkdir(profile, { recursive: true, mode: 0o700 });
+        await writeFile(path.join(profile, 'profile.json'), JSON.stringify({ id: 'same-id', title }), { mode: 0o600 });
+    }
+    await writeFile(path.join(root, '.env'),
+        'PROFILE_SERVICE=camoufox\nCAMOUFOX_STORAGE_DIR=' + oldStore + '\nCAMOUFOX_RECORD_BODIES=invalid\n', { mode: 0o600 });
+
+    const result = runModule(root, `
+        import assert from 'node:assert/strict';
+        import { writeFileSync } from 'node:fs';
+        import application from './src/index.js';
+        import { getProfile } from './src/camoufox/client.js';
+        await assert.rejects(application.main(), {
+            code: 'PRIVATE_ENV_CONFIGURATION_ERROR',
+            message: 'CAMOUFOX_RECORD_BODIES must be true or false'
+        });
+        assert.equal(process.env.CAMOUFOX_STORAGE_DIR, undefined);
+        assert.equal(process.env.CAMOUFOX_RECORD_BODIES, undefined);
+        writeFileSync('.env', ${JSON.stringify('PROFILE_SERVICE=camoufox\nCAMOUFOX_STORAGE_DIR=' + currentStore +
+            '\nCAMOUFOX_RECORD_BODIES=false\n')});
+        assert.equal((await getProfile('same-id')).title, 'current');
+        await assert.rejects(application.main(), { code: 'PROXY_CONFIGURATION_ERROR' });
+        assert.equal(process.env.CAMOUFOX_STORAGE_DIR, ${JSON.stringify(currentStore)});
+    `, { LOG_LEVEL: 'silent' });
+    assert.equal(result.status, 0, result.stderr);
+});
+
+test('Application preflight can retry a transient private configuration read in the same process', async t => {
+    const root = await makeFixture(t);
+    await writeFile(path.join(root, '.env'), 'CAMOUFOX_STORAGE_DIR=fixture-profiles\n', { mode: 0o600 });
+    await writeFile(path.join(root, '.emv'), 'PROFILE_SERVICE=gpm\n', { mode: 0o600 });
+    const result = runModule(root, `
+        import assert from 'node:assert/strict';
+        import fs from 'node:fs';
+        import application from './src/index.js';
+        const fallback = fs.statSync('.emv');
+        const read = fs.readFileSync;
+        let injected = 0;
+        fs.readFileSync = (file, ...args) => {
+            if (!injected && typeof file === 'number') {
+                const { dev, ino } = fs.fstatSync(file);
+                if (dev === fallback.dev && ino === fallback.ino) {
+                    injected++;
+                    throw Object.assign(new Error('Synthetic I/O failure'), { code: 'EIO' });
+                }
+            }
+            return read(file, ...args);
+        };
+        try {
+            await assert.rejects(application.main(), {
+                code: 'PRIVATE_ENV_CONFIGURATION_ERROR',
+                message: 'Could not read .emv as a private configuration file'
+            });
+        } finally {
+            fs.readFileSync = read;
+        }
+        assert.equal(injected, 1);
+        assert.equal(process.env.CAMOUFOX_STORAGE_DIR, undefined);
+        assert.equal(process.env.PROFILE_SERVICE, undefined);
+        await assert.rejects(application.createAccount(), { code: 'PROXY_CONFIGURATION_ERROR' });
+        await assert.rejects(application.main(), { code: 'PROXY_CONFIGURATION_ERROR' });
+        assert.equal(fs.existsSync('results.json'), false);
+        assert.equal(fs.existsSync('summary.json'), false);
+    `, { LOG_LEVEL: 'silent' });
+    assert.equal(result.status, 0, result.stderr);
+});
+
 test('The GoLogin fallback is read only by callers that need its key', async t => {
     const root = await makeFixture(t);
     const primary = path.join(root, '.env');
@@ -699,6 +818,28 @@ test('A GoLogin client with an explicit key ignores an unreadable default fallba
         rmdirSync('.emv');
         writeFileSync('.emv', 'GOLOGIN_API_KEY=fixture-fallback-key\\n', { mode: 0o600 });
         assert.equal(getGoLoginApiKey(), 'fixture-fallback-key');
+    `);
+    assert.equal(result.status, 0, result.stderr);
+});
+
+test('local default credential lookup caches only the first complete configuration', async t => {
+    const root = await makeFixture(t);
+    await writeFile(path.join(root, '.env'), 'PROFILE_SERVICE=camoufox\n', { mode: 0o600 });
+    await stubGoLoginModules(root);
+
+    const result = runModule(root, `
+        import assert from 'node:assert/strict';
+        import { writeFileSync } from 'node:fs';
+        import config from './src/config.js';
+        import { getGoLoginApiKey } from './src/gologin/client.js';
+        assert.equal(config.gologin.apiKey, '');
+        assert.throws(getGoLoginApiKey, /GOLOGIN_API_KEY is not set/);
+        writeFileSync('.emv', 'GOLOGIN_API_KEY=fixture-first\\n', { mode: 0o600 });
+        assert.equal(config.gologin.apiKey, 'fixture-first');
+        assert.equal(getGoLoginApiKey(), 'fixture-first');
+        writeFileSync('.emv', 'GOLOGIN_API_KEY=fixture-later\\n');
+        assert.equal(config.gologin.apiKey, 'fixture-first');
+        assert.equal(getGoLoginApiKey(), 'fixture-first');
     `);
     assert.equal(result.status, 0, result.stderr);
 });

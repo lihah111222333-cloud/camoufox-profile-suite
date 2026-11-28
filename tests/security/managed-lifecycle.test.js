@@ -176,6 +176,13 @@ async function fixture(t, { productionLogger = false } = {}) {
         globalThis.setTimeout = callback => queueMicrotask(callback);
         export default { profileService: process.env.FIXTURE_PROFILE_SERVICE || 'gpm' };
     `);
+    await put('src/utils/application-config.js', `
+        import config from '../config.js';
+        export function loadApplicationConfig(validate) {
+            validate?.(process.env);
+            return config;
+        }
+    `);
     if (!productionLogger) {
         await put('src/utils/logger.js', `
             import state from '../fixture.cjs';
@@ -845,9 +852,18 @@ test('CLI warns about existing pending results with stable locations before repl
     assert.ok(completed.stderr.includes('entry 1 (resultId ' + pending.resultId + ') (pending)'));
     assert.match(completed.stderr, /entry 2 \(stop-unconfirmed\)/);
     assert.doesNotMatch(completed.stderr, /older-private-profile|legacy-private-profile/);
-    const [kept, keptLegacy, current] = JSON.parse(await readFile(filename));
+    const saved = JSON.parse(await readFile(filename));
+    assert.equal(saved.length, 4);
+    const [kept, keptLegacy, unresolvedSummary, current] = saved;
     assert.deepEqual(kept, pending);
-    assert.equal(keptLegacy.profileCleanup, 'stop-unconfirmed');
+    assert.equal(keptLegacy.profileId, legacy.profileId);
+    assert.equal(keptLegacy.profileCleanup, legacy.profileCleanup);
+    assert.equal(keptLegacy.resultId, undefined);
+    assert.equal(unresolvedSummary.profileId, legacy.profileId);
+    assert.equal(unresolvedSummary.profileCleanup, 'stop-unconfirmed');
+    assert.ok(unresolvedSummary.resultId);
+    assert.ok(unresolvedSummary.summaryCleanupSource);
+    assert.ok(completed.stderr.includes('entry 3 (resultId ' + unresolvedSummary.resultId + ') (stop-unconfirmed)'));
     assert.equal(current.profileCleanup, 'stopped');
     const summary = JSON.parse(await readFile(path.join(sandbox.root, 'summary.json')));
     assert.equal(summary.results.length, 1);
@@ -1191,7 +1207,7 @@ test('a long-running logger writes each entry to its UTC date file', async t => 
     const logs = path.join(sandbox.root, 'logs');
     assert.deepEqual((await readdir(logs)).sort(), ['app-2026-01-01.log', 'app-2026-01-02.log']);
     assert.equal(await readFile(path.join(logs, 'app-2026-01-01.log'), 'utf8'),
-        '[2026-01-01T23:59:59.990Z] [INFO] Before midnight\n');
+        '\n[2026-01-01T23:59:59.990Z] [INFO] Before midnight\n');
     assert.equal(await readFile(path.join(logs, 'app-2026-01-02.log'), 'utf8'),
-        '[2026-01-02T00:00:00.010Z] [INFO] After midnight\n');
+        '\n[2026-01-02T00:00:00.010Z] [INFO] After midnight\n');
 });

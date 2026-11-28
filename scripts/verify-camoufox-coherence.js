@@ -438,6 +438,16 @@ async function runDiagnostic() {
         return;
     }
 
+    const osArgs = args.filter(arg => arg === '--os' || arg.startsWith('--os='));
+    const requestedOs = osArgs[0]?.slice('--os='.length).toLowerCase();
+    if (osArgs.length > 1 || (osArgs.length === 1 && !SUPPORTED_OS_TARGETS.includes(requestedOs))) {
+        console.error(`Error: --os requires one of ${SUPPORTED_OS_TARGETS.join(', ')}. Specify it once.`);
+        console.error(USAGE);
+        process.exitCode = 2;
+        return;
+    }
+    const osTargets = requestedOs ? [requestedOs] : SUPPORTED_OS_TARGETS;
+
     const [
         { writeCaptureExport },
         { isCamoufoxModuleResolvable, isPackageEntryResolvable },
@@ -448,11 +458,6 @@ async function runDiagnostic() {
         import('../src/camoufox/coherence-auditor.js')
     ]);
     const forceDryRun = args.includes('--dry-run') || args.includes('--check-env');
-    const osArg = args.find(arg => arg.startsWith('--os='));
-    const requestedOs = osArg ? osArg.split('=')[1]?.toLowerCase() : null;
-    const osTargets = requestedOs && SUPPORTED_OS_TARGETS.includes(requestedOs)
-        ? [requestedOs]
-        : SUPPORTED_OS_TARGETS;
 
     console.log('================================================================================');
     console.log('🦊 Camoufox Cross-OS Fingerprint Coherence Diagnostic CLI');

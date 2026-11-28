@@ -9,6 +9,7 @@ import {
     createProfile, deleteProfile, rollbackCreatedProfile, setCamoufoxModule, startProfile, stopAllActiveProfiles,
     stopProfile, unregisterProcessCleanupHooks
 } from '../../src/camoufox/client.js';
+import { PROFILE_LEASE_DIRECTORY } from '../../src/camoufox/profile-storage.js';
 import { CamoufoxTrafficRecorder, exportTrafficToHar, verifyTrafficIntegrity } from '../../src/camoufox/traffic-recorder.js';
 
 function mockLauncher(launches = [], browsers = []) {
@@ -53,6 +54,15 @@ function mockLauncher(launches = [], browsers = []) {
             return browser;
         }
     };
+}
+
+// Only for an exited fixture subprocess whose launcher is an in-memory EventEmitter.
+function archiveExitedMockLease(t, profilesDir, profileId) {
+    const lease = path.join(profilesDir, PROFILE_LEASE_DIRECTORY, profileId);
+    assert.ok(fs.statSync(path.join(lease, '~native-exit-unconfirmed')).isFile());
+    const archive = fs.mkdtempSync(path.join(os.tmpdir(), 'exited-mock-lease-'));
+    t.after(() => fs.rmSync(archive, { recursive: true, force: true }));
+    fs.renameSync(lease, path.join(archive, profileId));
 }
 
 function managedFixture(t) {
@@ -479,6 +489,11 @@ test('a HAR-only checkpoint recovers recorded events from a previous process bef
     assert.equal(index.harRecovery.finalized, false);
     assert.equal(index.integrity.eventCount, 0);
     const original = fs.readFileSync(ledgerPath);
+    await assert.rejects(open({ recordHar: false }), { code: 'ERR_CAMOUFOX_NATIVE_EXIT_UNCONFIRMED' });
+    assert.equal(await stop(), false);
+    assert.deepEqual(fs.readFileSync(ledgerPath), original);
+    assert.equal(launches.length, 0);
+    archiveExitedMockLease(t, options.profilesDir, profileId);
     await assert.rejects(open({ recordHar: false }), { code: 'ERR_CAMOUFOX_HAR_EXPORT_PENDING' });
     assert.deepEqual(fs.readFileSync(ledgerPath), original);
     assert.equal(launches.length, 0);
@@ -541,6 +556,11 @@ test('HAR-only recovery accepts the empty marker for a committed attachment', as
     const payload = fs.readFileSync(payloadPath);
     const markerPath = path.join(path.dirname(payloadPath), '.pending-' + path.basename(payloadPath));
     assert.equal(fs.statSync(markerPath).size, 0);
+
+    assert.equal(await stop(), false);
+    assert.deepEqual(fs.readFileSync(harPath), previousHar);
+    assert.deepEqual(fs.readFileSync(payloadPath), payload);
+    archiveExitedMockLease(t, options.profilesDir, profileId);
 
     const unknown = path.join(path.dirname(markerPath), '.pending-req-2-0123456789ab.txt');
     fs.writeFileSync(unknown, '', { mode: 0o600 });
@@ -1017,7 +1037,10 @@ test('HAR-only recovery uses the target version from the first ready checkpoint'
         assert.ok(fs.statSync(ledger).size > 0);
         unregisterProcessCleanupHooks();
     `;
-    const interruptedCapture = () => execFileSync(process.execPath, ['--input-type=module', '-e', child], { timeout: 10000 });
+    const interruptedCapture = () => {
+        execFileSync(process.execPath, ['--input-type=module', '-e', child], { timeout: 10000 });
+        archiveExitedMockLease(t, options.profilesDir, profileId);
+    };
     interruptedCapture();
     assert.equal(await stop(), true);
     assert.equal(JSON.parse(fs.readFileSync(harPath)).log.entries[0].request.url, 'https://fixture.invalid/recovered');

@@ -392,6 +392,28 @@ test('Camoufox diagnostic help runs without its diagnostic modules or state', (t
     }
 });
 
+test('Camoufox diagnostic rejects invalid OS arguments before loading modules', (t) => {
+    const root = fixture(t);
+    const command = path.join(root, 'verify-camoufox-coherence.mjs');
+    fs.copyFileSync(path.join(repo, 'scripts', 'verify-camoufox-coherence.js'), command);
+    const temporaryDir = path.join(root, 'temporary');
+    fs.mkdirSync(temporaryDir);
+
+    for (const option of ['--os=linxu', '--os=', '--os', '--os=linux=extra']) {
+        const run = spawnSync(process.execPath, [command, '--dry-run', option], {
+            cwd: root,
+            encoding: 'utf8',
+            timeout: 5000,
+            env: { ...process.env, TMPDIR: temporaryDir, TMP: temporaryDir, TEMP: temporaryDir }
+        });
+        assert.equal(run.status, 2, run.error?.message || run.stderr + run.stdout);
+        assert.equal(run.stdout, '');
+        assert.match(run.stderr, /--os requires.*windows, macos, linux/);
+        assert.match(run.stderr, /^Usage:/m);
+        assert.deepEqual(fs.readdirSync(temporaryDir), []);
+    }
+});
+
 test('Camoufox diagnostic separates live evidence, unavailable data, and synthetic reports', (t) => {
     const root = fixture(t);
     const stateDir = path.join(root, 'state');
@@ -406,6 +428,7 @@ test('Camoufox diagnostic separates live evidence, unavailable data, and synthet
     const sources = [
         script,
         'src/camoufox/capture-io.js',
+        'src/camoufox/capture-transaction-identity.js',
         'src/camoufox/capture-export-policy.js',
         'src/camoufox/coherence-auditor.js',
         'src/camoufox/device-presets.js',

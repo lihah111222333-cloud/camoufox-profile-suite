@@ -120,7 +120,8 @@ function writeLog(level, message, data = null) {
         const logDir = path.join(ensureStateDirectory(), 'logs');
         ensurePrivateDirectory(logDir, { requireOwner: true });
         const logFile = path.join(logDir, `app-${timestamp.slice(0, 10)}.log`);
-        appendPrivateFile(logFile, formatted, { requireOwner: true });
+        // Separate this record even if the previous writer left a partial line.
+        appendPrivateFile(logFile, `\n${formatted}`, { requireOwner: true, singleWrite: true });
     } catch {
         console.error('Failed to write to the application log file');
     }

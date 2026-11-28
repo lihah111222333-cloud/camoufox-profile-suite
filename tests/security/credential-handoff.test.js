@@ -47,6 +47,7 @@ test('App diagnostics omit credentials and preserve private log permissions acro
     const scratch = await mkdtemp(path.join(tmpdir(), 'gmail-credential-log-'));
     t.after(() => rm(scratch, { recursive: true, force: true }));
     const files = [
+        'src/utils/application-config.js',
         'src/utils/logger.js',
         'src/utils/private-storage.js',
         'src/utils/private-env.js',

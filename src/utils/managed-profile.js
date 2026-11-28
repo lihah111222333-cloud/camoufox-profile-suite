@@ -1,4 +1,5 @@
 import { requireControllerProfileId } from './controller-id.js';
+import { controllerRequestOutcomeUnconfirmed } from './controller-request.js';
 import logger from './logger.js';
 
 function cleanupError(profileId, profileCleanup, message, cause) {
@@ -7,7 +8,7 @@ function cleanupError(profileId, profileCleanup, message, cause) {
 
 class ManagedStartupCleanupError extends Error {
     constructor(profileId, cause) {
-        super('Managed profile startup cancelled after controller launch. Shutdown is unconfirmed.', { cause });
+        super('Managed profile startup did not finish. Shutdown is unconfirmed.', { cause });
         this.profileId = profileId;
         this.profileCleanup = 'stop-unconfirmed';
     }
@@ -29,6 +30,7 @@ export default class ManagedProfile {
     #deleteUnconfirmed = false;
     #ownedPages = new Map();
     #openingPage = null;
+    #borrowedPageCreationUnconfirmed = false;
     #borrowedCleanupBrowser = null;
 
     constructor(profileId, client, addressField, address, startBrowser) {
@@ -65,6 +67,7 @@ export default class ManagedProfile {
         if (this.#stopState === 'unconfirmed') {
             throw cleanupError(this.profileId, 'stop-unconfirmed', 'Managed profile shutdown unconfirmed');
         }
+        if (this.#borrowedPageCreationUnconfirmed) throw this.#borrowedPagesUnconfirmed();
         if (this.#borrowedCleanupBrowser) {
             if (this.#ownedPages.size && this.#borrowedCleanupBrowser.isConnected?.() === false) {
                 throw this.#borrowedPagesUnconfirmed();
@@ -76,11 +79,20 @@ export default class ManagedProfile {
         const cancellation = new AbortController();
         const abort = () => cancellation.abort(signal.reason);
         let launchAcknowledged = false;
+        let unconfirmedLaunch;
         const startProfile = this.#client && (async () => {
-            // Await a dispatched launch even when the caller cancels the local attachment.
-            const receipt = await this.#client.startProfile(this.profileId);
-            launchAcknowledged = true;
-            return receipt;
+            try {
+                // Await a dispatched launch even when the caller cancels the local attachment.
+                const receipt = await this.#client.startProfile(this.profileId);
+                launchAcknowledged = true;
+                return receipt;
+            } catch (error) {
+                if (controllerRequestOutcomeUnconfirmed(error)) {
+                    unconfirmedLaunch = error;
+                    cancellation.abort(error);
+                }
+                throw error;
+            }
         });
         signal?.addEventListener('abort', abort, { once: true });
         this.#startCancellation = cancellation;
@@ -92,9 +104,9 @@ export default class ManagedProfile {
             return profile;
         }).catch(async error => {
             await this.#detachBrowser(error);
-            if (launchAcknowledged && signal?.aborted) {
+            if (unconfirmedLaunch || (launchAcknowledged && signal?.aborted)) {
                 this.#stopState = 'unconfirmed';
-                throw new ManagedStartupCleanupError(this.profileId, error);
+                throw new ManagedStartupCleanupError(this.profileId, unconfirmedLaunch ?? error);
             }
             throw error;
         }).finally(() => {
@@ -130,8 +142,23 @@ export default class ManagedProfile {
 
     async createOwnedPage() {
         const browser = this.browser;
+        if (this.#borrowedPageCreationUnconfirmed) throw this.#borrowedPagesUnconfirmed();
         if (!browser) throw new Error('Managed browser is unavailable');
-        this.#openingPage ??= browser.newPage().then(page => {
+        this.#openingPage ??= Promise.resolve().then(async () => {
+            if (!this.#client && browser.isConnected?.() === false) {
+                throw new Error('Borrowed browser connection is unavailable');
+            }
+            let page;
+            try {
+                page = await browser.newPage();
+                if (!page) throw new Error('Managed browser did not return a page');
+            } catch (error) {
+                if (this.#client) throw error;
+                // A failed page request can leave a tab without a handle or a known target ID.
+                this.#borrowedPageCreationUnconfirmed = true;
+                throw this.#borrowedPagesUnconfirmed(error);
+            }
+
             this.#ownedPages.set(page, null);
             if (!this.#client) {
                 try {
@@ -154,11 +181,13 @@ export default class ManagedProfile {
     #borrowedPagesUnconfirmed(cause) {
         return Object.assign(cleanupError(
             this.profileId, 'stop-unconfirmed',
-            'Borrowed browser disconnected with managed pages pending cleanup. Check the original browser.',
+            this.#borrowedPageCreationUnconfirmed
+                ? 'Borrowed browser page creation is unconfirmed. Check the original browser.'
+                : 'Borrowed browser disconnected with managed pages pending cleanup. Check the original browser.',
             cause
         ), {
             targetIds: [...this.#ownedPages.values()].filter(Boolean),
-            unresolvedPageCount: this.#ownedPages.size
+            unresolvedPageCount: this.#ownedPages.size + Number(this.#borrowedPageCreationUnconfirmed)
         });
     }
 
@@ -183,7 +212,7 @@ export default class ManagedProfile {
         if (!this.#client) {
             this.#borrowedCleanupBrowser = browser;
             if (this.#ownedPages.size) {
-                if (browser?.isConnected?.() === false) {
+                if (this.#borrowedPageCreationUnconfirmed || browser?.isConnected?.() === false) {
                     throw this.#borrowedPagesUnconfirmed(cause);
                 }
                 return;
@@ -197,6 +226,7 @@ export default class ManagedProfile {
         } catch {
             logger.warn('Could not detach the managed browser connection', { profileId: this.profileId });
         }
+        if (this.#borrowedPageCreationUnconfirmed) throw this.#borrowedPagesUnconfirmed(cause);
     }
 
     stop() {

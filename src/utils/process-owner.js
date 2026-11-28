@@ -115,6 +115,11 @@ export function describeProcessOwner() {
     return `${hostDigest()} ${generation}${coordinates}\n`;
 }
 
+export function isSameProcessScope(identity) {
+    const scope = process.platform === 'linux' ? readLinuxScope() : (ownScope ??= readProcessScope());
+    return Boolean(scope?.boot && identity.boot === scope.boot && identity.namespace === scope.namespace);
+}
+
 export function readProcessOwner(filePath) {
     const stat = fs.lstatSync(filePath);
     if (!stat.isFile() || stat.nlink !== 1 || stat.size > MAX_MARKER_BYTES ||

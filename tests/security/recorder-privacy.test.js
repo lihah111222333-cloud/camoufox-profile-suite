@@ -561,6 +561,7 @@ test('reopened wire applies current header, URL, trigger and body rules to accep
     await recorder.stop();
     const archivedIndex = JSON.parse(fs.readFileSync(recorder.attributionIndexPath, 'utf8'));
     archivedIndex.session.accountEmail = archivedEmail;
+    delete archivedIndex.session.recordingNamespace;
     fs.writeFileSync(recorder.attributionIndexPath, JSON.stringify(archivedIndex));
     fs.writeFileSync(recorder.trafficNdjsonPath, archived);
     const reopened = new CamoufoxTrafficRecorder(recorderOptions);

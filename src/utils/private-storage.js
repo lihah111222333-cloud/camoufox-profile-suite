@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { TextDecoder } from 'node:util';
 
 const FILE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
@@ -11,6 +12,12 @@ const OPEN_EXISTING = (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK 
 const APPEND_EXISTING = fs.constants.O_WRONLY | fs.constants.O_APPEND;
 const MAX_VERIFIED_DIRECTORIES = 64;
 const verifiedDirectoryAcls = new Map();
+const privateUtf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+/** Decode private text without replacing malformed bytes. Leave BOM handling to the file format. */
+export function decodePrivateUtf8(bytes) {
+    return privateUtf8.decode(bytes);
+}
 
 function privateAclError(message) {
     return Object.assign(new Error(message), { code: 'PRIVATE_STORAGE_ACL_ERROR' });
@@ -84,10 +91,29 @@ function sameRegularFile(current, expected) {
     return current.isFile() && current.dev === expected.dev && current.ino === expected.ino;
 }
 
+export function removeCreatedPrivateFile(filePath, expected, { empty = false } = {}) {
+    const current = fs.lstatSync(filePath, { bigint: true, throwIfNoEntry: false });
+    if (!current) return true;
+    if (!expected || !sameRegularFile(current, expected) || current.nlink !== 1n ||
+        current.uid !== expected.uid || (empty && current.size !== 0n) ||
+        (typeof process.geteuid === 'function' && current.uid !== BigInt(process.geteuid()))) return false;
+    fs.rmSync(filePath, { force: true });
+    return true;
+}
+
+function rollbackCreatedPrivateFile(filePath, created, error, options) {
+    try {
+        if (removeCreatedPrivateFile(filePath, created, options)) return;
+    } catch {
+        // Keep the primary error when the storage fault also prevents cleanup.
+    }
+    if (error instanceof Error && Object.isExtensible(error)) error.cleanupPending = true;
+}
+
 function openPrivateFile(filePath, access = fs.constants.O_RDONLY, {
     requireOwner = false,
     restrict = true,
-    checkAcl = access === fs.constants.O_RDONLY && requireOwner && restrict,
+    checkAcl = requireOwner && restrict,
     replacing = false
 } = {}, expectedFile) {
     const existing = expectedFile ?? fs.lstatSync(filePath);
@@ -119,7 +145,9 @@ function openPrivateFile(filePath, access = fs.constants.O_RDONLY, {
 }
 
 // Only call this for application-owned directories.
-export function ensurePrivateDirectory(directory, { requireOwner = false, checkAcl = requireOwner, create = true } = {}) {
+export function ensurePrivateDirectory(directory, {
+    requireOwner = false, checkAcl = requireOwner, create = true, restrict = true
+} = {}) {
     if (create) fs.mkdirSync(directory, { recursive: true, mode: DIRECTORY_MODE });
     const verifyAcl = checkAcl && process.platform === 'darwin';
     const existing = fs.lstatSync(directory, { bigint: verifyAcl });
@@ -128,7 +156,7 @@ export function ensurePrivateDirectory(directory, { requireOwner = false, checkA
     }
     if (requireOwner) assertOwner(existing, directory);
     if (verifyAcl) assertPrivateDirectoryAcl(directory, existing);
-    if (!SUPPORTS_OWNER_MODES || (Number(existing.mode) & 0o7777) === DIRECTORY_MODE) {
+    if (!restrict || !SUPPORTS_OWNER_MODES || (Number(existing.mode) & 0o7777) === DIRECTORY_MODE) {
         return;
     }
 
@@ -146,7 +174,7 @@ export function ensurePrivateDirectory(directory, { requireOwner = false, checkA
 }
 
 export function restrictPrivateFile(filePath, options) {
-    fs.closeSync(openPrivateFile(filePath, fs.constants.O_RDONLY, options));
+    fs.closeSync(openPrivateFile(filePath, fs.constants.O_RDONLY, options, options?.expectedFile));
 }
 
 export function readPrivateFile(filePath, encoding = 'utf8', options) {
@@ -189,11 +217,13 @@ export function writePrivateFile(filePath, data, options) {
     const temporaryPath = options?.temporaryPath ??
         path.join(path.dirname(filePath), `.${path.basename(filePath)}.${randomUUID()}.tmp`);
     const fd = fs.openSync(temporaryPath, 'wx', FILE_MODE);
+    let created;
     try {
         try {
-            const opened = fs.fstatSync(fd);
-            if (checkAcl) assertPrivateAcl(temporaryPath, opened);
-            restrictMode(fd, opened, FILE_MODE);
+            created = fs.fstatSync(fd, { bigint: true });
+            if (options?.requireOwner) assertOwner(created, temporaryPath);
+            if (checkAcl) assertPrivateAcl(temporaryPath, created);
+            restrictMode(fd, created, FILE_MODE);
             if (options?.recordTemporaryFile) {
                 options.recordTemporaryFile(fs.fstatSync(fd, { bigint: true }));
             }
@@ -205,7 +235,7 @@ export function writePrivateFile(filePath, data, options) {
         fs.renameSync(temporaryPath, filePath);
         if (options?.durable) syncDirectory(path.dirname(filePath));
     } catch (error) {
-        fs.rmSync(temporaryPath, { force: true });
+        rollbackCreatedPrivateFile(temporaryPath, created, error);
         throw error;
     }
 }
@@ -218,12 +248,22 @@ export function appendPrivateFile(filePath, data, options) {
         if (error.code !== 'ENOENT') {
             throw error;
         }
+        let created;
         try {
             fd = fs.openSync(filePath, 'ax', FILE_MODE);
-            restrictMode(fd, fs.fstatSync(fd), FILE_MODE);
+            created = fs.fstatSync(fd, { bigint: true });
+            if (options?.requireOwner) assertOwner(created, filePath);
+            const checkAcl = options?.checkAcl ?? (options?.requireOwner && options?.restrict !== false);
+            if (checkAcl) assertPrivateAcl(filePath, created);
+            restrictMode(fd, created, FILE_MODE);
         } catch (createError) {
             if (fd !== undefined) {
-                fs.closeSync(fd);
+                try {
+                    fs.closeSync(fd);
+                } finally {
+                    rollbackCreatedPrivateFile(filePath, created, createError, { empty: true });
+                }
+                throw createError;
             }
             if (createError.code !== 'EEXIST') {
                 throw createError;
@@ -232,7 +272,15 @@ export function appendPrivateFile(filePath, data, options) {
         }
     }
     try {
-        fs.writeFileSync(fd, data);
+        if (options?.singleWrite) {
+            // Retrying a short append can interleave its remaining bytes with another writer.
+            const bytes = typeof data === 'string' ? Buffer.from(data) : data;
+            if (fs.writeSync(fd, bytes) !== bytes.byteLength) {
+                throw new Error('Incomplete private file append');
+            }
+        } else {
+            fs.writeFileSync(fd, data);
+        }
     } finally {
         fs.closeSync(fd);
     }

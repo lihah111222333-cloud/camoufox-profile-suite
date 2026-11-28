@@ -2,7 +2,7 @@ import { createDecipheriv } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { isMainThread } from 'node:worker_threads';
-import { readPrivateFile } from './private-storage.js';
+import { decodePrivateUtf8, readPrivateFile } from './private-storage.js';
 import {
     configurationError, getDefaultProfilesDirectory, getLegacyDirectory, getStateDirectory, validateExistingStateDirectory
 } from './state-paths.js';
@@ -25,9 +25,13 @@ function parseEnvironment(content) {
 
 function readEnvironmentFile(filePath, readOnly) {
     try {
-        return readPrivateFile(filePath, 'utf8', { requireOwner: true, restrict: !readOnly, checkAcl: true });
+        const bytes = readPrivateFile(filePath, null, { requireOwner: true, restrict: !readOnly, checkAcl: true });
+        return decodePrivateUtf8(bytes);
     } catch (error) {
         if (error.code === 'ENOENT') return undefined;
+        if (error.code === 'ERR_ENCODING_INVALID_ENCODED_DATA') {
+            throw configurationError('Invalid UTF-8 in private configuration file ' + path.basename(filePath));
+        }
         throw configurationError('Could not read ' + path.basename(filePath) + ' as a private configuration file');
     }
 }
@@ -47,10 +51,11 @@ function createVaultParser(value) {
     }
     if (!keys.length) throw configurationError('Invalid DOTENV_KEY');
 
+    let selectedField;
     return content => {
         const vault = parseEnvironment(content);
         for (const { field, password } of keys) {
-            if (!vault[field]) continue;
+            if ((selectedField !== undefined && selectedField !== field) || !vault[field]) continue;
             try {
                 // Dotenv Vault stores a 12-byte nonce, AES-256-GCM ciphertext and a 16-byte tag.
                 const bytes = Buffer.from(vault[field], 'base64');
@@ -59,8 +64,12 @@ function createVaultParser(value) {
                 const decrypt = createDecipheriv('aes-256-gcm', key, bytes.subarray(0, 12), { authTagLength: 16 });
                 decrypt.setAuthTag(bytes.subarray(-16));
                 const decoded = Buffer.concat([decrypt.update(bytes.subarray(12, -16)), decrypt.final()]);
-                return parseEnvironment(decoded.toString('utf8'));
-            } catch {
+                // Once authenticated, every vault must use the same environment.
+                selectedField = field;
+                return parseEnvironment(decodePrivateUtf8(decoded));
+            } catch (error) {
+                // Authenticated but malformed text cannot be repaired by rotating the key.
+                if (error.code === 'ERR_ENCODING_INVALID_ENCODED_DATA') throw error;
                 // A later rotation key may decrypt this environment.
             }
         }
@@ -102,7 +111,9 @@ function applyEnvironment(env, values, caseInsensitive, onlyKey) {
     }
 }
 
-export function loadApplicationEnvironment({ env = process.env, readOnly = false, includeGoLoginFallback = false } = {}) {
+function stageApplicationEnvironment(env, { readOnly, includeGoLoginFallback }) {
+    // Keep the supplied environment as the source of higher-priority values.
+    const staged = Object.create(env);
     const vaultKey = env.DOTENV_KEY;
     let directory;
     try {
@@ -110,7 +121,7 @@ export function loadApplicationEnvironment({ env = process.env, readOnly = false
     } catch (error) {
         throw configurationError(error.message);
     }
-    if (!directory) return env;
+    if (!directory) return staged;
 
     let parseVault;
     const read = filename => {
@@ -135,9 +146,6 @@ export function loadApplicationEnvironment({ env = process.env, readOnly = false
         }
     };
 
-    // Stage additions until all required files have been read. Fall back to
-    // the original environment for precedence checks without copying its keys.
-    const staged = Object.create(env);
     // Only Windows' main-thread process environment ignores key casing.
     const caseInsensitive = process.platform === 'win32' && isMainThread && env === process.env;
     applyEnvironment(staged, read('.env'), caseInsensitive);
@@ -148,6 +156,14 @@ export function loadApplicationEnvironment({ env = process.env, readOnly = false
         // fallback settings once the application service is configured.
         applyEnvironment(staged, read('.emv'), caseInsensitive, 'GOLOGIN_API_KEY');
     }
+    return staged;
+}
+
+export function loadApplicationEnvironment({
+    env = process.env, readOnly = false, includeGoLoginFallback = false, validate
+} = {}) {
+    const staged = stageApplicationEnvironment(env, { readOnly, includeGoLoginFallback });
+    validate?.(staged);
     return Object.assign(env, staged);
 }
 

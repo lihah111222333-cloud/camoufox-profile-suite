@@ -3,21 +3,30 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { listCaptureDirectory, readCaptureFile } from './capture-io.js';
 import {
+    assertPrivateAcl,
+    decodePrivateUtf8,
     ensurePrivateDirectory,
     readPrivateFile,
+    removeCreatedPrivateFile,
     restrictPrivateFile,
     writePrivateFile
 } from '../utils/private-storage.js';
-import { describeProcessOwner, processOwnerStatus, readProcessOwner } from '../utils/process-owner.js';
+import { describeProcessOwner, isSameProcessScope, processOwnerStatus, readProcessOwner } from '../utils/process-owner.js';
 
 // This directory name cannot be a valid profile ID.
 export const PROFILE_LEASE_DIRECTORY = '.camoufox-leases~';
 const NATIVE_EXIT_MARKER = '~native-exit-unconfirmed';
+export const PRIVATE_NATIVE_LOG = Object.freeze({ requireOwner: true, checkAcl: true });
+const CAPTURE_WRITER_LEASE_NAME = /^\.camoufox-traffic-[a-f0-9]{64}~$/;
+const LEASE_OWNER_NAME = /^([1-9]\d*)-[0-9a-f-]{36}$/;
+const BOUND_CAPTURE_OWNER_NAME = /^([1-9]\d*)-[0-9a-f-]{36}\.(-?\d+)\.(-?\d+)\.(-?\d+)$/;
 
 const EMPTY_STORAGE_STATE = { cookies: [], origins: [] };
-const PRIVATE_SNAPSHOT = { requireOwner: true };
-const EXISTING_PROFILE = { ...PRIVATE_SNAPSHOT, create: false };
-const SNAPSHOT_OWNER_NAME = /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.(-?\d+)\.(-?\d+)\.owner$/;
+const PRIVATE_PROFILE_FILE = { requireOwner: true };
+const EXISTING_PROFILE = { ...PRIVATE_PROFILE_FILE, create: false };
+const METADATA_STAGING = '.camoufox-profile-json~';
+const SNAPSHOT_STAGING = '.camoufox-storage-state~';
+const STAGING_OWNER_NAME = /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.(-?\d+)\.(-?\d+)(?:\.(-?\d+))?\.owner$/;
 const NATIVE_LOG_NAMES = {
     sslKeyLogPath: 'sslkeylog.txt',
     neckoMozLogPath: 'necko-pre-tls.moz_log'
@@ -74,13 +83,20 @@ export function inspectProfileDirectory({ profileDir }) {
     }
 }
 
-function parseProfileMetadata(raw, expectedId) {
+function parseProfileMetadata(bytes, expectedId) {
     let metadata;
     try {
-        metadata = JSON.parse(raw);
+        metadata = JSON.parse(decodePrivateUtf8(bytes));
     } catch (error) {
-        if (!(error instanceof SyntaxError)) throw error;
-        throw Object.assign(new SyntaxError('Invalid Camoufox profile metadata JSON'), {
+        let message;
+        if (error.code === 'ERR_ENCODING_INVALID_ENCODED_DATA') {
+            message = 'Invalid UTF-8 in Camoufox profile metadata';
+        } else if (error instanceof SyntaxError) {
+            message = 'Invalid Camoufox profile metadata JSON';
+        } else {
+            throw error;
+        }
+        throw Object.assign(new SyntaxError(message), {
             code: 'ERR_CAMOUFOX_PROFILE_METADATA_INVALID'
         });
     }
@@ -88,8 +104,8 @@ function parseProfileMetadata(raw, expectedId) {
 }
 
 function readProfileMetadataFile(location) {
-    const metadataPath = path.join(location.profileDir, 'profile.json');
-    return parseProfileMetadata(readPrivateFile(metadataPath), location.id);
+    const raw = readCaptureFile(location.profileDir, 'profile.json', { trustedLocal: true });
+    return parseProfileMetadata(raw, location.id);
 }
 
 function requireProfileIdentity(metadata, expectedId) {
@@ -104,11 +120,9 @@ function requireProfileIdentity(metadata, expectedId) {
     return metadata;
 }
 
-export function readProfileMetadata(location, { readOnly = false } = {}) {
+export function readProfileMetadata(location) {
     if (!inspectProfileDirectory(location)) return null;
-    if (!readOnly) return readProfileMetadataFile(location);
-    const raw = readCaptureFile(location.profileDir, 'profile.json', { trustedLocal: true });
-    return parseProfileMetadata(raw.toString('utf8'), location.id);
+    return readProfileMetadataFile(location);
 }
 
 export function inspectProfileForDeletion(location) {
@@ -122,7 +136,7 @@ export function stampProfileIdentity(location, metadataPath, metadata) {
     const stats = inspectProfileDirectory(location);
     if (!stats) throw new Error('Camoufox profile directory is missing');
     const generation = randomUUID();
-    writePrivateFile(metadataPath, JSON.stringify({ ...metadata, _storageGeneration: generation }, null, 2));
+    writeProfileMetadata(metadataPath, { ...metadata, _storageGeneration: generation });
     return { dev: stats.dev, ino: stats.ino, generation };
 }
 
@@ -137,7 +151,8 @@ export function assertProfileIdentity(location, identity) {
 }
 
 function leaseOwner(directory) {
-    if (!inspectProfileDirectory({ profileDir: directory })) return null;
+    const stats = inspectProfileDirectory({ profileDir: directory });
+    if (!stats) return null;
     try {
         const entries = fs.readdirSync(directory, { withFileTypes: true });
         const nativeExit = entries.find(({ name }) => name === NATIVE_EXIT_MARKER);
@@ -145,13 +160,26 @@ function leaseOwner(directory) {
         const owners = entries.filter(({ name }) => name !== NATIVE_EXIT_MARKER);
         if (!owners.length) return nativeExit ? { nativeExitUnconfirmed: true } : null;
         const [owner] = owners;
-        const pid = Number(/^([1-9]\d*)-[0-9a-f-]{36}$/.exec(owner.name)?.[1]);
+        const binding = CAPTURE_WRITER_LEASE_NAME.test(path.basename(directory)) &&
+            BOUND_CAPTURE_OWNER_NAME.exec(owner.name);
+        const pid = Number((binding || LEASE_OWNER_NAME.exec(owner.name))?.[1]);
         if (owners.length !== 1 || !owner.isFile() || !Number.isInteger(pid) || pid > 0x7fff_ffff) {
             throw new Error('Invalid Camoufox profile lease');
         }
-        const identity = readProcessOwner(path.join(directory, owner.name));
+        const ownerPath = path.join(directory, owner.name);
+        const identity = readProcessOwner(ownerPath);
         if (!identity) throw new Error('Invalid Camoufox profile lease');
-        return { pid, name: owner.name, identity, nativeExitUnconfirmed: Boolean(nativeExit) };
+        const result = { pid, name: owner.name, identity, nativeExitUnconfirmed: Boolean(nativeExit) };
+        if (binding) {
+            const [, , device, directoryInode, ownerInode] = binding;
+            const marker = fs.lstatSync(ownerPath, { bigint: true });
+            const sameDevice = stats.dev.toString() === device && marker.dev === stats.dev;
+            const sameDirectory = stats.ino.toString() === directoryInode;
+            const sameMarker = marker.ino.toString() === ownerInode;
+            result.bindingChanged = !sameDevice || !sameDirectory || !sameMarker;
+            result.copied = sameDevice && !sameDirectory && !sameMarker;
+        }
+        return result;
     } catch (error) {
         if (error.code === 'ENOENT') return null;
         throw error;
@@ -175,9 +203,14 @@ export function nativeExitUnconfirmedError() {
 
 function assertInactiveLeaseOwner(incumbent) {
     if (!incumbent) return;
-    if (incumbent.nativeExitUnconfirmed) throw nativeExitUnconfirmedError();
-    const status = processOwnerStatus(incumbent.pid, incumbent.identity);
-    if (status === 'dead') return;
+    // A copied capture marker must identify a different directory and marker on
+    // this boot, in the same PID namespace. Native exit guards still apply.
+    if (!incumbent.nativeExitUnconfirmed && incumbent.copied && isSameProcessScope(incumbent.identity)) return;
+    const status = incumbent.pid ? processOwnerStatus(incumbent.pid, incumbent.identity) : 'dead';
+    if (status === 'dead') {
+        if (incumbent.nativeExitUnconfirmed) throw nativeExitUnconfirmedError();
+        return;
+    }
     const message = status === 'unverified'
         ? 'Camoufox profile lease owner could not be verified. Follow the lock recovery steps in ENV_VARIABLES.md.'
         : 'Camoufox profile is in use by an active owner';
@@ -201,11 +234,18 @@ export function acquireProfileLease(location) {
 
 export function acquireDirectoryLease(directory) {
     const leaseRoot = path.dirname(directory);
-    const owner = `${process.pid}-${randomUUID()}`;
+    let owner = `${process.pid}-${randomUUID()}`;
     const candidate = fs.mkdtempSync(path.join(leaseRoot, '~candidate-'));
 
     try {
-        fs.writeFileSync(path.join(candidate, owner), describeProcessOwner(), { flag: 'wx', mode: 0o600 });
+        const markerPath = path.join(candidate, owner);
+        fs.writeFileSync(markerPath, describeProcessOwner(), { flag: 'wx', mode: 0o600 });
+        if (CAPTURE_WRITER_LEASE_NAME.test(path.basename(directory))) {
+            const stats = fs.lstatSync(candidate, { bigint: true });
+            const marker = fs.lstatSync(markerPath, { bigint: true });
+            owner += `.${stats.dev}.${stats.ino}.${marker.ino}`;
+            fs.renameSync(markerPath, path.join(candidate, owner));
+        }
         // Publish a populated lease atomically. An incumbent's marker prevents
         // replacement, and cleanup can only remove a specific marker and an empty directory.
         while (true) {
@@ -230,7 +270,7 @@ export function acquireDirectoryLease(directory) {
 
 export function assertProfileLease({ directory, owner }) {
     const incumbent = leaseOwner(directory);
-    if (incumbent?.name !== owner) {
+    if (incumbent?.name !== owner || incumbent?.bindingChanged) {
         throw Object.assign(new Error('Camoufox profile lease is no longer held by this session'), {
             code: 'ERR_CAMOUFOX_PROFILE_STALE'
         });
@@ -244,9 +284,14 @@ export function retainProfileLeaseForNativeExit(lease) {
     fs.closeSync(fs.openSync(markerPath, 'wx', 0o600));
 }
 
+export function confirmProfileLeaseNativeExit(lease) {
+    if (!assertProfileLease(lease).nativeExitUnconfirmed) return;
+    fs.unlinkSync(path.join(lease.directory, NATIVE_EXIT_MARKER));
+}
+
 export function releaseProfileLease({ directory, owner }) {
     const incumbent = leaseOwner(directory);
-    if (incumbent?.name !== owner) return;
+    if (incumbent?.name !== owner || incumbent?.bindingChanged) return;
     if (incumbent.nativeExitUnconfirmed) throw nativeExitUnconfirmedError();
     removeLeaseOwner(directory, owner);
 }
@@ -297,7 +342,7 @@ function acquireCaptureTreeLease(directory, writer = null) {
             for (const entry of entries) {
                 if (!entry.isDirectory()) continue;
                 const child = path.join(parent, entry.name);
-                if (/^\.camoufox-traffic-[a-f0-9]{64}~$/.test(entry.name)) requireLeaseIdle(child);
+                if (CAPTURE_WRITER_LEASE_NAME.test(entry.name)) requireLeaseIdle(child);
                 else pending.push(child);
             }
         }
@@ -338,6 +383,7 @@ export function acquireProfileDeletionStaging(location) {
     const key = hashStorageName(location.id);
     return {
         directory,
+        profileLeaseDirectory: path.join(leaseRoot, location.id),
         prefix: `${key}.`,
         lease: acquireDirectoryLease(path.join(directory, `~${key}`))
     };
@@ -348,25 +394,31 @@ function stagedDeletionName(staging, identity) {
     return `${staging.prefix}${identity.dev}.${identity.ino}.${generation}`;
 }
 
-export function stageProfileDeletion(location, staging, identity) {
+export function stageProfileDeletion(location, staging, identity, lease) {
     assertProfileIdentity(location, identity);
-    // The rename records the verified identity outside the live profile. Later
-    // cleanup can authenticate the remaining directory even if profile.json is gone.
-    fs.renameSync(location.profileDir, path.join(staging.directory, stagedDeletionName(staging, identity)));
+    // The rename records the detached identity and exact owner token. A retry
+    // can finish releasing this lease even if profile.json is already gone.
+    const name = `${stagedDeletionName(staging, identity)}.${lease.owner}`;
+    fs.renameSync(location.profileDir, path.join(staging.directory, name));
 }
 
 export function removeStagedProfileDeletions(staging, identity) {
-    const { directory, prefix } = staging;
-    const names = identity ? [stagedDeletionName(staging, identity)] :
-        fs.readdirSync(directory).filter((name) => name.startsWith(prefix));
+    const { directory, prefix, profileLeaseDirectory } = staging;
+    const target = identity && stagedDeletionName(staging, identity);
+    const names = fs.readdirSync(directory).filter((name) =>
+        target ? name === target || name.startsWith(`${target}.`) : name.startsWith(prefix));
     let removed = false;
     for (const name of names) {
         const profileDir = path.join(directory, name);
         const stats = inspectProfileDirectory({ profileDir });
         if (!stats) continue;
-        const match = /^(-?\d+)\.(-?\d+)\.[0-9a-f]{64}$/.exec(name.slice(prefix.length));
+        const match = /^(-?\d+)\.(-?\d+)\.[0-9a-f]{64}(?:\.([1-9]\d*-[0-9a-f-]{36}))?$/.exec(name.slice(prefix.length));
         if (!match || match[1] !== String(stats.dev) || match[2] !== String(stats.ino)) {
             throw new Error('Staged Camoufox profile does not match its deletion identity');
+        }
+        const owner = match[3];
+        if (owner && fs.lstatSync(path.join(profileLeaseDirectory, owner), { throwIfNoEntry: false })) {
+            releaseProfileLease({ directory: profileLeaseDirectory, owner });
         }
         fs.rmSync(profileDir, { recursive: true });
         removed = true;
@@ -379,7 +431,7 @@ export function resolveProfileNativeDirectory(profileId, profilesDir, { trustedL
     if (!inspectProfileDirectory(location)) return null;
     const raw = readCaptureFile(location.profileDir, 'profile.json', { optional: true, trustedLocal });
     if (!raw) return null;
-    parseProfileMetadata(raw.toString('utf8'), location.id);
+    parseProfileMetadata(raw, location.id);
     const nativeDir = path.join(location.profileDir, '.native');
     inspectProfileDirectory({ profileDir: nativeDir });
     return nativeDir;
@@ -419,7 +471,7 @@ export function initializeProfileStorageAt(location, metadata) {
     try {
         const storage = prepareProfileStorage(staged);
         const initialized = { ...metadata, _storageGeneration: randomUUID() };
-        writePrivateFile(storage.metadataPath, JSON.stringify(initialized, null, 2));
+        writeProfileMetadata(storage.metadataPath, initialized);
         requireUnusedId();
         fs.renameSync(staged.profileDir, profileDir);
         return { storage: profileStoragePaths(profileDir), metadata: initialized };
@@ -430,91 +482,132 @@ export function initializeProfileStorageAt(location, metadata) {
 }
 
 export function ensureProfileStorageAt(location) {
-    if (!readProfileMetadata(location)) {
+    if (!inspectProfileDirectory(location)) {
         throw Object.assign(new Error('Camoufox profile directory is missing'), { code: 'ENOENT' });
     }
-    const storage = prepareProfileStorage(location);
     // Both callers hold this profile's lease throughout storage preparation.
-    discardInterruptedSnapshots(location.profileDir);
+    const metadataPath = path.join(location.profileDir, 'profile.json');
+    const expectedFile = fs.lstatSync(metadataPath);
+    const raw = readPrivateFile(metadataPath, null, { ...PRIVATE_PROFILE_FILE, restrict: false, expectedFile });
+    parseProfileMetadata(raw, location.id);
+    const storage = prepareProfileStorage(location, expectedFile);
+    discardInterruptedProfileWrites(location.profileDir, SNAPSHOT_STAGING);
     return storage;
 }
 
-function prepareProfileStorage(location) {
+function prepareProfileStorage(location, expectedMetadata) {
     const storage = profileStoragePaths(location.profileDir);
-    const { profileDir, trafficDir, payloadsDir, storageStatePath } = storage;
+    const { profileDir, trafficDir, payloadsDir, storageStatePath, metadataPath } = storage;
     ensurePrivateDirectory(profileDir, EXISTING_PROFILE);
+    if (expectedMetadata) {
+        restrictPrivateFile(metadataPath, { ...PRIVATE_PROFILE_FILE, expectedFile: expectedMetadata });
+    }
     for (const dir of [trafficDir, payloadsDir]) ensurePrivateDirectory(dir);
-    if (!restrictIfPresent(storageStatePath, PRIVATE_SNAPSHOT)) {
-        writePrivateFile(storageStatePath, JSON.stringify(EMPTY_STORAGE_STATE, null, 2), PRIVATE_SNAPSHOT);
+    if (!restrictIfPresent(storageStatePath, PRIVATE_PROFILE_FILE)) {
+        writePrivateFile(storageStatePath, JSON.stringify(EMPTY_STORAGE_STATE, null, 2), PRIVATE_PROFILE_FILE);
     }
     return storage;
 }
 
-function snapshotStagingPrefix(profileDir) {
+function profileWriteStagingPrefix(profileDir, staging) {
     const stats = inspectProfileDirectory({ profileDir });
     if (!stats) throw new Error('Camoufox profile directory is missing');
-    return `.camoufox-storage-state~${stats.dev}.${stats.ino}.`;
+    return `${staging}${stats.dev}.${stats.ino}.`;
 }
 
-function ownedSnapshotFile(stats) {
-    return stats?.isFile() && stats.nlink === 1n &&
-        (typeof process.geteuid !== 'function' || stats.uid === BigInt(process.geteuid()));
+function isPrivateStagingFile(filePath, stats) {
+    if (!stats?.isFile() || stats.nlink !== 1n ||
+        (typeof process.geteuid === 'function' && stats.uid !== BigInt(process.geteuid())) ||
+        (process.platform !== 'win32' && (stats.mode & 0o077n) !== 0n)) return false;
+    try {
+        assertPrivateAcl(filePath, stats);
+        return true;
+    } catch (error) {
+        if (error.code !== 'PRIVATE_STORAGE_ACL_ERROR') throw error;
+        return false;
+    }
 }
 
-function discardInterruptedSnapshots(profileDir) {
-    const prefix = snapshotStagingPrefix(profileDir);
+function discardInterruptedProfileWrites(profileDir, staging) {
+    const prefix = profileWriteStagingPrefix(profileDir, staging);
     const statOptions = { bigint: true, throwIfNoEntry: false };
     for (const name of fs.readdirSync(profileDir)) {
         if (!name.startsWith(prefix)) continue;
-        const match = SNAPSHOT_OWNER_NAME.exec(name.slice(prefix.length));
+        const match = STAGING_OWNER_NAME.exec(name.slice(prefix.length));
         if (!match) continue;
+        const [, id, device, inode, birthTime] = match;
+        if (staging === METADATA_STAGING && birthTime === undefined) continue;
 
         const ownerPath = path.join(profileDir, name);
         const owner = fs.lstatSync(ownerPath, statOptions);
-        if (!ownedSnapshotFile(owner) || owner.size !== 0n) continue;
+        if (owner?.size !== 0n || !isPrivateStagingFile(ownerPath, owner)) continue;
 
-        const [, id, device, inode] = match;
         const temporaryPath = path.join(profileDir, `${prefix}${id}.tmp`);
         const temporary = fs.lstatSync(temporaryPath, statOptions);
         if (temporary) {
-            if (!ownedSnapshotFile(temporary) || temporary.dev.toString() !== device ||
-                temporary.ino.toString() !== inode) continue;
-            fs.unlinkSync(temporaryPath);
+            if (temporary.dev.toString() !== device || temporary.ino.toString() !== inode ||
+                (birthTime !== undefined && temporary.birthtimeNs.toString() !== birthTime) ||
+                !isPrivateStagingFile(temporaryPath, temporary) ||
+                !removeCreatedPrivateFile(temporaryPath, temporary)) continue;
         }
-        fs.unlinkSync(ownerPath);
+        removeCreatedPrivateFile(ownerPath, owner, { empty: true });
     }
 }
 
-export function writeStorageState(storageStatePath, state) {
-    const profileDir = path.dirname(storageStatePath);
-    ensurePrivateDirectory(profileDir, EXISTING_PROFILE);
-    const staging = path.join(profileDir, snapshotStagingPrefix(profileDir) + randomUUID());
-    const temporaryPath = `${staging}.tmp`;
+function writeStagedProfileJson(filePath, value, staging) {
+    const profileDir = path.dirname(filePath);
+    const stem = path.join(profileDir, profileWriteStagingPrefix(profileDir, staging) + randomUUID());
+    const temporaryPath = `${stem}.tmp`;
     let ownerPath;
+    let ownerStats;
 
     try {
-        writePrivateFile(storageStatePath, JSON.stringify(state, null, 2), {
-            ...PRIVATE_SNAPSHOT,
+        writePrivateFile(filePath, JSON.stringify(value, null, 2), {
+            ...PRIVATE_PROFILE_FILE,
             temporaryPath,
-            // Record the file's identity before any cookies reach disk.
+            // Record the file's identity before the private contents reach disk.
             recordTemporaryFile(stats) {
-                const marker = `${staging}.${stats.dev}.${stats.ino}.owner`;
+                const birthTime = staging === METADATA_STAGING ? `.${stats.birthtimeNs}` : '';
+                const marker = `${stem}.${stats.dev}.${stats.ino}${birthTime}.owner`;
                 const fd = fs.openSync(marker, 'wx', 0o600);
                 ownerPath = marker;
-                fs.closeSync(fd);
+                try {
+                    ownerStats = fs.fstatSync(fd, { bigint: true });
+                } finally {
+                    fs.closeSync(fd);
+                }
             }
         });
     } finally {
         try {
             if (ownerPath && !fs.lstatSync(temporaryPath, { throwIfNoEntry: false })) {
-                fs.rmSync(ownerPath, { force: true });
+                removeCreatedPrivateFile(ownerPath, ownerStats, { empty: true });
             }
         } catch {
-            process.emitWarning('Could not clean up the Camoufox storage state marker.', {
-                code: 'CAMOUFOX_SNAPSHOT_CLEANUP_FAILED'
-            });
+            if (staging === METADATA_STAGING) {
+                process.emitWarning('Could not clean up the Camoufox profile metadata marker.', {
+                    code: 'CAMOUFOX_PROFILE_METADATA_CLEANUP_FAILED'
+                });
+            } else {
+                process.emitWarning('Could not clean up the Camoufox storage state marker.', {
+                    code: 'CAMOUFOX_SNAPSHOT_CLEANUP_FAILED'
+                });
+            }
         }
     }
+}
+
+export function writeProfileMetadata(metadataPath, metadata) {
+    const profileDir = path.dirname(metadataPath);
+    // Callers hold the profile lease. Respect the existing directory's write permissions.
+    ensurePrivateDirectory(profileDir, { ...EXISTING_PROFILE, restrict: false });
+    discardInterruptedProfileWrites(profileDir, METADATA_STAGING);
+    writeStagedProfileJson(metadataPath, metadata, METADATA_STAGING);
+}
+
+export function writeStorageState(storageStatePath, state) {
+    ensurePrivateDirectory(path.dirname(storageStatePath), EXISTING_PROFILE);
+    writeStagedProfileJson(storageStatePath, state, SNAPSHOT_STAGING);
 }
 
 function profileStoragePaths(profileDir) {
@@ -573,9 +666,9 @@ export function assertExternalNativePath(trafficDir, nativePath) {
 
 export function restrictNativeLogs(storage) {
     if (!fs.existsSync(storage.nativeDir)) return;
-    ensurePrivateDirectory(storage.nativeDir);
+    ensurePrivateDirectory(storage.nativeDir, PRIVATE_NATIVE_LOG);
     for (const { name } of captureEntriesIfPresent(storage.nativeDir).filter(isNativeLogName)) {
-        restrictPrivateFile(path.join(storage.nativeDir, name));
+        restrictPrivateFile(path.join(storage.nativeDir, name), PRIVATE_NATIVE_LOG);
     }
 }
 
@@ -600,7 +693,7 @@ export function archiveLegacyNativeLogs(storage, captureLease = null) {
     const treeLease = acquireCaptureTreeLease(storage.trafficDir, captureLease);
     try {
         assertExternalNativePath(storage.trafficDir, storage.nativeDir);
-        ensurePrivateDirectory(storage.nativeDir);
+        ensurePrivateDirectory(storage.nativeDir, PRIVATE_NATIVE_LOG);
         // Preserve the whole archive with its manifest. Never dereference entries during the move.
         const directories = [
             [storage.trafficDir, capture],
@@ -611,7 +704,9 @@ export function archiveLegacyNativeLogs(storage, captureLease = null) {
             if (entries.length === 0) continue;
             ensurePrivateDirectory(directory);
             for (const entry of entries) {
-                if (entry.isFile()) restrictPrivateFile(path.join(directory, entry.name));
+                if (!entry.isFile()) continue;
+                const permissions = isNativeLogName(entry) ? PRIVATE_NATIVE_LOG : undefined;
+                restrictPrivateFile(path.join(directory, entry.name), permissions);
             }
         }
         const legacyDir = fs.mkdtempSync(path.join(storage.nativeDir, 'legacy-'));
@@ -632,21 +727,21 @@ export function prepareNativeLogs(storage, {
     sslKeyLog, neckoMozLog, harPath,
     sslKeyLogPath = storage.sslKeyLogPath, neckoMozLogPath = storage.neckoMozLogPath
 }) {
-    if (sslKeyLog || neckoMozLog) ensurePrivateDirectory(storage.nativeDir);
+    if (sslKeyLog || neckoMozLog) ensurePrivateDirectory(storage.nativeDir, PRIVATE_NATIVE_LOG);
     restrictIfPresent(storage.harPath);
     if (harPath && harPath !== storage.harPath) restrictIfPresent(harPath);
     restrictNativeLogs(storage);
 
-    if (sslKeyLog && !restrictIfPresent(sslKeyLogPath)) {
-        writePrivateFile(sslKeyLogPath, '# NSS SSL/TLS Secrets Log\n');
+    if (sslKeyLog && !restrictIfPresent(sslKeyLogPath, PRIVATE_NATIVE_LOG)) {
+        writePrivateFile(sslKeyLogPath, '# NSS SSL/TLS Secrets Log\n', PRIVATE_NATIVE_LOG);
     }
-    if (neckoMozLog && !restrictIfPresent(neckoMozLogPath)) {
-        writePrivateFile(neckoMozLogPath, '');
+    if (neckoMozLog && !restrictIfPresent(neckoMozLogPath, PRIVATE_NATIVE_LOG)) {
+        writePrivateFile(neckoMozLogPath, '', PRIVATE_NATIVE_LOG);
     }
 }
 
 export function readStorageState(storageStatePath) {
-    const raw = readPrivateFile(storageStatePath, 'utf8', PRIVATE_SNAPSHOT);
+    const raw = readPrivateFile(storageStatePath, 'utf8', { ...PRIVATE_PROFILE_FILE, restrict: false, checkAcl: true });
     try {
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed?.cookies) && Array.isArray(parsed?.origins)) return parsed;
